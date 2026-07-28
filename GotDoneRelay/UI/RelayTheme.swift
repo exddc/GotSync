@@ -58,8 +58,8 @@ struct PrivacyDisclosureView: View {
                     .font(.headline)
                 Text(
                     compact
-                        ? "Task text is end-to-end encrypted. The relay only routes opaque bytes."
-                        : "No account, analytics, or cloud task database. The relay can see connection timing and byte counts, but never task text or encryption keys."
+                        ? "Task text is end-to-end encrypted. Opaque ciphertext is deleted after receipt or expires after 365 days."
+                        : "No account, analytics, or readable cloud task database. The relay keeps ciphertext until the other iPhone applies it, or for at most 365 days by default. It can see timing and byte counts, but never task text or encryption keys."
                 )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -78,6 +78,8 @@ struct SyncStatusView: View {
     let detail: String
     let roundTripMilliseconds: Double?
     let lastSyncedAt: Date?
+    var mailboxAvailable = false
+    var mailboxNeedsAttention = false
     var showsDetail = true
 
     var body: some View {
@@ -131,16 +133,22 @@ struct SyncStatusView: View {
     }
 
     private var statusColor: Color {
+        if mailboxNeedsAttention, phase != .failed {
+            return RelayTheme.warning
+        }
+        if mailboxAvailable, phase != .failed {
+            return RelayTheme.success
+        }
         switch phase {
         case .synced:
-            RelayTheme.success
+            return RelayTheme.success
         case .waitingForPeer, .verifying, .provisioning,
              .connecting, .reconciling:
-            RelayTheme.warning
+            return RelayTheme.warning
         case .failed:
-            .red
+            return .red
         case .unpaired, .offline:
-            .secondary
+            return .secondary
         }
     }
 }

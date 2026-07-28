@@ -1,6 +1,8 @@
 # Sync research
 
-Research completed on 2026-07-27 before implementation began.
+Initial research completed on 2026-07-27 before implementation began. The
+offline-delivery follow-up was researched on 2026-07-28 before the persistent
+mailbox was implemented.
 
 ## Product constraints
 
@@ -10,17 +12,57 @@ The proof of concept must have:
 - a phrase and QR enrollment experience;
 - explicit approval on the existing device;
 - end-to-end encrypted content;
-- a relay that holds only live routing state and aggregate metrics in memory;
+- a relay that routes live frames and stores only end-to-end-encrypted offline
+  envelopes plus aggregate metrics;
 - foreground, low-latency propagation between two iOS devices;
 - local durability and deterministic convergence after reconnection.
 
 The proof of concept does not promise:
 
-- delivery while every other device is offline;
+- delivery of an edit that never reached the mailbox before its only source
+  lost connectivity;
 - continuous background execution on iOS;
 - anonymous networking or traffic-analysis resistance;
 - production-ready device revocation, group key rotation, or recovery;
 - a cryptographically audited protocol.
+
+## Offline-delivery follow-up
+
+The first implementation required both devices online at the same time. That
+preserved a very small server privacy boundary but produced the wrong product
+experience. Brave and Signal both demonstrate that asynchronous linked-device
+delivery needs a durable server-side queue. The useful privacy goal is not
+"zero server storage"; it is "the server stores nothing it can decrypt and
+collects no account identity."
+
+The live encrypted-frame format cannot be reused for storage because every
+frame is bound to one ephemeral handshake transcript, directional counter, and
+nonce prefix. The follow-up therefore keeps live WebSockets unchanged and adds
+an independently encrypted mailbox envelope for each immutable operation.
+
+Signal's Sesame specification supplies the important delivery model:
+messages may wait in server mailboxes, clients may be offline for arbitrary
+periods, and duplicate delivery must be tolerated. The implementation adopts
+non-destructive fetch, durable local apply before ACK, and idempotent replay.
+It does not adopt Signal accounts, push identifiers, or server-readable
+routing identity.
+
+RFC 8439 permits ChaCha20-Poly1305 when a nonce is unique for a key. The POC
+derives a fresh per-operation key from a keyed 256-bit operation ID, allowing a
+fixed nonce for that independently derived key and exact deterministic retries.
+This construction is intentionally documented as custom and unaudited.
+
+iOS does not promise execution after force-quit. Foreground launch/polling is
+the reliable receive trigger without APNs. `beginBackgroundTask` only provides
+a best-effort grace period to finish an upload already initiated as the app
+backgrounds; it is not a scheduler or wake mechanism.
+
+Follow-up sources:
+
+- [Signal Sesame asynchronous multi-device sessions](https://signal.org/docs/specifications/sesame/)
+- [ChaCha20 and Poly1305 for IETF protocols, RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html)
+- [Apple: extending your app's background execution time](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time)
+- [Apple BackgroundTasks framework](https://developer.apple.com/documentation/backgroundtasks)
 
 ## Brave Sync v2
 
@@ -86,7 +128,8 @@ Adopt:
 - distinct device identities;
 - a separate initial-state transfer.
 
-Do not adopt Signal's server mailbox because it persists messages.
+Adopt the mailbox delivery contract, but store only application-level
+end-to-end ciphertext and delete it immediately after durable receipt.
 
 Sources:
 
@@ -224,10 +267,13 @@ The implementation deliberately differs from Brave:
 - Pairing requires both devices online and explicit host approval.
 - Ephemeral X25519 plus the invitation PSK derives a pair root.
 - Each normal connection performs another ephemeral authenticated handshake.
-- The relay is a volatile two-socket router with aggregate counters only.
+- The relay keeps a volatile two-socket live router plus a directional,
+  capability-authorized encrypted mailbox.
 - Each device persists its own operation log and reconciles missing operations
-  after reconnect.
+  after reconnect; deterministic mailbox envelopes carry the same immutable
+  operations while one peer is offline.
 
-The absence of server storage is an availability tradeoff, not a free privacy
-improvement. If every device containing a missing update is offline or lost,
-the relay cannot recover that update.
+Server storage is an availability choice with a real metadata cost. The relay
+now learns stable mailbox pseudonyms, ciphertext sizes, upload/fetch/ACK timing,
+cursors, and expiry, but not task contents, device IDs, keys, or an account.
+Retained envelopes do not have forward secrecy from later pair-root compromise.

@@ -127,10 +127,23 @@ struct PendingPair: Codable, Equatable, Sendable {
     let expiresAt: Date
 }
 
+struct MailboxCheckpoint: Codable, Equatable, Sendable {
+    let version: UInt8
+    let pairID: Data
+    let uploadedLocalSequence: UInt64
+
+    init(pairID: Data, uploadedLocalSequence: UInt64) {
+        version = SyncProtocol.version
+        self.pairID = pairID
+        self.uploadedLocalSequence = uploadedLocalSequence
+    }
+}
+
 struct CredentialStore: Sendable {
     private let keychain: KeychainStore
     private let activeAccount = "active-pair-v1"
     private let pendingAccount = "pending-pair-v1"
+    private let mailboxCheckpointAccount = "mailbox-checkpoint-v1"
 
     init(keychain: KeychainStore) {
         self.keychain = keychain
@@ -164,8 +177,25 @@ struct CredentialStore: Sendable {
         try keychain.delete(account: pendingAccount)
     }
 
+    func mailboxCheckpoint() throws -> MailboxCheckpoint? {
+        guard let data = try keychain.read(account: mailboxCheckpointAccount) else {
+            return nil
+        }
+        return try CanonicalJSON.decoder.decode(MailboxCheckpoint.self, from: data)
+    }
+
+    func saveMailboxCheckpoint(_ checkpoint: MailboxCheckpoint) throws {
+        let data = try CanonicalJSON.encoder.encode(checkpoint)
+        try keychain.write(data, account: mailboxCheckpointAccount)
+    }
+
+    func clearMailboxCheckpoint() throws {
+        try keychain.delete(account: mailboxCheckpointAccount)
+    }
+
     func clearPair() throws {
         try keychain.delete(account: activeAccount)
         try keychain.delete(account: pendingAccount)
+        try keychain.delete(account: mailboxCheckpointAccount)
     }
 }

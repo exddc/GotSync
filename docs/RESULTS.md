@@ -1,85 +1,82 @@
 # Verification results
 
-Verified on 2026-07-27 with iPhone 17 Pro and iPhone 17 simulators on the
+Verified on 2026-07-28 with iPhone 17 Pro and iPhone 17 simulators on the
 local machine.
 
 ## Automated checks
 
-- XcodeBuildMCP simulator suite: 30 passed, 0 failed, 0 build warnings.
-- Python relay suite: 18 tests and 9 subtests passed.
-- Python dependency check: compatible pinned environment.
-- Replication permutations cover duplicate delivery, Lamport tie-breaking,
-  field independence, cross-origin updates arriving before create, gaps, forks,
-  persistence, provisioning, bounds, and six valid delivery orders around a
-  remove-wins tombstone.
-- Security tests cover deterministic cross-role key agreement, explicit
-  confirmation, a fixed encrypted-frame vector, checksum validation, duplicate
-  QR fields, AEAD tampering, strict frame sequence replay rejection, and
-  ThisDeviceOnly Keychain round-trips. Erase recovery is exercised at every
-  boundary between the two Keychain deletions, replica deletion/recreation, and
-  final recovery-marker removal. Rejected edits keep their recoverable error
-  state until the user changes or successfully resubmits the draft. A
-  fault-injected runtime persistence failure remains fatal across app lifecycle
-  callbacks instead of reconnecting an unsafe replica.
+- XcodeBuildMCP simulator suite: 38 passed, 0 failed, 0 build warnings.
+- XcodeBuildMCP Release simulator build: succeeded with 0 warnings.
+- Python relay suite: 37 tests and 12 subtests passed.
+- Python bytecode compilation and dependency compatibility checks passed.
+- Existing replication coverage includes duplicate delivery, Lamport
+  tie-breaking, independent fields, gaps, forks, persistence, provisioning,
+  bounds, and remove-wins delivery permutations.
+- Mailbox crypto coverage includes an independently generated fixed vector,
+  direction separation, deterministic retry bytes, tampering, wrong-pair
+  rejection, and envelope bounds.
+- Store-and-forward coverage includes offline delivery, streamed response
+  limits, retry after a committed PUT loses its response, restart from a
+  Keychain checkpoint, redelivery after an ACK failure, exactly-once replica
+  application, erase-versus-request races, authorization, quotas, expiry,
+  receipt tombstones, and SQLite restart recovery.
 
-## Two-simulator proof
+## Two-simulator async proof
 
-1. The host generated a QR and a random 17-word invitation.
-2. The joiner entered the phrase manually.
-3. Both simulators independently displayed safety code `775 460`.
-4. Host approval provisioned the encrypted archive and both devices reached
-   `Synced live`.
-5. A task created on the joiner appeared on the host.
-6. Completing it on the host appeared on the joiner.
-7. The relay was stopped and `Write notes` was created locally on the joiner.
-   It remained absent from the host while the relay was unavailable.
-8. Restarting the relay caused both apps to perform a fresh authenticated
-   handshake and the missing operation reconciled.
-9. The first outage run exposed an indefinite `waitsForConnectivity` stall.
-   The transport was changed to fail WebSocket opening after five seconds and
-   enter bounded exponential backoff. A second stop/restart then reconnected
-   automatically without relaunching either app.
-10. After relay hardening and the final rebuild, a completion changed on the
-    joiner appeared on the host, and the host's reversal appeared on the
-    joiner.
-11. A final sequential-toggle stress pass spanned a forced relay shutdown.
-    Both apps reconnected without relaunching, converged to the same task
-    registers, and stayed on the recovered connection.
+The final proof used the real iOS clients and the persistent Python relay, not
+an in-process transport substitute:
 
-After the final stress reconnect, relay counters reported no protocol errors,
-queue overflows, rejected registrations, internal errors, or dropped pre-peer
-frames. Only the two app sockets and one sync room remained live. The final
-two-minute waiting bound matches the invitation deadline; the short-duration
-integration tests exercise expiry and capacity recovery.
+1. The already paired host and joiner reached live sync.
+2. The joiner app was stopped, leaving only the host online.
+3. The host created `Async survives relay restart`.
+4. The host displayed `Saved for offline delivery` after the relay durably
+   accepted the encrypted envelope.
+5. The mailbox database contained one live 226-byte ciphertext. The host app
+   was then stopped too.
+6. The relay process was stopped. SQLite reported `ok` from
+   `PRAGMA integrity_check`, with the same ciphertext still present.
+7. The relay restarted against the same database.
+8. Only the joiner app was launched. The task appeared within about four
+   seconds while the host remained stopped.
+9. After the joiner durably applied and acknowledged the operation, the relay
+   retained zero live payload bytes. It kept the non-payload receipt needed to
+   prevent a retry from resurrecting the acknowledged message.
 
-## Loopback latency
+The database transition was:
 
-The final hardened relay was measured in four consecutive runs of 1,000
-sequential 256-byte binary round trips through two WebSocket clients:
+| Checkpoint | Receipts | Live payloads | Live payload bytes |
+| --- | ---: | ---: | ---: |
+| Sender stopped, before relay restart | 28 | 1 | 226 |
+| Receiver applied and acknowledged | 28 | 0 | 0 |
 
-| Metric | Observed range |
+After restart, relay metrics recorded one fetched and one acknowledged mailbox
+message with no authentication, protocol, capacity, or internal errors.
+
+This exercises the requested boundary: the sending iPhone, receiving iPhone,
+and relay were never required to be online simultaneously for delivery.
+
+## Live-path latency
+
+The final regression run sent 1,000 sequential 256-byte binary round trips
+through two local WebSocket clients:
+
+| Metric | Observed |
 | --- | ---: |
-| p50 | 0.375–0.450 ms |
-| p95 | 0.537–0.865 ms |
-| worst single sample | 23.325 ms |
+| p50 | 0.350 ms |
+| p95 | 0.488 ms |
+| worst single sample | 0.911 ms |
 
-The encrypted in-app ping path displayed roughly 2–17 ms during simulator
-interaction, 3.9–8.3 ms during the final bidirectional smoke test, and
-3.8/2.4 ms in the final joiner/host screenshots. The 23.325 ms relay sample was
-a single local scheduling outlier. These are loopback development
-measurements, not internet or device-energy claims.
+These are local relay timings, not internet, end-to-end UI, or device-energy
+claims. Foreground mailbox polling currently targets roughly two seconds and
+uses bounded jittered backoff after failure. In the simulator restart proof,
+launch-to-visible delivery was within about four seconds.
 
-The measurements cover the live transport and small demo replica. They do not
-measure local commit or durable peer acknowledgement near the 10,000-operation
-limit. The POC currently rewrites its complete canonical JSON archive on every
-mutation; replacing that with indexed SQLite/WAL storage is a production
-scaling requirement, not a result established here.
+The live path still sends an encrypted operation immediately. The mailbox path
+first commits the same logical operation locally, uploads a deterministic
+encrypted envelope, and advances its local checkpoint only after the relay
+transaction succeeds.
 
-The live path has no polling. Interactive operations are locally committed and
-sent as a single encrypted frame immediately. Reconnect uses version vectors
-instead of replaying the full archive.
-
-Run the relay-only benchmark with:
+Run the live relay benchmark with:
 
 ```sh
 cd relay
@@ -88,20 +85,30 @@ cd relay
 
 ## Visual comparison
 
-| Before | After |
-| --- | --- |
-| ![Baseline](screenshots/before-baseline.jpg) | ![Welcome](screenshots/after-welcome.jpg) |
-
-| Pair approval | Host synced | Joiner synced |
+| Before: live-only wording | Sender: peer offline | Receiver: after relay restart |
 | --- | --- | --- |
-| ![Safety code](screenshots/pairing-safety-code.jpg) | ![Host](screenshots/final-host-synced.jpg) | ![Joiner](screenshots/final-joiner-synced.jpg) |
+| ![Before async mailbox](screenshots/before-async-mailbox.jpg) | ![Ciphertext stored for offline delivery](screenshots/async-host-stored.jpg) | ![Offline edit received after restart](screenshots/async-joiner-after-restart.jpg) |
+
+The full live and durable paths are diagrammed in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Scope of the evidence
 
-This proves foreground two-device behavior against a local stateless relay. It
-does not establish production cryptographic assurance, internet behavior,
-background delivery, multi-device membership, revocation, long-term load
-characteristics, or compatibility with the production Got Done data model.
-In particular, the staged pairing commit is not crash-atomic: interruption
-after the host becomes active but before the joiner does can require a local
-reset and a new pairing on both devices.
+This proves foreground two-device behavior against a local persistent relay,
+including delivery after both clients and the relay have stopped. The relay
+stores ciphertext, routing tokens, expiry information, and aggregate metrics;
+it does not receive the content key or plaintext.
+
+It does not establish a production cryptographic audit, internet behavior,
+multi-device membership, revocation, long-term load behavior, push
+notifications, or compatibility with the production Got Done data model. iOS
+background execution is best effort: an edit already accepted by the relay is
+safe, but an edit made without connectivity cannot reach the other phone until
+that source app gets another execution opportunity and reconnects. Force-quit
+cannot be treated as a guaranteed final network flush.
+
+Acknowledged ciphertext is removed immediately at the logical database level.
+Idempotency receipts expire under the configured retention cap, which defaults
+to 365 days for this POC. SQLite pages, WAL files, backups, TLS termination,
+abuse controls, and operational deletion policies need production hardening
+before claiming forensic erasure.

@@ -8,36 +8,51 @@ flowchart LR
         hostUI["SwiftUI task UI"]
         hostReplica["Atomic CRDT archive + operation log"]
         hostKeys["ThisDeviceOnly Keychain"]
-        hostChannel["X25519 + ChaChaPoly channel"]
+        hostLive["Ephemeral live channel"]
+        hostMailbox["Stored-envelope cipher + poller"]
         hostUI -->|"Local mutation"| hostReplica
-        hostReplica -->|"Missing operations"| hostChannel
-        hostKeys -->|"Pair root + device ID"| hostChannel
+        hostReplica -->|"Immediate operations"| hostLive
+        hostReplica -->|"Contiguous local operations"| hostMailbox
+        hostKeys -->|"Pair root + device ID"| hostLive
+        hostKeys -->|"Directional mailbox keys"| hostMailbox
     end
 
     subgraph relayProcess ["Python relay"]
         rooms["Volatile two-socket rooms"]
-        counters["Aggregate in-memory counters"]
+        mailbox["SQLite opaque envelopes + receipts"]
+        counters["Aggregate counters"]
         rooms -->|"Counts only"| counters
+        mailbox -->|"Counts only"| counters
     end
 
     subgraph joinerDevice ["Joiner iPhone"]
-        joinerChannel["X25519 + ChaChaPoly channel"]
+        joinerLive["Ephemeral live channel"]
+        joinerMailbox["Stored-envelope cipher + poller"]
         joinerKeys["ThisDeviceOnly Keychain"]
         joinerReplica["Atomic CRDT archive + operation log"]
         joinerUI["SwiftUI task UI"]
-        joinerChannel -->|"Verified operations"| joinerReplica
-        joinerKeys -->|"Pair root + device ID"| joinerChannel
+        joinerLive -->|"Verified live operations"| joinerReplica
+        joinerMailbox -->|"Persist, then ACK"| joinerReplica
+        joinerKeys -->|"Pair root + device ID"| joinerLive
+        joinerKeys -->|"Directional mailbox keys"| joinerMailbox
         joinerReplica -->|"Published state"| joinerUI
     end
 
-    hostChannel <-->|"Opaque binary WebSocket frames"| rooms
-    rooms <-->|"Opaque binary WebSocket frames"| joinerChannel
+    hostLive <-->|"Opaque WebSocket frames"| rooms
+    rooms <-->|"Opaque WebSocket frames"| joinerLive
+    hostMailbox -->|"PUT host-to-joiner ciphertext"| mailbox
+    mailbox -->|"FETCH joiner inbound ciphertext"| joinerMailbox
+    joinerMailbox -->|"ACK after durable apply"| mailbox
+    joinerMailbox -->|"PUT joiner-to-host ciphertext"| mailbox
+    mailbox -->|"FETCH host inbound ciphertext"| hostMailbox
+    hostMailbox -->|"ACK after durable apply"| mailbox
 ```
 
-The relay has no datastore, mailbox, device registry, or task API. Each device
-is its own durable mailbox. If both replicas are offline, no delivery is
-possible. The POC relay bounds process state to 256 live sockets and 128 rooms
-by default, and expires a route with one waiting peer after two minutes.
+The WebSocket route remains the lowest-latency path and never persists frames.
+The mailbox is a separate directional store-and-forward path. It has no task
+API and never receives decryption keys or plaintext. SQLite retains opaque
+envelopes until the receiving replica durably applies and acknowledges them, or
+until retention expires.
 
 | Device-only | Relay-visible |
 | --- | --- |
@@ -45,6 +60,8 @@ by default, and expires a route with one waiting peer after two minutes.
 | Device IDs and pair ID | Stable pseudonymous sync route |
 | Pair root and traffic keys | Ciphertext byte counts |
 | Operation contents and version vectors | Which two live sockets share a route |
+| Mailbox encryption roots and message-ID keys | Directional routes and global cursors |
+| Mailbox plaintext and AEAD keys | Request authorization (not persisted), upload, fetch, ACK, size, and expiry timing |
 
 ## Pairing
 
@@ -112,7 +129,43 @@ update that arrives before its task's create is retained as a hidden partial
 record; it becomes visible only after a create is retained and both fields
 exist.
 
-## Foreground state
+## Offline store-and-forward
+
+```mermaid
+sequenceDiagram
+    participant Host
+    participant Mailbox as Encrypted mailbox
+    participant Joiner
+
+    Note over Joiner: App is closed
+    Host->>Host: Atomically persist local operation
+    Host->>Host: Derive per-operation key and envelope
+    Host->>Mailbox: PUT deterministic ciphertext
+    Mailbox-->>Host: Durable cursor
+    Host->>Host: Save uploaded sequence checkpoint
+    Note over Host: App may now close
+    Note over Joiner: App launches later
+    Joiner->>Mailbox: FETCH inbound route
+    Mailbox-->>Joiner: Opaque envelope + cursor
+    Joiner->>Joiner: Authenticate, decrypt, validate
+    Joiner->>Joiner: Atomically persist replica update
+    Joiner->>Mailbox: ACK through cursor
+    Mailbox->>Mailbox: Remove ciphertext, keep dedupe receipt
+```
+
+The sender does not equate a successful upload with peer delivery. Its
+checkpoint means only that the relay durably accepted the ciphertext. The
+receiver's replica persistence happens before ACK. If either HTTP response is
+lost, deterministic envelopes and idempotent replica operations make retry
+safe. Host-to-joiner and joiner-to-host use separate routes so a normal client
+cannot consume its own outbound queue.
+
+The active app polls every two seconds and also starts a cycle immediately on
+launch, foregrounding, and local edit. Failure uses bounded backoff. Background
+entry asks iOS for enough time to finish one best-effort cycle; no background
+wake or force-quit guarantee is claimed.
+
+## Connection and mailbox state
 
 ```mermaid
 stateDiagram-v2
@@ -125,4 +178,11 @@ stateDiagram-v2
     Offline --> Connecting: backoff with jitter
     Synced --> Offline: app enters background
     Offline --> Connecting: app becomes active
+    state "Mailbox loop" as Mailbox {
+        [*] --> Checking
+        Checking --> Available: upload/fetch succeeds
+        Available --> Checking: edit or 2s poll
+        Checking --> Unavailable: request fails
+        Unavailable --> Checking: bounded retry or foreground
+    }
 ```

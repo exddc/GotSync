@@ -1,0 +1,943 @@
+import Foundation
+import XCTest
+@testable import GotDoneRelay
+
+final class MailboxTests: XCTestCase {
+    func testStoredEnvelopeIsDeterministicAndDirectional() throws {
+        let pairRoot = Data(0..<32)
+        let pairID = Data(160..<176)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x11, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x22, count: 16)
+        )
+        let operation = TaskOperation(
+            originDeviceID: hostID,
+            originSequence: 1,
+            lamport: 1,
+            taskID: UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!,
+            mutation: .create(title: "Offline", completed: false)
+        )
+        let host = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+        let joiner = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .joiner,
+                local: joinerID,
+                remote: hostID
+            )
+        )
+
+        let first = try host.seal(operation)
+        let retry = try host.seal(operation)
+
+        XCTAssertEqual(first, retry)
+        XCTAssertEqual(try joiner.open(first), operation)
+        XCTAssertNotEqual(host.outbound.route, host.inbound.route)
+        XCTAssertEqual(host.outbound.route, joiner.inbound.route)
+        XCTAssertEqual(host.inbound.route, joiner.outbound.route)
+        XCTAssertEqual(
+            host.outbound.route,
+            (MailboxKeyMaterial.routeLabel + host.outbound.authorization).sha256
+        )
+        XCTAssertThrowsError(try host.open(first))
+    }
+
+    func testStoredEnvelopeVersionOneVector() throws {
+        let pairRoot = Data(0..<32)
+        let pairID = Data(160..<176)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x11, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x22, count: 16)
+        )
+        let operation = TaskOperation(
+            originDeviceID: hostID,
+            originSequence: 1,
+            lamport: 1,
+            taskID: UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!,
+            mutation: .create(title: "Offline", completed: false)
+        )
+        let host = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+        let envelope = try host.seal(operation)
+
+        XCTAssertEqual(
+            host.outbound.route.hexString,
+            "094c4fdd7654e4e688b4176223ec7a7edabc8b92167f78268d77b57eb4e1559e"
+        )
+        XCTAssertEqual(
+            envelope.messageID.hexString,
+            "cf5241d20e44a6afc74b4798a779646b1cf71e230d7b0204ac6cded1fe117757"
+        )
+        XCTAssertEqual(
+            envelope.ciphertext.hexString,
+            "8a45040a6c56da75cd2973c8df12a09cfc65b627c722befa87f90d6a3eb5d0c85b301fd72995abd8d36f3fe093ebb2462729fc6aada6610baf66def0cdc2753518feaba626e6fdf4a9e6e706729557b23f522d3915c0e659fc3c2ad487a8a21f76cc632d6b8125873459a375db856fc377bf55c392cf875cbfd249dcf84c237150191e5d51e5819e2c35accb5d9ce84c0aa65f51d40f43217952a50310ecdd4ea900af28085f3c7aab7c1f30a0934d02cc97099e911506422fbf4fe6c9ddb15747a56837dd4cb9f1417fea"
+        )
+    }
+
+    func testStoredEnvelopeRejectsTamperingAndWrongPair() throws {
+        let pairRoot = Data(repeating: 0x31, count: 32)
+        let pairID = Data(repeating: 0x41, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x51, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x61, count: 16)
+        )
+        let operation = TaskOperation(
+            originDeviceID: hostID,
+            originSequence: 1,
+            lamport: 1,
+            taskID: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+            mutation: .create(title: "Private", completed: false)
+        )
+        let host = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+        let joiner = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .joiner,
+                local: joinerID,
+                remote: hostID
+            )
+        )
+        let envelope = try host.seal(operation)
+
+        var changedID = envelope.messageID
+        changedID[changedID.startIndex] ^= 0x01
+        let idTampered = try StoredMailboxEnvelope(
+            messageID: changedID,
+            ciphertext: envelope.ciphertext
+        )
+        XCTAssertThrowsError(try joiner.open(idTampered))
+
+        var changedCiphertext = envelope.ciphertext
+        changedCiphertext[changedCiphertext.startIndex] ^= 0x01
+        let ciphertextTampered = try StoredMailboxEnvelope(
+            messageID: envelope.messageID,
+            ciphertext: changedCiphertext
+        )
+        XCTAssertThrowsError(try joiner.open(ciphertextTampered))
+
+        let wrongPair = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: Data(repeating: 0x42, count: 16),
+                role: .joiner,
+                local: joinerID,
+                remote: hostID
+            )
+        )
+        XCTAssertThrowsError(try wrongPair.open(envelope))
+    }
+
+    func testHTTPMailboxRejectsStreamedOversizeResponse() async throws {
+        MailboxURLProtocol.setResponseBody(
+            Data(
+                repeating: 0x7b,
+                count: ProtocolLimits.mailboxRequestBytes + 1
+            )
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MailboxURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+        }
+        let transport = HTTPMailboxTransport(
+            baseURL: SyncProtocol.defaultMailboxURL,
+            session: session
+        )
+
+        do {
+            _ = try await transport.fetch(
+                route: Data(repeating: 0x01, count: 32),
+                authorization: Data(repeating: 0x02, count: 32),
+                after: 0,
+                limit: 1
+            )
+            XCTFail("Expected the response-size limit.")
+        } catch {
+            XCTAssertEqual(
+                error as? MailboxTransportError,
+                .responseTooLarge
+            )
+        }
+    }
+
+    @MainActor
+    func testOfflineMailboxSyncsBothDirectionsAfterSenderBackgrounds() async throws {
+        let transport = MemoryMailboxTransport()
+        let pairRoot = Data(repeating: 0x81, count: 32)
+        let pairID = Data(repeating: 0x82, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x83, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x84, count: 16)
+        )
+        let hostKeychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let joinerKeychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let hostDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let joinerDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let hostStore = CredentialStore(keychain: hostKeychain)
+        let joinerStore = CredentialStore(keychain: joinerKeychain)
+        defer {
+            try? hostStore.clearPair()
+            try? joinerStore.clearPair()
+            try? hostKeychain.delete(account: InstallIdentity.account)
+            try? joinerKeychain.delete(account: InstallIdentity.account)
+            try? FileManager.default.removeItem(at: hostDirectory)
+            try? FileManager.default.removeItem(at: joinerDirectory)
+        }
+
+        try hostKeychain.write(hostID.bytes, account: InstallIdentity.account)
+        try joinerKeychain.write(joinerID.bytes, account: InstallIdentity.account)
+        try hostStore.saveActive(
+            credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+        try joinerStore.saveActive(
+            credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .joiner,
+                local: joinerID,
+                remote: hostID
+            )
+        )
+
+        let host = SyncAppModel(
+            keychain: hostKeychain,
+            baseDirectory: hostDirectory,
+            mailboxTransport: transport
+        )
+        XCTAssertTrue(host.addTask(title: "Created while joiner is closed"))
+        let hostUploaded = await eventually {
+            host.pendingMailboxOperationCount == 0
+                && host.mailboxState == .available
+        }
+        XCTAssertTrue(hostUploaded)
+        host.applicationDidEnterBackground()
+
+        let joiner = SyncAppModel(
+            keychain: joinerKeychain,
+            baseDirectory: joinerDirectory,
+            mailboxTransport: transport
+        )
+        let joinerReceived = await eventually {
+            joiner.tasks.first?.titleValue
+                == "Created while joiner is closed"
+        }
+        XCTAssertTrue(joinerReceived)
+        let firstLiveMessageCount = await transport.liveMessageCount()
+        XCTAssertEqual(firstLiveMessageCount, 0)
+
+        XCTAssertTrue(joiner.addTask(title: "Created while host is closed"))
+        let joinerUploaded = await eventually {
+            joiner.pendingMailboxOperationCount == 0
+        }
+        XCTAssertTrue(joinerUploaded)
+        joiner.applicationDidEnterBackground()
+        host.applicationDidBecomeActive()
+
+        let hostReceived = await eventually {
+            Set(host.tasks.compactMap(\.titleValue)) == Set([
+                "Created while joiner is closed",
+                "Created while host is closed",
+            ])
+        }
+        XCTAssertTrue(hostReceived)
+        let secondLiveMessageCount = await transport.liveMessageCount()
+        XCTAssertEqual(secondLiveMessageCount, 0)
+        host.applicationDidEnterBackground()
+    }
+
+    @MainActor
+    func testEraseWaitsForCanceledFetchBeforeForgettingRoutes() async throws {
+        let pairRoot = Data(repeating: 0x91, count: 32)
+        let pairID = Data(repeating: 0x92, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x93, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0x94, count: 16)
+        )
+        let hostCredentials = credentials(
+            pairRoot: pairRoot,
+            pairID: pairID,
+            role: .host,
+            local: hostID,
+            remote: joinerID
+        )
+        let joinerMailbox = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .joiner,
+                local: joinerID,
+                remote: hostID
+            )
+        )
+        let remoteOperation = TaskOperation(
+            originDeviceID: joinerID,
+            originSequence: 1,
+            lamport: 1,
+            taskID: UUID(uuidString: "99999999-aaaa-bbbb-cccc-dddddddddddd")!,
+            mutation: .create(title: "Must remain erased", completed: false)
+        )
+        let transport = BlockingFetchMailboxTransport(
+            page: MailboxFetchPage(
+                messages: [
+                    FetchedMailboxEnvelope(
+                        cursor: 1,
+                        envelope: try joinerMailbox.seal(remoteOperation)
+                    ),
+                ],
+                nextCursor: 1,
+                hasMore: false
+            )
+        )
+        let keychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let credentialStore = CredentialStore(keychain: keychain)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            try? credentialStore.clearPair()
+            try? keychain.delete(account: InstallIdentity.account)
+            try? FileManager.default.removeItem(at: baseDirectory)
+        }
+        try keychain.write(hostID.bytes, account: InstallIdentity.account)
+        try credentialStore.saveActive(hostCredentials)
+        let model = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: transport
+        )
+
+        let fetchDeadline = Date().addingTimeInterval(5)
+        var fetchStarted = false
+        while Date() < fetchDeadline {
+            if await transport.fetchHasStarted() {
+                fetchStarted = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(fetchStarted)
+
+        model.eraseLocalProofOfConcept()
+        let forgottenBeforeFetchFinished =
+            await transport.forgottenRouteCount()
+        XCTAssertEqual(forgottenBeforeFetchFinished, 0)
+        await transport.releaseFetch()
+
+        let forgetDeadline = Date().addingTimeInterval(5)
+        var routesForgotten = false
+        while Date() < forgetDeadline {
+            if await transport.forgottenRouteCount() == 2 {
+                routesForgotten = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(routesForgotten)
+        XCTAssertEqual(model.phase, .unpaired)
+        XCTAssertTrue(model.tasks.isEmpty)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(model.tasks.isEmpty)
+    }
+
+    @MainActor
+    func testAmbiguousPutRetriesIdenticalEnvelopeAfterModelRestart() async throws {
+        let pairRoot = Data(repeating: 0xa1, count: 32)
+        let pairID = Data(repeating: 0xa2, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xa3, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xa4, count: 16)
+        )
+        let keychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let credentialStore = CredentialStore(keychain: keychain)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let transport = CrashBoundaryMailboxTransport(
+            failsFirstPutAfterStore: true
+        )
+        defer {
+            try? credentialStore.clearPair()
+            try? keychain.delete(account: InstallIdentity.account)
+            try? FileManager.default.removeItem(at: baseDirectory)
+        }
+        try keychain.write(hostID.bytes, account: InstallIdentity.account)
+        try credentialStore.saveActive(
+            credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+
+        let firstModel = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: transport
+        )
+        XCTAssertTrue(firstModel.addTask(title: "Retry exactly"))
+        let failureObserved = await eventually {
+            firstModel.mailboxState == .unavailable
+                && firstModel.pendingMailboxOperationCount == 1
+        }
+        XCTAssertTrue(failureObserved)
+        await firstModel.stopRuntimeForTesting()
+
+        let restartedModel = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: transport
+        )
+        let retryCompleted = await eventually {
+            restartedModel.pendingMailboxOperationCount == 0
+                && restartedModel.mailboxState == .available
+        }
+        XCTAssertTrue(retryCompleted)
+        let putAttempts = await transport.putAttempts()
+        XCTAssertGreaterThanOrEqual(putAttempts.count, 2)
+        XCTAssertEqual(putAttempts[0], putAttempts[1])
+        XCTAssertEqual(
+            try credentialStore.mailboxCheckpoint()?.uploadedLocalSequence,
+            1
+        )
+        await restartedModel.stopRuntimeForTesting()
+    }
+
+    @MainActor
+    func testAckFailureRedeliversWithoutDuplicatingReplica() async throws {
+        let pairRoot = Data(repeating: 0xb1, count: 32)
+        let pairID = Data(repeating: 0xb2, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xb3, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xb4, count: 16)
+        )
+        let hostCredentials = credentials(
+            pairRoot: pairRoot,
+            pairID: pairID,
+            role: .host,
+            local: hostID,
+            remote: joinerID
+        )
+        let joinerMailbox = try PairMailbox(
+            credentials: credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .joiner,
+                local: joinerID,
+                remote: hostID
+            )
+        )
+        let operation = TaskOperation(
+            originDeviceID: joinerID,
+            originSequence: 1,
+            lamport: 1,
+            taskID: UUID(uuidString: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff")!,
+            mutation: .create(title: "Apply once", completed: false)
+        )
+        let keychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let credentialStore = CredentialStore(keychain: keychain)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let transport = CrashBoundaryMailboxTransport(
+            failsFirstAcknowledgement: true
+        )
+        defer {
+            try? credentialStore.clearPair()
+            try? keychain.delete(account: InstallIdentity.account)
+            try? FileManager.default.removeItem(at: baseDirectory)
+        }
+        try keychain.write(hostID.bytes, account: InstallIdentity.account)
+        try credentialStore.saveActive(hostCredentials)
+        try await transport.seed(
+            route: joinerMailbox.outbound.route,
+            envelope: joinerMailbox.seal(operation)
+        )
+
+        let firstModel = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: transport
+        )
+        let failedAckObserved = await eventually {
+            firstModel.tasks.first?.titleValue == "Apply once"
+                && firstModel.mailboxState == .unavailable
+        }
+        XCTAssertTrue(failedAckObserved)
+        await firstModel.stopRuntimeForTesting()
+
+        let restartedModel = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: transport
+        )
+        let redeliveryAcknowledged = await eventually {
+            restartedModel.tasks.first?.titleValue == "Apply once"
+                && restartedModel.mailboxState == .available
+        }
+        XCTAssertTrue(redeliveryAcknowledged)
+        let remainingMessages = await transport.liveMessageCount()
+        XCTAssertEqual(remainingMessages, 0)
+        let persisted = try TaskReplica(
+            deviceID: hostID,
+            persistenceURL: baseDirectory
+                .appendingPathComponent("replica-v1.json")
+        )
+        XCTAssertEqual(persisted.retainedOperations, [operation])
+        XCTAssertEqual(persisted.tasks.count, 1)
+        await restartedModel.stopRuntimeForTesting()
+    }
+
+    private func credentials(
+        pairRoot: Data,
+        pairID: Data,
+        role: DeviceRole,
+        local: ReplicaDeviceID,
+        remote: ReplicaDeviceID
+    ) -> PairCredentials {
+        PairCredentials(
+            pairRoot: pairRoot,
+            pairID: pairID,
+            role: role,
+            localDeviceID: local.bytes,
+            remoteDeviceID: remote.bytes
+        )
+    }
+
+    @MainActor
+    private func eventually(
+        timeout: TimeInterval = 5,
+        condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return condition()
+    }
+
+}
+
+private actor MemoryMailboxTransport: MailboxTransport {
+    private struct Record {
+        let cursor: UInt64
+        let messageID: Data
+        let ciphertextHash: Data
+        var envelope: StoredMailboxEnvelope?
+    }
+
+    private var records: [Data: [Record]] = [:]
+    private var nextCursor: UInt64 = 1
+
+    func put(
+        route: Data,
+        authorization: Data,
+        messages: [StoredMailboxEnvelope]
+    ) async throws -> [MailboxStoredReceipt] {
+        try authorize(route: route, authorization: authorization)
+        var routeRecords = records[route, default: []]
+        var receipts: [MailboxStoredReceipt] = []
+        for message in messages {
+            let hash = message.ciphertext.sha256
+            if let existing = routeRecords.first(where: {
+                $0.messageID == message.messageID
+            }) {
+                guard existing.ciphertextHash == hash else {
+                    throw MailboxTransportError.rejected(
+                        status: 409,
+                        code: "messageConflict"
+                    )
+                }
+                receipts.append(
+                    MailboxStoredReceipt(
+                        messageID: message.messageID,
+                        cursor: existing.cursor
+                    )
+                )
+                continue
+            }
+            let cursor = nextCursor
+            nextCursor += 1
+            routeRecords.append(
+                Record(
+                    cursor: cursor,
+                    messageID: message.messageID,
+                    ciphertextHash: hash,
+                    envelope: message
+                )
+            )
+            receipts.append(
+                MailboxStoredReceipt(
+                    messageID: message.messageID,
+                    cursor: cursor
+                )
+            )
+        }
+        records[route] = routeRecords
+        return receipts
+    }
+
+    func fetch(
+        route: Data,
+        authorization: Data,
+        after cursor: UInt64,
+        limit: Int
+    ) async throws -> MailboxFetchPage {
+        try authorize(route: route, authorization: authorization)
+        let available = records[route, default: []]
+            .filter { $0.cursor > cursor && $0.envelope != nil }
+            .sorted { $0.cursor < $1.cursor }
+        let selected = Array(available.prefix(limit))
+        let messages = selected.compactMap { record in
+            record.envelope.map {
+                FetchedMailboxEnvelope(cursor: record.cursor, envelope: $0)
+            }
+        }
+        return MailboxFetchPage(
+            messages: messages,
+            nextCursor: messages.last?.cursor ?? cursor,
+            hasMore: available.count > selected.count
+        )
+    }
+
+    func acknowledge(
+        route: Data,
+        authorization: Data,
+        through cursor: UInt64
+    ) async throws {
+        try authorize(route: route, authorization: authorization)
+        var routeRecords = records[route, default: []]
+        for index in routeRecords.indices
+        where routeRecords[index].cursor <= cursor {
+            routeRecords[index].envelope = nil
+        }
+        records[route] = routeRecords
+    }
+
+    func forget(route: Data, authorization: Data) async throws {
+        try authorize(route: route, authorization: authorization)
+        records.removeValue(forKey: route)
+    }
+
+    func liveMessageCount() -> Int {
+        records.values.reduce(0) { count, records in
+            count + records.filter { $0.envelope != nil }.count
+        }
+    }
+
+    private func authorize(route: Data, authorization: Data) throws {
+        guard
+            route
+                == (MailboxKeyMaterial.routeLabel + authorization).sha256
+        else {
+            throw MailboxTransportError.rejected(
+                status: 401,
+                code: "unauthorized"
+            )
+        }
+    }
+}
+
+private actor BlockingFetchMailboxTransport: MailboxTransport {
+    private let page: MailboxFetchPage
+    private var fetchContinuation:
+        CheckedContinuation<MailboxFetchPage, Never>?
+    private var fetchStarted = false
+    private var forgottenRoutes = Set<Data>()
+
+    init(page: MailboxFetchPage) {
+        self.page = page
+    }
+
+    func put(
+        route: Data,
+        authorization: Data,
+        messages: [StoredMailboxEnvelope]
+    ) async throws -> [MailboxStoredReceipt] {
+        []
+    }
+
+    func fetch(
+        route: Data,
+        authorization: Data,
+        after cursor: UInt64,
+        limit: Int
+    ) async throws -> MailboxFetchPage {
+        fetchStarted = true
+        return await withCheckedContinuation { continuation in
+            fetchContinuation = continuation
+        }
+    }
+
+    func acknowledge(
+        route: Data,
+        authorization: Data,
+        through cursor: UInt64
+    ) async throws {}
+
+    func forget(route: Data, authorization: Data) async throws {
+        forgottenRoutes.insert(route)
+    }
+
+    func fetchHasStarted() -> Bool {
+        fetchStarted
+    }
+
+    func releaseFetch() {
+        fetchContinuation?.resume(returning: page)
+        fetchContinuation = nil
+    }
+
+    func forgottenRouteCount() -> Int {
+        forgottenRoutes.count
+    }
+}
+
+private final class MailboxURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let responseLock = NSLock()
+    nonisolated(unsafe) private static var responseBody = Data()
+
+    static func setResponseBody(_ data: Data) {
+        responseLock.lock()
+        responseBody = data
+        responseLock.unlock()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(
+        for request: URLRequest
+    ) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.responseLock.lock()
+        let body = Self.responseBody
+        Self.responseLock.unlock()
+        guard
+            let url = request.url,
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )
+        else {
+            client?.urlProtocol(
+                self,
+                didFailWithError: URLError(.badServerResponse)
+            )
+            return
+        }
+        client?.urlProtocol(
+            self,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        let chunkSize = 16 * 1_024
+        for start in stride(from: 0, to: body.count, by: chunkSize) {
+            let end = min(start + chunkSize, body.count)
+            client?.urlProtocol(
+                self,
+                didLoad: body.subdata(in: start..<end)
+            )
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private actor CrashBoundaryMailboxTransport: MailboxTransport {
+    private struct Record {
+        let cursor: UInt64
+        let envelope: StoredMailboxEnvelope
+        var isLive: Bool
+    }
+
+    private var records: [Data: [Record]] = [:]
+    private var capturedPutAttempts: [[StoredMailboxEnvelope]] = []
+    private var nextCursor: UInt64 = 1
+    private var shouldFailPut: Bool
+    private var shouldFailAcknowledgement: Bool
+
+    init(
+        failsFirstPutAfterStore: Bool = false,
+        failsFirstAcknowledgement: Bool = false
+    ) {
+        shouldFailPut = failsFirstPutAfterStore
+        shouldFailAcknowledgement = failsFirstAcknowledgement
+    }
+
+    func seed(route: Data, envelope: StoredMailboxEnvelope) {
+        records[route, default: []].append(
+            Record(cursor: nextCursor, envelope: envelope, isLive: true)
+        )
+        nextCursor += 1
+    }
+
+    func put(
+        route: Data,
+        authorization: Data,
+        messages: [StoredMailboxEnvelope]
+    ) async throws -> [MailboxStoredReceipt] {
+        capturedPutAttempts.append(messages)
+        var routeRecords = records[route, default: []]
+        var receipts: [MailboxStoredReceipt] = []
+        for message in messages {
+            if let existing = routeRecords.first(where: {
+                $0.envelope.messageID == message.messageID
+            }) {
+                guard existing.envelope == message else {
+                    throw MailboxTransportError.rejected(
+                        status: 409,
+                        code: "messageConflict"
+                    )
+                }
+                receipts.append(
+                    MailboxStoredReceipt(
+                        messageID: message.messageID,
+                        cursor: existing.cursor
+                    )
+                )
+                continue
+            }
+            let cursor = nextCursor
+            nextCursor += 1
+            routeRecords.append(
+                Record(
+                    cursor: cursor,
+                    envelope: message,
+                    isLive: true
+                )
+            )
+            receipts.append(
+                MailboxStoredReceipt(
+                    messageID: message.messageID,
+                    cursor: cursor
+                )
+            )
+        }
+        records[route] = routeRecords
+        if shouldFailPut {
+            shouldFailPut = false
+            throw URLError(.timedOut)
+        }
+        return receipts
+    }
+
+    func fetch(
+        route: Data,
+        authorization: Data,
+        after cursor: UInt64,
+        limit: Int
+    ) async throws -> MailboxFetchPage {
+        let available = records[route, default: []]
+            .filter { $0.isLive && $0.cursor > cursor }
+            .sorted { $0.cursor < $1.cursor }
+        let selected = Array(available.prefix(limit))
+        return MailboxFetchPage(
+            messages: selected.map {
+                FetchedMailboxEnvelope(
+                    cursor: $0.cursor,
+                    envelope: $0.envelope
+                )
+            },
+            nextCursor: selected.last?.cursor ?? cursor,
+            hasMore: available.count > selected.count
+        )
+    }
+
+    func acknowledge(
+        route: Data,
+        authorization: Data,
+        through cursor: UInt64
+    ) async throws {
+        if shouldFailAcknowledgement {
+            shouldFailAcknowledgement = false
+            throw URLError(.networkConnectionLost)
+        }
+        var routeRecords = records[route, default: []]
+        for index in routeRecords.indices
+        where routeRecords[index].cursor <= cursor {
+            routeRecords[index].isLive = false
+        }
+        records[route] = routeRecords
+    }
+
+    func forget(route: Data, authorization: Data) async throws {
+        records.removeValue(forKey: route)
+    }
+
+    func putAttempts() -> [[StoredMailboxEnvelope]] {
+        capturedPutAttempts
+    }
+
+    func liveMessageCount() -> Int {
+        records.values.reduce(0) { count, records in
+            count + records.filter(\.isLive).count
+        }
+    }
+}

@@ -6,6 +6,9 @@ enum SyncProtocol {
     static let version: UInt8 = 1
     static let appID = Data("com.gotdone.relay.poc".utf8)
     static let defaultRelayURL = URL(string: "ws://127.0.0.1:8765/v1")!
+    static let defaultMailboxURL = URL(
+        string: "http://127.0.0.1:8767/v1/mailbox"
+    )!
 }
 
 enum ProtocolLimits {
@@ -20,6 +23,10 @@ enum ProtocolLimits {
     static let taskCount = 1_000
     static let operationCount = 10_000
     static let vectorOrigins = 8
+    static let mailboxEnvelopeBytes = 64 * 1_024
+    static let mailboxBatchCount = 128
+    static let mailboxRequestBytes = 512 * 1_024
+    static let mailboxFetchCount = 64
 }
 
 enum DeviceRole: String, Codable, Sendable {

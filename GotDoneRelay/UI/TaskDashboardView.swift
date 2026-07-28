@@ -12,9 +12,13 @@ struct TaskDashboardView: View {
                 phase: model.phase,
                 title: model.statusTitle,
                 detail: model.statusDetail,
-                roundTripMilliseconds: model.lastRoundTripMilliseconds,
+                roundTripMilliseconds: model.phase == .synced
+                    ? model.lastRoundTripMilliseconds
+                    : nil,
                 lastSyncedAt: model.lastSyncedAt,
-                showsDetail: model.phase != .synced
+                mailboxAvailable: model.isMailboxAvailable,
+                mailboxNeedsAttention: model.mailboxNeedsAttention,
+                showsDetail: model.showsStatusDetail
             )
             .padding(.horizontal, 20)
             .padding(.top, 10)
@@ -36,7 +40,8 @@ struct TaskDashboardView: View {
                 Menu {
                     Section {
                         Text("End-to-end encrypted")
-                        Text("Relay: \(model.relayURL.host() ?? "local")")
+                        Text("Live relay: \(model.relayURL.host() ?? "local")")
+                        Text("Offline mailbox: \(model.mailboxURL.host() ?? "local")")
                     }
 
                     Button(
@@ -76,7 +81,7 @@ struct TaskDashboardView: View {
                 }
             } footer: {
                 Label(
-                    "Edits work offline and reconcile when both apps reconnect.",
+                    "Encrypted edits wait for the other iPhone, then the relay deletes them.",
                     systemImage: "lock.fill"
                 )
                 .font(.footnote)
@@ -95,7 +100,7 @@ struct TaskDashboardView: View {
         ContentUnavailableView {
             Label("Nothing to sync yet", systemImage: "checkmark.circle")
         } description: {
-            Text("Add a task below. It will appear on the other iPhone as soon as the encrypted link is live.")
+            Text("Add a task below. It syncs live or waits encrypted until the other iPhone opens.")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 28)

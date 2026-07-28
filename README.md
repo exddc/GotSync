@@ -7,15 +7,17 @@ The project contains:
 
 - a SwiftUI iPhone sample app;
 - a reusable local-first replication and encrypted transport layer;
-- a Python WebSocket relay with volatile rooms and aggregate in-memory metrics;
+- a Python relay with volatile WebSocket rooms, a durable encrypted mailbox,
+  and aggregate metrics;
 - unit and two-simulator integration verification;
 - protocol, threat-model, latency, and Got Done integration documentation.
 
 Implementation is intentionally narrower than a production sync service:
 
-- both peers must eventually be online together;
-- the foreground app owns the live connection;
-- the relay never stores offline messages;
+- the foreground app owns live delivery and polls for offline delivery;
+- an edit must reach the mailbox before its source device loses connectivity;
+- iOS background time is best effort and there are no push notifications;
+- mailbox ciphertext expires after 365 days by default;
 - initial provisioning is limited to a 280 KiB replica archive;
 - the sample syncs small task titles and completion state;
 - an interruption at the final two-device pairing commit boundary can require
@@ -47,9 +49,13 @@ on the host.
 The local development endpoints are:
 
 - WebSocket relay: `ws://127.0.0.1:8765/v1`
+- encrypted mailbox: `http://127.0.0.1:8767/v1/mailbox`
 - loopback-only health and aggregate metrics: `http://127.0.0.1:8766`
 
-Plain WebSocket transport and the ATS exception are development-only.
+The mailbox defaults to `relay/relay-data/mailbox.sqlite3`. Payloads are
+end-to-end encrypted, acknowledged only after device-local persistence, and
+removed immediately after acknowledgement. Plain WebSocket/HTTP transport and
+the ATS exception are development-only.
 The relay defaults to 256 live sockets, 128 volatile rooms, and a two-minute
 wait for a lone peer; see [the relay README](relay/README.md) for configurable
 limits and control error codes.
@@ -63,5 +69,3 @@ cd relay
 .venv/bin/python -m pytest tests -q
 uv pip check --python .venv/bin/python
 ```
-
-No commit has been created for this proof of concept.

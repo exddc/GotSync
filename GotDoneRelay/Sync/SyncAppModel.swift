@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UIKit
 
 enum SyncPhase: Equatable, Sendable {
     case unpaired
@@ -11,6 +12,13 @@ enum SyncPhase: Equatable, Sendable {
     case synced
     case offline
     case failed
+}
+
+enum MailboxSyncState: Equatable, Sendable {
+    case idle
+    case syncing
+    case available
+    case unavailable
 }
 
 enum SyncAppError: Error, LocalizedError {
@@ -60,10 +68,17 @@ final class SyncAppModel: ObservableObject {
     @Published private(set) var isPaired = false
     @Published private(set) var isHostApprovalPending = false
     @Published private(set) var localEditErrorMessage: String?
+    @Published private(set) var mailboxState: MailboxSyncState = .idle
+    @Published private(set) var pendingMailboxOperationCount = 0
+    @Published private(set) var lastMailboxStoredAt: Date?
+    @Published private(set) var lastMailboxReceivedAt: Date?
+    @Published private(set) var mailboxErrorMessage: String?
 
-    let relayURL = SyncProtocol.defaultRelayURL
+    let relayURL: URL
+    let mailboxURL: URL
 
     private let credentialStore: CredentialStore
+    private let mailboxTransport: any MailboxTransport
     private let deviceID: ReplicaDeviceID
     private let persistenceURL: URL
     private let hasDurableIdentity: Bool
@@ -76,19 +91,35 @@ final class SyncAppModel: ObservableObject {
     private var syncTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var outboundTask: Task<Void, Never>?
+    private var mailboxPollTask: Task<Void, Never>?
+    private var mailboxCycleTask: Task<Void, Never>?
+    private var backgroundFlushTask: Task<Void, Never>?
     private var outboundDrainID: UUID?
+    private var mailboxCycleID: UUID?
     private var pairingSocket: RelaySocket?
     private var activeSocket: RelaySocket?
     private var channelReady = false
     private var approvalContinuation: CheckedContinuation<Bool, Never>?
     private var pendingPings: [Data: ContinuousClock.Instant] = [:]
     private var deferredOperations: [TaskOperation] = []
+    private var uploadedLocalSequence: UInt64 = 0
+    private var mailboxCycleRequested = false
+    private var mailboxFailureCount = 0
+    private var nextMailboxAttemptAt = Date.distantPast
+    private var backgroundTaskIdentifier = UIBackgroundTaskIdentifier.invalid
     private var appIsActive = true
 
     init(
         keychain: KeychainStore = KeychainStore(),
-        baseDirectory: URL? = nil
+        baseDirectory: URL? = nil,
+        relayURL: URL = SyncProtocol.defaultRelayURL,
+        mailboxURL: URL = SyncProtocol.defaultMailboxURL,
+        mailboxTransport: (any MailboxTransport)? = nil
     ) {
+        self.relayURL = relayURL
+        self.mailboxURL = mailboxURL
+        self.mailboxTransport = mailboxTransport
+            ?? HTTPMailboxTransport(baseURL: mailboxURL)
         let resolvedCredentialStore = CredentialStore(keychain: keychain)
         credentialStore = resolvedCredentialStore
 
@@ -155,6 +186,25 @@ final class SyncAppModel: ObservableObject {
                     store: credentialStore,
                     deviceID: deviceID
                 )
+                if let credentials {
+                    do {
+                        if let checkpoint = try credentialStore.mailboxCheckpoint() {
+                            guard
+                                checkpoint.version == SyncProtocol.version,
+                                checkpoint.pairID == credentials.pairID,
+                                checkpoint.uploadedLocalSequence
+                                    <= replica.versionVector[deviceID]
+                            else {
+                                throw SyncAppError.invalidCredentials
+                            }
+                            uploadedLocalSequence =
+                                checkpoint.uploadedLocalSequence
+                        }
+                    } catch {
+                        uploadedLocalSequence = 0
+                        try? credentialStore.clearMailboxCheckpoint()
+                    }
+                }
                 if credentials == nil, let pending = try credentialStore.pending() {
                     if pending.role == .joiner {
                         if FileManager.default.fileExists(atPath: persistenceURL.path) {
@@ -178,6 +228,7 @@ final class SyncAppModel: ObservableObject {
 
         tasks = replica.tasks
         isPaired = credentials != nil
+        refreshPendingMailboxCount()
         phase = isPaired ? .connecting : .unpaired
         if let bootError {
             phase = .failed
@@ -187,12 +238,55 @@ final class SyncAppModel: ObservableObject {
         if credentials != nil {
             Task { [weak self] in
                 self?.startSyncLoop()
+                self?.startMailboxLoop()
             }
         }
     }
 
+    var isMailboxAvailable: Bool {
+        mailboxState == .available
+    }
+
+    var mailboxNeedsAttention: Bool {
+        isPaired
+            && (
+                pendingMailboxOperationCount > 0
+                    || mailboxState == .unavailable
+            )
+    }
+
+    var showsStatusDetail: Bool {
+        phase != .synced || mailboxNeedsAttention
+    }
+
     var statusTitle: String {
-        switch phase {
+        if isPaired, phase != .failed {
+            if pendingMailboxOperationCount > 0 {
+                return phase == .synced
+                    ? "Live · saving offline copy"
+                    : "Saving encrypted changes"
+            }
+            if mailboxState == .unavailable {
+                return phase == .synced
+                    ? "Live · offline delivery unavailable"
+                    : "Waiting for internet"
+            }
+        }
+        if isPaired, phase != .synced, phase != .failed {
+            switch mailboxState {
+            case .syncing:
+                return "Checking for changes"
+            case .available:
+                return lastMailboxStoredAt == nil
+                    ? "Async sync ready"
+                    : "Saved for offline delivery"
+            case .unavailable:
+                return "Waiting for internet"
+            case .idle:
+                break
+            }
+        }
+        return switch phase {
         case .unpaired:
             "Not paired"
         case .waitingForPeer:
@@ -208,14 +302,42 @@ final class SyncAppModel: ObservableObject {
         case .synced:
             "Synced live"
         case .offline:
-            "Waiting to reconnect"
+            "Waiting for internet"
         case .failed:
             "Needs attention"
         }
     }
 
     var statusDetail: String {
-        switch phase {
+        if isPaired, phase != .failed {
+            if pendingMailboxOperationCount > 0 {
+                return phase == .synced
+                    ? "Live sync is active; saving ciphertext before this app can safely close."
+                    : pendingMailboxOperationCount == 1
+                        ? "Encrypting and saving one change for the other iPhone."
+                        : "Encrypting and saving \(pendingMailboxOperationCount) changes for the other iPhone."
+            }
+            if mailboxState == .unavailable {
+                return phase == .synced
+                    ? "Live sync works, but offline delivery is unavailable. Keep this app open until it returns."
+                    : "Local edits are safe and upload automatically when internet returns."
+            }
+        }
+        if isPaired, phase != .synced, phase != .failed {
+            switch mailboxState {
+            case .syncing:
+                return "Checking the private mailbox for encrypted changes."
+            case .available:
+                return lastMailboxStoredAt == nil
+                    ? "This iPhone checks for encrypted changes even when its peer is offline."
+                    : "Stored ciphertext is deleted after the other iPhone durably applies it."
+            case .unavailable:
+                break
+            case .idle:
+                break
+            }
+        }
+        return switch phase {
         case .unpaired:
             "No account, cloud database, or tracking identifier."
         case .waitingForPeer:
@@ -231,9 +353,10 @@ final class SyncAppModel: ObservableObject {
         case .reconciling:
             "Exchanging version vectors and missing operations."
         case .synced:
-            "Changes are sent immediately while both apps are open."
+            "Changes travel live and are also protected for offline delivery."
         case .offline:
-            "Local edits are safe and will reconcile when both apps return."
+            mailboxErrorMessage
+                ?? "Local edits are safe and upload automatically when internet returns."
         case .failed:
             errorMessage ?? "Sync could not continue."
         }
@@ -426,11 +549,18 @@ final class SyncAppModel: ObservableObject {
         guard hasDurableIdentity else {
             return
         }
+        let mailboxToForget = credentials.flatMap {
+            try? PairMailbox(credentials: $0)
+        }
+        let mailboxCycleToFinish = mailboxCycleTask
         pairingTask?.cancel()
         pairingExpiryTask?.cancel()
         syncTask?.cancel()
         pingTask?.cancel()
         outboundTask?.cancel()
+        mailboxPollTask?.cancel()
+        mailboxCycleTask?.cancel()
+        backgroundFlushTask?.cancel()
         pairingAttemptID = nil
         credentials = nil
         isPaired = false
@@ -439,9 +569,17 @@ final class SyncAppModel: ObservableObject {
         syncTask = nil
         pingTask = nil
         outboundTask = nil
+        mailboxPollTask = nil
+        mailboxCycleTask = nil
+        backgroundFlushTask = nil
         outboundDrainID = nil
+        mailboxCycleID = nil
+        mailboxCycleRequested = false
+        mailboxFailureCount = 0
+        nextMailboxAttemptAt = .distantPast
         approvalContinuation?.resume(returning: false)
         approvalContinuation = nil
+        endBackgroundFlush()
 
         if let pairingSocket {
             Task { await pairingSocket.cancel() }
@@ -454,7 +592,23 @@ final class SyncAppModel: ObservableObject {
         channelReady = false
         pendingPings = [:]
         deferredOperations = []
+        uploadedLocalSequence = 0
         hasDurableStorage = false
+
+        if let mailboxToForget {
+            let transport = mailboxTransport
+            Task {
+                await mailboxCycleToFinish?.value
+                try? await transport.forget(
+                    route: mailboxToForget.outbound.route,
+                    authorization: mailboxToForget.outbound.authorization
+                )
+                try? await transport.forget(
+                    route: mailboxToForget.inbound.route,
+                    authorization: mailboxToForget.inbound.authorization
+                )
+            }
+        }
 
         do {
             let markerURL = persistenceURL.deletingLastPathComponent()
@@ -473,8 +627,13 @@ final class SyncAppModel: ObservableObject {
             safetyCode = nil
             lastRoundTripMilliseconds = nil
             lastSyncedAt = nil
+            lastMailboxStoredAt = nil
+            lastMailboxReceivedAt = nil
             errorMessage = nil
+            mailboxErrorMessage = nil
             localEditErrorMessage = nil
+            mailboxState = .idle
+            pendingMailboxOperationCount = 0
             phase = .unpaired
         } catch {
             fail(error)
@@ -483,13 +642,19 @@ final class SyncAppModel: ObservableObject {
 
     func applicationDidBecomeActive() {
         appIsActive = true
+        backgroundFlushTask?.cancel()
+        backgroundFlushTask = nil
+        endBackgroundFlush()
         if isPaired {
             startSyncLoop()
+            startMailboxLoop()
         }
     }
 
     func applicationDidEnterBackground() {
         appIsActive = false
+        mailboxPollTask?.cancel()
+        mailboxPollTask = nil
         syncTask?.cancel()
         pingTask?.cancel()
         outboundTask?.cancel()
@@ -503,8 +668,53 @@ final class SyncAppModel: ObservableObject {
         channelReady = false
         if isPaired {
             phase = .offline
+            startBackgroundMailboxFlush()
         }
     }
+
+    #if DEBUG
+    func stopRuntimeForTesting() async {
+        appIsActive = false
+        mailboxCycleRequested = false
+        let tasks = [
+            pairingTask,
+            pairingExpiryTask,
+            syncTask,
+            pingTask,
+            outboundTask,
+            mailboxPollTask,
+            mailboxCycleTask,
+            backgroundFlushTask,
+        ].compactMap { $0 }
+        for task in tasks {
+            task.cancel()
+        }
+        if let pairingSocket {
+            await pairingSocket.cancel()
+        }
+        if let activeSocket {
+            await activeSocket.cancel()
+        }
+        for task in tasks {
+            await task.value
+        }
+        pairingTask = nil
+        pairingExpiryTask = nil
+        syncTask = nil
+        pingTask = nil
+        outboundTask = nil
+        mailboxPollTask = nil
+        mailboxCycleTask = nil
+        backgroundFlushTask = nil
+        outboundDrainID = nil
+        mailboxCycleID = nil
+        mailboxCycleRequested = false
+        pairingSocket = nil
+        activeSocket = nil
+        channelReady = false
+        endBackgroundFlush()
+    }
+    #endif
 
     private func beginJoin(with invitation: Invitation) {
         invitationPhrase = nil
@@ -614,6 +824,7 @@ final class SyncAppModel: ObservableObject {
                 localDeviceID: deviceID.bytes,
                 remoteDeviceID: remoteDeviceID
             )
+            try credentialStore.clearMailboxCheckpoint()
             try credentialStore.saveActive(credentials)
             self.credentials = credentials
             isPaired = true
@@ -765,6 +976,7 @@ final class SyncAppModel: ObservableObject {
                 localDeviceID: deviceID.bytes,
                 remoteDeviceID: hostDeviceData
             )
+            try credentialStore.clearMailboxCheckpoint()
             try credentialStore.saveActive(credentials)
             self.credentials = credentials
             isPaired = true
@@ -806,8 +1018,13 @@ final class SyncAppModel: ObservableObject {
         invitationURL = nil
         safetyCode = nil
         isHostApprovalPending = false
+        uploadedLocalSequence = 0
+        mailboxFailureCount = 0
+        nextMailboxAttemptAt = .distantPast
+        refreshPendingMailboxCount()
         phase = .connecting
         startSyncLoop()
+        startMailboxLoop()
     }
 
     private func pairingFailed(_ error: Error, attemptID: UUID) {
@@ -826,6 +1043,7 @@ final class SyncAppModel: ObservableObject {
         if isPaired {
             phase = .connecting
             startSyncLoop()
+            startMailboxLoop()
         } else {
             do {
                 try rollbackPendingPairing()
@@ -852,6 +1070,287 @@ final class SyncAppModel: ObservableObject {
         syncTask = Task { [weak self] in
             await self?.maintainSync(credentials)
         }
+    }
+
+    private func startMailboxLoop() {
+        guard
+            appIsActive,
+            hasDurableStorage,
+            mailboxPollTask == nil,
+            credentials != nil
+        else {
+            return
+        }
+        requestMailboxCycle(force: true)
+        mailboxPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                } catch {
+                    return
+                }
+                guard
+                    let self,
+                    self.appIsActive,
+                    self.hasDurableStorage,
+                    self.credentials != nil
+                else {
+                    return
+                }
+                self.requestMailboxCycle(force: false)
+            }
+        }
+    }
+
+    private func requestMailboxCycle(
+        force: Bool,
+        allowInactive: Bool = false
+    ) {
+        guard
+            hasDurableStorage,
+            credentials != nil,
+            appIsActive || allowInactive,
+            force || Date() >= nextMailboxAttemptAt
+        else {
+            return
+        }
+        mailboxCycleRequested = true
+        guard mailboxCycleTask == nil, let credentials else {
+            return
+        }
+        let cycleID = UUID()
+        mailboxCycleID = cycleID
+        mailboxCycleTask = Task { [weak self] in
+            await self?.drainMailboxCycles(
+                credentials: credentials,
+                cycleID: cycleID
+            )
+        }
+    }
+
+    private func drainMailboxCycles(
+        credentials: PairCredentials,
+        cycleID: UUID
+    ) async {
+        while
+            !Task.isCancelled,
+            hasDurableStorage,
+            self.credentials == credentials,
+            mailboxCycleRequested
+        {
+            mailboxCycleRequested = false
+            mailboxState = .syncing
+            do {
+                try await performMailboxCycle(credentials: credentials)
+                mailboxFailureCount = 0
+                nextMailboxAttemptAt = .distantPast
+                mailboxErrorMessage = nil
+                mailboxState = .available
+            } catch is CancellationError {
+                break
+            } catch {
+                guard
+                    !Task.isCancelled,
+                    hasDurableStorage,
+                    self.credentials == credentials,
+                    mailboxCycleID == cycleID
+                else {
+                    break
+                }
+                mailboxFailureCount = min(mailboxFailureCount + 1, 16)
+                let exponent = min(mailboxFailureCount - 1, 4)
+                let retryDelay = min(
+                    Double(2 * (1 << exponent)),
+                    30
+                ) + Double.random(in: 0...0.5)
+                nextMailboxAttemptAt = Date().addingTimeInterval(retryDelay)
+                mailboxErrorMessage = Self.displayMessage(for: error)
+                mailboxState = .unavailable
+                mailboxCycleRequested = false
+                break
+            }
+        }
+
+        guard mailboxCycleID == cycleID else {
+            return
+        }
+        mailboxCycleTask = nil
+        mailboxCycleID = nil
+        if mailboxCycleRequested,
+           hasDurableStorage,
+           self.credentials == credentials
+        {
+            requestMailboxCycle(
+                force: true,
+                allowInactive: !appIsActive
+            )
+        }
+    }
+
+    private func performMailboxCycle(
+        credentials: PairCredentials
+    ) async throws {
+        guard hasDurableStorage else {
+            throw SyncAppError.localStorageUnavailable
+        }
+        try validate(credentials)
+        let mailbox = try PairMailbox(credentials: credentials)
+        try await uploadMailboxOperations(mailbox, credentials: credentials)
+        try await receiveMailboxOperations(
+            mailbox,
+            credentials: credentials
+        )
+    }
+
+    private func uploadMailboxOperations(
+        _ mailbox: PairMailbox,
+        credentials: PairCredentials
+    ) async throws {
+        while !Task.isCancelled {
+            let localSequence = replica.versionVector[deviceID]
+            guard uploadedLocalSequence <= localSequence else {
+                throw SyncAppError.invalidCredentials
+            }
+            let pending = replica.retainedOperations
+                .filter {
+                    $0.originDeviceID == deviceID
+                        && $0.originSequence > uploadedLocalSequence
+                }
+                .sorted {
+                    $0.originSequence < $1.originSequence
+                }
+            guard !pending.isEmpty else {
+                refreshPendingMailboxCount()
+                return
+            }
+            guard pending[0].originSequence == uploadedLocalSequence + 1 else {
+                throw ReplicaError.sequenceGap(
+                    origin: deviceID,
+                    expected: uploadedLocalSequence + 1,
+                    received: pending[0].originSequence
+                )
+            }
+
+            let operations = Array(
+                pending.prefix(ProtocolLimits.mailboxBatchCount)
+            )
+            for (offset, operation) in operations.enumerated() {
+                guard
+                    operation.originSequence
+                        == uploadedLocalSequence + UInt64(offset) + 1
+                else {
+                    throw ReplicaError.sequenceGap(
+                        origin: deviceID,
+                        expected: uploadedLocalSequence + UInt64(offset) + 1,
+                        received: operation.originSequence
+                    )
+                }
+            }
+            let envelopes = try operations.map(mailbox.seal)
+            _ = try await mailboxTransport.put(
+                route: mailbox.outbound.route,
+                authorization: mailbox.outbound.authorization,
+                messages: envelopes
+            )
+
+            try Task.checkCancellation()
+            guard
+                self.credentials == credentials,
+                let lastSequence = operations.last?.originSequence
+            else {
+                throw CancellationError()
+            }
+            let checkpoint = MailboxCheckpoint(
+                pairID: credentials.pairID,
+                uploadedLocalSequence: lastSequence
+            )
+            try credentialStore.saveMailboxCheckpoint(checkpoint)
+            uploadedLocalSequence = lastSequence
+            lastMailboxStoredAt = Date()
+            refreshPendingMailboxCount()
+        }
+        throw CancellationError()
+    }
+
+    private func receiveMailboxOperations(
+        _ mailbox: PairMailbox,
+        credentials: PairCredentials
+    ) async throws {
+        var afterCursor: UInt64 = 0
+        while !Task.isCancelled {
+            let page = try await mailboxTransport.fetch(
+                route: mailbox.inbound.route,
+                authorization: mailbox.inbound.authorization,
+                after: afterCursor,
+                limit: ProtocolLimits.mailboxFetchCount
+            )
+            try Task.checkCancellation()
+            guard self.credentials == credentials else {
+                throw CancellationError()
+            }
+            guard !page.messages.isEmpty else {
+                return
+            }
+
+            let operations = try page.messages.map {
+                try mailbox.open($0.envelope)
+            }
+            let accepted = try replica.applyRemote(operations)
+            publishReplica()
+            if accepted > 0 {
+                lastMailboxReceivedAt = Date()
+                lastSyncedAt = Date()
+            }
+            try await mailboxTransport.acknowledge(
+                route: mailbox.inbound.route,
+                authorization: mailbox.inbound.authorization,
+                through: page.nextCursor
+            )
+
+            guard page.hasMore else {
+                return
+            }
+            afterCursor = page.nextCursor
+        }
+        throw CancellationError()
+    }
+
+    private func startBackgroundMailboxFlush() {
+        guard credentials != nil, hasDurableStorage else {
+            return
+        }
+        endBackgroundFlush()
+        backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(
+            withName: "Encrypted mailbox flush"
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.mailboxCycleTask?.cancel()
+                self?.backgroundFlushTask?.cancel()
+                self?.endBackgroundFlush()
+            }
+        }
+        requestMailboxCycle(force: true, allowInactive: true)
+        guard let cycleTask = mailboxCycleTask else {
+            endBackgroundFlush()
+            return
+        }
+        backgroundFlushTask = Task { [weak self] in
+            await cycleTask.value
+            guard !Task.isCancelled else {
+                return
+            }
+            self?.endBackgroundFlush()
+            self?.backgroundFlushTask = nil
+        }
+    }
+
+    private func endBackgroundFlush() {
+        guard backgroundTaskIdentifier != .invalid else {
+            return
+        }
+        let identifier = backgroundTaskIdentifier
+        backgroundTaskIdentifier = .invalid
+        UIApplication.shared.endBackgroundTask(identifier)
     }
 
     private func maintainSync(_ credentials: PairCredentials) async {
@@ -964,17 +1463,36 @@ final class SyncAppModel: ObservableObject {
 
         while !Task.isCancelled {
             let event = try await socket.receive()
+            try Task.checkCancellation()
+            guard
+                self.credentials == credentials,
+                activeSocket === socket
+            else {
+                throw CancellationError()
+            }
             switch event {
             case .binary(let frame):
                 guard channelReady else {
                     throw RelaySocketError.notConnected
                 }
                 let plaintext = try await socket.openEncrypted(frame)
+                try Task.checkCancellation()
+                guard
+                    self.credentials == credentials,
+                    activeSocket === socket,
+                    channelReady
+                else {
+                    throw CancellationError()
+                }
                 let message = try WireCodec.decode(
                     SyncWireMessage.self,
                     from: plaintext
                 )
-                try await handleSync(message)
+                try await handleSync(
+                    message,
+                    credentials: credentials,
+                    socket: socket
+                )
             case .peerLeft:
                 throw RelaySocketError.peerLeft
             case .peerReady:
@@ -985,7 +1503,11 @@ final class SyncAppModel: ObservableObject {
         }
     }
 
-    private func handleSync(_ message: SyncWireMessage) async throws {
+    private func handleSync(
+        _ message: SyncWireMessage,
+        credentials: PairCredentials,
+        socket: RelaySocket
+    ) async throws {
         guard hasDurableStorage else {
             throw SyncAppError.localStorageUnavailable
         }
@@ -1016,6 +1538,7 @@ final class SyncAppModel: ObservableObject {
             _ = try replica.applyRemote(operations)
             publishReplica()
             try await sendSync(.acknowledgement(vector: replica.versionVector))
+            try requireActiveSync(credentials: credentials, socket: socket)
             if phase == .synced {
                 lastSyncedAt = Date()
             }
@@ -1028,6 +1551,7 @@ final class SyncAppModel: ObservableObject {
                 throw SyncAppError.invalidSyncMessage
             }
             try await flushDeferredOperations()
+            try requireActiveSync(credentials: credentials, socket: socket)
             if vector.isAtLeast(replica.versionVector) {
                 phase = .synced
                 lastSyncedAt = Date()
@@ -1063,6 +1587,20 @@ final class SyncAppModel: ObservableObject {
         }
     }
 
+    private func requireActiveSync(
+        credentials: PairCredentials,
+        socket: RelaySocket
+    ) throws {
+        try Task.checkCancellation()
+        guard
+            self.credentials == credentials,
+            activeSocket === socket,
+            channelReady
+        else {
+            throw CancellationError()
+        }
+    }
+
     private func sendMissingOperations(
         to vector: ReplicaVersionVector
     ) async throws {
@@ -1080,6 +1618,8 @@ final class SyncAppModel: ObservableObject {
             return
         }
         deferredOperations.append(contentsOf: operations)
+        refreshPendingMailboxCount()
+        requestMailboxCycle(force: true)
         guard
             channelReady,
             phase == .synced,
@@ -1334,6 +1874,17 @@ final class SyncAppModel: ObservableObject {
         tasks = replica.tasks
     }
 
+    private func refreshPendingMailboxCount() {
+        let localSequence = replica.versionVector[deviceID]
+        guard localSequence >= uploadedLocalSequence else {
+            pendingMailboxOperationCount = 0
+            return
+        }
+        pendingMailboxOperationCount = Int(
+            localSequence - uploadedLocalSequence
+        )
+    }
+
     private func validateProvisioningArchiveSize() throws {
         let archive = try replica.exportProvisioningArchive()
         guard archive.count <= ProtocolLimits.provisioningArchiveBytes else {
@@ -1381,8 +1932,14 @@ final class SyncAppModel: ObservableObject {
         syncTask?.cancel()
         pingTask?.cancel()
         outboundTask?.cancel()
+        mailboxPollTask?.cancel()
+        mailboxCycleTask?.cancel()
         pingTask = nil
         outboundTask = nil
+        mailboxPollTask = nil
+        mailboxCycleTask = nil
+        mailboxCycleID = nil
+        mailboxCycleRequested = false
         outboundDrainID = nil
         pendingPings = [:]
         if let activeSocket {

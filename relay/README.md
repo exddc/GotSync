@@ -1,10 +1,17 @@
 # Got Done relay
 
-This is the deliberately small, volatile relay for the Got Done sync proof of
-concept. It routes opaque binary WebSocket messages between two live peers. It
-does not encrypt, inspect, persist, replay, or buffer frames before a peer
-arrives. While both peers are live, it uses only bounded transient forwarding
-queues for opaque application frames.
+This is the deliberately small relay for the Got Done sync proof of concept.
+It provides two transports:
+
+- A volatile WebSocket path routes opaque binary messages between two live
+  peers with low latency.
+- A persistent HTTP mailbox stores opaque, end-to-end-encrypted envelopes so a
+  device can publish changes while its peer is offline.
+
+The relay does not encrypt, decrypt, or inspect application envelopes. Live
+frames are never persisted or buffered before a peer arrives. The mailbox
+persists only opaque bytes, random identifiers, cursors, hashes needed for
+idempotency, and expiry timestamps.
 
 ## Run
 
@@ -17,9 +24,17 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
 .venv/bin/python run.py
 ```
 
-The WebSocket endpoint is `ws://127.0.0.1:8765/v1`. For a simulator to reach a
-relay running on the same Mac, `127.0.0.1` works with the iOS Simulator. A real
-device needs a reachable bind address and production TLS.
+The WebSocket endpoint is `ws://127.0.0.1:8765/v1`. The mailbox endpoint
+defaults to `http://127.0.0.1:8767`. For a simulator to reach a relay running
+on the same Mac, `127.0.0.1` works with the iOS Simulator. A real device needs
+a reachable bind address and production TLS.
+
+The mailbox SQLite database defaults to `relay-data/mailbox.sqlite3`, uses WAL
+journaling with full synchronous durability, and is restricted to mode `0600`.
+Override the location with `--mailbox-database` and retention with
+`--mailbox-retention SECONDS`.
+
+## Live WebSocket relay
 
 The POC defaults to at most 256 live WebSocket connections and 128 rooms.
 Override these hard limits with `--max-connections` and `--max-rooms`. A lone
@@ -45,9 +60,64 @@ arrives is dropped immediately. WebSocket compression is disabled. Messages
 are limited to 512 KiB, and each destination has a forwarding queue capped at
 16 frames and 1 MiB.
 
+## Encrypted mailbox
+
+Every mailbox call is a JSON `POST`; route and authorization values never
+appear in a URL:
+
+- `/v1/mailbox/put` accepts `route`, `auth`, and `messages`.
+- `/v1/mailbox/fetch` accepts `route`, `auth`, `after`, and an optional `limit`.
+- `/v1/mailbox/ack` accepts `route`, `auth`, and `cursor`.
+- `/v1/mailbox/forget` accepts `route` and `auth`.
+
+`route`, `auth`, message `id`, and `payload` use canonical unpadded base64url.
+The first three decode to exactly 32 bytes. The client derives its route as:
+
+```text
+SHA256(UTF8("com.gotdone.sync/mailbox-route/v1") || auth)
+```
+
+The server verifies that relationship with a constant-time comparison on
+every request. An example append is:
+
+```json
+{
+  "route": "canonical-base64url-32-bytes",
+  "auth": "canonical-base64url-32-bytes",
+  "messages": [
+    {
+      "id": "canonical-base64url-32-bytes",
+      "payload": "opaque-encrypted-envelope"
+    }
+  ]
+}
+```
+
+`put` returns each stable global `cursor`. Reusing an ID with identical bytes
+is idempotent, including after acknowledgement; reusing it for different bytes
+returns `409`. `fetch` returns the oldest unacknowledged messages after the
+requested cursor in cursor order. `ack` immediately erases payloads through
+the route-scoped cursor while retaining ID/hash receipts until expiry.
+`forget` idempotently deletes all payloads and receipts for the authorized
+route.
+
+Request bodies and serialized fetch responses are limited to 512 KiB, pages
+and append batches to 128 messages, and each opaque payload to 64 KiB. Fetch
+pages may therefore contain fewer than the requested message count. Defaults
+allow 10,000 receipts and 64 MiB of live payload per route, plus global caps.
+All caps have corresponding `--mailbox-max-*` arguments.
+
+Mailbox data expires after 365 days by default. Fetching does not extend
+retention. Adding a new unique message extends the expiry of the route's whole
+unacknowledged queue so older origin-sequence entries cannot expire ahead of
+the newly appended entry. A client reset should call `forget`; retention is
+the fallback when it cannot. Expired rows are unavailable at the deadline and
+are physically purged on startup, during mailbox access, or by the hourly
+background purge. Configure that interval with `--mailbox-purge-interval`.
+
 ## Health and metrics
 
-The second listener is restricted to a loopback address and defaults to
+The metrics listener is restricted to a loopback address and defaults to
 `127.0.0.1:8766`.
 
 - `GET /healthz` returns process health.
@@ -55,11 +125,15 @@ The second listener is restricted to a loopback address and defaults to
 - `POST /metrics/reset` clears cumulative counters while preserving active
   gauges.
 
-Metrics never contain route tokens, payloads, client addresses, headers, or
-device identifiers. The WebSocket library logger is disabled, and the relay
-does not create a database or payload log. All rooms disappear as soon as they
-become empty or their waiting peer expires, and all metrics reset when the
-process restarts.
+Metrics never contain route tokens, authorization values, message IDs,
+payloads, client addresses, headers, or device identifiers. The WebSocket
+library logger is disabled, and the relay creates no payload log. All live
+rooms disappear as soon as they become empty or their waiting peer expires,
+and all metrics reset when the process restarts.
+
+The relay still observes unavoidable metadata such as IP addresses, request
+timing, ciphertext sizes, and acknowledgement timing. Cursors are global and
+monotonic, so their gaps can also reveal rough aggregate mailbox write volume.
 
 ## Test
 
@@ -75,6 +149,7 @@ Run the loopback forwarding benchmark with:
 .venv/bin/python benchmark.py --iterations 1000 --payload-bytes 256
 ```
 
-This POC is plain `ws://` for local development. A deployed version needs
-`wss://`, certificate validation, rate limits, and carefully scrubbed proxy
-access logs.
+This POC uses plain HTTP and `ws://` for local development. A deployed version
+needs HTTPS and `wss://`, certificate validation, rate limits, encrypted
+backups, operational storage monitoring, and carefully scrubbed proxy access
+logs.

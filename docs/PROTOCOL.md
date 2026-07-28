@@ -11,7 +11,10 @@ and must not be treated as production cryptography.
 
 - The relay never receives a task title, completion value, long-term pair root,
   or plaintext device identifier.
-- The relay keeps no database, mailbox, payload log, or pre-peer message buffer.
+- The relay persists only independently authenticated ciphertext envelopes,
+  opaque mailbox routes, cursors, hashes, and expiry metadata.
+- The recipient acknowledges an envelope only after its local replica update
+  is durably persisted; acknowledgement immediately removes its ciphertext.
 - A phrase or QR is a one-time 128-bit random invitation.
 - The existing device approves a live join after both devices show the same
   safety code.
@@ -19,6 +22,7 @@ and must not be treated as production cryptography.
   device's Keychain.
 - Every normal connection derives fresh directional traffic keys.
 - Application writes are locally durable before transmission.
+- A stored-envelope retry is byte-identical and idempotent.
 - Applying the same operation set in any order produces the same visible tasks.
 
 ## Threat model
@@ -40,8 +44,15 @@ It cannot prevent:
   live;
 - IP address, timing, duration, byte-count, and room-co-membership observation
   by the relay;
+- stable directional mailbox-route, cursor, retention, and acknowledgement
+  timing observation by the relay;
 - data loss when every replica carrying the only copy of an update is lost;
-- continuous foreground socket execution after iOS suspends the app.
+- delivery of an edit that never reached the relay before its only source went
+  offline;
+- continuous foreground socket execution or guaranteed background upload after
+  iOS suspends or force-quits the app;
+- forward secrecy for ciphertext retained in the mailbox: later compromise of
+  the pair root can decrypt retained envelopes.
 
 Possession of a live invitation is treated as authorization to attempt pairing
 in this POC. The safety code catches accidental cross-pairing and implementation
@@ -75,6 +86,7 @@ roleA = 0x41
 roleB = 0x42
 pairMode = 0x50
 syncMode = 0x53
+mailboxMode = 0x4d
 ```
 
 Transcript fields are encoded as `fieldTag(UInt8) || length(UInt32) || bytes`.
@@ -106,6 +118,12 @@ The server:
 5. forwards later binary frames unchanged to the other socket;
 6. destroys an empty room immediately;
 7. never buffers a client frame before the second peer exists.
+
+The separate HTTP mailbox is durable and does not alter these live-room rules.
+It listens on `/v1/mailbox/*`, accepts only JSON `POST` bodies, and never places
+mailbox credentials in a URL. The default SQLite store uses WAL journaling and
+`synchronous=FULL`. Aggregate metrics contain no route, authorization,
+message-ID, or payload values.
 
 The default process limits are 256 admitted live WebSocket connections and 128
 rooms, including rooms with only one waiting peer. A lone peer expires after
@@ -377,6 +395,128 @@ POC limits:
 | Per-socket forwarding queue | 16 frames or 1 MiB |
 | Relay registration deadline | 5 seconds |
 | Client WebSocket open deadline | 5 seconds |
+| Stored mailbox envelope | 64 KiB including AEAD tag |
+| Mailbox append batch | 128 envelopes |
+| Client mailbox fetch page | 64 envelopes |
+| Mailbox request or serialized response | 512 KiB |
+| Mailbox unacknowledged retention | 365 days by default |
+| Mailbox receipts per directional route | 10,000 by default |
+| Mailbox live ciphertext per directional route | 64 MiB by default |
+
+## Asynchronous encrypted mailbox
+
+Connection-bound live frames cannot be stored for a later session: their keys,
+nonce prefixes, counters, and associated data belong to one ephemeral
+handshake. Offline delivery therefore encrypts each immutable task operation
+again with independent, session-stable mailbox material.
+
+Each direction has a separate mailbox. For sender role `A` use direction label
+`A-to-B`; for role `B` use `B-to-A`:
+
+```text
+authorization = HKDF-SHA256(pairRoot,
+  info: "com.gotdone.sync/mailbox-auth/" || direction || "/v1", 32)
+
+route = SHA256(
+  UTF8("com.gotdone.sync/mailbox-route/v1") || authorization
+)
+
+encryptionRoot = HKDF-SHA256(pairRoot,
+  info: "com.gotdone.sync/mailbox-encryption/" || direction || "/v1", 32)
+
+messageIDKey = HKDF-SHA256(pairRoot,
+  info: "com.gotdone.sync/mailbox-message-id/" || direction || "/v1", 32)
+```
+
+The server verifies `route` from `authorization` on every request and stores
+neither the authorization value nor its pair root. Host-to-joiner and
+joiner-to-host routes are different. A device appends only to its outbound
+route and fetches/acknowledges only its inbound route.
+
+For canonical operation bytes `P`:
+
+```text
+messageID = HMAC-SHA256(messageIDKey, P)
+
+messageKey = HKDF-SHA256(encryptionRoot,
+  info: "com.gotdone.sync/mailbox-message-key/v1" || messageID, 32)
+
+nonce = 000000000000000000000000
+payload = ChaCha20-Poly1305(messageKey, nonce, P, AAD).ciphertext || tag
+```
+
+The all-zero nonce is safe here because every distinct, immutable operation
+gets a distinct pseudorandom `messageKey`; it is not reused under one key.
+Repeating the same operation intentionally reproduces the same key, nonce, AAD,
+and ciphertext so an ambiguous network retry is exact. A message-ID collision
+would also collide a 256-bit keyed HMAC and is treated as outside the POC's
+practical failure model.
+
+Mailbox AAD is the normal tagged transcript encoding:
+
+| Tag | Value |
+| ---: | --- |
+| 1 | `appID` |
+| 2 | protocol version |
+| 3 | `mailboxMode` |
+| 4 | 16-byte pair ID |
+| 5 | sender role byte |
+| 6 | 32-byte directional route |
+| 7 | 32-byte message ID |
+
+After decryption the recipient re-encodes the operation canonically, recomputes
+the HMAC message ID in constant time, and verifies that its origin is the
+paired remote device.
+
+The HTTP contract is:
+
+```text
+POST /v1/mailbox/put
+  {route, auth, messages: [{id, payload}]}
+
+POST /v1/mailbox/fetch
+  {route, auth, after, limit}
+
+POST /v1/mailbox/ack
+  {route, auth, cursor}
+
+POST /v1/mailbox/forget
+  {route, auth}
+```
+
+Binary fields are canonical unpadded base64url. `put` is transactionally
+idempotent on `(route, messageID)`: identical bytes return the original cursor;
+different bytes return a conflict. The relay assigns monotonically increasing
+opaque cursors. Fetch is ordered and non-destructive. The recipient:
+
+1. fetches a bounded page;
+2. authenticates and validates every envelope;
+3. atomically applies and persists the operations;
+4. acknowledges inclusively through the page's last cursor.
+
+A crash before step 3 leaves the replica unchanged. A crash after step 3 but
+before step 4 redelivers byte-identical operations, which the replica accepts
+as no-ops. ACK nulls ciphertext immediately but retains the message ID and
+ciphertext hash until expiry, so a sender retry after a lost response cannot
+resurrect already-consumed data.
+
+The sender uploads local-origin operations in contiguous sequence order. Only
+after a successful `put` does it save the highest uploaded sequence in the
+ThisDeviceOnly Keychain. Failure before that checkpoint resends the same
+deterministic envelopes. The operation log remains the durable source of
+truth.
+
+The client uploads immediately after each local edit and polls approximately
+every two seconds while active, with bounded failure backoff. Entering the
+background requests one best-effort flush using iOS background execution time;
+there is no APNs wake-up and force-quit upload is not promised. Launch or
+foregrounding immediately uploads and polls.
+
+Unacknowledged ciphertext and its receipts expire after 365 days by default.
+A new unique append extends the whole unacknowledged directional queue to the
+same expiry, preventing an origin-sequence gap inside an active queue.
+Fetching does not extend retention. Explicit local reset best-effort forgets
+both directions; expiry is the fallback.
 
 ## Replicated task model
 
@@ -514,9 +654,13 @@ causal watermark proving that every authorized device can discard old history.
 ## Performance choices
 
 - One persistent WebSocket while the app is active.
-- No polling on the live path.
+- No polling or batching delay on the live path.
+- A separate two-second foreground mailbox poll, plus immediate cycles on edit,
+  launch, and foregrounding.
 - Immediate local UI application.
 - Immediate single-operation send for interactive edits.
+- Deterministic mailbox retries avoid a local ciphertext outbox while the
+  operation log and Keychain upload checkpoint remain authoritative.
 - One actor or serial executor owns every socket send.
 - One connection-scoped outbound drain preserves local origin order; a stale
   send failure cannot cancel a replacement socket.
@@ -560,12 +704,21 @@ time. This is accepted and disclosed POC metadata. A production route-rotation
 scheme must be recoverable on both sides before it can safely reduce that
 linkability.
 
+The mailbox loop is independent of live connection state. A successful mailbox
+upload means "durably stored for delivery," not "applied by the peer." A
+successful inbound ACK means this device durably applied the page. The POC does
+not yet send an encrypted peer receipt back to advance a sender-visible
+`peerAppliedVector`.
+
 ## Production gaps
 
 Before production:
 
 - replace or audit the custom handshake composition and publish test vectors;
 - require `wss://`, certificate validation, rate limits, and scrubbed proxy logs;
+- require `https://` for the mailbox, encrypted database backups, storage
+  monitoring, and a reviewed deletion/forensics policy for SQLite pages, WAL,
+  snapshots, and backups;
 - implement resumable, idempotent pairing recovery across the final two-device
   commit boundary;
 - add explicit per-message deadlines to the cryptographic handshake;
@@ -574,6 +727,13 @@ Before production:
 - add malformed-frame fuzzing and nonce-reuse tests;
 - design background wake-up metadata consciously rather than pretending iOS
   permits a permanent socket;
+- decide whether APNs wake-up tokens fit the product's no-tracking promise;
+- replace or independently audit deterministic stored-envelope derivation,
+  add published cross-language vectors, and design mailbox key epochs for
+  forward secrecy and device revocation;
+- add encrypted peer receipts if the UI must distinguish server acceptance from
+  remote-device application;
+- consider ciphertext padding if message-size leakage is unacceptable;
 - add deterministic recurrence IDs and field-appropriate CRDTs for Got Done;
 - implement content-addressed blob transfer separately from operations;
 - replace whole-archive JSON rewrites and linear lookups with an indexed
