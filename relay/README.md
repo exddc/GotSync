@@ -27,11 +27,13 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
 The WebSocket endpoint is `ws://127.0.0.1:8765/v1`. The mailbox endpoint
 defaults to `http://127.0.0.1:8767`. For a simulator to reach a relay running
 on the same Mac, `127.0.0.1` works with the iOS Simulator. A real device needs
-a reachable bind address and production TLS.
+a deployed TLS endpoint. The relay rejects non-loopback live and mailbox binds
+by default. `--allow-insecure-non-loopback` exists only for an explicit local
+demo and emits a plaintext-exposure warning.
 
 The mailbox SQLite database defaults to `relay-data/mailbox.sqlite3`, uses WAL
-journaling with full synchronous durability, and is restricted to mode `0600`.
-Override the location with `--mailbox-database` and retention with
+journaling, full synchronous durability, connection-level `secure_delete`, and
+mode `0600`. Override the location with `--mailbox-database` and retention with
 `--mailbox-retention SECONDS`.
 
 ## Live WebSocket relay
@@ -71,14 +73,24 @@ appear in a URL:
 - `/v1/mailbox/forget` accepts `route` and `auth`.
 
 `route`, `auth`, message `id`, and `payload` use canonical unpadded base64url.
-The first three decode to exactly 32 bytes. The client derives its route as:
+The first three decode to exactly 32 bytes. Ordinary encrypted task mailboxes
+derive their route as:
 
 ```text
 SHA256(UTF8("com.gotdone.sync/mailbox-route/v1") || auth)
 ```
 
-The server verifies that relationship with a constant-time comparison on
-every request. An example append is:
+Encrypted pairing-control messages instead derive their route as:
+
+```text
+SHA256(UTF8("com.gotdone.sync/pairing-control-route/v2") || auth)
+```
+
+Provision chunks, readiness, commit, receipt, and abort records use
+stage- and direction-separated authorization values within that namespace.
+The server accepts exactly the task-mailbox and pairing-control namespaces and
+verifies both relationships with constant-time comparisons on every request.
+Routes derived from any other label are rejected. An example append is:
 
 ```json
 {
@@ -93,27 +105,35 @@ every request. An example append is:
 }
 ```
 
-`put` returns each stable global `cursor`. Reusing an ID with identical bytes
-is idempotent, including after acknowledgement; reusing it for different bytes
+`put` returns each stable global `cursor` and an `acknowledged` Boolean. The
+Boolean is false while that payload is live and true when only its receipt
+tombstone remains after recipient ACK. Reusing an ID with identical bytes is
+idempotent, including after acknowledgement; reusing it for different bytes
 returns `409`. `fetch` returns the oldest unacknowledged messages after the
-requested cursor in cursor order. `ack` immediately erases payloads through
-the route-scoped cursor while retaining ID/hash receipts until expiry.
-`forget` idempotently deletes all payloads and receipts for the authorized
-route.
+requested cursor in cursor order. `ack` logically nulls payloads through the
+route-scoped cursor so they are no longer served, while retaining ID/hash
+receipts until expiry. SQLite WAL pages, snapshots, and backups are outside
+that logical-deletion guarantee. `forget` idempotently deletes all payloads and
+receipts for the authorized route.
 
 Request bodies and serialized fetch responses are limited to 512 KiB, pages
 and append batches to 128 messages, and each opaque payload to 64 KiB. Fetch
 pages may therefore contain fewer than the requested message count. Defaults
 allow 10,000 receipts and 64 MiB of live payload per route, plus global caps.
-All caps have corresponding `--mailbox-max-*` arguments.
+All caps have corresponding `--mailbox-max-*` arguments. At most 64 mailbox
+connections are handled concurrently by default; configure that bound with
+`--mailbox-max-connections`.
 
 Mailbox data expires after 365 days by default. Fetching does not extend
-retention. Adding a new unique message extends the expiry of the route's whole
-unacknowledged queue so older origin-sequence entries cannot expire ahead of
-the newly appended entry. A client reset should call `forget`; retention is
-the fallback when it cannot. Expired rows are unavailable at the deadline and
-are physically purged on startup, during mailbox access, or by the hourly
-background purge. Configure that interval with `--mailbox-purge-interval`.
+retention. The first unacknowledged message starts one fixed deadline for that
+directional queue. Later messages inherit that deadline instead of extending
+it, so dependent operations expire together and continuous writes cannot
+retain ciphertext indefinitely. Once every live message is acknowledged or
+expired, the next queue receives a fresh full retention period. A client reset
+should call `forget`; retention is the fallback when it cannot. Expired rows
+are unavailable at the deadline and are purged on startup, during mailbox
+access, or by the hourly background purge. Configure that interval with
+`--mailbox-purge-interval`.
 
 ## Health and metrics
 
@@ -121,6 +141,9 @@ The metrics listener is restricted to a loopback address and defaults to
 `127.0.0.1:8766`.
 
 - `GET /healthz` returns process health.
+- `GET /readyz` returns readiness only after a bounded SQLite write-lock and
+  commit probe succeeds and the database has capacity for another page. The
+  probe leaves its logical row unchanged.
 - `GET /metrics` returns aggregate counters and active gauges.
 - `POST /metrics/reset` clears cumulative counters while preserving active
   gauges.
@@ -149,7 +172,7 @@ Run the loopback forwarding benchmark with:
 .venv/bin/python benchmark.py --iterations 1000 --payload-bytes 256
 ```
 
-This POC uses plain HTTP and `ws://` for local development. A deployed version
-needs HTTPS and `wss://`, certificate validation, rate limits, encrypted
-backups, operational storage monitoring, and carefully scrubbed proxy access
-logs.
+This POC uses plain HTTP and `ws://` for loopback development. A deployed
+version needs HTTPS and `wss://`, an admission design resistant to anonymous
+capacity exhaustion, rate limits, encrypted backups, operational storage
+monitoring, and carefully scrubbed proxy access logs.

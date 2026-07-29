@@ -32,6 +32,17 @@ enum MailboxTransportError: Error, Equatable, LocalizedError {
 struct MailboxStoredReceipt: Equatable, Sendable {
     let messageID: Data
     let cursor: UInt64
+    let acknowledged: Bool
+
+    init(
+        messageID: Data,
+        cursor: UInt64,
+        acknowledged: Bool = false
+    ) {
+        self.messageID = messageID
+        self.cursor = cursor
+        self.acknowledged = acknowledged
+    }
 }
 
 struct FetchedMailboxEnvelope: Equatable, Sendable {
@@ -78,6 +89,7 @@ final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
         let id: String
         let payload: String?
         let cursor: UInt64?
+        let acknowledged: Bool?
     }
 
     private struct PutRequest: Encodable {
@@ -172,7 +184,8 @@ final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
                 PutItem(
                     id: $0.messageID.base64URLString,
                     payload: $0.ciphertext.base64URLString,
-                    cursor: nil
+                    cursor: nil,
+                    acknowledged: nil
                 )
             }
         )
@@ -203,7 +216,11 @@ final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
                 throw MailboxTransportError.invalidResponse
             }
             receipts.append(
-                MailboxStoredReceipt(messageID: messageID, cursor: cursor)
+                MailboxStoredReceipt(
+                    messageID: messageID,
+                    cursor: cursor,
+                    acknowledged: item.acknowledged ?? false
+                )
             )
         }
         guard
@@ -405,30 +422,19 @@ final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
     }
 
     private func endpointURL(_ endpoint: String) throws -> URL {
-        guard
-            baseURL.user == nil,
-            baseURL.password == nil,
-            baseURL.query == nil,
-            baseURL.fragment == nil,
-            baseURL.path == "/v1/mailbox",
-            let scheme = baseURL.scheme?.lowercased(),
-            scheme == "http" || scheme == "https",
-            let host = baseURL.host?.lowercased(),
-            !host.isEmpty
-        else {
-            throw MailboxTransportError.invalidURL
-        }
-        #if DEBUG
-        if scheme == "http" {
-            guard host == "127.0.0.1" || host == "localhost" || host == "::1" else {
+        do {
+            try SyncEndpointConfiguration.validateMailboxURL(
+                baseURL,
+                policy: .runtime
+            )
+        } catch let error as SyncEndpointConfigurationError {
+            if error == .invalidMailbox,
+               baseURL.scheme?.lowercased() == "http"
+            {
                 throw MailboxTransportError.insecureTransport
             }
+            throw MailboxTransportError.invalidURL
         }
-        #else
-        guard scheme == "https" else {
-            throw MailboxTransportError.insecureTransport
-        }
-        #endif
         return baseURL.appendingPathComponent(endpoint)
     }
 

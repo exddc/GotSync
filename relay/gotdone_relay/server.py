@@ -51,6 +51,7 @@ MAX_FORWARD_QUEUE_BYTES = 1024 * 1024
 REGISTRATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_CONNECTIONS = 256
 DEFAULT_MAX_ROOMS = 128
+DEFAULT_MAX_MAILBOX_CONNECTIONS = 64
 DEFAULT_WAITING_ROOM_TTL_SECONDS = 120.0
 
 PEER_READY = json.dumps(
@@ -97,6 +98,7 @@ COUNTER_NAMES = (
     "forward_queue_overflows",
     "control_frames_sent",
     "mailbox_requests",
+    "mailbox_connection_capacity_rejections",
     "mailbox_bad_requests",
     "mailbox_authorization_rejections",
     "mailbox_capacity_rejections",
@@ -574,13 +576,18 @@ class RelayServer:
         mailbox_max_route_live_bytes: int = DEFAULT_MAX_ROUTE_LIVE_BYTES,
         mailbox_max_global_receipts: int = DEFAULT_MAX_GLOBAL_RECEIPTS,
         mailbox_max_global_live_bytes: int = DEFAULT_MAX_GLOBAL_LIVE_BYTES,
+        mailbox_max_connections: int = DEFAULT_MAX_MAILBOX_CONNECTIONS,
         metrics: Metrics | None = None,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_rooms: int = DEFAULT_MAX_ROOMS,
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
         mailbox_clock: Callable[[], float] | None = None,
+        allow_insecure_non_loopback: bool = False,
     ) -> None:
-        _require_loopback(metrics_host)
+        _require_loopback(metrics_host, label="metrics host")
+        if not allow_insecure_non_loopback:
+            _require_loopback(host, label="relay host")
+            _require_loopback(mailbox_host, label="mailbox host")
         if (
             not math.isfinite(mailbox_purge_interval_seconds)
             or mailbox_purge_interval_seconds <= 0
@@ -593,6 +600,8 @@ class RelayServer:
             for candidate in (port, metrics_port, mailbox_port)
         ):
             raise ValueError("ports must be between 0 and 65535")
+        if mailbox_max_connections <= 0:
+            raise ValueError("mailbox max connections must be positive")
         self.host = host
         self.port = port
         self.metrics_host = metrics_host
@@ -600,6 +609,7 @@ class RelayServer:
         self.mailbox_host = mailbox_host
         self.mailbox_port = mailbox_port
         self.mailbox_purge_interval_seconds = mailbox_purge_interval_seconds
+        self.mailbox_max_connections = mailbox_max_connections
         self.service = RelayService(
             metrics,
             max_connections=max_connections,
@@ -747,6 +757,12 @@ class RelayServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        if len(self._mailbox_tasks) >= self.mailbox_max_connections:
+            self.service.metrics.increment(
+                "mailbox_connection_capacity_rejections"
+            )
+            writer.close()
+            return
         task = asyncio.create_task(self._handle_mailbox_http(reader, writer))
         self._mailbox_tasks.add(task)
         task.add_done_callback(self._mailbox_tasks.discard)
@@ -878,7 +894,11 @@ class RelayServer:
         self.service.metrics.increment("mailbox_messages_put", len(messages))
         return {
             "messages": [
-                {"cursor": message.cursor, "id": encode_base64url(message.message_id)}
+                {
+                    "acknowledged": message.acknowledged,
+                    "cursor": message.cursor,
+                    "id": encode_base64url(message.message_id),
+                }
                 for message in stored
             ],
             "version": PROTOCOL_VERSION,
@@ -1000,6 +1020,22 @@ class RelayServer:
                     writer,
                     200,
                     {"status": "ok", "version": PROTOCOL_VERSION},
+                )
+            elif method == "GET" and target == "/readyz":
+                try:
+                    ready = await asyncio.wait_for(
+                        asyncio.to_thread(self.mailbox.is_ready),
+                        timeout=1,
+                    )
+                except TimeoutError:
+                    ready = False
+                await _write_http_response(
+                    writer,
+                    200 if ready else 503,
+                    {
+                        "status": "ready" if ready else "unavailable",
+                        "version": PROTOCOL_VERSION,
+                    },
                 )
             elif method == "GET" and target == "/metrics":
                 await _write_http_response(writer, 200, self.service.metrics.snapshot())
@@ -1151,15 +1187,15 @@ def _require_cursor(value: object, *, field: str) -> int:
     return value
 
 
-def _require_loopback(host: str) -> None:
+def _require_loopback(host: str, *, label: str) -> None:
     if host == "localhost":
         return
     try:
         address = ipaddress.ip_address(host)
     except ValueError as error:
-        raise ValueError("metrics host must be a loopback address") from error
+        raise ValueError(f"{label} must be a loopback address") from error
     if not address.is_loopback:
-        raise ValueError("metrics host must be a loopback address")
+        raise ValueError(f"{label} must be a loopback address")
 
 
 async def _write_http_response(
@@ -1175,6 +1211,7 @@ async def _write_http_response(
         429: "Too Many Requests",
         431: "Request Header Fields Too Large",
         500: "Internal Server Error",
+        503: "Service Unavailable",
     }
     body = _encode_json_document(document)
     headers = (
@@ -1246,6 +1283,16 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_GLOBAL_LIVE_BYTES,
         type=int,
     )
+    parser.add_argument(
+        "--mailbox-max-connections",
+        default=DEFAULT_MAX_MAILBOX_CONNECTIONS,
+        type=int,
+    )
+    parser.add_argument(
+        "--allow-insecure-non-loopback",
+        action="store_true",
+        help="allow plaintext relay listeners on non-loopback interfaces",
+    )
     parser.add_argument("--max-connections", default=DEFAULT_MAX_CONNECTIONS, type=int)
     parser.add_argument("--max-rooms", default=DEFAULT_MAX_ROOMS, type=int)
     parser.add_argument(
@@ -1271,9 +1318,11 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
         mailbox_max_route_live_bytes=args.mailbox_max_route_live_bytes,
         mailbox_max_global_receipts=args.mailbox_max_global_receipts,
         mailbox_max_global_live_bytes=args.mailbox_max_global_live_bytes,
+        mailbox_max_connections=args.mailbox_max_connections,
         max_connections=args.max_connections,
         max_rooms=args.max_rooms,
         waiting_room_ttl=args.waiting_room_ttl,
+        allow_insecure_non_loopback=args.allow_insecure_non_loopback,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1287,6 +1336,10 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
             pass
 
     try:
+        if args.allow_insecure_non_loopback:
+            logging.warning(
+                "plaintext relay listeners may be reachable beyond this machine"
+            )
         await relay.start()
         print(f"relay ready on {relay.host}:{relay.websocket_port}/v1")
         print(

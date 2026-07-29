@@ -20,8 +20,10 @@ Implementation is intentionally narrower than a production sync service:
 - mailbox ciphertext expires after 365 days by default;
 - initial provisioning is limited to a 280 KiB replica archive;
 - the sample syncs small task titles and completion state;
-- an interruption at the final two-device pairing commit boundary can require
-  resetting and pairing both devices again;
+- post-handshake pairing provision, ready, commit, receipt, and cancellation
+  are durable and resume after interrupted responses or app restarts;
+- a phone with preserved local tasks can join or re-link without overwriting
+  them; matching history is reused and conflicting tasks require confirmation;
 - the cryptographic protocol is experimental and not independently audited.
 
 Read [the research](docs/RESEARCH.md) and
@@ -52,13 +54,25 @@ The local development endpoints are:
 - encrypted mailbox: `http://127.0.0.1:8767/v1/mailbox`
 - loopback-only health and aggregate metrics: `http://127.0.0.1:8766`
 
+Debug builds fall back to those loopback endpoints. Release builds have no
+fallback and fail closed unless the build injects both:
+
+- `GOTDONE_RELAY_URL`, using `wss://` and the exact `/v1` path;
+- `GOTDONE_MAILBOX_URL`, using `https://` and the exact `/v1/mailbox` path.
+
+Release validation rejects loopback, plaintext, credentials in URLs, queries,
+fragments, and unresolved build-setting placeholders before the sync model
+starts. The HTTP and WebSocket transports reject redirects at request time.
+
 The mailbox defaults to `relay/relay-data/mailbox.sqlite3`. Payloads are
 end-to-end encrypted, acknowledged only after device-local persistence, and
-removed immediately after acknowledgement. Plain WebSocket/HTTP transport and
-the ATS exception are development-only.
+no longer served after acknowledgement. Plain WebSocket/HTTP transport and the
+ATS exception are development-only.
 The relay defaults to 256 live sockets, 128 volatile rooms, and a two-minute
-wait for a lone peer; see [the relay README](relay/README.md) for configurable
-limits and control error codes.
+wait for a lone peer. Its plaintext listeners are loopback-only unless an
+explicit insecure-demo override is supplied. See
+[the relay README](relay/README.md) for configurable limits and control error
+codes.
 
 ## Test
 

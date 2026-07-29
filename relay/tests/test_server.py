@@ -132,7 +132,17 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
 class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.relay = RelayServer(port=0, metrics_port=0)
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.mailbox_database_path = os.path.join(
+            self.temporary_directory.name,
+            "mailbox.sqlite3",
+        )
+        self.relay = RelayServer(
+            port=0,
+            metrics_port=0,
+            mailbox_port=0,
+            mailbox_database_path=self.mailbox_database_path,
+        )
         await self.relay.start()
         self.clients: list[ClientConnection] = []
 
@@ -142,6 +152,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return_exceptions=True,
         )
         await self.relay.close()
+        self.temporary_directory.cleanup()
 
     async def open_client(self, path: str = "/v1") -> ClientConnection:
         client = await connect(
@@ -156,7 +167,13 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def restart_relay(self, **limits: Any) -> None:
         await self.relay.close()
-        self.relay = RelayServer(port=0, metrics_port=0, **limits)
+        self.relay = RelayServer(
+            port=0,
+            metrics_port=0,
+            mailbox_port=0,
+            mailbox_database_path=self.mailbox_database_path,
+            **limits,
+        )
         await self.relay.start()
 
     async def registered_pair(
@@ -412,6 +429,10 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health_status, 200)
         self.assertEqual(health, {"status": "ok", "version": 1})
 
+        ready_status, ready, _ = await self.http_request("GET", "/readyz")
+        self.assertEqual(ready_status, 200)
+        self.assertEqual(ready, {"status": "ready", "version": 1})
+
         status, metrics, raw_metrics = await self.http_request("GET", "/metrics")
         self.assertEqual(status, 200)
         self.assertEqual(metrics["gauges"]["active_connections"], 2)
@@ -472,3 +493,38 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_metrics_listener_rejects_non_loopback_bind(self) -> None:
         with self.assertRaisesRegex(ValueError, "loopback"):
             RelayServer(metrics_host="0.0.0.0")
+
+    async def test_plaintext_listeners_reject_non_loopback_binds_by_default(
+        self,
+    ) -> None:
+        for options in (
+            {"host": "0.0.0.0"},
+            {"mailbox_host": "0.0.0.0"},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, "loopback"):
+                    RelayServer(**options)
+
+    async def test_insecure_non_loopback_bind_requires_explicit_override(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            relay = RelayServer(
+                host="0.0.0.0",
+                mailbox_host="0.0.0.0",
+                mailbox_database_path=os.path.join(
+                    temporary_directory,
+                    "mailbox.sqlite3",
+                ),
+                allow_insecure_non_loopback=True,
+            )
+            await relay.close()
+
+    async def test_readiness_reports_closed_mailbox_store(self) -> None:
+        self.relay.mailbox.close()
+        status, document, _ = await self.http_request("GET", "/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            document,
+            {"status": "unavailable", "version": 1},
+        )

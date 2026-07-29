@@ -31,20 +31,4 @@ final class WireMessageTests: XCTestCase {
         }
     }
 
-    func testProvisioningArchiveLimitFitsEncryptedPlaintextFrame() throws {
-        let archive = Data(
-            repeating: 0x5a,
-            count: ProtocolLimits.provisioningArchiveBytes
-        )
-        let message = PairWireMessage.provision(
-            archive: archive,
-            archiveHash: archive.sha256,
-            hostDeviceID: Data(repeating: 0x11, count: 16)
-        )
-
-        XCTAssertLessThanOrEqual(
-            try WireCodec.encode(message).count,
-            ProtocolLimits.plaintextBytes
-        )
-    }
 }

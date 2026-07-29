@@ -51,22 +51,30 @@ struct TaskReplica: Sendable {
     }
 
     var tasks: [ReplicatedTask] {
-        let createdTaskIDs = Set(
-            archive.operations.compactMap { operation -> UUID? in
-                if case .create = operation.mutation {
-                    return operation.taskID
-                }
-                return nil
+        var creationStamps: [UUID: ReplicaStamp] = [:]
+        for operation in archive.operations {
+            if case .create = operation.mutation {
+                creationStamps[operation.taskID] = max(
+                    creationStamps[operation.taskID] ?? operation.stamp,
+                    operation.stamp
+                )
             }
-        )
+        }
         return archive.taskRecords
             .filter {
-                createdTaskIDs.contains($0.id)
+                creationStamps[$0.id] != nil
                     && !$0.isDeleted
                     && $0.title != nil
                     && $0.completed != nil
             }
-            .sorted(by: ReplicaOrdering.tasks)
+            .sorted {
+                let lhsStamp = creationStamps[$0.id]!
+                let rhsStamp = creationStamps[$1.id]!
+                if lhsStamp != rhsStamp {
+                    return lhsStamp > rhsStamp
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }
     }
 
     var taskRecords: [ReplicatedTask] {
@@ -160,6 +168,118 @@ struct TaskReplica: Sendable {
         return try provisioning.canonicalData()
     }
 
+    func matchesProvisioningArchive(
+        sourceDeviceID: ReplicaDeviceID,
+        archiveHash: Data
+    ) throws -> Bool {
+        guard
+            sourceDeviceID != deviceID,
+            archiveHash.count == 32
+        else {
+            return false
+        }
+        let provisioning = ReplicaProvisioningArchive(
+            formatVersion: archive.formatVersion,
+            sourceDeviceID: sourceDeviceID,
+            lamport: archive.lamport,
+            versionVector: archive.versionVector,
+            taskRecords: archive.taskRecords,
+            operations: archive.operations
+        )
+        return try provisioning.canonicalData().sha256 == archiveHash
+    }
+
+    func containsHistory(from baseline: TaskReplica) throws -> Bool {
+        guard deviceID == baseline.deviceID else {
+            return false
+        }
+        for operation in baseline.retainedOperations {
+            guard let retained = archive.operations.first(where: {
+                $0.originDeviceID == operation.originDeviceID
+                    && $0.originSequence == operation.originSequence
+            }) else {
+                return false
+            }
+            guard try retained.canonicalData() == operation.canonicalData() else {
+                return false
+            }
+        }
+        return true
+    }
+
+    static func keepBothCandidate(
+        staged: TaskReplica,
+        local: TaskReplica,
+        pairID: Data
+    ) throws -> TaskReplica {
+        guard staged.deviceID == local.deviceID else {
+            throw ReplicaError.archiveDeviceMismatch(
+                expected: staged.deviceID,
+                actual: local.deviceID
+            )
+        }
+        guard pairID.count == 16 else {
+            throw ReplicaError.corruptArchive(
+                "A pairing ID must contain 16 bytes."
+            )
+        }
+
+        var candidate = try TaskReplica(
+            archive: staged.archive,
+            persistenceURL: nil
+        )
+        for task in local.tasks.reversed() {
+            guard
+                let title = task.titleValue,
+                let completed = task.isCompleted
+            else {
+                throw ReplicaError.corruptArchive(
+                    "A visible task is missing materialized fields."
+                )
+            }
+            if let existing = candidate.task(id: task.id),
+               !existing.isDeleted,
+               existing.titleValue == title,
+               existing.isCompleted == completed
+            {
+                continue
+            }
+
+            var recovered = false
+            for salt in UInt16.min...UInt16.max {
+                let recoveredID = recoveredTaskID(
+                    originalID: task.id,
+                    pairID: pairID,
+                    salt: salt
+                )
+                if let existing = candidate.task(id: recoveredID) {
+                    if
+                        !existing.isDeleted,
+                        existing.titleValue == title,
+                        existing.isCompleted == completed
+                    {
+                        recovered = true
+                        break
+                    }
+                    continue
+                }
+                try candidate.createTask(
+                    id: recoveredID,
+                    title: title,
+                    completed: completed
+                )
+                recovered = true
+                break
+            }
+            guard recovered else {
+                throw ReplicaError.corruptArchive(
+                    "No recovered task ID is available."
+                )
+            }
+        }
+        return candidate
+    }
+
     static func provision(
         deviceID: ReplicaDeviceID,
         from data: Data,
@@ -169,10 +289,12 @@ struct TaskReplica: Sendable {
         guard provisioning.formatVersion == ReplicaLimits.archiveFormatVersion else {
             throw ReplicaError.unsupportedArchiveVersion(provisioning.formatVersion)
         }
-        guard provisioning.sourceDeviceID != deviceID,
-              provisioning.versionVector[deviceID] == 0
-        else {
+        guard provisioning.sourceDeviceID != deviceID else {
             throw ReplicaError.provisioningDeviceCollision(deviceID)
+        }
+        let localSequence = provisioning.versionVector[deviceID]
+        guard localSequence < UInt64.max else {
+            throw ReplicaError.originSequenceExhausted
         }
 
         if let persistenceURL, FileManager.default.fileExists(atPath: persistenceURL.path) {
@@ -188,13 +310,38 @@ struct TaskReplica: Sendable {
         let imported = ReplicaArchive(
             formatVersion: provisioning.formatVersion,
             deviceID: deviceID,
-            nextLocalOriginSequence: 1,
+            nextLocalOriginSequence: localSequence + 1,
             lamport: provisioning.lamport,
             versionVector: provisioning.versionVector,
             taskRecords: provisioning.taskRecords,
             operations: provisioning.operations
         )
         return try TaskReplica(archive: imported, persistenceURL: persistenceURL)
+    }
+
+    private static func recoveredTaskID(
+        originalID: UUID,
+        pairID: Data,
+        salt: UInt16
+    ) -> UUID {
+        var input = Data(
+            "com.gotdone.sync/pairing-conflict-task/v2".utf8
+        )
+        input.append(pairID)
+        input.append(ReplicaDeviceID(uuid: originalID).bytes)
+        input.append(UInt8(salt >> 8))
+        input.append(UInt8(salt & 0xff))
+        var bytes = Array(input.sha256.prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(
+            uuid: (
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15]
+            )
+        )
     }
 
     private mutating func makeLocalOperation(

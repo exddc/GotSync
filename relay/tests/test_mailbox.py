@@ -6,8 +6,10 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +18,16 @@ from gotdone_relay.mailbox import (
     MAX_MAILBOX_PAYLOAD_BYTES,
     MAX_MAILBOX_REQUEST_BYTES,
     MAX_MAILBOX_RESPONSE_BYTES,
+    MailboxAuthorizationError,
     MailboxCapacityError,
     MailboxConflictError,
     MailboxError,
     MailboxPutMessage,
     MailboxStore,
+    authorize_mailbox,
     encode_base64url,
     mailbox_route_for_auth,
+    pairing_control_route_for_auth,
 )
 from gotdone_relay.server import RelayServer
 
@@ -41,6 +46,30 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.value
+
+
+class MailboxAuthorizationTests(unittest.TestCase):
+    def test_accepts_both_fixed_route_namespaces(self) -> None:
+        auth = key(1)
+
+        authorize_mailbox(mailbox_route_for_auth(auth), auth)
+        authorize_mailbox(pairing_control_route_for_auth(auth), auth)
+
+    def test_rejects_unknown_and_mismatched_routes(self) -> None:
+        auth = key(2)
+        other_auth = key(3)
+        rejected_routes = (
+            hashlib.sha256(
+                b"com.gotdone.sync/unknown-route/v1" + auth
+            ).digest(),
+            mailbox_route_for_auth(other_auth),
+            pairing_control_route_for_auth(other_auth),
+        )
+
+        for route in rejected_routes:
+            with self.subTest(route=encode_base64url(route)):
+                with self.assertRaises(MailboxAuthorizationError):
+                    authorize_mailbox(route, auth)
 
 
 class MailboxStoreTests(unittest.TestCase):
@@ -78,8 +107,13 @@ class MailboxStoreTests(unittest.TestCase):
         parent.chmod(0o755)
         database_path = parent / "mailbox.sqlite3"
 
-        with MailboxStore(database_path):
-            pass
+        with MailboxStore(database_path) as store:
+            self.assertEqual(
+                store._connection.execute(
+                    "PRAGMA secure_delete"
+                ).fetchone()[0],
+                1,
+            )
 
         self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
         self.assertEqual(database_path.stat().st_mode & 0o777, 0o600)
@@ -88,7 +122,9 @@ class MailboxStoreTests(unittest.TestCase):
         route = mailbox_route_for_auth(key(24))
         message = put_message(24, b"opaque")
         payload_hash = hashlib.sha256(message.payload).digest()
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(
+            sqlite3.connect(self.database_path)
+        ) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE mailbox_messages (
@@ -147,6 +183,8 @@ class MailboxStoreTests(unittest.TestCase):
             first = store.put(route, [message])[0]
             retry = store.put(route, [message])[0]
             self.assertEqual(retry.cursor, first.cursor)
+            self.assertFalse(first.acknowledged)
+            self.assertFalse(retry.acknowledged)
 
             with self.assertRaises(MailboxConflictError):
                 store.put(route, [put_message(20, b"different")])
@@ -159,6 +197,7 @@ class MailboxStoreTests(unittest.TestCase):
         with self.store() as store:
             post_ack_retry = store.put(route, [message])[0]
             self.assertEqual(post_ack_retry.cursor, first.cursor)
+            self.assertTrue(post_ack_retry.acknowledged)
             self.assertEqual(store.fetch(route, after_cursor=0).messages, ())
             self.assertEqual(
                 store.counts(),
@@ -208,7 +247,7 @@ class MailboxStoreTests(unittest.TestCase):
                 stored_b[0].cursor,
             )
 
-    def test_new_put_extends_retention_but_polling_does_not(self) -> None:
+    def test_new_put_does_not_extend_pending_queue_deadline(self) -> None:
         clock = FakeClock()
         route = mailbox_route_for_auth(key(6))
         with self.store(retention_seconds=10, clock=clock) as store:
@@ -216,16 +255,32 @@ class MailboxStoreTests(unittest.TestCase):
             clock.value += 6
             second = store.put(route, [put_message(41, b"new")])[0]
 
-            clock.value += 5
+            clock.value += 3
             fetched = store.fetch(route, after_cursor=0)
             self.assertEqual(
                 [message.cursor for message in fetched.messages],
                 [first.cursor, second.cursor],
             )
 
-            clock.value += 5
+            clock.value += 1
             self.assertEqual(store.fetch(route, after_cursor=0).messages, ())
             self.assertEqual(store.counts()["receipts"], 0)
+
+    def test_new_queue_gets_full_retention_after_previous_queue_is_acked(self) -> None:
+        clock = FakeClock()
+        route = mailbox_route_for_auth(key(25))
+        with self.store(retention_seconds=10, clock=clock) as store:
+            first = store.put(route, [put_message(44, b"first")])[0]
+            store.acknowledge(route, through_cursor=first.cursor)
+            clock.value += 6
+            second = store.put(route, [put_message(45, b"second")])[0]
+
+            clock.value += 5
+            fetched = store.fetch(route, after_cursor=first.cursor)
+            self.assertEqual(
+                [message.cursor for message in fetched.messages],
+                [second.cursor],
+            )
 
     def test_backward_clock_does_not_shorten_existing_retention(self) -> None:
         clock = FakeClock()
@@ -253,6 +308,104 @@ class MailboxStoreTests(unittest.TestCase):
         with self.store(clock=lambda: float("nan")) as store:
             with self.assertRaisesRegex(RuntimeError, "clock"):
                 store.fetch(route, after_cursor=0)
+
+    def test_readiness_requires_a_writable_store(self) -> None:
+        with self.store() as store:
+            original_generation = store._connection.execute(
+                """
+                SELECT generation
+                FROM mailbox_readiness
+                WHERE singleton = 1
+                """
+            ).fetchone()[0]
+            self.assertTrue(store.is_ready())
+            self.assertEqual(
+                store._connection.execute(
+                    """
+                    SELECT generation
+                    FROM mailbox_readiness
+                    WHERE singleton = 1
+                    """
+                ).fetchone()[0],
+                original_generation,
+            )
+            store._connection.execute("PRAGMA query_only = ON")
+            self.assertFalse(store.is_ready())
+            store._connection.execute("PRAGMA query_only = OFF")
+            self.assertTrue(store.is_ready())
+            store.close()
+            self.assertFalse(store.is_ready())
+
+    def test_readiness_rejects_exhausted_database_page_capacity(self) -> None:
+        with self.store() as store:
+            store._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            page_count = int(
+                store._connection.execute(
+                    "PRAGMA page_count"
+                ).fetchone()[0]
+            )
+            configured_max = int(
+                store._connection.execute(
+                    f"PRAGMA max_page_count = {page_count}"
+                ).fetchone()[0]
+            )
+            self.assertEqual(configured_max, page_count)
+            self.assertEqual(
+                store._connection.execute(
+                    "PRAGMA freelist_count"
+                ).fetchone()[0],
+                0,
+            )
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "full",
+            ):
+                store._connection.execute(
+                    """
+                    INSERT INTO mailbox_messages(
+                        route,
+                        message_id,
+                        payload,
+                        payload_hash,
+                        expires_at
+                    ) VALUES (?, ?, zeroblob(65536), ?, ?)
+                    """,
+                    (
+                        bytes(32),
+                        bytes([1]) * 32,
+                        bytes([2]) * 32,
+                        2_000,
+                    ),
+                )
+            self.assertFalse(store.is_ready())
+
+    def test_readiness_is_bounded_while_another_writer_holds_database(
+        self,
+    ) -> None:
+        with self.store() as store:
+            with closing(
+                sqlite3.connect(
+                    self.database_path,
+                    isolation_level=None,
+                    timeout=0.1,
+                )
+            ) as blocker:
+                blocker.execute("BEGIN IMMEDIATE")
+                blocker.execute(
+                    """
+                    UPDATE mailbox_readiness
+                    SET generation = generation + 1
+                    WHERE singleton = 1
+                    """
+                )
+                started = time.monotonic()
+                self.assertFalse(
+                    store.is_ready(max_wait_seconds=0.05)
+                )
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 0.5)
+                blocker.rollback()
+            self.assertTrue(store.is_ready())
 
     def test_receipt_and_live_byte_caps_are_transactional(self) -> None:
         route = mailbox_route_for_auth(key(7))
@@ -422,6 +575,53 @@ class MailboxHTTPTests(unittest.IsolatedAsyncioTestCase):
             "route": encode_base64url(route),
         }
 
+    async def test_http_authorization_accepts_only_fixed_route_namespaces(
+        self,
+    ) -> None:
+        auth = key(27)
+        allowed_routes = (
+            mailbox_route_for_auth(auth),
+            pairing_control_route_for_auth(auth),
+        )
+        for route in allowed_routes:
+            with self.subTest(route=encode_base64url(route)):
+                status, _, _ = await self.request_json(
+                    "/v1/mailbox/fetch",
+                    {
+                        "auth": encode_base64url(auth),
+                        "route": encode_base64url(route),
+                        "after": 0,
+                    },
+                )
+                self.assertEqual(status, 200)
+
+        rejected_credentials = (
+            {
+                "auth": encode_base64url(auth),
+                "route": encode_base64url(
+                    hashlib.sha256(
+                        b"com.gotdone.sync/unknown-route/v1" + auth
+                    ).digest()
+                ),
+            },
+            {
+                "auth": encode_base64url(key(28)),
+                "route": encode_base64url(mailbox_route_for_auth(auth)),
+            },
+            {
+                "auth": encode_base64url(key(28)),
+                "route": encode_base64url(pairing_control_route_for_auth(auth)),
+            },
+        )
+        for credentials in rejected_credentials:
+            with self.subTest(route=credentials["route"]):
+                status, response, _ = await self.request_json(
+                    "/v1/mailbox/fetch",
+                    {**credentials, "after": 0},
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(response["error"], "unauthorized")
+
     async def test_authorization_and_route_isolation(self) -> None:
         route_a, credentials_a = self.credentials(10)
         _, credentials_b = self.credentials(11)
@@ -493,6 +693,7 @@ class MailboxHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((first_status, retry_status), (200, 200))
         self.assertEqual(first, retry)
+        self.assertFalse(first["messages"][0]["acknowledged"])
         cursor = first["messages"][0]["cursor"]
 
         fetch_status, fetched, _ = await self.request_json(
@@ -518,6 +719,7 @@ class MailboxHTTPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(retry_status, 200)
         self.assertEqual(retry["messages"][0]["cursor"], cursor)
+        self.assertTrue(retry["messages"][0]["acknowledged"])
         _, empty, _ = await self.request_json(
             "/v1/mailbox/fetch",
             {**credentials, "after": 0},
@@ -696,6 +898,57 @@ class MailboxHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(oversized_status, 413)
         self.assertEqual(oversized["error"], "requestTooLarge")
 
+    async def test_mailbox_connection_limit_bounds_slow_requests_and_recovers(
+        self,
+    ) -> None:
+        await self.relay.close()
+        self.relay = RelayServer(
+            port=0,
+            metrics_port=0,
+            mailbox_port=0,
+            mailbox_database_path=self.database_path,
+            mailbox_max_connections=1,
+        )
+        await self.relay.start()
+
+        _, first_writer = await asyncio.open_connection(
+            "127.0.0.1",
+            self.relay.bound_mailbox_port,
+        )
+        first_writer.write(b"POST /v1/mailbox/fetch HTTP/1.1\r\n")
+        await first_writer.drain()
+        async with asyncio.timeout(1):
+            while len(self.relay._mailbox_tasks) != 1:
+                await asyncio.sleep(0)
+
+        second_reader, second_writer = await asyncio.open_connection(
+            "127.0.0.1",
+            self.relay.bound_mailbox_port,
+        )
+        self.assertEqual(await asyncio.wait_for(second_reader.read(), 1), b"")
+        self.assertEqual(len(self.relay._mailbox_tasks), 1)
+        self.assertEqual(
+            self.relay.service.metrics.snapshot()["counters"][
+                "mailbox_connection_capacity_rejections"
+            ],
+            1,
+        )
+        second_writer.close()
+        await second_writer.wait_closed()
+
+        first_writer.close()
+        await first_writer.wait_closed()
+        async with asyncio.timeout(1):
+            while self.relay._mailbox_tasks:
+                await asyncio.sleep(0)
+
+        _, credentials = self.credentials(26)
+        status, _, _ = await self.request_json(
+            "/v1/mailbox/fetch",
+            {**credentials, "after": 0},
+        )
+        self.assertEqual(status, 200)
+
     async def test_metrics_are_aggregate_and_contain_no_mailbox_secrets(self) -> None:
         _, credentials = self.credentials(16)
         message_id = encode_base64url(key(110))
@@ -749,7 +1002,9 @@ class MailboxHTTPTests(unittest.IsolatedAsyncioTestCase):
         await self.relay.start()
 
         def receipt_count() -> int:
-            with sqlite3.connect(self.database_path) as connection:
+            with closing(
+                sqlite3.connect(self.database_path)
+            ) as connection:
                 return int(
                     connection.execute(
                         "SELECT COUNT(*) FROM mailbox_messages"

@@ -67,19 +67,12 @@ actor RelaySocket {
         guard route.count == 32 else {
             throw RelaySocketError.invalidRoute
         }
-        guard
-            url.canonicalRelayOrigin != nil,
-            url.path == "/v1",
-            url.query == nil,
-            url.fragment == nil
-        else {
+        guard (try? SyncEndpointConfiguration.validateRelayURL(
+            url,
+            policy: .runtime
+        )) != nil else {
             throw RelaySocketError.invalidRelayURL
         }
-        #if !DEBUG
-        guard url.scheme?.lowercased() == "wss" else {
-            throw RelaySocketError.invalidRelayURL
-        }
-        #endif
 
         cancel()
         let configuration = URLSessionConfiguration.ephemeral
@@ -298,6 +291,17 @@ private final class RelayOpenObserver: NSObject,
         if let error {
             resolve(.failure(error))
         }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        resolve(.failure(RelaySocketError.invalidRelayURL))
+        completionHandler(nil)
     }
 
     func urlSession(

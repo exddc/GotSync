@@ -3,6 +3,7 @@ import SwiftUI
 struct WelcomeView: View {
     @ObservedObject var model: SyncAppModel
     let joinAction: () -> Void
+    let eraseAction: () -> Void
 
     var body: some View {
         ScrollView {
@@ -48,20 +49,44 @@ struct WelcomeView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
+                    .disabled(!model.canJoinExistingSync)
                     .accessibilityIdentifier("join-private-sync")
-                    .accessibilityHint("Opens the phrase and QR code join options.")
+                    .accessibilityHint(
+                        model.canJoinExistingSync
+                            ? "Opens the phrase and QR code join options."
+                            : "Disabled until local storage is available."
+                    )
                 }
 
-                if model.phase == .failed {
+                if !model.tasks.isEmpty {
                     Label(
-                        model.errorMessage ?? "The connection ended unexpectedly.",
-                        systemImage: "exclamationmark.triangle.fill"
+                        "\(model.tasks.count) local \(model.tasks.count == 1 ? "task is" : "tasks are") still saved here. To link a replacement phone without losing \(model.tasks.count == 1 ? "it" : "them"), create Private Sync on this iPhone.",
+                        systemImage: "iphone.and.arrow.forward"
                     )
                     .font(.subheadline)
-                    .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .relayCard()
                     .accessibilityElement(children: .combine)
+                }
+
+                if model.phase == .failed {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label(
+                            model.errorMessage
+                                ?? "The connection ended unexpectedly.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.subheadline)
+                        .foregroundStyle(.red)
+
+                        Button("Erase Local Data…", role: .destructive) {
+                            eraseAction()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .relayCard()
                 }
 
                 PrivacyDisclosureView()

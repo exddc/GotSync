@@ -51,8 +51,8 @@ flowchart LR
 The WebSocket route remains the lowest-latency path and never persists frames.
 The mailbox is a separate directional store-and-forward path. It has no task
 API and never receives decryption keys or plaintext. SQLite retains opaque
-envelopes until the receiving replica durably applies and acknowledges them, or
-until retention expires.
+envelopes until the receiving replica durably applies and acknowledges them,
+an authorized unlink/erase/cleanup forgets the route, or retention expires.
 
 | Device-only | Relay-visible |
 | --- | --- |
@@ -68,21 +68,42 @@ until retention expires.
 ```mermaid
 sequenceDiagram
     participant Host
-    participant Relay
+    participant Live as Volatile relay
+    participant Mailbox as Encrypted mailbox
     participant Joiner
 
-    Host->>Relay: Register derived pair route
-    Joiner->>Relay: Register derived pair route
-    Relay-->>Host: peerReady
-    Relay-->>Joiner: peerReady
-    Host->>Joiner: AHello via relay
+    Host->>Live: Register derived pair route
+    Joiner->>Live: Register derived pair route
+    Live-->>Host: peerReady
+    Live-->>Joiner: peerReady
+    Host->>Joiner: AHello via volatile relay
     Joiner-->>Host: BHello + PSK confirmation
     Host->>Joiner: Host confirmation
+    Joiner->>Joiner: Persist waiting-for-provision
     Host-->>Host: Approve matching safety code
-    Host->>Joiner: Encrypted replica archive
-    Joiner-->>Host: Encrypted ready + device ID
-    Host->>Joiner: Encrypted commit
-    Joiner-->>Host: Encrypted receipt
+    Host->>Host: Persist provision frontier
+    Host->>Mailbox: PUT deterministic encrypted chunks
+    Mailbox-->>Joiner: FETCH and authenticate chunks
+    Joiner->>Joiner: Stage host archive
+    alt Existing local replica differs
+        Joiner->>Joiner: Persist awaiting-merge approval
+        Joiner->>Joiner: Confirm Keep Both
+        Joiner->>Joiner: Build and validate complete candidate
+        Joiner->>Joiner: Persist protected prepared candidate
+    end
+    Joiner->>Joiner: Persist ready
+    Joiner->>Mailbox: PUT deterministic ready
+    Mailbox-->>Host: FETCH ready
+    Host->>Host: Persist commit decision
+    Host->>Mailbox: PUT deterministic commit
+    Mailbox-->>Joiner: FETCH commit
+    Joiner->>Joiner: Install prepared archive and active keys
+    Joiner->>Joiner: Journal sealed receipt
+    Joiner->>Mailbox: PUT deterministic receipt
+    Mailbox-->>Host: FETCH receipt
+    Host->>Host: Finish active link and cleanup
+    Host->>Joiner: Authenticated active sync
+    Joiner->>Joiner: Remove matching receipt journal entry
 ```
 
 The QR and 17-word phrase encode the same random 128-bit invitation. They never
@@ -90,12 +111,67 @@ contain the long-term pair root. Pairing uses PSK-authenticated ephemeral X25519
 and explicit HMAC confirmation before the host can approve provisioning.
 Provisioning rejects an archive larger than 280 KiB.
 
-The pending record and staged joiner archive are rolled back on cancellation,
-terminal pre-commit failure, or a later launch without active credentials.
-This avoids silently activating an incomplete join, but it does not solve the
-two-generals commit boundary: interruption after the host saves active
-credentials and before the joiner does can require resetting and pairing both
-devices again.
+Pairing completion version 2 is bound into the authenticated handshake, so an
+older live-only completion peer fails before either side persists pairing
+state. Provision, ready, commit, receipt, and precommit abort each use distinct
+directional pairing-control keys. Every local state is persisted before the
+corresponding PUT may have succeeded, and deterministic ciphertext makes an
+ambiguous response safe to retry after a disconnect or restart.
+
+A supported non-empty join or re-link enters
+`provisionStagedAwaitingMergeApproval` before ready. On confirmation, the
+joiner builds a detached complete candidate from the staged host frontier and
+its untouched local replica. Tasks with the same stable ID, title, and
+completion state are reused; local-only or conflicting visible tasks receive
+deterministic IDs. The candidate must satisfy the complete task, operation, and
+origin limits and is written to a protected prepared-merge file before ready
+is persisted or sent. A failed preflight leaves the main replica unchanged and
+pairing cancellable. This is a value-level Keep Both operation, not a merge of
+two unrelated CRDT histories.
+
+Both roles can cancel while still precommit: the joiner while waiting for
+provision or merge approval, and the host while publishing provision. The
+sealed abort is journaled before pending state is removed. The host checks a
+joiner abort before accepting ready and again before commit publication; the
+joiner checks a host abort before accepting commit. An observed precommit abort
+therefore takes precedence. Cancellation is locked once the commit decision can
+have been published.
+
+Abort and receipt terminal actions live in a separate device-only Keychain
+journal bounded to 32 entries and keyed by pair ID plus action kind. An entry
+contains only the already sealed envelope and the minimum route, authorization,
+pair/device, and message metadata required to resend it; it does not retain the
+pair root. The app republishes entries immediately on launch or foreground,
+uses bounded backoff after failure, and re-attempts successfully stored entries
+hourly so an expired or purged relay copy is recreated on a later attempt. The
+relay's authenticated PUT response distinguishes a live payload from an
+acknowledged receipt tombstone. Either terminal action is retired after that
+peer-ACK proof, followed by best-effort route deletion. A matching receipt can
+also retire after the joiner establishes a normal authenticated active-sync
+session with the expected credentials.
+
+A damaged terminal journal is never silently discarded. When active joiner
+credentials contain the pairing archive hash, the app reconstructs the
+deterministic sealed receipt, quarantines the damaged bytes, and atomically
+restores a usable journal. Otherwise it keeps the valid replica and credentials
+but surfaces repair and refuses a new pairing until the user explicitly resets
+Private Sync while keeping tasks, or performs full erase.
+
+On upgrade, a legacy pending record beside active credentials is treated as an
+ambiguous one-sided link. Current pair credentials and the pending record are
+cleared, tasks and install identity remain intact, and the UI requires a fresh
+link. Staging, prepared-merge, and backup files without a live pending record
+are nonessential orphans: their cleanup is best effort and cannot invalidate an
+otherwise healthy active pair or disable local editing. Current attempts use
+pair-ID-scoped artifact filenames, so an undeletable legacy or prior-attempt
+file cannot become the next attempt's staging input. Full erase enumerates
+every exact legacy name and canonical pair-ID-suffixed artifact before it
+reports completion.
+
+Abort consumption also has a durable receiver state. The recipient saves the
+abort cursor and sender identity before ACK, can reconstruct the exact sealed
+abort after restart, and clears pending state only after a PUT proves the relay
+holds its acknowledged tombstone.
 
 ## Reconnect and reconciliation
 
@@ -178,11 +254,17 @@ stateDiagram-v2
     Offline --> Connecting: backoff with jitter
     Synced --> Offline: app enters background
     Offline --> Connecting: app becomes active
+    Synced --> LocalOnly: unlink and keep tasks
+    LocalOnly --> LocalOnly: edit tasks locally
+    LocalOnly --> Pairing: create or join private sync
+    LocalOnly --> Unpaired: erase local tasks
     state "Mailbox loop" as Mailbox {
         [*] --> Checking
         Checking --> Available: upload/fetch succeeds
         Available --> Checking: edit or 2s poll
-        Checking --> Unavailable: request fails
-        Unavailable --> Checking: bounded retry or foreground
+        Checking --> Retrying: transient request fails
+        Retrying --> Checking: bounded retry or foreground
+        Checking --> Repair: authentication, sequence, or crypto failure
+        Repair --> [*]: keep tasks and reset or replace private sync
     }
 ```

@@ -54,12 +54,12 @@ struct PrivacyDisclosureView: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Private by construction")
+                Text("End-to-end encrypted")
                     .font(.headline)
                 Text(
                     compact
-                        ? "Task text is end-to-end encrypted. Opaque ciphertext is deleted after receipt or expires after 365 days."
-                        : "No account, analytics, or readable cloud task database. The relay keeps ciphertext until the other iPhone applies it, or for at most 365 days by default. It can see timing and byte counts, but never task text or encryption keys."
+                        ? "The relay temporarily stores encrypted payloads for offline delivery. It can see timing and size, not task text."
+                        : "No account, ad tracking, or per-user analytics. The relay temporarily stores encrypted payloads for offline delivery and can see timing and size, not task text or encryption keys."
                 )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -72,14 +72,51 @@ struct PrivacyDisclosureView: View {
     }
 }
 
+struct SyncNoticeView: View {
+    let notice: SyncNotice
+    let repairAction: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Group {
+                if notice.kind == .saving {
+                    ProgressView()
+                } else {
+                    Image(systemName: notice.kind == .repair
+                        ? "exclamationmark.triangle.fill"
+                        : "arrow.trianglehead.2.clockwise.rotate.90")
+                }
+            }
+            .frame(width: 22, height: 22)
+            .foregroundStyle(notice.kind == .repair ? .red : RelayTheme.warning)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice.title)
+                    .font(.headline)
+                Text(notice.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if notice.kind == .repair {
+                    Button("Keep Tasks and Replace Link", action: repairAction)
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .padding(.top, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .relayCard()
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct SyncStatusView: View {
     let phase: SyncPhase
     let title: String
     let detail: String
-    let roundTripMilliseconds: Double?
-    let lastSyncedAt: Date?
-    var mailboxAvailable = false
-    var mailboxNeedsAttention = false
     var showsDetail = true
 
     var body: some View {
@@ -100,15 +137,6 @@ struct SyncStatusView: View {
                     .font(.headline)
 
                 Spacer(minLength: 8)
-
-                if let roundTripMilliseconds {
-                    Label(
-                        "RTT \(roundTripMilliseconds, specifier: "%.1f") ms",
-                        systemImage: "bolt.horizontal.fill"
-                    )
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                }
             }
 
             if showsDetail {
@@ -118,14 +146,6 @@ struct SyncStatusView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if let lastSyncedAt {
-                HStack(spacing: 5) {
-                    Image(systemName: "clock")
-                    Text("Last change \(lastSyncedAt, style: .relative)")
-                }
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .relayCard()
@@ -133,16 +153,10 @@ struct SyncStatusView: View {
     }
 
     private var statusColor: Color {
-        if mailboxNeedsAttention, phase != .failed {
-            return RelayTheme.warning
-        }
-        if mailboxAvailable, phase != .failed {
-            return RelayTheme.success
-        }
         switch phase {
         case .synced:
             return RelayTheme.success
-        case .waitingForPeer, .verifying, .provisioning,
+        case .waitingForPeer, .verifying, .provisioning, .finalizing,
              .connecting, .reconciling:
             return RelayTheme.warning
         case .failed:

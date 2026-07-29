@@ -28,15 +28,21 @@ struct HandshakeContext: Sendable {
     let pairID: Data?
     let roleADeviceID: Data?
     let roleBDeviceID: Data?
+    let pairingProtocolVersion: UInt8?
 
-    static func pairing(relayOrigin: String, route: Data) -> HandshakeContext {
+    static func pairing(
+        relayOrigin: String,
+        route: Data,
+        pairingProtocolVersion: UInt8? = SyncProtocol.pairingVersion
+    ) -> HandshakeContext {
         HandshakeContext(
             mode: .pairing,
             relayOrigin: relayOrigin,
             route: route,
             pairID: nil,
             roleADeviceID: nil,
-            roleBDeviceID: nil
+            roleBDeviceID: nil,
+            pairingProtocolVersion: pairingProtocolVersion
         )
     }
 
@@ -53,7 +59,8 @@ struct HandshakeContext: Sendable {
             route: route,
             pairID: pairID,
             roleADeviceID: roleADeviceID,
-            roleBDeviceID: roleBDeviceID
+            roleBDeviceID: roleBDeviceID,
+            pairingProtocolVersion: nil
         )
     }
 
@@ -81,7 +88,20 @@ struct HandshakeContext: Sendable {
         try builder.append(tag: 3, value: Data(relayOrigin.utf8))
         try builder.append(tag: 4, value: route)
 
-        if mode == .sync {
+        if mode == .pairing {
+            guard let pairingProtocolVersion else {
+                try builder.append(tag: 8, value: connectionID)
+                try builder.append(tag: 9, value: roleAPublicKey)
+                try builder.append(tag: 10, value: nonceA)
+                try builder.append(tag: 11, value: roleBPublicKey)
+                try builder.append(tag: 12, value: nonceB)
+                return builder.data.sha256
+            }
+            try builder.append(
+                tag: 5,
+                value: Data([pairingProtocolVersion])
+            )
+        } else {
             guard
                 let pairID,
                 pairID.count == 16,

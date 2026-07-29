@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAILBOX_ROUTE_CONTEXT = b"com.gotdone.sync/mailbox-route/v1"
+PAIRING_CONTROL_ROUTE_CONTEXT = b"com.gotdone.sync/pairing-control-route/v2"
 MAX_MAILBOX_PAYLOAD_BYTES = 64 * 1024
 MAX_MAILBOX_BATCH_MESSAGES = 128
 MAX_MAILBOX_REQUEST_BYTES = 512 * 1024
@@ -66,6 +67,7 @@ class MailboxPutMessage:
 class MailboxStoredMessage:
     message_id: bytes
     cursor: int
+    acknowledged: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,11 +127,24 @@ def mailbox_route_for_auth(auth: bytes) -> bytes:
     return hashlib.sha256(MAILBOX_ROUTE_CONTEXT + auth).digest()
 
 
+def pairing_control_route_for_auth(auth: bytes) -> bytes:
+    if len(auth) != 32:
+        raise MailboxError("auth has the wrong length")
+    return hashlib.sha256(PAIRING_CONTROL_ROUTE_CONTEXT + auth).digest()
+
+
 def authorize_mailbox(route: bytes, auth: bytes) -> None:
     if len(route) != 32 or len(auth) != 32:
         raise MailboxAuthorizationError("invalid mailbox authorization")
-    expected_route = mailbox_route_for_auth(auth)
-    if not hmac.compare_digest(route, expected_route):
+    mailbox_route_matches = hmac.compare_digest(
+        route,
+        mailbox_route_for_auth(auth),
+    )
+    pairing_control_route_matches = hmac.compare_digest(
+        route,
+        pairing_control_route_for_auth(auth),
+    )
+    if not (mailbox_route_matches | pairing_control_route_matches):
         raise MailboxAuthorizationError("invalid mailbox authorization")
 
 
@@ -190,6 +205,7 @@ class MailboxStore:
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA trusted_schema = OFF")
         self._connection.execute("PRAGMA temp_store = MEMORY")
+        self._connection.execute("PRAGMA secure_delete = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA synchronous = FULL")
         self._connection.executescript(
@@ -207,6 +223,12 @@ class MailboxStore:
                 ON mailbox_messages(route, cursor);
             CREATE INDEX IF NOT EXISTS mailbox_expiry
                 ON mailbox_messages(expires_at);
+            CREATE TABLE IF NOT EXISTS mailbox_readiness (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                generation INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO mailbox_readiness(singleton, generation)
+            VALUES (1, 0);
             """
         )
         columns = {
@@ -258,18 +280,22 @@ class MailboxStore:
         expires_at = now + self.retention_seconds
         with self._transaction():
             self._purge_expired(now)
-            existing_rows: dict[bytes, tuple[int, bytes]] = {}
+            existing_rows: dict[bytes, tuple[int, bytes, bool]] = {}
             placeholders = ",".join("?" for _ in messages)
             rows = self._connection.execute(
                 f"""
-                SELECT message_id, cursor, payload_hash
+                SELECT message_id, cursor, payload_hash, payload IS NULL
                 FROM mailbox_messages
                 WHERE route = ? AND message_id IN ({placeholders})
                 """,
                 (route, *(message.message_id for message in messages)),
             )
-            for message_id, cursor, payload_hash in rows:
-                existing_rows[bytes(message_id)] = (int(cursor), bytes(payload_hash))
+            for message_id, cursor, payload_hash, acknowledged in rows:
+                existing_rows[bytes(message_id)] = (
+                    int(cursor),
+                    bytes(payload_hash),
+                    bool(acknowledged),
+                )
 
             new_messages: list[tuple[MailboxPutMessage, bytes]] = []
             for message in messages:
@@ -292,25 +318,16 @@ class MailboxStore:
                 )
                 existing_expiry = self._connection.execute(
                     """
-                    SELECT MAX(expires_at)
+                    SELECT MIN(expires_at)
                     FROM mailbox_messages
                     WHERE route = ? AND payload IS NOT NULL
                     """,
                     (route,),
                 ).fetchone()[0]
-                route_expires_at = max(
-                    expires_at,
+                route_expires_at = (
                     float(existing_expiry)
                     if existing_expiry is not None
-                    else expires_at,
-                )
-                self._connection.execute(
-                    """
-                    UPDATE mailbox_messages
-                    SET expires_at = ?
-                    WHERE route = ? AND payload IS NOT NULL
-                    """,
-                    (route_expires_at, route),
+                    else expires_at
                 )
                 for message, payload_hash in new_messages:
                     cursor = self._connection.execute(
@@ -333,12 +350,17 @@ class MailboxStore:
                     ).lastrowid
                     if cursor is None:
                         raise RuntimeError("SQLite did not assign a mailbox cursor")
-                    existing_rows[message.message_id] = (int(cursor), payload_hash)
+                    existing_rows[message.message_id] = (
+                        int(cursor),
+                        payload_hash,
+                        False,
+                    )
 
             return tuple(
                 MailboxStoredMessage(
                     message_id=message.message_id,
                     cursor=existing_rows[message.message_id][0],
+                    acknowledged=existing_rows[message.message_id][2],
                 )
                 for message in messages
             )
@@ -436,11 +458,93 @@ class MailboxStore:
                 FROM mailbox_messages
                 """
             ).fetchone()
-        return {
-            "receipts": int(receipts),
-            "live_messages": int(live_messages),
-            "live_bytes": int(live_bytes),
-        }
+            return {
+                "receipts": int(receipts),
+                "live_messages": int(live_messages),
+                "live_bytes": int(live_bytes),
+            }
+
+    def is_ready(self, *, max_wait_seconds: float = 0.25) -> bool:
+        if not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0:
+            raise ValueError("max_wait_seconds must be finite and positive")
+        deadline = time.monotonic() + max_wait_seconds
+        if not self._lock.acquire(timeout=max_wait_seconds):
+            return False
+        original_busy_timeout: int | None = None
+        transaction_open = False
+        try:
+            if self._closed:
+                return False
+            try:
+                original_busy_timeout = int(
+                    self._connection.execute(
+                        "PRAGMA busy_timeout"
+                    ).fetchone()[0]
+                )
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return False
+                readiness_timeout = max(
+                    1,
+                    math.ceil(remaining_seconds * 1_000),
+                )
+                self._connection.execute(
+                    f"PRAGMA busy_timeout = {readiness_timeout}"
+                )
+                self._connection.execute("BEGIN IMMEDIATE")
+                transaction_open = True
+
+                page_count = int(
+                    self._connection.execute(
+                        "PRAGMA page_count"
+                    ).fetchone()[0]
+                )
+                free_page_count = int(
+                    self._connection.execute(
+                        "PRAGMA freelist_count"
+                    ).fetchone()[0]
+                )
+                max_page_count = int(
+                    self._connection.execute(
+                        "PRAGMA max_page_count"
+                    ).fetchone()[0]
+                )
+                if page_count >= max_page_count and free_page_count == 0:
+                    self._connection.execute("ROLLBACK")
+                    transaction_open = False
+                    return False
+
+                result = self._connection.execute(
+                    """
+                    REPLACE INTO mailbox_readiness(singleton, generation)
+                    SELECT singleton, generation
+                    FROM mailbox_readiness
+                    WHERE singleton = 1
+                    """
+                )
+                if result.rowcount != 1:
+                    self._connection.execute("ROLLBACK")
+                    transaction_open = False
+                    return False
+                self._connection.execute("COMMIT")
+                transaction_open = False
+            except sqlite3.Error:
+                if transaction_open:
+                    try:
+                        self._connection.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                return False
+            return True
+        finally:
+            if original_busy_timeout is not None and not self._closed:
+                try:
+                    self._connection.execute(
+                        f"PRAGMA busy_timeout = {original_busy_timeout}"
+                    )
+                except sqlite3.Error:
+                    pass
+            self._lock.release()
 
     def _check_capacity(
         self,

@@ -18,6 +18,42 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(replica.lamport, 2)
     }
 
+    func testVisibleTasksAreNewestCreatedFirstDeterministically() throws {
+        let olderID = task(301)
+        let tieLowID = task(302)
+        let tieHighID = task(303)
+        let older = operation(
+            origin: 1,
+            sequence: 1,
+            lamport: 4,
+            taskID: olderID,
+            mutation: .create(title: "Older", completed: false)
+        )
+        let tieLow = operation(
+            origin: 2,
+            sequence: 1,
+            lamport: 7,
+            taskID: tieLowID,
+            mutation: .create(title: "Tie low", completed: false)
+        )
+        let tieHigh = operation(
+            origin: 3,
+            sequence: 1,
+            lamport: 7,
+            taskID: tieHighID,
+            mutation: .create(title: "Tie high", completed: false)
+        )
+
+        for delivery in permutations(of: [older, tieHigh, tieLow]) {
+            var replica = try TaskReplica(deviceID: device(9))
+            try replica.applyRemote(delivery)
+            XCTAssertEqual(
+                replica.tasks.map(\.id),
+                [tieHighID, tieLowID, olderID]
+            )
+        }
+    }
+
     func testPermutationsAndDuplicatesConverge() throws {
         let taskID = task(2)
         let create = operation(
@@ -411,6 +447,36 @@ final class ReplicaTests: XCTestCase {
         ) {
             XCTAssertEqual($0 as? ReplicaError, .provisioningRequiresEmptyReplica)
         }
+    }
+
+    func testProvisioningResumesPreviouslyLinkedDeviceSequence() throws {
+        let hostID = device(1)
+        let joinerID = device(2)
+        var host = try TaskReplica(deviceID: hostID)
+        try host.createTask(id: task(10), title: "Host")
+        var firstJoin = try TaskReplica.provision(
+            deviceID: joinerID,
+            from: host.exportProvisioningArchive()
+        )
+        let firstJoinerEdit = try firstJoin.createTask(
+            id: task(11),
+            title: "First join"
+        )
+        _ = try host.applyRemote([firstJoinerEdit])
+
+        var rejoined = try TaskReplica.provision(
+            deviceID: joinerID,
+            from: host.exportProvisioningArchive()
+        )
+        let nextJoinerEdit = try rejoined.createTask(
+            id: task(12),
+            title: "After rejoin"
+        )
+
+        XCTAssertEqual(rejoined.versionVector[joinerID], 2)
+        XCTAssertEqual(nextJoinerEdit.originDeviceID, joinerID)
+        XCTAssertEqual(nextJoinerEdit.originSequence, 2)
+        XCTAssertEqual(try host.applyRemote([nextJoinerEdit]), 1)
     }
 
     func testMissingOperationsAndVectorEntriesAreDeterministicallySorted() throws {

@@ -3,11 +3,23 @@ import SwiftUI
 
 struct JoinSyncSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var model: SyncAppModel
     @State private var phrase = ""
-    @State private var inputMode: JoinInputMode = .phrase
+    @State private var inputMode: JoinInputMode
     @State private var validationMessage: String?
+    @State private var cameraAccessDenied = false
+    @State private var scannerID = UUID()
     @FocusState private var phraseIsFocused: Bool
+
+    init(model: SyncAppModel) {
+        self.model = model
+        _inputMode = State(
+            initialValue: AVCaptureDevice.default(for: .video) == nil
+                ? .phrase
+                : .camera
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -19,6 +31,17 @@ struct JoinSyncSheet: View {
                         detail: "Use the invitation shown on the main iPhone. No task data is sent until the main iPhone approves the matching safety code.",
                         symbol: "link.badge.plus"
                     )
+
+                    if model.hasLocalReplicaHistory {
+                        Label(
+                            "Your local tasks stay on this iPhone during setup. If the task lists differ, Got Done asks how to combine them before the link finishes.",
+                            systemImage: "iphone.and.arrow.forward"
+                        )
+                        .font(.subheadline)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .relayCard()
+                        .accessibilityElement(children: .combine)
+                    }
 
                     if cameraIsAvailable {
                         Picker("Invitation method", selection: $inputMode) {
@@ -53,6 +76,28 @@ struct JoinSyncSheet: View {
             }
         }
         .presentationDetents([.large])
+        .onChange(of: inputMode) {
+            validationMessage = nil
+        }
+        .onChange(of: phrase) {
+            validationMessage = nil
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, inputMode == .camera else {
+                return
+            }
+            switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .authorized:
+                cameraAccessDenied = false
+                scannerID = UUID()
+            case .denied, .restricted:
+                cameraAccessDenied = true
+            case .notDetermined:
+                break
+            @unknown default:
+                cameraAccessDenied = true
+            }
+        }
     }
 
     private var phraseEntry: some View {
@@ -85,6 +130,14 @@ struct JoinSyncSheet: View {
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
+            } else if let phraseValidationMessage {
+                Label(
+                    phraseValidationMessage,
+                    systemImage: "exclamationmark.circle.fill"
+                )
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("\(wordCount) of 17 words")
                     .font(.caption)
@@ -101,7 +154,7 @@ struct JoinSyncSheet: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(wordCount != 17)
+            .disabled(validatedInvitation == nil)
             .accessibilityIdentifier("join-submit")
         }
         .relayCard()
@@ -109,24 +162,30 @@ struct JoinSyncSheet: View {
 
     private var cameraEntry: some View {
         VStack(spacing: 12) {
-            QRScannerView { payload in
-                guard
-                    let url = URL(string: payload),
-                    (try? Invitation.from(url: url)) != nil
-                else {
-                    validationMessage = "That QR code is not a Got Done invitation."
-                    return false
+            QRScannerView(
+                onPayload: { payload in
+                    guard
+                        let url = URL(string: payload),
+                        (try? Invitation.from(url: url)) != nil
+                    else {
+                        validationMessage = "That QR code is not a Got Done invitation."
+                        return false
+                    }
+                    validationMessage = nil
+                    model.joinPrivateSync(url: url)
+                    if model.phase == .failed {
+                        validationMessage = model.errorMessage
+                        return false
+                    } else {
+                        dismiss()
+                        return true
+                    }
+                },
+                onCameraAccessDenied: {
+                    cameraAccessDenied = true
                 }
-                validationMessage = nil
-                model.joinPrivateSync(url: url)
-                if model.phase == .failed {
-                    validationMessage = model.errorMessage
-                    return false
-                } else {
-                    dismiss()
-                    return true
-                }
-            }
+            )
+            .id(scannerID)
             .frame(height: 320)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
@@ -140,6 +199,27 @@ struct JoinSyncSheet: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+
+            if cameraAccessDenied {
+                HStack {
+                    Button("Open Settings") {
+                        guard let url = URL(
+                            string: UIApplication.openSettingsURLString
+                        ) else {
+                            return
+                        }
+                        UIApplication.shared.open(url)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Enter Phrase") {
+                        inputMode = .phrase
+                        phraseIsFocused = true
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .controlSize(.large)
+            }
 
             if let validationMessage {
                 Label(validationMessage, systemImage: "exclamationmark.circle.fill")
@@ -157,8 +237,39 @@ struct JoinSyncSheet: View {
         AVCaptureDevice.default(for: .video) != nil
     }
 
+    private var validatedInvitation: Invitation? {
+        guard wordCount == 17 else {
+            return nil
+        }
+        return try? Invitation.from(phrase: phrase)
+    }
+
+    private var phraseValidationMessage: String? {
+        guard wordCount >= 17 else {
+            return nil
+        }
+        guard wordCount == 17 else {
+            return "Use exactly 17 words."
+        }
+        do {
+            _ = try Invitation.from(phrase: phrase)
+            return nil
+        } catch MnemonicError.unknownWord(let word) {
+            return "“\(word)” is not in this invitation."
+        } catch MnemonicError.invalidChecksum {
+            return "The words do not form a valid invitation. Check the last word."
+        } catch {
+            return "This invitation phrase is invalid."
+        }
+    }
+
     private func joinWithPhrase() {
         validationMessage = nil
+        guard validatedInvitation != nil else {
+            validationMessage = phraseValidationMessage
+                ?? "Enter all 17 invitation words."
+            return
+        }
         model.joinPrivateSync(phrase: phrase)
         if model.phase == .failed {
             validationMessage = model.errorMessage
@@ -169,8 +280,8 @@ struct JoinSyncSheet: View {
 }
 
 private enum JoinInputMode: String, CaseIterable, Identifiable {
-    case phrase
     case camera
+    case phrase
 
     var id: String { rawValue }
 

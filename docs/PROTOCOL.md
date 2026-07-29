@@ -1,6 +1,7 @@
 # Got Done Relay proof-of-concept protocol
 
-Status: implemented proof of concept, experimental protocol version 1.
+Status: implemented proof of concept, transport/sync version 1 and pairing
+completion version 2.
 
 This document describes the current implementation. The code and test vectors
 must stay consistent with it. The construction uses standard CryptoKit
@@ -14,7 +15,8 @@ and must not be treated as production cryptography.
 - The relay persists only independently authenticated ciphertext envelopes,
   opaque mailbox routes, cursors, hashes, and expiry metadata.
 - The recipient acknowledges an envelope only after its local replica update
-  is durably persisted; acknowledgement immediately removes its ciphertext.
+  is durably persisted; acknowledgement immediately stops serving the
+  ciphertext and logically nulls its payload.
 - A phrase or QR is a one-time 128-bit random invitation.
 - The existing device approves a live join after both devices show the same
   safety code.
@@ -82,9 +84,9 @@ Protocol constants:
 ```text
 appID = UTF8("com.gotdone.relay.poc")
 version = 0x01
+pairingVersion = 0x02
 roleA = 0x41
 roleB = 0x42
-pairMode = 0x50
 syncMode = 0x53
 mailboxMode = 0x4d
 ```
@@ -122,14 +124,15 @@ The server:
 The separate HTTP mailbox is durable and does not alter these live-room rules.
 It listens on `/v1/mailbox/*`, accepts only JSON `POST` bodies, and never places
 mailbox credentials in a URL. The default SQLite store uses WAL journaling and
-`synchronous=FULL`. Aggregate metrics contain no route, authorization,
+`synchronous=FULL`, enables connection-level `secure_delete`, and restricts the
+database to mode `0600`. Aggregate metrics contain no route, authorization,
 message-ID, or payload values.
 
 The default process limits are 256 admitted live WebSocket connections and 128
-rooms, including rooms with only one waiting peer. A lone peer expires after
-two minutes by default. The wait timer is cancelled while two peers are present and
-starts again for the remaining peer after `peerLeft`. These defaults are
-configurable at relay startup.
+rooms, including rooms with only one waiting peer, plus 64 concurrent mailbox
+connections. A lone peer expires after two minutes by default. The wait timer is
+cancelled while two peers are present and starts again for the remaining peer
+after `peerLeft`. These defaults are configurable at relay startup.
 
 Relay capacity and route control failures use small text frames:
 
@@ -160,11 +163,9 @@ gotdone://pair?v=1&secret=<base64url>
 The relay origin is configured independently and included in the authenticated
 handshake transcript. The invitation is held in memory, expires after two
 minutes, is limited to one confirmed attempt, and is invalidated after a
-normal successful pair or cancellation. It is never logged. If the user taps
-Copy, the app writes it to the local-only pasteboard with a two-minute
-expiration; Universal Clipboard is disabled for that item. Otherwise it is not
-intentionally persisted. Swift cannot promise zeroization of every temporary
-copy.
+normal successful pair, mismatch rejection, regeneration, or cancellation. It
+is never logged or intentionally written to the pasteboard. Swift cannot
+promise zeroization of every temporary copy.
 
 Derived values:
 
@@ -191,9 +192,14 @@ After `peerReady`:
 ```text
 T = SHA256(
   appID || version || canonicalRelayOrigin || pairRoute ||
+  pairingVersion ||
   connectionID || HA.publicKey || nonceA || HB.publicKey || nonceB
 )
 ```
+
+`pairingVersion` is inside the authenticated transcript. A client without the
+durable version-2 completion protocol derives a different transcript and fails
+key confirmation before either device persists pairing state.
 
 5. Both calculate:
 
@@ -211,75 +217,116 @@ confirmKey = HKDF-SHA256(sessionSecret,
    `HMAC(sessionSecret, "com.gotdone.sync/safety-code/v1" || T)`.
 9. A waits for explicit user approval.
 
-After approval, independent values are derived:
+After confirmation, independent values are derived:
 
 ```text
-hostToJoiner = HKDF-SHA256(sessionSecret,
-  info: "com.gotdone.sync/pair-traffic/A-to-B/v1", 32)
-joinerToHost = HKDF-SHA256(sessionSecret,
-  info: "com.gotdone.sync/pair-traffic/B-to-A/v1", 32)
 pairRoot = HKDF-SHA256(sessionSecret,
   info: "com.gotdone.sync/pair-root/v1", 32)
 pairID = HKDF-SHA256(sessionSecret,
   info: "com.gotdone.sync/pair-id/v1", 16)
-pairAtoBNoncePrefix = HKDF-SHA256(sessionSecret,
-  info: "com.gotdone.sync/pair-nonce/A-to-B/v1", 4)
-pairBtoANoncePrefix = HKDF-SHA256(sessionSecret,
-  info: "com.gotdone.sync/pair-nonce/B-to-A/v1", 4)
 ```
 
-A sends an encrypted provisioning document containing:
+A makes an encrypted provisioning document available containing:
 
 - A's random device ID;
 - the current replica archive, its version vector, and its SHA-256 hash;
 - the protocol version.
 
-B and A both reject a provisioning archive larger than 280 KiB. This leaves
-space for its encrypted application envelope under the separate 384 KiB
-plaintext-frame limit.
+B and A both reject a provisioning archive larger than 280 KiB. The document
+is split into independently authenticated pairing-control envelopes that fit
+the 64 KiB mailbox payload limit.
 
-B must have an empty replica in this two-device POC. It rejects provisioning
-without modifying local data if it has any task, operation, tombstone, or
-credentials from another chain. The host archive is a captured frontier;
-operations created after that frontier remain in A's log and are sent during
-normal reconciliation.
+B leaves any existing local replica untouched while the host archive is staged.
+This permits a phone with local tasks to join without accepting destructive
+replacement. A previously linked B may already appear in A's version vector;
+the staged replica resumes B's next local sequence immediately after that
+imported frontier so re-linking cannot fork B's origin. The host archive is a
+captured frontier; operations created after it remain in A's log and are sent
+during normal reconciliation.
 
-Pairing payloads use the encrypted-frame construction below with the pair
-direction's nonce prefix, a fresh counter beginning at zero in each direction,
-and the exact AAD defined below with `modeByte = pairMode (0x50)`.
+Pair completion is a durable, idempotent state machine:
 
-Pair completion is staged, but the POC does not claim crash-atomic or fully
-recoverable commit:
+1. B persists `waitingForProvision` as soon as the authenticated handshake
+   completes. A mismatch or cancellation at this point seals and persists an
+   authenticated abort record before pending state can be removed.
+2. After approval, A snapshots the archive hash, persists
+   `provisionMayHaveBeenStored`, and PUTs deterministic encrypted provision
+   chunks. A restart recreates identical chunks from the locked local archive.
+3. B fetches and authenticates every chunk, verifies the archive hash and host
+   identity, and stages the archive atomically. An empty or byte-equivalent
+   local replica can advance directly to `readyMayHaveBeenStored`. A differing
+   non-empty replica instead persists
+   `provisionStagedAwaitingMergeApproval` without sending ready.
+4. If Keep Both is confirmed, B constructs the complete candidate in memory
+   from the staged host frontier and its untouched local replica. Exact stable
+   ID/title/completion matches are reused; local-only or conflicting visible
+   tasks are recreated under deterministic IDs. The whole result must satisfy
+   task, retained-operation, and origin limits. B writes the validated result
+   to a protected prepared-merge file before persisting
+   `readyMayHaveBeenStored` and PUTting deterministic ready. Any failure leaves
+   the original local replica unchanged and the merge choice available.
+5. A authenticates ready, checks once more for a precommit abort, persists the
+   joiner identity and
+   `commitMarkerMayHaveBeenStored`, then repeatedly PUTs the same encrypted
+   commit marker. A saves active credentials only after the relay confirms the
+   marker.
+6. B checks for a host abort, fetches commit, atomically installs or validates
+   the complete prepared replica, and saves active credentials.
+7. B seals the deterministic receipt and persists it in the terminal-action
+   journal before its first PUT. After a confirmed PUT, B can clear
+   pending/staging while retaining that journal entry. A clears its pending
+   record only after fetching and authenticating the receipt.
+8. B continues republishing the journaled receipt across launches and relay
+   retention. It removes the entry after a PUT reports that the exact sealed
+   message was already acknowledged by A, or after a normal authenticated
+   active sync session proves that the matching host completed pairing.
 
-1. Before A sends provisioning, it atomically persists `pendingPair` containing
-   pair ID, root, role, archive hash, and expiry.
-2. B verifies and atomically stages the archive plus its own `pendingPair`
-   before sending `ready(archiveHash, deviceID)`.
-3. A verifies the request, saves active credentials,
-   and sends `commit(pairID)`.
-4. B saves active credentials and clears its pending record only after
-   `commit`, then sends `commitReceipt(pairID)`.
-5. A deletes its pending record after the receipt.
+Every state is stored before the network action it describes may have happened.
+An ambiguous response therefore causes the exact same authenticated envelope to
+be retried. Both roles resume from Keychain and protected staging files after a
+restart. Before ready, B can cancel while waiting for provision or merge
+approval, and A can cancel while its provision state is still precommit. The
+sender journals the sealed abort before clearing pending state. A checks a
+joiner abort before accepting ready and again before commit publication; B
+checks a host abort before accepting commit. An observed precommit abort takes
+precedence over a racing ready record. After commit may have been published,
+ordinary cancellation is hidden.
 
-Cancellation or terminal failure before active credentials exist clears the
-pending record. For a joiner, it also deletes the staged replica archive and
-recreates an empty local replica before clearing the pending marker, so a crash
-retries rollback instead of orphaning imported data. Launch applies the same
-rule: a pending record without active credentials is rolled back, never
-silently promoted. Each in-memory attempt has a generation token checked after
-suspension points and before durable activation, so a canceled attempt cannot
-activate or overwrite a newer attempt. Existing active credentials take
-precedence and start normal reconnection.
+Before an abort recipient clears pending state, it persists the abort cursor
+and sender identity in `abortAcknowledgementMayHaveBeenStored`. It recreates
+the deterministic sealed abort, PUTs it to distinguish a live payload from an
+acknowledged tombstone, ACKs when needed, and verifies a subsequent PUT reports
+`acknowledged`. A crash or ambiguous ACK therefore resumes with the pair root
+still available instead of leaving the sender's terminal proof stranded.
 
-No two-device exchange can make both commits crash-atomic. A crash or transport
-failure after A saves active credentials but before B saves active credentials
-can therefore leave A paired while B rolls back. This POC has no recovery
-exchange for that split and requires a local reset and a new pairing on both
-devices. Production needs a resumable, idempotent `ready`/`commit` protocol
-covering this boundary, including an empty initial archive.
+The protected staging archive remains the authenticated host baseline. A
+separate protected prepared-merge archive contains the complete result approved
+by B. Commit installation uses that complete file atomically; it never
+recreates local tasks one at a time after the irreversible commit. Cleanup of
+staging, prepared-merge, or backup files after success, cancellation, or a
+later launch is best effort. Such orphans are not credentials and a deletion
+failure cannot invalidate an active pair or disable the main replica.
+New attempts use filenames scoped by their authenticated 16-byte pair ID, so
+an undeletable artifact from an older attempt cannot be selected by a later
+pairing. Legacy fixed filenames are cleanup-only compatibility artifacts. Full
+erase enumerates only these exact names and canonical pair-ID suffixes before
+reporting success, including artifacts whose pending Keychain record was
+already cleared.
 
-Normal successful completion and explicit cancellation release invitation and
-ephemeral references.
+An upgrade can encounter a legacy pending record beside active credentials
+because the earlier live-only flow could persist one side before completion.
+That combination is deliberately not treated as active. The client clears the
+current pair, pending record, and mailbox checkpoint, preserves tasks and the
+install identity, and requires an explicit fresh link. A legacy pending record
+without active credentials is rolled back with the same task-preserving
+behavior.
+
+Normal success and authenticated cancellation release invitation and ephemeral
+references. An individual pairing-control ciphertext is retained only until
+cleanup succeeds or the relay retention deadline expires. A durable terminal
+journal may recreate the same sealed receipt or abort until the peer
+acknowledges it. A normal authenticated active session is an additional
+completion proof for a joiner's receipt.
 
 ## Normal connection handshake
 
@@ -342,8 +389,7 @@ version(1) || transcriptHash(32) || modeByte(1) ||
 direction(1) || UInt64BE(sequence)(8)
 ```
 
-`modeByte` is `pairMode (0x50)` for provisioning frames and `syncMode (0x53)`
-for normal synchronization frames. `direction` is the sender role byte:
+`modeByte` is `syncMode (0x53)`. `direction` is the sender role byte:
 `roleA (0x41)` for host-to-joiner or `roleB (0x42)` for joiner-to-host. There is
 no literal string in the AAD.
 
@@ -364,10 +410,6 @@ The nonce is reconstructed and is not transmitted separately. A receiver
 requires exactly the next sequence. Duplicate, gap, malformed, oversized, or
 unauthentic frames close the session. Application operation sequence numbers
 are never reused as cipher nonces.
-
-The same rules apply to pairing payload frames using pair-specific keys,
-prefixes, transcript, and the pair mode byte. A counter is checked before
-increment and the connection closes instead of wrapping at `UInt64.max`.
 
 Handshake and confirmation messages are a separate typed binary codec and are
 never accepted as encrypted application frames. The binary handshake decoder
@@ -402,6 +444,7 @@ POC limits:
 | Mailbox unacknowledged retention | 365 days by default |
 | Mailbox receipts per directional route | 10,000 by default |
 | Mailbox live ciphertext per directional route | 64 MiB by default |
+| Concurrent mailbox connections | 64 by default, configurable |
 
 ## Asynchronous encrypted mailbox
 
@@ -427,6 +470,76 @@ encryptionRoot = HKDF-SHA256(pairRoot,
 messageIDKey = HKDF-SHA256(pairRoot,
   info: "com.gotdone.sync/mailbox-message-id/" || direction || "/v1", 32)
 ```
+
+Durable encrypted pairing control uses independently derived authorization
+values for provision, ready, commit/receipt, and abort, separated again by
+sender role. All stages share one dedicated route namespace:
+
+```text
+route = SHA256(
+  UTF8("com.gotdone.sync/pairing-control-route/v2") || authorization
+)
+```
+
+The relay accepts exactly the ordinary mailbox and pairing-control route
+namespaces. It computes both candidates and compares them in constant time;
+routes derived from arbitrary labels are unauthorized.
+
+For pairing stage `S` (`provision`, `ready`, `commit`, or `abort`) and sender
+direction `D`, authorization, encryption root, and message-ID key use separate
+HKDF labels under:
+
+```text
+com.gotdone.sync/pairing-control-{auth|encryption|message-id}/S/D/v2
+```
+
+The 16-byte pair ID is HKDF context. Canonical control records carry the wire
+field `version` with value `2` and the pair ID. Ready and commit records also bind the
+host ID, joiner ID, and archive hash. Abort binds its sender role and device ID.
+Provision records bind the host ID, full archive byte count, archive hash,
+chunk index, and chunk count. Chunks can arrive out of order, but the client
+requires one complete, consistent set and verifies the reconstructed hash.
+
+Each control record uses a keyed deterministic message ID and a message-specific
+key. AAD binds app ID, pairing version, stage, sender role, pair ID, route, and
+message ID. Retrying an ambiguous PUT therefore reproduces the same route,
+message ID, ciphertext, and server receipt.
+
+Abort and receipt senders retain an already sealed terminal action in a
+`ThisDeviceOnly` Keychain journal before pending state is cleared. The journal
+is keyed by `(pairID, actionKind)`, rejects conflicting duplicates, and is
+bounded to 32 entries. A record contains protocol versions, pair ID, action
+kind, roles/device IDs, route authorization, route, message ID, and ciphertext.
+It deliberately contains neither `pairRoot` nor a plaintext record or
+pairing-control encryption key. Reaching the bound refuses another pairing
+attempt rather than discarding an unresolved proof.
+
+While the app is active, journal actions are published immediately on launch or
+foreground. Failed attempts use bounded exponential backoff; confirmed PUTs
+are attempted again hourly so an expired or operationally purged relay copy is
+eventually recreated. A journal action for the pair currently owned by the
+primary finalizer is skipped to avoid two local state machines publishing it.
+Idempotent PUT means every retry carries the same envelope.
+
+Each successful PUT response includes `acknowledged`. It is `false` while the
+relay still serves that exact ciphertext and `true` when the recipient has
+durably acknowledged it and only its receipt tombstone remains. A terminal
+receipt or abort is removed from the sender's journal only after this
+capability-authorized proof; the sender then forgets the terminal route best
+effort. A receipt can also retire after the same joiner credentials complete a
+normal PSK-authenticated active handshake and install their secure session.
+Relay acceptance, `peerReady`, or an unauthenticated socket is not completion
+proof. Unlink-and-keep preserves unresolved terminal entries and their
+republisher.
+
+If the terminal journal cannot be decoded, its raw bytes are not deleted. An
+active joiner retains the 32-byte pairing archive hash in its device-only
+credentials, allowing the app to reconstruct the deterministic sealed receipt,
+quarantine the damaged bytes under a separate Keychain account, and replace
+the active journal atomically. If reconstruction is impossible, the current
+local replica and valid active credentials remain intact, but the UI requires
+sync repair and blocks another pairing attempt until the user explicitly keeps
+their tasks and resets the old sync recovery history, or performs full erase.
 
 The server verifies `route` from `authorization` on every request and stores
 neither the authorization value nor its pair root. Host-to-joiner and
@@ -485,9 +598,11 @@ POST /v1/mailbox/forget
 ```
 
 Binary fields are canonical unpadded base64url. `put` is transactionally
-idempotent on `(route, messageID)`: identical bytes return the original cursor;
-different bytes return a conflict. The relay assigns monotonically increasing
-opaque cursors. Fetch is ordered and non-destructive. The recipient:
+idempotent on `(route, messageID)`: identical bytes return the original cursor
+and an `acknowledged` Boolean; different bytes return a conflict. The Boolean
+is false for a live payload and true after an ACK has logically removed it.
+The relay assigns monotonically increasing opaque cursors. Fetch is ordered and
+non-destructive. The recipient:
 
 1. fetches a bounded page;
 2. authenticates and validates every envelope;
@@ -513,10 +628,12 @@ there is no APNs wake-up and force-quit upload is not promised. Launch or
 foregrounding immediately uploads and polls.
 
 Unacknowledged ciphertext and its receipts expire after 365 days by default.
-A new unique append extends the whole unacknowledged directional queue to the
-same expiry, preventing an origin-sequence gap inside an active queue.
-Fetching does not extend retention. Explicit local reset best-effort forgets
-both directions; expiry is the fallback.
+The first live message starts a fixed deadline for its directional queue.
+Later unique appends inherit that deadline, preventing both an origin-sequence
+gap inside the queue and indefinite retention through continuous writes. Once
+the live queue is empty, its next message starts a fresh deadline. Fetching
+does not extend retention. Explicit erase or unlink best-effort forgets both
+directions; expiry is the fallback.
 
 ## Replicated task model
 
@@ -657,6 +774,9 @@ causal watermark proving that every authorized device can discard old history.
 - No polling or batching delay on the live path.
 - A separate two-second foreground mailbox poll, plus immediate cycles on edit,
   launch, and foregrounding.
+- Outbound upload and inbound fetch are attempted independently so a capacity
+  or service failure in one direction does not starve valid progress in the
+  other.
 - Immediate local UI application.
 - Immediate single-operation send for interactive edits.
 - Deterministic mailbox retries avoid a local ciphertext outbox while the
@@ -666,7 +786,7 @@ causal watermark proving that every authorized device can discard old history.
   send failure cannot cancel a replacement socket.
 - Binary encrypted frames and disabled WebSocket compression.
 - Bounded frame, queue, operation-batch, task-count, and title-size limits.
-- Missing history is sent before large snapshots.
+- Bounded catch-up operation batches are sent before later live edits.
 - A future burst path may coalesce for 5-10 ms or 32-64 KiB without delaying a
   single interactive edit.
 
@@ -715,12 +835,14 @@ not yet send an encrypted peer receipt back to advance a sender-visible
 Before production:
 
 - replace or audit the custom handshake composition and publish test vectors;
-- require `wss://`, certificate validation, rate limits, and scrubbed proxy logs;
+- inject real Release `wss://` and `https://` endpoints, validate them on
+  physical devices, and retain the current fail-closed build validation;
+- add an anonymous admission mechanism with meaningful scarcity before
+  exposing the capability-authorized relay publicly;
+- require certificate validation, rate limits, and scrubbed proxy logs;
 - require `https://` for the mailbox, encrypted database backups, storage
   monitoring, and a reviewed deletion/forensics policy for SQLite pages, WAL,
   snapshots, and backups;
-- implement resumable, idempotent pairing recovery across the final two-device
-  commit boundary;
 - add explicit per-message deadlines to the cryptographic handshake;
 - add signed per-device membership and authenticated revocation;
 - rotate a key epoch after device removal;

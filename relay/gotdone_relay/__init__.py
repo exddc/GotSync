@@ -2,6 +2,7 @@ from .mailbox import (
     DEFAULT_MAILBOX_RETENTION_SECONDS,
     DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS,
     MAILBOX_ROUTE_CONTEXT,
+    PAIRING_CONTROL_ROUTE_CONTEXT,
     MAX_MAILBOX_BATCH_MESSAGES,
     MAX_MAILBOX_PAYLOAD_BYTES,
     MAX_MAILBOX_REQUEST_BYTES,
@@ -19,9 +20,11 @@ from .mailbox import (
     decode_canonical_base64url,
     encode_base64url,
     mailbox_route_for_auth,
+    pairing_control_route_for_auth,
 )
 from .server import (
     DEFAULT_MAILBOX_DATABASE_PATH,
+    DEFAULT_MAX_MAILBOX_CONNECTIONS,
     MAX_BINARY_MESSAGE_BYTES,
     MAX_FORWARD_QUEUE_BYTES,
     MAX_FORWARD_QUEUE_FRAMES,
@@ -34,9 +37,11 @@ from .server import (
 
 __all__ = [
     "DEFAULT_MAILBOX_DATABASE_PATH",
+    "DEFAULT_MAX_MAILBOX_CONNECTIONS",
     "DEFAULT_MAILBOX_RETENTION_SECONDS",
     "DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS",
     "MAILBOX_ROUTE_CONTEXT",
+    "PAIRING_CONTROL_ROUTE_CONTEXT",
     "MAX_BINARY_MESSAGE_BYTES",
     "MAX_FORWARD_QUEUE_BYTES",
     "MAX_FORWARD_QUEUE_FRAMES",
@@ -61,5 +66,6 @@ __all__ = [
     "decode_canonical_base64url",
     "encode_base64url",
     "mailbox_route_for_auth",
+    "pairing_control_route_for_auth",
     "parse_registration",
 ]

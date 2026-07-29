@@ -12,8 +12,8 @@ The proof of concept must have:
 - a phrase and QR enrollment experience;
 - explicit approval on the existing device;
 - end-to-end encrypted content;
-- a relay that routes live frames and stores only end-to-end-encrypted offline
-  envelopes plus aggregate metrics;
+- a relay that routes live frames and stores only end-to-end-encrypted
+  application and pairing-control envelopes plus aggregate metrics;
 - foreground, low-latency propagation between two iOS devices;
 - local durability and deterministic convergence after reconnection.
 
@@ -128,8 +128,9 @@ Adopt:
 - distinct device identities;
 - a separate initial-state transfer.
 
-Adopt the mailbox delivery contract, but store only application-level
-end-to-end ciphertext and delete it immediately after durable receipt.
+Adopt the mailbox delivery contract, but store only application-operation and
+pairing-control end-to-end ciphertext and delete it after durable receipt or
+pairing cleanup.
 
 Sources:
 
@@ -264,7 +265,9 @@ concept.
 The implementation deliberately differs from Brave:
 
 - QR and phrase carry a short-lived invitation, never the long-term pair root.
-- Pairing requires both devices online and explicit host approval.
+- Pairing requires both devices to overlap for the live invitation handshake
+  and explicit host approval. Encrypted pairing-control finalization then
+  resumes asynchronously through the mailbox.
 - Ephemeral X25519 plus the invitation PSK derives a pair root.
 - Each normal connection performs another ephemeral authenticated handshake.
 - The relay keeps a volatile two-socket live router plus a directional,
