@@ -1300,25 +1300,7 @@ final class PairingRecoveryTests: XCTestCase {
             mailboxTransport: transport,
             pairingRetryDelayNanoseconds: 10_000_000
         )
-        let conflictVisible = await eventually {
-            model.errorMessage?.contains("preserved both copies") == true
-        }
-
-        XCTAssertTrue(conflictVisible)
-        XCTAssertFalse(model.isPaired)
-        XCTAssertTrue(model.isPairingFinalizationLocked)
-        XCTAssertTrue(model.hasPairingReplicaConflict)
-        XCTAssertEqual(
-            Set(model.tasks.compactMap(\.titleValue)),
-            ["Imported", "Keep local"]
-        )
-        XCTAssertNotNil(try fixture.credentialStore.pending())
-        XCTAssertNil(try fixture.credentialStore.active())
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: fixture.stagingURL.path)
-        )
-
-        model.resolvePairingReplicaConflictKeepingBoth()
+        // Additive-only merge (local-only tasks, no conflicts) auto-continues.
         let recovered = await eventually {
             model.isPaired
                 && !model.isPairingFinalizationLocked
@@ -1327,6 +1309,7 @@ final class PairingRecoveryTests: XCTestCase {
 
         XCTAssertTrue(recovered)
         XCTAssertFalse(model.hasPairingReplicaConflict)
+        XCTAssertNil(model.keepBothPreview)
         XCTAssertEqual(
             Set(model.tasks.compactMap(\.titleValue)),
             ["Imported", "Keep local"]

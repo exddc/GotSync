@@ -28,7 +28,7 @@ struct JoinSyncSheet: View {
                     PairingHeaderView(
                         eyebrow: "Second iPhone",
                         title: "Join private sync",
-                        detail: "Use the invitation shown on the main iPhone. No task data is sent until the main iPhone approves the matching safety code.",
+                        detail: "Scan the QR code on the main iPhone. Use the phrase only if the camera is unavailable. No tasks are shared until the main iPhone approves the matching safety code.",
                         symbol: "link.badge.plus"
                     )
 
@@ -201,24 +201,35 @@ struct JoinSyncSheet: View {
                 .multilineTextAlignment(.center)
 
             if cameraAccessDenied {
-                HStack {
-                    Button("Open Settings") {
-                        guard let url = URL(
-                            string: UIApplication.openSettingsURLString
-                        ) else {
-                            return
-                        }
-                        UIApplication.shared.open(url)
-                    }
-                    .buttonStyle(.borderedProminent)
+                VStack(alignment: .leading, spacing: 10) {
+                    Label(
+                        "Camera access is off. You can still join with the 17-word phrase from the main iPhone, or enable camera in Settings.",
+                        systemImage: "camera.fill"
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                    Button("Enter Phrase") {
-                        inputMode = .phrase
-                        phraseIsFocused = true
+                    HStack {
+                        Button("Open Settings") {
+                            guard let url = URL(
+                                string: UIApplication.openSettingsURLString
+                            ) else {
+                                return
+                            }
+                            UIApplication.shared.open(url)
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button("Enter Phrase") {
+                            inputMode = .phrase
+                            phraseIsFocused = true
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
+                    .controlSize(.large)
                 }
-                .controlSize(.large)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if let validationMessage {

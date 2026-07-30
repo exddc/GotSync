@@ -21,7 +21,7 @@ struct WelcomeView: View {
                 .accessibilityElement(children: .combine)
 
                 Text(
-                    "Link two iPhones with a one-time phrase or QR code. Changes travel end-to-end encrypted."
+                    "Link exactly two iPhones with a one-time QR code or phrase. Changes travel end-to-end encrypted. \(ProductSyncPolicy.deliverySummary)"
                 )
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -73,11 +73,17 @@ struct WelcomeView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Label(
                             model.errorMessage
-                                ?? "The connection ended unexpectedly.",
+                                ?? "Private Sync could not continue. Your tasks are still safe if any were saved here.",
                             systemImage: "exclamationmark.triangle.fill"
                         )
                         .font(.subheadline)
                         .foregroundStyle(.red)
+
+                        Button("Create Private Sync") {
+                            model.createPrivateSync()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
 
                         Button("Erase Local Data…", role: .destructive) {
                             eraseAction()
@@ -92,7 +98,7 @@ struct WelcomeView: View {
                 PrivacyDisclosureView()
 
                 Label(
-                    "Keep both apps open while you pair them the first time.",
+                    ProductSyncPolicy.pairingKeepOpenSummary,
                     systemImage: "iphone.gen3.radiowaves.left.and.right"
                 )
                 .font(.footnote)

@@ -1032,10 +1032,14 @@ final class MailboxTests: XCTestCase {
         XCTAssertTrue(capacityObserved)
         XCTAssertEqual(
             model.syncNotice?.title,
-            "Encrypted mailbox storage limit reached"
+            "Private mailbox is full"
         )
         XCTAssertTrue(
-            model.syncNotice?.detail.contains("while the app is open") == true
+            model.syncNotice?.detail.contains("saved on this iPhone") == true
+        )
+        XCTAssertFalse(
+            model.syncNotice?.detail.lowercased().contains("keep got done open")
+                == true
         )
         XCTAssertFalse(model.syncNotice?.detail.contains("unlink") == true)
         XCTAssertEqual(model.pendingMailboxOperationCount, 1)

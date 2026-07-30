@@ -12,7 +12,7 @@ struct PairingInvitationView: View {
                 PairingHeaderView(
                     eyebrow: "Main iPhone",
                     title: "Pair a second iPhone",
-                    detail: "On the other iPhone, tap Join Existing Sync and scan this code or enter the phrase.",
+                    detail: "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. \(ProductSyncPolicy.twoDeviceBoundary)",
                     symbol: "iphone.gen3.radiowaves.left.and.right"
                 )
 
@@ -85,6 +85,12 @@ struct PairingInvitationView: View {
 
     private func remainingText(until expiresAt: Date, now: Date) -> String {
         let seconds = max(0, Int(expiresAt.timeIntervalSince(now).rounded(.up)))
+        if seconds >= 60 {
+            let minutes = (seconds + 59) / 60
+            return minutes == 1
+                ? "Invitation expires in about 1 minute"
+                : "Invitation expires in about \(minutes) minutes"
+        }
         return seconds == 1
             ? "Invitation expires in 1 second"
             : "Invitation expires in \(seconds) seconds"
@@ -119,35 +125,56 @@ struct PairingProgressView: View {
 
                 VStack(spacing: 10) {
                     if model.hasPairingReplicaConflict {
-                        Image(systemName: "exclamationmark.triangle.fill")
+                        Image(systemName: "rectangle.on.rectangle.angled")
                             .font(.title2)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(RelayTheme.warning)
                             .accessibilityHidden(true)
                     } else {
                         ProgressView()
                     }
                     Text(model.statusTitle)
                         .font(.title2.weight(.bold))
+                        .multilineTextAlignment(.center)
                     Text(model.statusDetail)
                         .font(.body)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    if !model.hasPairingReplicaConflict {
+                        UserPairingStepIndicator(
+                            step: model.userPairingPresentation.step
+                        )
+                    }
                 }
 
                 PrivacyDisclosureView(compact: true)
 
                 if model.hasPairingReplicaConflict {
                     VStack(spacing: 12) {
-                        Text(
-                            "Both copies are still on this iPhone. Got Done checks the complete combined copy before either phone commits to the link."
-                        )
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
+                        if let preview = model.keepBothPreview {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("What combining will do")
+                                    .font(.headline)
+                                Text(preview.confirmationSummary)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .relayCard()
+                            .accessibilityIdentifier("keep-both-preview")
+                        } else {
+                            Text(
+                                "Both copies are still on this iPhone. Got Done checks the complete combined list before either phone commits to the link."
+                            )
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
 
-                        Button("Keep Both Task Lists and Finish…") {
+                        Button("Combine Task Lists and Finish…") {
                             isConflictConfirmationPresented = true
                         }
                         .buttonStyle(.borderedProminent)
@@ -174,7 +201,7 @@ struct PairingProgressView: View {
                     .accessibilityIdentifier("cancel-pairing")
                 } else {
                     Label(
-                        "This encrypted step is saved. You can close Got Done. It resumes the next time you open it.",
+                        "This step is saved. You can leave Got Done; it resumes the next time you open it.",
                         systemImage: "arrow.clockwise.icloud"
                     )
                     .font(.subheadline)
@@ -191,17 +218,18 @@ struct PairingProgressView: View {
         .navigationTitle("Private Sync")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog(
-            "Keep both task lists and finish?",
+            "Combine task lists?",
             isPresented: $isConflictConfirmationPresented,
             titleVisibility: .visible
         ) {
-            Button("Keep Both and Finish") {
+            Button("Combine and Finish") {
                 model.resolvePairingReplicaConflictKeepingBoth()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Got Done keeps the main iPhone’s archive, reuses unchanged tasks, and adds local-only or conflicting tasks with their completion state. Conflicting versions may appear twice."
+                model.keepBothPreview?.confirmationSummary
+                    ?? "Got Done keeps matching tasks once, adds local-only tasks, and may show conflicting versions twice. Cancel leaves this iPhone unchanged."
             )
         }
         .onAppear {
@@ -227,6 +255,51 @@ struct PairingProgressView: View {
     }
 }
 
+struct UserPairingStepIndicator: View {
+    let step: UserPairingStep
+
+    var body: some View {
+        HStack(spacing: 8) {
+            stepChip("1", title: "Other phone", active: step == .waitingForOtherPhone)
+            stepChip("2", title: "You", active: step == .waitingForYou)
+            stepChip("3", title: "Finish", active: step == .finishing)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        switch step {
+        case .waitingForOtherPhone:
+            "Step 1 of 3: waiting for the other phone"
+        case .waitingForYou:
+            "Step 2 of 3: waiting for you"
+        case .finishing:
+            "Step 3 of 3: finishing"
+        }
+    }
+
+    private func stepChip(
+        _ number: String,
+        title: String,
+        active: Bool
+    ) -> some View {
+        VStack(spacing: 4) {
+            Text(number)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(active ? .white : .secondary)
+                .frame(width: 22, height: 22)
+                .background(
+                    Circle().fill(active ? RelayTheme.accent : Color.secondary.opacity(0.18))
+                )
+            Text(title)
+                .font(.caption2.weight(active ? .semibold : .regular))
+                .foregroundStyle(active ? .primary : .secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
 struct SafetyCodeView: View {
     @ObservedObject var model: SyncAppModel
     let code: String
@@ -239,7 +312,7 @@ struct SafetyCodeView: View {
                 PairingHeaderView(
                     eyebrow: "Safety check",
                     title: "Do these digits match?",
-                    detail: "Compare this code with the other iPhone. A matching code confirms that nobody altered the encrypted setup.",
+                    detail: "Compare this code with the other iPhone. A matching code confirms that nobody altered setup.",
                     symbol: "checkmark.shield.fill"
                 )
 
@@ -282,7 +355,7 @@ struct SafetyCodeView: View {
                         ProgressView()
                         Text(
                             model.phase == .provisioning
-                                ? "Importing the encrypted task archive…"
+                                ? "Importing the shared task list…"
                                 : "Waiting for approval on the main iPhone…"
                         )
                         .font(.subheadline)

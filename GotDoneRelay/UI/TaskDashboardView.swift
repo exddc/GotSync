@@ -9,7 +9,9 @@ struct TaskDashboardView: View {
     @State private var draftTitle = ""
     @State private var pendingDeletion: PendingDeletion?
     @State private var deleteCommitTask: Task<Void, Never>?
+    @State private var isSupportStatusPresented = false
     @FocusState private var composerIsFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,16 +20,50 @@ struct TaskDashboardView: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 10)
                     .padding(.bottom, 8)
-            } else if let notice = model.syncNotice {
-                SyncNoticeView(
-                    notice: notice,
-                    repairAction: {
-                        isUnlinkConfirmationPresented = true
-                    }
-                )
+            } else {
+                if model.showsLinkCompleteCelebration {
+                    LinkCompleteBanner()
+                        .padding(.horizontal, 20)
+                        .padding(.top, 10)
+                        .padding(.bottom, 8)
+                        .transition(
+                            reduceMotion
+                                ? .opacity
+                                : .move(edge: .top).combined(with: .opacity)
+                        )
+                } else if let notice = model.syncNotice {
+                    SyncNoticeView(
+                        notice: notice,
+                        repairAction: {
+                            isUnlinkConfirmationPresented = true
+                        }
+                    )
                     .padding(.horizontal, 20)
                     .padding(.top, 10)
                     .padding(.bottom, 8)
+                } else if let cue = model.inboundArrivalCue {
+                    SoftCueBanner(
+                        text: cue,
+                        systemImage: "iphone.badge.play"
+                    )
+                    .padding(.horizontal, 20)
+                    .padding(.top, 10)
+                    .padding(.bottom, 8)
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .move(edge: .top).combined(with: .opacity)
+                    )
+                } else if let confidence = model.lastSyncConfidenceText {
+                    SoftCueBanner(
+                        text: confidence,
+                        systemImage: "checkmark.circle"
+                    )
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+                    .transition(.opacity)
+                }
             }
 
             if visibleTasks.isEmpty {
@@ -45,7 +81,22 @@ struct TaskDashboardView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     if model.isPaired {
-                        Section {
+                        Button(
+                            "Sync status",
+                            systemImage: "info.circle"
+                        ) {
+                            isSupportStatusPresented = true
+                        }
+
+                        Button(
+                            "Unlink and Keep Tasks",
+                            systemImage: "link.badge.minus"
+                        ) {
+                            isUnlinkConfirmationPresented = true
+                        }
+
+                        #if DEBUG
+                        Menu("Diagnostics") {
                             Text("End-to-end encrypted")
                             Text("Live relay: \(model.relayURL.host() ?? "local")")
                             Text("Offline mailbox: \(model.mailboxURL.host() ?? "local")")
@@ -58,13 +109,7 @@ struct TaskDashboardView: View {
                                 Text("Last sync error: \(error)")
                             }
                         }
-
-                        Button(
-                            "Unlink and Keep Tasks",
-                            systemImage: "link.badge.minus"
-                        ) {
-                            isUnlinkConfirmationPresented = true
-                        }
+                        #endif
                     }
 
                     Button(
@@ -79,6 +124,9 @@ struct TaskDashboardView: View {
                 }
                 .accessibilityLabel("Private sync options")
             }
+        }
+        .sheet(isPresented: $isSupportStatusPresented) {
+            SupportStatusSheet(model: model)
         }
         .onChange(of: model.tasks.map(\.id)) {
             reconcilePendingDeletion()
@@ -126,7 +174,7 @@ struct TaskDashboardView: View {
             } footer: {
                 Label(
                     model.isPaired
-                        ? "Task text stays end-to-end encrypted during live and offline delivery."
+                        ? ProductSyncPolicy.deliverySummary
                         : "New edits are not syncing and stay on this iPhone until you create a new private sync.",
                     systemImage: model.isPaired ? "lock.fill" : "iphone"
                 )
@@ -151,9 +199,9 @@ struct TaskDashboardView: View {
         } description: {
             Text(
                 model.isPaired
-                    ? "Add a task below. After secure upload, it can wait encrypted until the other iPhone opens."
+                    ? "Add a task below. It is saved on this iPhone first, then appears on the other iPhone the next time that phone opens Got Done."
                     : model.canEditLocalTasks
-                        ? "Add a local task below or create a new private sync for a replacement iPhone."
+                        ? "Add a local task below or create Private Sync for a replacement iPhone."
                         : "Restart Got Done or erase local data to recover from the storage error."
             )
         }
@@ -258,7 +306,7 @@ struct TaskDashboardView: View {
 
             Text(
                 model.canEditLocalTasks
-                    ? "New edits stay on this iPhone until you create or join a private sync. Devices from the old link may still keep their existing copies."
+                    ? "Link ended or never started — tasks stay on this iPhone. Create Private Sync for a replacement phone, or join an invitation from your other iPhone."
                     : "Local storage is unavailable, so these tasks cannot be edited right now. Restart Got Done or erase local data to start over."
             )
             .font(.subheadline)
@@ -275,9 +323,9 @@ struct TaskDashboardView: View {
                 } label: {
                     Label(
                         model.pairingRecoveryResetRequired
-                            ? "Keep Tasks and Reset Sync"
+                            ? "Keep Tasks · Reset Link"
                             : model.phase == .failed
-                                ? "Try Private Sync Again"
+                                ? "Create Private Sync for Replacement"
                                 : "Create Private Sync",
                         systemImage: "qrcode"
                     )
@@ -514,5 +562,72 @@ private struct PendingDeletion: Equatable, Identifiable {
     init(id: UUID = UUID(), taskIDs: [UUID]) {
         self.id = id
         self.taskIDs = taskIDs
+    }
+}
+
+private struct LinkCompleteBanner: View {
+    var body: some View {
+        Label("Private Sync is on", systemImage: "checkmark.seal.fill")
+            .font(.headline)
+            .foregroundStyle(RelayTheme.success)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .relayCard()
+            .accessibilityIdentifier("link-complete-banner")
+    }
+}
+
+private struct SoftCueBanner: View {
+    let text: String
+    let systemImage: String
+
+    var body: some View {
+        Label(text, systemImage: systemImage)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(RelayTheme.card)
+            )
+            .accessibilityIdentifier("soft-sync-cue")
+    }
+}
+
+struct SupportStatusSheet: View {
+    @ObservedObject var model: SyncAppModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            let summary = model.supportStatusSummary
+            List {
+                Section("Status") {
+                    Text(summary.linkStatusLine)
+                    Text(summary.lastUpdateLine)
+                    Text(summary.pendingLine)
+                    Text(summary.localEditLine)
+                }
+                Section("When does the other iPhone see edits?") {
+                    Text(summary.deliveryDetail)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Section {
+                    Text(ProductSyncPolicy.twoDeviceBoundary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Sync status")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 }

@@ -128,14 +128,14 @@ private struct SyncRootView: View {
         }
         .confirmationDialog(
             model.pairingRecoveryResetRequired
-                ? "Reset Private Sync?"
+                ? "Keep tasks · reset link?"
                 : "Unlink this iPhone?",
             isPresented: $isUnlinkConfirmationPresented,
             titleVisibility: .visible
         ) {
             Button(
                 model.pairingRecoveryResetRequired
-                    ? "Keep Tasks and Reset Sync"
+                    ? "Keep Tasks · Reset Link"
                     : "Unlink and Keep Tasks"
             ) {
                 model.unlinkAndKeepTasks()
@@ -144,8 +144,8 @@ private struct SyncRootView: View {
         } message: {
             Text(
                 model.pairingRecoveryResetRequired
-                    ? "Tasks stay on this iPhone. Unfinished recovery proofs are removed, and a phone from the old link may also need its link reset."
-                    : "Tasks stay on this iPhone. It stops using the old link, so you can create a new private sync for a replacement phone."
+                    ? "Tasks stay on this iPhone. Unfinished pairing recovery is cleared so you can create Private Sync again. Erase is not required."
+                    : "Tasks stay on this iPhone. This phone leaves the link so you can create Private Sync for a replacement. The other phone keeps its existing tasks until it unlinks too."
             )
         }
         .onOpenURL { url in

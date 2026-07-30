@@ -58,8 +58,8 @@ struct PrivacyDisclosureView: View {
                     .font(.headline)
                 Text(
                     compact
-                        ? "The relay temporarily stores encrypted payloads for offline delivery. It can see timing and size, not task text."
-                        : "No account, ad tracking, or per-user analytics. The relay temporarily stores encrypted payloads for offline delivery and can see timing and size, not task text or encryption keys."
+                        ? "The relay temporarily holds private packages for offline delivery. It can see timing and size, not task text."
+                        : "No account, ad tracking, or per-user analytics. The relay temporarily holds private packages for offline delivery and can see timing and size, not task text or keys."
                 )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -100,8 +100,8 @@ struct SyncNoticeView: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 if notice.kind == .repair {
-                    Button("Keep Tasks and Replace Link", action: repairAction)
-                        .buttonStyle(.bordered)
+                    Button("Keep Tasks · Create New Link", action: repairAction)
+                        .buttonStyle(.borderedProminent)
                         .controlSize(.large)
                         .padding(.top, 4)
                 }
