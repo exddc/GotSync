@@ -10,9 +10,15 @@ struct PairingInvitationView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 PairingHeaderView(
-                    eyebrow: "Main iPhone",
-                    title: "Pair a second iPhone",
-                    detail: "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. Invitation valid for 15 minutes. \(ProductSyncPolicy.twoDeviceBoundary)",
+                    eyebrow: model.isIssuingGroupInvite
+                        ? "Invite to this sync"
+                        : "Main iPhone",
+                    title: model.isIssuingGroupInvite
+                        ? "Invite another iPhone"
+                        : "Start a private sync",
+                    detail: model.isIssuingGroupInvite
+                        ? "\(ProductSyncPolicy.inviteDetail) On the other iPhone, tap Join Existing Sync and scan this code."
+                        : "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. Invitation valid for 15 minutes. \(ProductSyncPolicy.multiDeviceBoundary)",
                     symbol: "iphone.gen3.radiowaves.left.and.right"
                 )
 

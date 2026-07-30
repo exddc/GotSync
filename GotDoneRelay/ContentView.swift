@@ -61,20 +61,21 @@ private struct SyncRootView: View {
                     SafetyCodeView(model: model, code: safetyCode)
                 } else if model.isPairingFinalizationLocked {
                     PairingProgressView(model: model)
+                } else if let phrase = model.invitationPhrase,
+                          let invitationURL = model.invitationURL
+                {
+                    // Founding invite or any-member group invite.
+                    PairingInvitationView(
+                        model: model,
+                        phrase: phrase,
+                        invitationURL: invitationURL
+                    )
                 } else if model.isPaired {
                     TaskDashboardView(
                         model: model,
                         isResetConfirmationPresented: $isResetConfirmationPresented,
                         isUnlinkConfirmationPresented: $isUnlinkConfirmationPresented,
                         joinAction: { presentedSheet = .join }
-                    )
-                } else if let phrase = model.invitationPhrase,
-                          let invitationURL = model.invitationURL
-                {
-                    PairingInvitationView(
-                        model: model,
-                        phrase: phrase,
-                        invitationURL: invitationURL
                     )
                 } else if model.phase == .waitingForPeer
                             || model.phase == .provisioning
@@ -145,11 +146,69 @@ private struct SyncRootView: View {
             Text(
                 model.pairingRecoveryResetRequired
                     ? "Tasks stay on this iPhone. Unfinished pairing recovery is cleared so you can create Private Sync again. Erase is not required."
-                    : "Tasks stay on this iPhone. This phone leaves the link so you can create Private Sync for a replacement. The other phone keeps its existing tasks until it unlinks too."
+                    : ProductSyncPolicy.leaveSyncDetail
             )
         }
         .onOpenURL { url in
+            #if DEBUG
+            if url.scheme?.lowercased() == "gotdone",
+               url.host?.lowercased() == "debug"
+            {
+                switch url.path.lowercased() {
+                case "/create", "create":
+                    model.createPrivateSync()
+                    return
+                case "/invite", "invite":
+                    model.inviteToGroup()
+                    return
+                case "/approve", "approve":
+                    model.approveSafetyCode()
+                    return
+                case "/erase", "erase":
+                    model.eraseLocalProofOfConcept()
+                    return
+                default:
+                    break
+                }
+            }
+            #endif
             model.joinPrivateSync(url: url)
+        }
+        .onAppear {
+            #if DEBUG
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                if GotDoneDebugLaunch.shouldErase {
+                    model.eraseLocalProofOfConcept()
+                }
+                if let joinURL = GotDoneDebugLaunch.joinURL {
+                    model.joinPrivateSync(url: joinURL)
+                }
+                if GotDoneDebugLaunch.shouldCreateInvite {
+                    model.createPrivateSync()
+                }
+                if GotDoneDebugLaunch.shouldInviteToGroup {
+                    model.inviteToGroup()
+                }
+                if GotDoneDebugLaunch.shouldApproveSafety {
+                    model.approveSafetyCode()
+                }
+                if GotDoneDebugLaunch.shouldSeedGroupUI {
+                    model.seedGroupUIForDebug(memberCount: 3)
+                }
+            }
+            if GotDoneDebugLaunch.shouldAutoApproveSafety {
+                // Poll briefly for host safety-code confirmation during multi-sim demos.
+                Task { @MainActor in
+                    for _ in 0..<80 {
+                        if model.isHostApprovalPending {
+                            model.approveSafetyCode()
+                            return
+                        }
+                        try? await Task.sleep(nanoseconds: 250_000_000)
+                    }
+                }
+            }
+            #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {

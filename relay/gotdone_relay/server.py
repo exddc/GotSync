@@ -52,6 +52,8 @@ REGISTRATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_CONNECTIONS = 256
 DEFAULT_MAX_ROOMS = 128
 DEFAULT_MAX_MAILBOX_CONNECTIONS = 64
+# Aligned with ProductSyncPolicy.maxDevices / ReplicaLimits.maxOrigins.
+DEFAULT_MAX_SOCKETS_PER_ROUTE = 8
 # Must stay aligned with ProductSyncPolicy.pairingWindowTimeToLive (15 minutes)
 # so physical QR + phrase pairing is not cut short by the relay waiting room.
 DEFAULT_WAITING_ROOM_TTL_SECONDS = 900.0
@@ -275,17 +277,21 @@ class RelayService:
         *,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_rooms: int = DEFAULT_MAX_ROOMS,
+        max_sockets_per_route: int = DEFAULT_MAX_SOCKETS_PER_ROUTE,
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
     ) -> None:
         if max_connections <= 0:
             raise ValueError("max_connections must be positive")
         if max_rooms <= 0:
             raise ValueError("max_rooms must be positive")
+        if max_sockets_per_route <= 0:
+            raise ValueError("max_sockets_per_route must be positive")
         if waiting_room_ttl <= 0:
             raise ValueError("waiting_room_ttl must be positive")
         self.metrics = metrics or Metrics()
         self.max_connections = max_connections
         self.max_rooms = max_rooms
+        self.max_sockets_per_route = max_sockets_per_route
         self.waiting_room_ttl = waiting_room_ttl
         self._rooms: dict[bytes, Room] = {}
         self._connection_count = 0
@@ -381,7 +387,7 @@ class RelayService:
                     return "relayBusy"
                 room = Room()
                 self._rooms[member.route] = room
-            if len(room.members) >= 2:
+            if len(room.members) >= self.max_sockets_per_route:
                 return "routeFull"
 
             room.members.append(member)
@@ -391,17 +397,24 @@ class RelayService:
 
             if len(room.members) == 1:
                 self._start_waiting_expiry(member.route, room, member)
-            if len(room.members) == 2:
+            elif len(room.members) >= 2:
+                # Multi-member rooms stay open without short lone-peer expiry.
                 self._cancel_waiting_expiry(room)
                 for peer in room.members:
+                    if peer is member:
+                        continue
                     if not peer.outbound.enqueue(
                         PEER_READY, forwarded_binary=False
                     ):
-                        raise RuntimeError("new room control queue is unexpectedly full")
+                        raise RuntimeError("room control queue is unexpectedly full")
+                if not member.outbound.enqueue(
+                    PEER_READY, forwarded_binary=False
+                ):
+                    raise RuntimeError("new member control queue is unexpectedly full")
             return "joined"
 
     async def _leave(self, member: Member) -> None:
-        peer_to_close: Member | None = None
+        peers_to_close: list[Member] = []
         async with self._lock:
             room = self._rooms.get(member.route)
             if room is None or member not in room.members:
@@ -412,18 +425,26 @@ class RelayService:
             member.joined = False
             self._connection_count -= 1
             if room.members:
-                peer = room.members[0]
-                self._start_waiting_expiry(member.route, room, peer)
-                if not peer.outbound.enqueue(PEER_LEFT, forwarded_binary=False):
-                    self.metrics.increment("forward_queue_overflows")
-                    peer_to_close = peer
+                if len(room.members) == 1:
+                    # Pairing / lone survivor waiting room.
+                    self._start_waiting_expiry(
+                        member.route, room, room.members[0]
+                    )
+                else:
+                    self._cancel_waiting_expiry(room)
+                for peer in room.members:
+                    if not peer.outbound.enqueue(
+                        PEER_LEFT, forwarded_binary=False
+                    ):
+                        self.metrics.increment("forward_queue_overflows")
+                        peers_to_close.append(peer)
             else:
                 self._cancel_waiting_expiry(room)
                 del self._rooms[member.route]
             self._update_active_metrics()
 
-        if peer_to_close is not None:
-            await self._close(peer_to_close.socket, 1013, "forward queue full")
+        for peer in peers_to_close:
+            await self._close(peer.socket, 1013, "forward queue full")
 
     def _start_waiting_expiry(
         self,
@@ -512,25 +533,27 @@ class RelayService:
                 self.metrics.increment("control_frames_sent")
 
     async def _forward(self, sender: Member, payload: bytes) -> None:
-        peer_to_close: Member | None = None
+        peers_to_close: list[Member] = []
         async with self._lock:
             room = self._rooms.get(sender.route)
             if (
                 room is None
                 or sender not in room.members
-                or len(room.members) != 2
+                or len(room.members) < 2
             ):
                 self.metrics.increment("binary_frames_dropped_no_peer")
                 self.metrics.increment("binary_bytes_dropped_no_peer", len(payload))
                 return
 
-            peer = room.members[0] if room.members[1] is sender else room.members[1]
-            if not peer.outbound.enqueue(payload, forwarded_binary=True):
-                self.metrics.increment("forward_queue_overflows")
-                peer_to_close = peer
+            for peer in room.members:
+                if peer is sender:
+                    continue
+                if not peer.outbound.enqueue(payload, forwarded_binary=True):
+                    self.metrics.increment("forward_queue_overflows")
+                    peers_to_close.append(peer)
 
-        if peer_to_close is not None:
-            await self._close(peer_to_close.socket, 1013, "forward queue full")
+        for peer in peers_to_close:
+            await self._close(peer.socket, 1013, "forward queue full")
 
     def _update_active_metrics(self) -> None:
         self.metrics.set_active(

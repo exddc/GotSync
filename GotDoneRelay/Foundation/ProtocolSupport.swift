@@ -121,7 +121,9 @@ struct SyncEndpointConfiguration: Equatable, Sendable {
         }
         switch policy {
         case .localDevelopment:
-            guard scheme == "wss" || isLoopback(host) else {
+            // Plaintext is allowed only on loopback or RFC1918 LAN hosts so a
+            // phone on the same Wi‑Fi can reach a Mac-hosted demo relay.
+            guard scheme == "wss" || isLoopback(host) || isPrivateLANHost(host) else {
                 throw SyncEndpointConfigurationError.invalidRelay
             }
         case .production:
@@ -150,7 +152,7 @@ struct SyncEndpointConfiguration: Equatable, Sendable {
         }
         switch policy {
         case .localDevelopment:
-            guard scheme == "https" || isLoopback(host) else {
+            guard scheme == "https" || isLoopback(host) || isPrivateLANHost(host) else {
                 throw SyncEndpointConfigurationError.invalidMailbox
             }
         case .production:
@@ -189,6 +191,23 @@ struct SyncEndpointConfiguration: Equatable, Sendable {
 
     private static func isLocalOnly(_ host: String) -> Bool {
         isLoopback(host) || host == "0.0.0.0" || host == "::"
+    }
+
+    /// RFC1918 private IPv4 ranges for same-network device demos.
+    private static func isPrivateLANHost(_ host: String) -> Bool {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4,
+              let a = UInt8(parts[0]),
+              let b = UInt8(parts[1]),
+              UInt8(parts[2]) != nil,
+              UInt8(parts[3]) != nil
+        else {
+            return false
+        }
+        if a == 10 { return true }
+        if a == 192 && b == 168 { return true }
+        if a == 172 && (16...31).contains(b) { return true }
+        return false
     }
 }
 

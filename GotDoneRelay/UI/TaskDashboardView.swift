@@ -10,6 +10,7 @@ struct TaskDashboardView: View {
     @State private var pendingDeletion: PendingDeletion?
     @State private var deleteCommitTask: Task<Void, Never>?
     @State private var isSupportStatusPresented = false
+    @State private var isManageSyncPresented = false
     @FocusState private var composerIsFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -82,6 +83,13 @@ struct TaskDashboardView: View {
                 Menu {
                     if model.isPaired {
                         Button(
+                            ProductSyncPolicy.manageSyncTitle,
+                            systemImage: "person.2"
+                        ) {
+                            isManageSyncPresented = true
+                        }
+
+                        Button(
                             "Sync status",
                             systemImage: "info.circle"
                         ) {
@@ -89,7 +97,7 @@ struct TaskDashboardView: View {
                         }
 
                         Button(
-                            "Unlink and Keep Tasks",
+                            ProductSyncPolicy.leaveSyncTitle,
                             systemImage: "link.badge.minus"
                         ) {
                             isUnlinkConfirmationPresented = true
@@ -98,6 +106,9 @@ struct TaskDashboardView: View {
                         #if DEBUG
                         Menu("Diagnostics") {
                             Text("End-to-end encrypted")
+                            Text(
+                                "Linked iPhones: \(model.linkedMemberCount)"
+                            )
                             Text("Live relay: \(model.relayURL.host() ?? "local")")
                             Text("Offline mailbox: \(model.mailboxURL.host() ?? "local")")
                             if let roundTrip = model.lastRoundTripMilliseconds {
@@ -124,6 +135,12 @@ struct TaskDashboardView: View {
                 }
                 .accessibilityLabel("Private sync options")
             }
+        }
+        .sheet(isPresented: $isManageSyncPresented) {
+            ManageSyncView(
+                model: model,
+                isUnlinkConfirmationPresented: $isUnlinkConfirmationPresented
+            )
         }
         .sheet(isPresented: $isSupportStatusPresented) {
             SupportStatusSheet(model: model)
@@ -615,9 +632,14 @@ struct SupportStatusSheet: View {
                         .foregroundStyle(.secondary)
                 }
                 Section {
-                    Text(ProductSyncPolicy.twoDeviceBoundary)
+                    Text(ProductSyncPolicy.multiDeviceBoundary)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    if model.isPaired {
+                        Text(model.manageSyncStatusLine)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .navigationTitle("Sync status")

@@ -133,4 +133,44 @@ final class EndpointConfigurationTests: XCTestCase {
             )
         }
     }
+
+    func testLocalDevelopmentAcceptsPrivateLANPlaintextEndpoints() throws {
+        let configuration = try SyncEndpointConfiguration.load(
+            values: [
+                SyncEndpointConfiguration.relayInfoKey:
+                    "ws://192.168.178.187:8765/v1",
+                SyncEndpointConfiguration.mailboxInfoKey:
+                    "http://192.168.178.187:8767/v1/mailbox",
+            ],
+            policy: .localDevelopment
+        )
+
+        XCTAssertEqual(
+            configuration.relayURL.absoluteString,
+            "ws://192.168.178.187:8765/v1"
+        )
+        XCTAssertEqual(
+            configuration.mailboxURL.absoluteString,
+            "http://192.168.178.187:8767/v1/mailbox"
+        )
+    }
+
+    func testLocalDevelopmentRejectsPublicPlaintextEndpoints() {
+        XCTAssertThrowsError(
+            try SyncEndpointConfiguration.load(
+                values: [
+                    SyncEndpointConfiguration.relayInfoKey:
+                        "ws://sync.example.com/v1",
+                    SyncEndpointConfiguration.mailboxInfoKey:
+                        "http://sync.example.com/v1/mailbox",
+                ],
+                policy: .localDevelopment
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? SyncEndpointConfigurationError,
+                .invalidRelay
+            )
+        }
+    }
 }

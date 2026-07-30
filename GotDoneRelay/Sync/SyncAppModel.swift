@@ -54,6 +54,7 @@ enum SyncAppError: Error, LocalizedError, Equatable {
     case legacyPairingNeedsRelink
     case pairingRecoveryHistoryFull
     case pairingRecoveryJournalDamaged
+    case groupAtCapacity
 
     var errorDescription: String? {
         switch self {
@@ -88,6 +89,8 @@ enum SyncAppError: Error, LocalizedError, Equatable {
             "Too many unfinished pairing steps are still saved. Keep your tasks and reset Private Sync before creating another link."
         case .pairingRecoveryJournalDamaged:
             "Saved pairing recovery data is damaged. Your tasks are safe — keep them and reset Private Sync before creating another link."
+        case .groupAtCapacity:
+            ProductSyncPolicy.groupFullMessage
         }
     }
 
@@ -190,7 +193,17 @@ final class SyncAppModel: ObservableObject {
     private let hasDurableIdentity: Bool
     private var hasDurableStorage: Bool
     private var replica: TaskReplica
-    private var credentials: PairCredentials?
+    private var credentials: GroupCredentials?
+    /// Group join material captured from provision (joiner only).
+    private var pendingGroupJoinSnapshot: GroupProvisionFields?
+
+    fileprivate struct GroupProvisionFields: Equatable, Sendable {
+        let groupID: Data
+        let epoch: UInt64
+        let groupRoot: Data
+        let membershipGeneration: UInt64
+        let memberDeviceIDs: [Data]
+    }
     private var pendingPairForRecovery: PendingPair?
     private var pairingAttemptID: UUID?
     private var pairingTask: Task<Void, Never>?
@@ -212,6 +225,8 @@ final class SyncAppModel: ObservableObject {
     private var pendingPings: [Data: ContinuousClock.Instant] = [:]
     private var deferredOperations: [TaskOperation] = []
     private var uploadedLocalSequence: UInt64 = 0
+    /// Per-recipient high-water marks for group mailbox fan-out.
+    private var uploadedThroughByRecipient: [Data: UInt64] = [:]
     private var mailboxCycleRequested = false
     private var mailboxFailureCount = 0
     private var nextMailboxAttemptAt = Date.distantPast
@@ -401,7 +416,7 @@ final class SyncAppModel: ObservableObject {
                         if let checkpoint = try credentialStore.mailboxCheckpoint() {
                             guard
                                 checkpoint.version == SyncProtocol.version,
-                                checkpoint.pairID == credentials.pairID,
+                                checkpoint.pairID == credentials.groupID,
                                 checkpoint.uploadedLocalSequence
                                     <= replica.versionVector[deviceID]
                             else {
@@ -409,9 +424,29 @@ final class SyncAppModel: ObservableObject {
                             }
                             uploadedLocalSequence =
                                 checkpoint.uploadedLocalSequence
+                            uploadedThroughByRecipient = Dictionary(
+                                uniqueKeysWithValues: checkpoint
+                                    .uploadedThroughByRecipient
+                                    .compactMap { key, value -> (Data, UInt64)? in
+                                        guard let data = try? Data(base64URL: key) else {
+                                            return nil
+                                        }
+                                        return (data, value)
+                                    }
+                            )
+                            // Legacy single-field checkpoint: seed all remotes.
+                            if uploadedThroughByRecipient.isEmpty,
+                               checkpoint.uploadedLocalSequence > 0
+                            {
+                                for remote in credentials.remoteActiveDeviceIDs {
+                                    uploadedThroughByRecipient[remote] =
+                                        checkpoint.uploadedLocalSequence
+                                }
+                            }
                         }
                     } catch {
                         uploadedLocalSequence = 0
+                        uploadedThroughByRecipient = [:]
                         try? credentialStore.clearMailboxCheckpoint()
                     }
                 }
@@ -551,7 +586,7 @@ final class SyncAppModel: ObservableObject {
             return SyncNotice(
                 kind: .saving,
                 title: "Saved on this iPhone",
-                detail: "Upload to your other iPhone continues in the background when possible. It appears there the next time that iPhone opens Got Done."
+                detail: "Upload to your linked iPhones continues in the background when possible. It appears there the next time those phones open Got Done."
             )
         }
         return nil
@@ -568,6 +603,88 @@ final class SyncAppModel: ObservableObject {
                 ? ProductSyncPolicy.deliverySummary
                 : "This iPhone is not linked. Local edits stay here until you create or join Private Sync."
         )
+    }
+
+    /// Active members in the linked group (including this iPhone).
+    var linkedMemberCount: Int {
+        credentials?.activeMemberCount ?? (isPaired ? 2 : 0)
+    }
+
+    var isGroupAtCapacity: Bool {
+        credentials?.isAtCapacity ?? false
+    }
+
+    /// Short labels for Manage Sync member list.
+    var linkedMemberLabels: [String] {
+        guard let credentials else {
+            return isPaired ? ["This iPhone", "Other iPhone"] : []
+        }
+        return credentials.activeMembers.map { member in
+            if member.deviceID == credentials.localDeviceID {
+                return "This iPhone"
+            }
+            let short = member.deviceID.prefix(4).map {
+                String(format: "%02x", $0)
+            }.joined()
+            return "iPhone · \(short)"
+        }
+    }
+
+    var manageSyncStatusLine: String {
+        ProductSyncPolicy.linkedStatusSummary(memberCount: linkedMemberCount)
+    }
+
+    func leaveGroupAndKeepTasks() {
+        unlinkAndKeepTasks()
+    }
+
+    #if DEBUG
+    /// Seeds a multi-member group for Manage Sync UI demos/screenshots.
+    func seedGroupUIForDebug(memberCount: Int = 3) {
+        guard
+            hasDurableIdentity,
+            hasDurableStorage,
+            !isPaired,
+            memberCount >= 2,
+            memberCount <= ProductSyncPolicy.maxDevices
+        else {
+            return
+        }
+        do {
+            var members = [GroupMember(deviceID: deviceID.bytes, joinedEpoch: 1)]
+            for index in 1..<memberCount {
+                members.append(
+                    GroupMember(
+                        deviceID: Data(repeating: UInt8(0xA0 + index), count: 16),
+                        joinedEpoch: 1
+                    )
+                )
+            }
+            let group = GroupCredentials(
+                groupID: Data(repeating: 0x51, count: 16),
+                epoch: 1,
+                groupRoot: Data(repeating: 0x52, count: 32),
+                localDeviceID: deviceID.bytes,
+                members: members,
+                membershipGeneration: UInt64(memberCount),
+                foundingPairRole: memberCount == 2 ? .host : nil
+            )
+            try group.validate(deviceID: deviceID)
+            try credentialStore.saveActive(group)
+            credentials = group
+            isPaired = true
+            phase = .synced
+            publishReplica()
+            startMailboxLoop()
+        } catch {
+            fail(error)
+        }
+    }
+    #endif
+
+    /// Whether the invitation UI is an in-group invite (vs founding).
+    var isIssuingGroupInvite: Bool {
+        isPaired && invitationPhrase != nil
     }
 
     var userPairingPresentation: UserPairingPresentation {
@@ -693,11 +810,15 @@ final class SyncAppModel: ObservableObject {
         return userPairingPresentation.detail
     }
 
+    /// Found a new group (unlinked) or invite another iPhone into the current group.
     func createPrivateSync() {
+        if isPaired {
+            inviteToGroup()
+            return
+        }
         guard
             hasDurableIdentity,
             hasDurableStorage,
-            !isPaired,
             !isPairingFinalizationLocked,
             pairingTask == nil
         else {
@@ -716,6 +837,7 @@ final class SyncAppModel: ObservableObject {
             errorMessage = nil
             activePairingRole = .host
             phase = .waitingForPeer
+            writeDebugInviteArtifact(phrase: invitation.phrase, url: invitation.url)
             let attemptID = UUID()
             pairingAttemptID = attemptID
             pairingTask = Task { [weak self] in
@@ -797,10 +919,7 @@ final class SyncAppModel: ObservableObject {
     }
 
     func rejectSafetyCode() {
-        guard
-            safetyCode != nil,
-            !isPaired
-        else {
+        guard safetyCode != nil else {
             return
         }
         if isHostApprovalPending {
@@ -809,26 +928,96 @@ final class SyncAppModel: ObservableObject {
             approvalContinuation = nil
             return
         }
-        cancelPairing()
+        cancelPairing(preserveLink: isPaired)
     }
 
     func regenerateInvitation() {
         guard
             invitationPhrase != nil,
-            !isPaired,
             !isPairingFinalizationLocked
         else {
             return
         }
-        cancelPairing()
-        createPrivateSync()
+        let wasLinked = isPaired
+        cancelPairing(preserveLink: wasLinked)
+        if wasLinked {
+            inviteToGroup()
+        } else {
+            createPrivateSync()
+        }
     }
 
-    func cancelPairing() {
-        guard !isPaired else {
+    /// Any linked member can issue a join invite into the existing group.
+    func inviteToGroup() {
+        guard
+            hasDurableIdentity,
+            hasDurableStorage,
+            isPaired,
+            !isPairingFinalizationLocked,
+            pairingTask == nil,
+            let credentials
+        else {
+            return
+        }
+        if credentials.isAtCapacity {
+            fail(SyncAppError.groupAtCapacity)
+            return
+        }
+        do {
+            try validateTerminalPairingCapacity()
+            try validateProvisioningArchiveSize()
+            let invitation = try Invitation.generate()
+            invitationPhrase = invitation.phrase
+            invitationURL = invitation.url
+            invitationExpiresAt = Date().addingTimeInterval(
+                ProductSyncPolicy.pairingWindowTimeToLive
+            )
+            safetyCode = nil
+            errorMessage = nil
+            activePairingRole = .host
+            phase = .waitingForPeer
+            writeDebugInviteArtifact(phrase: invitation.phrase, url: invitation.url)
+            let attemptID = UUID()
+            pairingAttemptID = attemptID
+            pairingTask = Task { [weak self] in
+                await self?.runHostPairing(invitation, attemptID: attemptID)
+            }
+            pairingExpiryTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(
+                        nanoseconds: ProductSyncPolicy.invitationTimeToLiveNanoseconds
+                    )
+                    guard
+                        let self,
+                        self.pairingAttemptID == attemptID,
+                        self.isPaired,
+                        !self.isPairingFinalizationLocked,
+                        self.invitationPhrase != nil,
+                        !Task.isCancelled
+                    else {
+                        return
+                    }
+                    self.cancelPairing(preserveLink: true)
+                    self.fail(SyncAppError.invitationExpired)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
+                }
+            }
+        } catch {
+            fail(error)
+        }
+    }
+
+    func cancelPairing(preserveLink: Bool = false) {
+        let keepLink = isPaired && (preserveLink || invitationPhrase != nil)
+        if isPaired && !keepLink {
             return
         }
         if isPairingFinalizationLocked {
+            // Group-invite finalization is still pairing-locked; abort path
+            // clears pending without unlinking when credentials already exist.
             requestPendingPairingAbort()
             return
         }
@@ -862,7 +1051,13 @@ final class SyncAppModel: ObservableObject {
         do {
             try rollbackPendingPairing()
             errorMessage = nil
-            phase = .unpaired
+            if keepLink, credentials != nil {
+                phase = channelReady ? .synced : .connecting
+                startSyncLoop()
+                startMailboxLoop()
+            } else {
+                phase = .unpaired
+            }
         } catch {
             hasDurableStorage = false
             fail(error)
@@ -987,8 +1182,8 @@ final class SyncAppModel: ObservableObject {
         guard hasDurableIdentity else {
             return
         }
-        let mailboxToForget = credentials.flatMap {
-            try? PairMailbox(credentials: $0)
+        let groupMailboxToForget = credentials.flatMap {
+            try? GroupMailbox(credentials: $0)
         }
         let terminalActionsToForget = terminalPairingActions
         let mailboxCycleToFinish = mailboxCycleTask
@@ -1038,20 +1233,26 @@ final class SyncAppModel: ObservableObject {
         pendingPings = [:]
         deferredOperations = []
         uploadedLocalSequence = 0
+        uploadedThroughByRecipient = [:]
+        uploadedThroughByRecipient = [:]
         hasDurableStorage = false
 
-        if let mailboxToForget {
+        if let groupMailboxToForget {
             let transport = mailboxTransport
             Task {
                 await mailboxCycleToFinish?.value
-                try? await transport.forget(
-                    route: mailboxToForget.outbound.route,
-                    authorization: mailboxToForget.outbound.authorization
-                )
-                try? await transport.forget(
-                    route: mailboxToForget.inbound.route,
-                    authorization: mailboxToForget.inbound.authorization
-                )
+                for material in groupMailboxToForget.outboundByRecipient.values {
+                    try? await transport.forget(
+                        route: material.route,
+                        authorization: material.authorization
+                    )
+                }
+                for material in groupMailboxToForget.inboundBySender.values {
+                    try? await transport.forget(
+                        route: material.route,
+                        authorization: material.authorization
+                    )
+                }
             }
         }
         if !terminalActionsToForget.isEmpty {
@@ -1141,8 +1342,8 @@ final class SyncAppModel: ObservableObject {
         else {
             return
         }
-        let mailboxToForget = credentials.flatMap {
-            try? PairMailbox(credentials: $0)
+        let groupMailboxToForget = credentials.flatMap {
+            try? GroupMailbox(credentials: $0)
         }
         let terminalActionsToForget = resetsPairingRecovery
             ? terminalPairingActions
@@ -1207,23 +1408,28 @@ final class SyncAppModel: ObservableObject {
         pendingPings = [:]
         deferredOperations = []
         uploadedLocalSequence = 0
+        uploadedThroughByRecipient = [:]
         if resetsPairingRecovery {
             terminalPairingActions = []
             terminalPairingJournalUsable = true
         }
 
-        if let mailboxToForget {
+        if let groupMailboxToForget {
             let transport = mailboxTransport
             Task {
                 await mailboxCycleToFinish?.value
-                try? await transport.forget(
-                    route: mailboxToForget.outbound.route,
-                    authorization: mailboxToForget.outbound.authorization
-                )
-                try? await transport.forget(
-                    route: mailboxToForget.inbound.route,
-                    authorization: mailboxToForget.inbound.authorization
-                )
+                for material in groupMailboxToForget.outboundByRecipient.values {
+                    try? await transport.forget(
+                        route: material.route,
+                        authorization: material.authorization
+                    )
+                }
+                for material in groupMailboxToForget.inboundBySender.values {
+                    try? await transport.forget(
+                        route: material.route,
+                        authorization: material.authorization
+                    )
+                }
             }
         }
         if !terminalActionsToForget.isEmpty {
@@ -1640,7 +1846,6 @@ final class SyncAppModel: ObservableObject {
     private func requestPendingPairingAbort() {
         guard
             let current = pendingPairForRecovery,
-            credentials == nil,
             (
                 current.role == .host
                     && current.finalizationState
@@ -1836,9 +2041,17 @@ final class SyncAppModel: ObservableObject {
                 pairRoot: pending.pairRoot,
                 pairID: pending.pairID
             )
+            let groupProvision = try groupProvisionFields(
+                forInvite: credentials
+            )
             let envelopes = try provisionMailbox.seal(
                 archive: archive,
-                hostDeviceID: deviceID.bytes
+                hostDeviceID: deviceID.bytes,
+                groupID: groupProvision?.groupID,
+                epoch: groupProvision?.epoch,
+                groupRoot: groupProvision?.groupRoot,
+                membershipGeneration: groupProvision?.membershipGeneration,
+                memberDeviceIDs: groupProvision?.memberDeviceIDs
             )
             try await putPairingEnvelopes(
                 envelopes,
@@ -1908,11 +2121,11 @@ final class SyncAppModel: ObservableObject {
         try validatePairingPut(receipts, envelopes: [marker])
         try requireCurrentPairingAttempt(attemptID)
 
-        let resolvedCredentials = try pairingCredentials(for: pending)
-        if let credentials {
-            guard credentials == resolvedCredentials else {
-                throw SyncAppError.invalidCredentials
-            }
+        let resolvedCredentials = try groupCredentials(for: pending)
+        if credentials != nil {
+            try credentialStore.saveActive(resolvedCredentials)
+            credentials = resolvedCredentials
+            try await publishMembershipSnapshot(resolvedCredentials)
         } else {
             try credentialStore.clearMailboxCheckpoint()
             try credentialStore.saveActive(resolvedCredentials)
@@ -1931,6 +2144,7 @@ final class SyncAppModel: ObservableObject {
         try requireCurrentPairingAttempt(attemptID)
         try credentialStore.clearPending()
         pendingPairForRecovery = nil
+        pendingGroupJoinSnapshot = nil
         finishPairing(resolvedCredentials, attemptID: attemptID)
         cleanPairingMailboxes(
             pending: pending,
@@ -2027,6 +2241,31 @@ final class SyncAppModel: ObservableObject {
                     == provision.payload.hostDeviceID
             else {
                 throw SyncAppError.invalidPairMessage
+            }
+            if provision.payload.isGroupJoin {
+                guard
+                    let groupID = provision.payload.groupID,
+                    let epoch = provision.payload.epoch,
+                    let groupRoot = provision.payload.groupRoot,
+                    let membershipGeneration =
+                        provision.payload.membershipGeneration,
+                    let memberDeviceIDs = provision.payload.memberDeviceIDs,
+                    memberDeviceIDs.contains(provision.payload.hostDeviceID),
+                    !memberDeviceIDs.contains(deviceID.bytes)
+                else {
+                    throw SyncAppError.invalidPairMessage
+                }
+                var roster = memberDeviceIDs
+                roster.append(deviceID.bytes)
+                pendingGroupJoinSnapshot = GroupProvisionFields(
+                    groupID: groupID,
+                    epoch: epoch,
+                    groupRoot: groupRoot,
+                    membershipGeneration: membershipGeneration,
+                    memberDeviceIDs: roster
+                )
+            } else {
+                pendingGroupJoinSnapshot = nil
             }
             if FileManager.default.fileExists(
                 atPath: pairingStagingURL.path
@@ -2137,7 +2376,7 @@ final class SyncAppModel: ObservableObject {
             record: record,
             senderRole: .host
         )
-        let resolvedCredentials = try pairingCredentials(for: pending)
+        let resolvedCredentials = try groupCredentials(for: pending)
         var markerCursor: UInt64?
 
         if let credentials {
@@ -2246,6 +2485,91 @@ final class SyncAppModel: ObservableObject {
                 ? pending.archiveHash
                 : nil
         )
+    }
+
+    /// When already linked, provision carries the existing group secret + roster
+    /// (including a placeholder slot for the joiner filled after ready).
+    private func groupProvisionFields(
+        forInvite existing: GroupCredentials?
+    ) throws -> GroupProvisionFields? {
+        guard let existing else {
+            return nil
+        }
+        try existing.validate(deviceID: deviceID)
+        guard !existing.isAtCapacity else {
+            throw SyncAppError.groupAtCapacity
+        }
+        return GroupProvisionFields(
+            groupID: existing.groupID,
+            epoch: existing.epoch,
+            groupRoot: existing.groupRoot,
+            membershipGeneration: existing.membershipGeneration &+ 1,
+            // Joiner ID is not known yet; host rewrites after ready using
+            // full roster in groupCredentials(for:). Placeholder is issuer-only
+            // so validation still includes host; joiner is appended later.
+            memberDeviceIDs: existing.activeMemberDeviceIDs
+        )
+    }
+
+    private func groupCredentials(
+        for pending: PendingPair
+    ) throws -> GroupCredentials {
+        let pair = try pairingCredentials(for: pending)
+        // Joiner admitted into an existing group via provision snapshot.
+        if let snapshot = pendingGroupJoinSnapshot {
+            guard snapshot.memberDeviceIDs.contains(deviceID.bytes) else {
+                throw SyncAppError.invalidCredentials
+            }
+            let members = snapshot.memberDeviceIDs.map {
+                GroupMember(deviceID: $0, joinedEpoch: snapshot.epoch)
+            }
+            return GroupCredentials(
+                groupID: snapshot.groupID,
+                epoch: snapshot.epoch,
+                groupRoot: snapshot.groupRoot,
+                localDeviceID: deviceID.bytes,
+                members: members,
+                membershipGeneration: snapshot.membershipGeneration,
+                foundingPairRole: nil,
+                pairingArchiveHash: pending.archiveHash
+            )
+        }
+        // Issuer already linked — add joiner to existing group.
+        if let existing = credentials, existing.activeMemberCount >= 2 {
+            guard let joinerID = pending.remoteDeviceID else {
+                throw SyncAppError.invalidCredentials
+            }
+            return try existing.addingMember(deviceID: joinerID)
+        }
+        // Founding ceremony: pair root becomes group root.
+        return GroupCredentials(pair: pair)
+    }
+
+    private func publishMembershipSnapshot(
+        _ credentials: GroupCredentials
+    ) async throws {
+        let snapshot = GroupMembershipSnapshot(
+            groupID: credentials.groupID,
+            epoch: credentials.epoch,
+            membershipGeneration: credentials.membershipGeneration,
+            members: credentials.activeMemberDeviceIDs,
+            issuerDeviceID: credentials.localDeviceID
+        )
+        for remote in credentials.remoteActiveDeviceIDs {
+            let mailbox = try GroupMembershipMailbox(
+                groupRoot: credentials.groupRoot,
+                groupID: credentials.groupID,
+                epoch: credentials.epoch,
+                senderDeviceID: credentials.localDeviceID,
+                recipientDeviceID: remote
+            )
+            let envelope = try mailbox.seal(snapshot)
+            _ = try await mailboxTransport.put(
+                route: mailbox.route,
+                authorization: mailbox.authorization,
+                messages: [envelope]
+            )
+        }
     }
 
     private func putPairingEnvelopes(
@@ -2505,7 +2829,13 @@ final class SyncAppModel: ObservableObject {
         isPairingFinalizationLocked = false
         hasPairingReplicaConflict = false
         errorMessage = nil
-        phase = .unpaired
+        if credentials != nil {
+            phase = channelReady ? .synced : .connecting
+            startSyncLoop()
+            startMailboxLoop()
+        } else {
+            phase = .unpaired
+        }
         startTerminalPairingLoop()
     }
 
@@ -2715,7 +3045,7 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func finishPairing(
-        _ credentials: PairCredentials,
+        _ credentials: GroupCredentials,
         attemptID: UUID
     ) {
         guard isCurrentPairingAttempt(attemptID) else {
@@ -2740,7 +3070,10 @@ final class SyncAppModel: ObservableObject {
         isHostApprovalPending = false
         activePairingRole = nil
         errorMessage = nil
-        uploadedLocalSequence = 0
+        // Preserve mailbox checkpoints when expanding an existing group.
+        if uploadedThroughByRecipient.isEmpty {
+            uploadedLocalSequence = 0
+        }
         mailboxFailureCount = 0
         nextMailboxAttemptAt = .distantPast
         refreshPendingMailboxCount()
@@ -3008,17 +3341,18 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func confirmAuthenticatedPeerCompletion(
-        _ credentials: PairCredentials
+        _ credentials: GroupCredentials
     ) {
         guard
             self.credentials == credentials,
-            credentials.role == .joiner,
+            let bridge = credentials.pairBridge,
+            bridge.role == .joiner,
             let action = terminalPairingActions.first(where: {
                 $0.kind == .receipt
-                    && $0.pairID == credentials.pairID
-                    && $0.role == credentials.role
-                    && $0.localDeviceID == credentials.localDeviceID
-                    && $0.remoteDeviceID == credentials.remoteDeviceID
+                    && $0.pairID == bridge.pairID
+                    && $0.role == bridge.role
+                    && $0.localDeviceID == bridge.localDeviceID
+                    && $0.remoteDeviceID == bridge.remoteDeviceID
             })
         else {
             return
@@ -3102,7 +3436,7 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func drainMailboxCycles(
-        credentials: PairCredentials,
+        credentials: GroupCredentials,
         cycleID: UUID
     ) async {
         while
@@ -3169,13 +3503,13 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func performMailboxCycle(
-        credentials: PairCredentials
+        credentials: GroupCredentials
     ) async throws {
         guard hasDurableStorage else {
             throw SyncAppError.localStorageUnavailable
         }
         try validate(credentials)
-        let mailbox = try PairMailbox(credentials: credentials)
+        let mailbox = try GroupMailbox(credentials: credentials)
         let uploadCompletion = MailboxUploadCompletion()
         async let uploadError = runMailboxUpload(
             mailbox,
@@ -3203,11 +3537,12 @@ final class SyncAppModel: ObservableObject {
         if let inboundError {
             throw inboundError
         }
+        try await receiveMembershipUpdates(credentials: credentials)
     }
 
     private func runMailboxUpload(
-        _ mailbox: PairMailbox,
-        credentials: PairCredentials,
+        _ mailbox: GroupMailbox,
+        credentials: GroupCredentials,
         completion: MailboxUploadCompletion
     ) async -> Error? {
         let error = await mailboxOperationError {
@@ -3221,8 +3556,8 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func pollMailboxInbound(
-        _ mailbox: PairMailbox,
-        credentials: PairCredentials,
+        _ mailbox: GroupMailbox,
+        credentials: GroupCredentials,
         until uploadCompletion: MailboxUploadCompletion
     ) async -> Error? {
         while !Task.isCancelled {
@@ -3258,117 +3593,196 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func uploadMailboxOperations(
-        _ mailbox: PairMailbox,
-        credentials: PairCredentials
+        _ mailbox: GroupMailbox,
+        credentials: GroupCredentials
     ) async throws {
         while !Task.isCancelled {
             let localSequence = replica.versionVector[deviceID]
-            guard uploadedLocalSequence <= localSequence else {
-                throw SyncAppError.invalidCredentials
-            }
-            let pending = replica.retainedOperations
-                .filter {
-                    $0.originDeviceID == deviceID
-                        && $0.originSequence > uploadedLocalSequence
-                }
-                .sorted {
-                    $0.originSequence < $1.originSequence
-                }
-            guard !pending.isEmpty else {
+            let recipients = credentials.remoteActiveDeviceIDs
+            guard !recipients.isEmpty else {
                 refreshPendingMailboxCount()
                 return
             }
-            guard pending[0].originSequence == uploadedLocalSequence + 1 else {
-                throw ReplicaError.sequenceGap(
-                    origin: deviceID,
-                    expected: uploadedLocalSequence + 1,
-                    received: pending[0].originSequence
-                )
-            }
 
-            let operations = Array(
-                pending.prefix(ProtocolLimits.mailboxBatchCount)
-            )
-            for (offset, operation) in operations.enumerated() {
-                guard
-                    operation.originSequence
-                        == uploadedLocalSequence + UInt64(offset) + 1
-                else {
+            var anyProgress = false
+            for recipient in recipients {
+                let uploaded = uploadedThroughByRecipient[recipient]
+                    ?? uploadedLocalSequence
+                guard uploaded <= localSequence else {
+                    throw SyncAppError.invalidCredentials
+                }
+                let pending = replica.retainedOperations
+                    .filter {
+                        $0.originDeviceID == deviceID
+                            && $0.originSequence > uploaded
+                    }
+                    .sorted {
+                        $0.originSequence < $1.originSequence
+                    }
+                guard !pending.isEmpty else {
+                    continue
+                }
+                guard pending[0].originSequence == uploaded + 1 else {
                     throw ReplicaError.sequenceGap(
                         origin: deviceID,
-                        expected: uploadedLocalSequence + UInt64(offset) + 1,
-                        received: operation.originSequence
+                        expected: uploaded + 1,
+                        received: pending[0].originSequence
                     )
                 }
+                let operations = Array(
+                    pending.prefix(ProtocolLimits.mailboxBatchCount)
+                )
+                for (offset, operation) in operations.enumerated() {
+                    guard
+                        operation.originSequence
+                            == uploaded + UInt64(offset) + 1
+                    else {
+                        throw ReplicaError.sequenceGap(
+                            origin: deviceID,
+                            expected: uploaded + UInt64(offset) + 1,
+                            received: operation.originSequence
+                        )
+                    }
+                }
+                guard let material = mailbox.outboundByRecipient[recipient] else {
+                    throw SyncAppError.invalidCredentials
+                }
+                let envelopes = try operations.map {
+                    try mailbox.seal($0, for: recipient)
+                }
+                _ = try await mailboxTransport.put(
+                    route: material.route,
+                    authorization: material.authorization,
+                    messages: envelopes
+                )
+                try Task.checkCancellation()
+                guard
+                    self.credentials == credentials,
+                    let lastSequence = operations.last?.originSequence
+                else {
+                    throw CancellationError()
+                }
+                uploadedThroughByRecipient[recipient] = lastSequence
+                anyProgress = true
             }
-            let envelopes = try operations.map(mailbox.seal)
-            _ = try await mailboxTransport.put(
-                route: mailbox.outbound.route,
-                authorization: mailbox.outbound.authorization,
-                messages: envelopes
-            )
 
-            try Task.checkCancellation()
-            guard
-                self.credentials == credentials,
-                let lastSequence = operations.last?.originSequence
-            else {
-                throw CancellationError()
+            if anyProgress {
+                let checkpoint = MailboxCheckpoint(
+                    groupID: credentials.groupID,
+                    uploadedThroughByRecipient: uploadedThroughByRecipient
+                )
+                try credentialStore.saveMailboxCheckpoint(checkpoint)
+                uploadedLocalSequence = checkpoint.uploadedLocalSequence
+                lastMailboxStoredAt = Date()
             }
-            let checkpoint = MailboxCheckpoint(
-                pairID: credentials.pairID,
-                uploadedLocalSequence: lastSequence
-            )
-            try credentialStore.saveMailboxCheckpoint(checkpoint)
-            uploadedLocalSequence = lastSequence
-            lastMailboxStoredAt = Date()
             refreshPendingMailboxCount()
+            if !anyProgress {
+                return
+            }
         }
         throw CancellationError()
     }
 
     private func receiveMailboxOperations(
-        _ mailbox: PairMailbox,
-        credentials: PairCredentials
+        _ mailbox: GroupMailbox,
+        credentials: GroupCredentials
     ) async throws {
-        var afterCursor: UInt64 = 0
-        while !Task.isCancelled {
+        for (sender, material) in mailbox.inboundBySender {
+            var afterCursor: UInt64 = 0
+            while !Task.isCancelled {
+                let page = try await mailboxTransport.fetch(
+                    route: material.route,
+                    authorization: material.authorization,
+                    after: afterCursor,
+                    limit: ProtocolLimits.mailboxFetchCount
+                )
+                try Task.checkCancellation()
+                guard self.credentials == credentials else {
+                    throw CancellationError()
+                }
+                guard !page.messages.isEmpty else {
+                    break
+                }
+
+                let operations = try page.messages.map {
+                    try mailbox.open($0.envelope, from: sender)
+                }
+                let accepted = try replica.applyRemote(operations)
+                publishReplica()
+                if accepted > 0 {
+                    lastMailboxReceivedAt = Date()
+                    lastSyncedAt = Date()
+                    presentInboundArrivalCue(accepted: accepted)
+                }
+                try await mailboxTransport.acknowledge(
+                    route: material.route,
+                    authorization: material.authorization,
+                    through: page.nextCursor
+                )
+                afterCursor = page.nextCursor
+                if !page.hasMore {
+                    break
+                }
+            }
+        }
+    }
+
+    private func receiveMembershipUpdates(
+        credentials: GroupCredentials
+    ) async throws {
+        for sender in credentials.remoteActiveDeviceIDs {
+            let mailbox = try GroupMembershipMailbox(
+                groupRoot: credentials.groupRoot,
+                groupID: credentials.groupID,
+                epoch: credentials.epoch,
+                senderDeviceID: sender,
+                recipientDeviceID: credentials.localDeviceID
+            )
             let page = try await mailboxTransport.fetch(
-                route: mailbox.inbound.route,
-                authorization: mailbox.inbound.authorization,
-                after: afterCursor,
+                route: mailbox.route,
+                authorization: mailbox.authorization,
+                after: 0,
                 limit: ProtocolLimits.mailboxFetchCount
             )
-            try Task.checkCancellation()
-            guard self.credentials == credentials else {
-                throw CancellationError()
-            }
             guard !page.messages.isEmpty else {
-                return
+                continue
             }
-
-            let operations = try page.messages.map {
-                try mailbox.open($0.envelope)
+            var highest: GroupMembershipSnapshot?
+            for message in page.messages {
+                let snapshot = try mailbox.open(message.envelope)
+                guard snapshot.groupID == credentials.groupID else {
+                    continue
+                }
+                if let highest,
+                   snapshot.membershipGeneration <= highest.membershipGeneration
+                {
+                    continue
+                }
+                highest = snapshot
             }
-            let accepted = try replica.applyRemote(operations)
-            publishReplica()
-            if accepted > 0 {
-                lastMailboxReceivedAt = Date()
-                lastSyncedAt = Date()
-                presentInboundArrivalCue(accepted: accepted)
+            if let highest,
+               highest.membershipGeneration > credentials.membershipGeneration,
+               highest.members.contains(deviceID.bytes)
+            {
+                let members = highest.members.map {
+                    GroupMember(deviceID: $0, joinedEpoch: highest.epoch)
+                }
+                let updated = try credentials.replacingRoster(
+                    members: members,
+                    membershipGeneration: highest.membershipGeneration,
+                    epoch: highest.epoch
+                )
+                try credentialStore.saveActive(updated)
+                self.credentials = updated
             }
-            try await mailboxTransport.acknowledge(
-                route: mailbox.inbound.route,
-                authorization: mailbox.inbound.authorization,
-                through: page.nextCursor
-            )
-
-            guard page.hasMore else {
-                return
+            if page.nextCursor > 0 {
+                try await mailboxTransport.acknowledge(
+                    route: mailbox.route,
+                    authorization: mailbox.authorization,
+                    through: page.nextCursor
+                )
             }
-            afterCursor = page.nextCursor
         }
-        throw CancellationError()
     }
 
     private func startBackgroundMailboxFlush() {
@@ -3404,7 +3818,7 @@ final class SyncAppModel: ObservableObject {
         UIApplication.shared.endBackgroundTask(identifier)
     }
 
-    private func maintainSync(_ credentials: PairCredentials) async {
+    private func maintainSync(_ credentials: GroupCredentials) async {
         var retryNanoseconds: UInt64 = 250_000_000
         while
             !Task.isCancelled,
@@ -3453,37 +3867,42 @@ final class SyncAppModel: ObservableObject {
         }
     }
 
-    private func runSyncConnection(_ credentials: PairCredentials) async throws {
+    private func runSyncConnection(_ credentials: GroupCredentials) async throws {
         guard hasDurableStorage else {
             throw SyncAppError.localStorageUnavailable
         }
         try validate(credentials)
+        // Live multi-peer rooms ship after mailbox fan-out; N>2 is mailbox-only.
+        guard let pair = credentials.pairBridge else {
+            phase = .synced
+            return
+        }
         phase = .connecting
         errorMessage = nil
 
-        let route = SyncKeyDerivation.syncRoute(pairRoot: credentials.pairRoot)
-        let psk = SyncKeyDerivation.syncPSK(pairRoot: credentials.pairRoot)
+        let route = SyncKeyDerivation.syncRoute(pairRoot: pair.pairRoot)
+        let psk = SyncKeyDerivation.syncPSK(pairRoot: pair.pairRoot)
         let socket = RelaySocket(url: relayURL)
         activeSocket = socket
         try await socket.connect(route: route)
         try await waitForPeer(on: socket)
 
-        let hostDeviceID = credentials.role == .host
-            ? credentials.localDeviceID
-            : credentials.remoteDeviceID
-        let joinerDeviceID = credentials.role == .joiner
-            ? credentials.localDeviceID
-            : credentials.remoteDeviceID
+        let hostDeviceID = pair.role == .host
+            ? pair.localDeviceID
+            : pair.remoteDeviceID
+        let joinerDeviceID = pair.role == .joiner
+            ? pair.localDeviceID
+            : pair.remoteDeviceID
         let context = HandshakeContext.sync(
             relayOrigin: try relayOrigin(),
             route: route,
-            pairID: credentials.pairID,
+            pairID: pair.pairID,
             roleADeviceID: hostDeviceID,
             roleBDeviceID: joinerDeviceID
         )
 
         let material: HandshakeMaterial
-        if credentials.role == .host {
+        if pair.role == .host {
             let handshake = try InitiatorHandshake(context: context, psk: psk)
             try await socket.send(handshake.hello)
             let response = try await nextBinary(on: socket)
@@ -3504,7 +3923,7 @@ final class SyncAppModel: ObservableObject {
 
         try await socket.installSecureSession(
             material: material,
-            role: credentials.role
+            role: pair.role
         )
         guard
             self.credentials == credentials,
@@ -3563,7 +3982,7 @@ final class SyncAppModel: ObservableObject {
 
     private func handleSync(
         _ message: SyncWireMessage,
-        credentials: PairCredentials,
+        credentials: GroupCredentials,
         socket: RelaySocket
     ) async throws {
         guard hasDurableStorage else {
@@ -3646,7 +4065,7 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func requireActiveSync(
-        credentials: PairCredentials,
+        credentials: GroupCredentials,
         socket: RelaySocket
     ) throws {
         try Task.checkCancellation()
@@ -3897,22 +4316,8 @@ final class SyncAppModel: ObservableObject {
         return pairID
     }
 
-    private func validate(_ credentials: PairCredentials) throws {
-        guard
-            credentials.version == SyncProtocol.version,
-            credentials.pairRoot.count == 32,
-            credentials.pairID.count == 16,
-            credentials.localDeviceID == deviceID.bytes,
-            credentials.remoteDeviceID.count == 16,
-            credentials.remoteDeviceID != credentials.localDeviceID,
-            credentials.pairingArchiveHash == nil
-                || (
-                    credentials.role == .joiner
-                        && credentials.pairingArchiveHash?.count == 32
-                )
-        else {
-            throw SyncAppError.invalidCredentials
-        }
+    private func validate(_ credentials: GroupCredentials) throws {
+        try credentials.validate(deviceID: deviceID)
     }
 
     private static func validate(
@@ -4027,7 +4432,7 @@ final class SyncAppModel: ObservableObject {
 
     private static func finalizingPending(
         _ pending: PendingPair,
-        active: PairCredentials?,
+        active: GroupCredentials?,
         deviceID: ReplicaDeviceID
     ) throws -> PendingPair? {
         guard pending.pairingVersion == SyncProtocol.pairingVersion else {
@@ -4036,13 +4441,14 @@ final class SyncAppModel: ObservableObject {
         try validate(pending, deviceID: deviceID)
         var normalized = pending
         if let active {
-            guard
-                active.pairRoot == pending.pairRoot,
-                active.pairID == pending.pairID,
-                active.role == pending.role,
-                active.localDeviceID == pending.localDeviceID,
-                active.remoteDeviceID == pending.remoteDeviceID
-            else {
+            let foundingMatch =
+                active.groupRoot == pending.pairRoot
+                && active.groupID == pending.pairID
+                && active.localDeviceID == pending.localDeviceID
+            let groupInviteMatch =
+                active.localDeviceID == pending.localDeviceID
+                && active.activeMemberCount >= 2
+            guard foundingMatch || groupInviteMatch else {
                 throw SyncAppError.invalidCredentials
             }
             if normalized.finalizationState == nil {
@@ -4161,6 +4567,21 @@ final class SyncAppModel: ObservableObject {
         phase = .failed
     }
 
+    /// DEBUG: write invite phrase/URL into the app container for multi-sim automation.
+    private func writeDebugInviteArtifact(phrase: String, url: URL) {
+        #if DEBUG
+        let directory = persistenceURL.deletingLastPathComponent()
+        let phraseURL = directory.appendingPathComponent("debug-invite-phrase.txt")
+        let inviteURLFile = directory.appendingPathComponent("debug-invite-url.txt")
+        try? phrase.write(to: phraseURL, atomically: true, encoding: .utf8)
+        try? url.absoluteString.write(
+            to: inviteURLFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        #endif
+    }
+
     private static func isPairingReplicaConflict(_ error: Error) -> Bool {
         guard let syncError = error as? SyncAppError else {
             return false
@@ -4222,33 +4643,20 @@ final class SyncAppModel: ObservableObject {
     private static func restoreActiveCredentials(
         store: CredentialStore,
         deviceID: ReplicaDeviceID
-    ) throws -> PairCredentials? {
-        if let active = try store.active() {
-            guard
-                active.version == SyncProtocol.version,
-                active.pairRoot.count == 32,
-                active.pairID.count == 16,
-                active.localDeviceID == deviceID.bytes,
-                active.remoteDeviceID.count == 16,
-                active.remoteDeviceID != active.localDeviceID,
-                active.pairingArchiveHash == nil
-                    || (
-                        active.role == .joiner
-                            && active.pairingArchiveHash?.count == 32
-                    )
-            else {
-                throw SyncAppError.invalidCredentials
-            }
-            return active
+    ) throws -> GroupCredentials? {
+        guard let active = try store.activeGroup() else {
+            return nil
         }
-        return nil
+        try active.validate(deviceID: deviceID)
+        return active
     }
 
     private static func reconstructedReceiptAction(
-        credentials: PairCredentials
+        credentials: GroupCredentials
     ) throws -> TerminalPairingAction? {
         guard
-            credentials.role == .joiner,
+            let bridge = credentials.pairBridge,
+            bridge.role == .joiner,
             let archiveHash = credentials.pairingArchiveHash,
             archiveHash.count == 32
         else {
@@ -4256,23 +4664,23 @@ final class SyncAppModel: ObservableObject {
         }
         let pending = PendingPair(
             version: SyncProtocol.version,
-            pairRoot: credentials.pairRoot,
-            pairID: credentials.pairID,
+            pairRoot: bridge.pairRoot,
+            pairID: bridge.pairID,
             role: .joiner,
-            localDeviceID: credentials.localDeviceID,
-            remoteDeviceID: credentials.remoteDeviceID,
+            localDeviceID: bridge.localDeviceID,
+            remoteDeviceID: bridge.remoteDeviceID,
             archiveHash: archiveHash,
             expiresAt: .distantFuture,
             finalizationState: .readyMayHaveBeenStored
         )
         let record = try PairingCommitRecord(
-            pairID: credentials.pairID,
-            hostDeviceID: credentials.remoteDeviceID,
-            joinerDeviceID: credentials.localDeviceID,
+            pairID: bridge.pairID,
+            hostDeviceID: bridge.remoteDeviceID,
+            joinerDeviceID: bridge.localDeviceID,
             archiveHash: archiveHash
         )
         let mailbox = try PairingCommitMailbox(
-            pairRoot: credentials.pairRoot,
+            pairRoot: bridge.pairRoot,
             record: record,
             senderRole: .joiner
         )

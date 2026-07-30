@@ -21,7 +21,7 @@ struct WelcomeView: View {
                 .accessibilityElement(children: .combine)
 
                 Text(
-                    "Link exactly two iPhones with a one-time QR code or phrase. Changes travel end-to-end encrypted. \(ProductSyncPolicy.deliverySummary)"
+                    "Link up to \(ProductSyncPolicy.maxDevices) iPhones with a one-time QR code or phrase. Changes travel end-to-end encrypted. \(ProductSyncPolicy.deliverySummary)"
                 )
                 .font(.body)
                 .foregroundStyle(.secondary)

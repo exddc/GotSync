@@ -2,8 +2,8 @@ import Foundation
 
 /// Product-level sync contract for this proof of concept.
 ///
-/// **Receive (open-to-sync):** the other iPhone sees edits while its app is open,
-/// or the next time it opens Got Done. There is no push path yet.
+/// **Receive (open-to-sync):** linked iPhones see edits while Got Done is open,
+/// or the next time they open. There is no push path yet.
 ///
 /// **Send (background-capable):** this iPhone uploads pending edits to the
 /// private mailbox while Got Done is open and while iOS grants background time.
@@ -44,14 +44,15 @@ enum ProductSyncPolicy {
     /// How long an inbound arrival cue remains visible.
     static let inboundArrivalCueDuration: TimeInterval = 2.8
 
-    static let maxDevices = 2
+    /// Cap aligned with `ReplicaLimits.maxOrigins` (Group Sync v2).
+    static let maxDevices = ReplicaLimits.maxOrigins
 
     /// BGTaskScheduler identifier for deferred mailbox upload.
     static let backgroundMailboxTaskIdentifier =
         "com.gotdone.relay.poc.mailbox-flush"
 
     static let deliverySummary =
-        "Edits save on this iPhone first and upload even when Got Done is in the background when iOS allows it. The other iPhone sees them while both are open, or the next time it opens Got Done."
+        "Edits save on this iPhone first and upload even when Got Done is in the background when iOS allows it. Other linked iPhones see them while Got Done is open, or the next time they open Got Done."
 
     static let senderBackgroundSummary =
         "This iPhone uploads pending edits in the background when iOS allows it. If upload is interrupted, it retries the next time you open Got Done."
@@ -59,8 +60,31 @@ enum ProductSyncPolicy {
     static let pairingKeepOpenSummary =
         "Keep both apps open while you pair them the first time. Pairing windows last 15 minutes."
 
-    static let twoDeviceBoundary =
-        "Private Sync links exactly two iPhones. There is no account recovery for a third device yet."
+    /// Legacy name kept for tests; multi-device boundary is the product string.
+    static let twoDeviceBoundary = multiDeviceBoundary
+
+    static let multiDeviceBoundary =
+        "Private Sync can link up to \(maxDevices) iPhones on one shared link. There is no account recovery if every phone is lost."
+
+    static let groupFullMessage =
+        "This sync already has \(maxDevices) iPhones. Leave a phone or start a new sync."
+
+    static let manageSyncTitle = "Manage Sync"
+
+    static let inviteAnotherIPhone = "Invite another iPhone"
+
+    static let inviteDetail =
+        "Show this code on phones you trust. Valid for 15 minutes. They join this sync."
+
+    static let leaveSyncTitle = "Leave sync and keep tasks"
+
+    static let leaveSyncDetail =
+        "Tasks stay on this iPhone. Other phones keep syncing with each other."
+
+    static func linkedStatusSummary(memberCount: Int) -> String {
+        let phones = memberCount == 1 ? "1 iPhone" : "\(memberCount) iPhones"
+        return "Linked with \(phones). Edits save here first; others see them when they open Got Done."
+    }
 
     // MARK: - Error taxonomy (consumer-facing)
 

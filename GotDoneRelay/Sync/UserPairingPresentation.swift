@@ -174,7 +174,7 @@ enum UserPairingPresentationBuilder {
             return UserPairingPresentation(
                 step: .waitingForYou,
                 title: "Not paired",
-                detail: ProductSyncPolicy.twoDeviceBoundary,
+                detail: ProductSyncPolicy.multiDeviceBoundary,
                 blockingActor: .you
             )
         }

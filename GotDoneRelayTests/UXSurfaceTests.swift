@@ -4,6 +4,26 @@ import XCTest
 
 @MainActor
 final class UXSurfaceTests: XCTestCase {
+    func testMultiDeviceBoundaryReplacesTwoDeviceOnlyCopy() {
+        XCTAssertEqual(ProductSyncPolicy.maxDevices, 8)
+        XCTAssertEqual(
+            ProductSyncPolicy.twoDeviceBoundary,
+            ProductSyncPolicy.multiDeviceBoundary
+        )
+        XCTAssertTrue(
+            ProductSyncPolicy.multiDeviceBoundary.contains("8")
+        )
+        XCTAssertTrue(
+            ProductSyncPolicy.groupFullMessage.contains("8")
+        )
+        XCTAssertEqual(ProductSyncPolicy.manageSyncTitle, "Manage Sync")
+        XCTAssertFalse(
+            ConsumerCopyBanlist.containsBannedToken(
+                ProductSyncPolicy.multiDeviceBoundary
+            )
+        )
+    }
+
     func testPairingWindowIsSingleProductNumber() {
         XCTAssertEqual(ProductSyncPolicy.pairingWindowTimeToLive, 15 * 60)
         XCTAssertEqual(

@@ -1,0 +1,42 @@
+(node:44950) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:44968) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:44968) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+📷 Snapshot UI
+
+   Simulator: 344FB375-42AD-4FFE-B73C-A4C06283E8F1
+
+Targets (8) — ref|action|role|label|value|id
+  e47|tap|button|Leave sync and keep tasks||link.badge.minus
+  e52|tap|button|Erase Link and Local Tasks||trash
+  e27|typeText|text-field||Add a shared task|task-title-field
+  e13|tap|button|Private sync options||
+  e14|tap|button|||
+  e41|tap|button|Manage Sync||person.2
+  e44|tap|button|Sync status||info.circle
+  e49|tap|button|Diagnostics||
+
+Scroll (6) — ref|action|role|label|value|id
+  e2|swipe|other|||
+  e33|swipe|other|||
+  e34|swipe|other|||
+  e35|swipe|other|||
+  e36|swipe|other|||
+  e37|swipe|other|||
+
+Tips
+  - Use target refs with tap, type_text, long_press, and touch.
+  - Use scroll refs with swipe.
+  - Refs are snapshot-specific; after snapshot_ui or wait_for_ui, use refs from the latest output.
+  - Use wait_for_ui for text/assertions or changing UI.
+
+✅ Runtime UI snapshot captured with 66 elements, 8 likely targets, and 6 scroll areas.
+
+Next steps:
+1. Refresh after layout changes: xcodebuildmcp ui-automation snapshot-ui --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1
+2. Wait for UI to settle: xcodebuildmcp ui-automation wait-for-ui --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1 --predicate settled
+3. Batch same-screen taps: xcodebuildmcp ui-automation batch --json '{"simulatorId":"344FB375-42AD-4FFE-B73C-A4C06283E8F1","steps":[{"action":"tap","elementRef":"e13"},{"action":"tap","elementRef":"e14"}]}'
+4. Tap an elementRef: xcodebuildmcp ui-automation tap --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1 --element-ref e47

@@ -539,13 +539,90 @@ struct TerminalPairingActionJournal: Codable, Equatable, Sendable {
 
 struct MailboxCheckpoint: Codable, Equatable, Sendable {
     let version: UInt8
+    /// Group ID (or legacy pair ID) this checkpoint belongs to.
     let pairID: Data
+    /// Minimum uploaded local sequence across recipients (legacy single-peer field).
     let uploadedLocalSequence: UInt64
+    /// Per-recipient high-water marks: base64url device ID → sequence.
+    let uploadedThroughByRecipient: [String: UInt64]
 
     init(pairID: Data, uploadedLocalSequence: UInt64) {
         version = SyncProtocol.version
         self.pairID = pairID
         self.uploadedLocalSequence = uploadedLocalSequence
+        uploadedThroughByRecipient = [:]
+    }
+
+    init(
+        groupID: Data,
+        uploadedThroughByRecipient: [Data: UInt64]
+    ) {
+        version = SyncProtocol.version
+        pairID = groupID
+        let mapped = Dictionary(
+            uniqueKeysWithValues: uploadedThroughByRecipient.map {
+                ($0.key.base64URLString, $0.value)
+            }
+        )
+        self.uploadedThroughByRecipient = mapped
+        uploadedLocalSequence = mapped.values.min() ?? 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case pairID
+        case uploadedLocalSequence
+        case uploadedThroughByRecipient
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(UInt8.self, forKey: .version)
+        pairID = try container.decode(Data.self, forKey: .pairID)
+        uploadedLocalSequence = try container.decode(
+            UInt64.self,
+            forKey: .uploadedLocalSequence
+        )
+        uploadedThroughByRecipient = try container.decodeIfPresent(
+            [String: UInt64].self,
+            forKey: .uploadedThroughByRecipient
+        ) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(pairID, forKey: .pairID)
+        try container.encode(uploadedLocalSequence, forKey: .uploadedLocalSequence)
+        try container.encode(
+            uploadedThroughByRecipient,
+            forKey: .uploadedThroughByRecipient
+        )
+    }
+
+    func uploadedThrough(for recipientDeviceID: Data) -> UInt64 {
+        uploadedThroughByRecipient[recipientDeviceID.base64URLString]
+            ?? uploadedLocalSequence
+    }
+
+    func withUploaded(
+        recipientDeviceID: Data,
+        sequence: UInt64
+    ) -> MailboxCheckpoint {
+        var map = Dictionary(
+            uniqueKeysWithValues: uploadedThroughByRecipient.compactMap {
+                key, value -> (Data, UInt64)? in
+                guard let data = try? Data(base64URL: key) else {
+                    return nil
+                }
+                return (data, value)
+            }
+        )
+        map[recipientDeviceID] = sequence
+        return MailboxCheckpoint(
+            groupID: pairID,
+            uploadedThroughByRecipient: map
+        )
     }
 }
 
@@ -557,6 +634,7 @@ struct CredentialStore: Sendable {
 
     private let keychain: KeychainStore
     private let activeAccount = "active-pair-v1"
+    private let activeGroupAccount = "active-group-v1"
     private let pendingAccount = "pending-pair-v1"
     private let mailboxCheckpointAccount = "mailbox-checkpoint-v1"
 
@@ -564,7 +642,32 @@ struct CredentialStore: Sendable {
         self.keychain = keychain
     }
 
+    /// Active linked credentials as a group snapshot (migrates pair on read).
+    func activeGroup() throws -> GroupCredentials? {
+        if let data = try keychain.read(account: activeGroupAccount) {
+            return try CanonicalJSON.decoder.decode(
+                GroupCredentials.self,
+                from: data
+            )
+        }
+        guard let pair = try activePairLegacy() else {
+            return nil
+        }
+        let group = GroupCredentials(pair: pair)
+        try saveActive(group)
+        try keychain.delete(account: activeAccount)
+        return group
+    }
+
+    /// Legacy pair credentials still used by recovery tests.
     func active() throws -> PairCredentials? {
+        if let group = try activeGroup(), let bridge = group.pairBridge {
+            return bridge
+        }
+        return try activePairLegacy()
+    }
+
+    private func activePairLegacy() throws -> PairCredentials? {
         guard let data = try keychain.read(account: activeAccount) else {
             return nil
         }
@@ -578,9 +681,15 @@ struct CredentialStore: Sendable {
         return try CanonicalJSON.decoder.decode(PendingPair.self, from: data)
     }
 
-    func saveActive(_ credentials: PairCredentials) throws {
+    func saveActive(_ credentials: GroupCredentials) throws {
         let data = try CanonicalJSON.encoder.encode(credentials)
-        try keychain.write(data, account: activeAccount)
+        try keychain.write(data, account: activeGroupAccount)
+        // Clear legacy pair blob so dual-read prefers group.
+        try keychain.delete(account: activeAccount)
+    }
+
+    func saveActive(_ credentials: PairCredentials) throws {
+        try saveActive(GroupCredentials(pair: credentials))
     }
 
     func savePending(_ pending: PendingPair) throws {
@@ -682,6 +791,7 @@ struct CredentialStore: Sendable {
         try keychain.delete(account: mailboxCheckpointAccount)
         try keychain.delete(account: pendingAccount)
         try keychain.delete(account: activeAccount)
+        try keychain.delete(account: activeGroupAccount)
     }
 
     func clearAllPairingData() throws {

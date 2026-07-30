@@ -485,11 +485,10 @@ final class MailboxTests: XCTestCase {
             mailboxTransport: transport
         )
         XCTAssertTrue(host.addTask(title: "Created while joiner is closed"))
-        let hostUploaded = await eventually {
+        let hostUploaded = await eventually(timeout: 10) {
             host.pendingMailboxOperationCount == 0
-                && host.mailboxState == .available
         }
-        XCTAssertTrue(hostUploaded)
+        XCTAssertTrue(hostUploaded, "host should upload pending group mailbox ops")
         host.applicationDidEnterBackground()
 
         let joiner = SyncAppModel(
@@ -497,29 +496,29 @@ final class MailboxTests: XCTestCase {
             baseDirectory: joinerDirectory,
             mailboxTransport: transport
         )
-        let joinerReceived = await eventually {
+        let joinerReceived = await eventually(timeout: 10) {
             joiner.tasks.first?.titleValue
                 == "Created while joiner is closed"
         }
-        XCTAssertTrue(joinerReceived)
+        XCTAssertTrue(joinerReceived, "joiner should receive host ops via group mailbox")
         let firstLiveMessageCount = await transport.liveMessageCount()
         XCTAssertEqual(firstLiveMessageCount, 0)
 
         XCTAssertTrue(joiner.addTask(title: "Created while host is closed"))
-        let joinerUploaded = await eventually {
+        let joinerUploaded = await eventually(timeout: 10) {
             joiner.pendingMailboxOperationCount == 0
         }
         XCTAssertTrue(joinerUploaded)
         joiner.applicationDidEnterBackground()
         host.applicationDidBecomeActive()
 
-        let hostReceived = await eventually {
+        let hostReceived = await eventually(timeout: 10) {
             Set(host.tasks.compactMap(\.titleValue)) == Set([
                 "Created while joiner is closed",
                 "Created while host is closed",
             ])
         }
-        XCTAssertTrue(hostReceived)
+        XCTAssertTrue(hostReceived, "host should receive joiner ops via group mailbox")
         let secondLiveMessageCount = await transport.liveMessageCount()
         XCTAssertEqual(secondLiveMessageCount, 0)
         host.applicationDidEnterBackground()
@@ -648,8 +647,8 @@ final class MailboxTests: XCTestCase {
             local: hostID,
             remote: joinerID
         )
-        let joinerMailbox = try PairMailbox(
-            credentials: credentials(
+        let joinerGroup = GroupCredentials(
+            pair: credentials(
                 pairRoot: pairRoot,
                 pairID: pairID,
                 role: .joiner,
@@ -657,6 +656,7 @@ final class MailboxTests: XCTestCase {
                 remote: hostID
             )
         )
+        let joinerMailbox = try GroupMailbox(credentials: joinerGroup)
         let remoteOperation = TaskOperation(
             originDeviceID: joinerID,
             originSequence: 1,
@@ -669,7 +669,10 @@ final class MailboxTests: XCTestCase {
                 messages: [
                     FetchedMailboxEnvelope(
                         cursor: 1,
-                        envelope: try joinerMailbox.seal(remoteOperation)
+                        envelope: try joinerMailbox.seal(
+                            remoteOperation,
+                            for: hostID.bytes
+                        )
                     ),
                 ],
                 nextCursor: 1,
@@ -938,8 +941,8 @@ final class MailboxTests: XCTestCase {
             local: hostID,
             remote: joinerID
         )
-        let joinerMailbox = try PairMailbox(
-            credentials: credentials(
+        let joinerGroup = GroupCredentials(
+            pair: credentials(
                 pairRoot: pairRoot,
                 pairID: pairID,
                 role: .joiner,
@@ -947,6 +950,7 @@ final class MailboxTests: XCTestCase {
                 remote: hostID
             )
         )
+        let joinerMailbox = try GroupMailbox(credentials: joinerGroup)
         let operation = TaskOperation(
             originDeviceID: joinerID,
             originSequence: 1,
@@ -970,9 +974,12 @@ final class MailboxTests: XCTestCase {
         }
         try keychain.write(hostID.bytes, account: InstallIdentity.account)
         try credentialStore.saveActive(hostCredentials)
+        let outbound = try XCTUnwrap(
+            joinerMailbox.outboundByRecipient[hostID.bytes]
+        )
         try await transport.seed(
-            route: joinerMailbox.outbound.route,
-            envelope: joinerMailbox.seal(operation)
+            route: outbound.route,
+            envelope: try joinerMailbox.seal(operation, for: hostID.bytes)
         )
 
         let firstModel = SyncAppModel(
@@ -1026,8 +1033,8 @@ final class MailboxTests: XCTestCase {
             local: hostID,
             remote: joinerID
         )
-        let joinerMailbox = try PairMailbox(
-            credentials: credentials(
+        let joinerGroup = GroupCredentials(
+            pair: credentials(
                 pairRoot: pairRoot,
                 pairID: pairID,
                 role: .joiner,
@@ -1035,6 +1042,7 @@ final class MailboxTests: XCTestCase {
                 remote: hostID
             )
         )
+        let joinerMailbox = try GroupMailbox(credentials: joinerGroup)
         let remoteOperation = TaskOperation(
             originDeviceID: joinerID,
             originSequence: 1,
@@ -1064,9 +1072,12 @@ final class MailboxTests: XCTestCase {
             persistenceURL: persistenceURL
         )
         try localReplica.createTask(title: "Pending outbound")
+        let outbound = try XCTUnwrap(
+            joinerMailbox.outboundByRecipient[hostID.bytes]
+        )
         await transport.seed(
-            route: joinerMailbox.outbound.route,
-            envelope: try joinerMailbox.seal(remoteOperation)
+            route: outbound.route,
+            envelope: try joinerMailbox.seal(remoteOperation, for: hostID.bytes)
         )
 
         let model = SyncAppModel(

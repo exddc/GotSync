@@ -1,0 +1,18 @@
+(node:47890) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:47908) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:47908) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+⚙️ Wait for UI
+
+   Simulator: 344FB375-42AD-4FFE-B73C-A4C06283E8F1
+
+Recovery
+  Code: WAIT_TIMEOUT
+  Message: Timed out after 8000ms waiting for UI predicate 'exists'.
+  Timeout: 8000ms
+  Hint: Selector fields match exact values. Use textContains for partial visible text, inspect the latest runtime snapshot, or adjust the wait selector.
+
+❌ Timed out after 8000ms waiting for UI predicate 'exists'.

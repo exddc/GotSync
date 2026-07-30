@@ -232,6 +232,37 @@ struct PairingProvisionPayload: Equatable, Sendable {
     let archive: Data
     let archiveHash: Data
     let hostDeviceID: Data
+    /// Present when the issuer is admitting a joiner into an existing group.
+    let groupID: Data?
+    let epoch: UInt64?
+    let groupRoot: Data?
+    let membershipGeneration: UInt64?
+    /// Full post-join active roster (device IDs), including the joiner.
+    let memberDeviceIDs: [Data]?
+
+    init(
+        archive: Data,
+        archiveHash: Data,
+        hostDeviceID: Data,
+        groupID: Data? = nil,
+        epoch: UInt64? = nil,
+        groupRoot: Data? = nil,
+        membershipGeneration: UInt64? = nil,
+        memberDeviceIDs: [Data]? = nil
+    ) {
+        self.archive = archive
+        self.archiveHash = archiveHash
+        self.hostDeviceID = hostDeviceID
+        self.groupID = groupID
+        self.epoch = epoch
+        self.groupRoot = groupRoot
+        self.membershipGeneration = membershipGeneration
+        self.memberDeviceIDs = memberDeviceIDs
+    }
+
+    var isGroupJoin: Bool {
+        groupRoot != nil && groupID != nil && memberDeviceIDs != nil
+    }
 }
 
 private struct PairingProvisionChunkRecord:
@@ -246,6 +277,11 @@ private struct PairingProvisionChunkRecord:
     let chunkIndex: Int
     let chunkCount: Int
     let chunk: Data
+    let groupID: Data?
+    let epoch: UInt64?
+    let groupRoot: Data?
+    let membershipGeneration: UInt64?
+    let memberDeviceIDs: [Data]?
 
     func validate() throws {
         guard
@@ -259,6 +295,35 @@ private struct PairingProvisionChunkRecord:
             chunk.count <= PairingProvisionMailbox.chunkBytes
         else {
             throw MailboxCryptoError.invalidEnvelope
+        }
+        let groupFields = [
+            groupID != nil,
+            epoch != nil,
+            groupRoot != nil,
+            membershipGeneration != nil,
+            memberDeviceIDs != nil,
+        ]
+        let groupPresent = groupFields.contains(true)
+        if groupPresent {
+            guard
+                groupFields.allSatisfy({ $0 }),
+                let groupID,
+                groupID.count == 16,
+                let groupRoot,
+                groupRoot.count == 32,
+                let epoch,
+                epoch >= 1,
+                let membershipGeneration,
+                membershipGeneration >= 1,
+                let memberDeviceIDs,
+                memberDeviceIDs.count >= 2,
+                memberDeviceIDs.count <= ProductSyncPolicy.maxDevices,
+                memberDeviceIDs.allSatisfy({ $0.count == 16 }),
+                Set(memberDeviceIDs).count == memberDeviceIDs.count,
+                memberDeviceIDs.contains(hostDeviceID)
+            else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
         }
     }
 }
@@ -305,7 +370,12 @@ struct PairingProvisionMailbox: Sendable {
 
     func seal(
         archive: Data,
-        hostDeviceID: Data
+        hostDeviceID: Data,
+        groupID: Data? = nil,
+        epoch: UInt64? = nil,
+        groupRoot: Data? = nil,
+        membershipGeneration: UInt64? = nil,
+        memberDeviceIDs: [Data]? = nil
     ) throws -> [StoredMailboxEnvelope] {
         guard
             archive.count <= ProtocolLimits.provisioningArchiveBytes,
@@ -327,7 +397,12 @@ struct PairingProvisionMailbox: Sendable {
                 archiveBytes: archive.count,
                 chunkIndex: chunkIndex,
                 chunkCount: chunkCount,
-                chunk: chunk
+                chunk: chunk,
+                groupID: groupID,
+                epoch: epoch,
+                groupRoot: groupRoot,
+                membershipGeneration: membershipGeneration,
+                memberDeviceIDs: memberDeviceIDs
             )
             return try cipher.seal(record.canonicalData())
         }
@@ -354,7 +429,13 @@ struct PairingProvisionMailbox: Sendable {
                     record.hostDeviceID == expected.hostDeviceID,
                     record.archiveHash == expected.archiveHash,
                     record.archiveBytes == expected.archiveBytes,
-                    record.chunkCount == expected.chunkCount
+                    record.chunkCount == expected.chunkCount,
+                    record.groupID == expected.groupID,
+                    record.epoch == expected.epoch,
+                    record.groupRoot == expected.groupRoot,
+                    record.membershipGeneration
+                        == expected.membershipGeneration,
+                    record.memberDeviceIDs == expected.memberDeviceIDs
                 else {
                     throw MailboxCryptoError.invalidEnvelope
                 }
@@ -406,7 +487,12 @@ struct PairingProvisionMailbox: Sendable {
         return PairingProvisionPayload(
             archive: archive,
             archiveHash: expected.archiveHash,
-            hostDeviceID: expected.hostDeviceID
+            hostDeviceID: expected.hostDeviceID,
+            groupID: expected.groupID,
+            epoch: expected.epoch,
+            groupRoot: expected.groupRoot,
+            membershipGeneration: expected.membershipGeneration,
+            memberDeviceIDs: expected.memberDeviceIDs
         )
     }
 

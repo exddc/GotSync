@@ -1,0 +1,47 @@
+(node:45673) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:45690) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:45690) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+📷 Snapshot UI
+
+   Simulator: 344FB375-42AD-4FFE-B73C-A4C06283E8F1
+
+Targets (4) — ref|action|role|label|value|id
+  e27|typeText|text-field||Add a shared task|task-title-field
+  e13|tap|button|Private sync options||
+  e14|tap|button|||
+  e46|tap|button|Done||
+
+Scroll (15) — ref|action|role|label|value|id
+  e2|swipe|other|||
+  e3|swipe|other|||
+  e4|swipe|other|||
+  e33|swipe|other|||
+  e35|swipe|other|||
+  e37|swipe|other|||
+  e38|swipe|other|||
+  e39|swipe|other|||
+  e40|swipe|other|||
+  e41|swipe|other|||
+  e47|swipe|other|||
+  e48|swipe|other|||
+  e49|swipe|other|||
+  e50|swipe|other|||
+  e51|swipe|other|||
+
+Tips
+  - Use target refs with tap, type_text, long_press, and touch.
+  - Use scroll refs with swipe.
+  - Refs are snapshot-specific; after snapshot_ui or wait_for_ui, use refs from the latest output.
+  - Use wait_for_ui for text/assertions or changing UI.
+
+✅ Runtime UI snapshot captured with 107 elements, 4 likely targets, and 15 scroll areas.
+
+Next steps:
+1. Refresh after layout changes: xcodebuildmcp ui-automation snapshot-ui --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1
+2. Wait for UI to settle: xcodebuildmcp ui-automation wait-for-ui --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1 --predicate settled
+3. Expand foreground sheet: xcodebuildmcp ui-automation drag --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1 --element-ref e36 --direction up --distance 0.35 --duration 0.8 --steps 80 --post-delay 0.8
+4. Tap an elementRef: xcodebuildmcp ui-automation tap --simulator-id 344FB375-42AD-4FFE-B73C-A4C06283E8F1 --element-ref e46
