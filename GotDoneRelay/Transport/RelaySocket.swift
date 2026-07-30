@@ -20,21 +20,21 @@ enum RelaySocketError: Error, Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidRelayURL:
-            "The relay URL is invalid."
+            ProductSyncPolicy.privateSyncUnreachableMessage
         case .invalidRoute:
-            "The relay route is invalid."
+            "Pairing could not continue. Create a new invitation and try again."
         case .notConnected:
-            "The relay is not connected."
+            ProductSyncPolicy.privateSyncUnreachableMessage
         case .unexpectedControl:
-            "The relay sent an unsupported control message."
+            ProductSyncPolicy.privateSyncUnreachableMessage
         case .invalidControl:
-            "The relay sent a malformed control message."
+            ProductSyncPolicy.privateSyncUnreachableMessage
         case .messageTooLarge:
-            "A relay message exceeded the protocol limit."
+            "A sync message was too large for this proof of concept."
         case .peerLeft:
-            "The other device disconnected."
+            ProductSyncPolicy.otherPhoneCancelledMessage
         case .connectionTimedOut:
-            "The relay connection timed out."
+            ProductSyncPolicy.privateSyncUnreachableMessage
         }
     }
 }

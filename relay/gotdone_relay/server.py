@@ -52,7 +52,9 @@ REGISTRATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_CONNECTIONS = 256
 DEFAULT_MAX_ROOMS = 128
 DEFAULT_MAX_MAILBOX_CONNECTIONS = 64
-DEFAULT_WAITING_ROOM_TTL_SECONDS = 120.0
+# Must stay aligned with ProductSyncPolicy.pairingWindowTimeToLive (15 minutes)
+# so physical QR + phrase pairing is not cut short by the relay waiting room.
+DEFAULT_WAITING_ROOM_TTL_SECONDS = 900.0
 
 PEER_READY = json.dumps(
     {"type": "peerReady", "version": PROTOCOL_VERSION},

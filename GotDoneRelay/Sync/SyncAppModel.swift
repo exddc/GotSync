@@ -34,13 +34,18 @@ struct SyncNotice: Equatable, Sendable {
     let detail: String
 }
 
-enum SyncAppError: Error, LocalizedError {
+enum SyncAppError: Error, LocalizedError, Equatable {
     case invalidPairMessage
     case invalidSyncMessage
     case invalidCredentials
+    /// Opaque/unmapped relay code — still user-outcome wording, not “check network.”
     case relay(String)
+    /// Distinct taxonomy: other phone cancelled / declined.
     case pairingDeclined
+    /// Distinct taxonomy: invitation or waiting-room window ended.
     case invitationExpired
+    /// Distinct taxonomy: cannot reach private sync infrastructure.
+    case privateSyncUnreachable
     case archiveTooLarge
     case localStorageUnavailable
     case safetyCodeMismatch
@@ -58,12 +63,15 @@ enum SyncAppError: Error, LocalizedError {
             "A sync update could not be read. Your tasks are still safe on this iPhone."
         case .invalidCredentials:
             "Saved Private Sync details are no longer valid. Keep your tasks and create a new link."
-        case .relay:
-            "Could not reach the private relay. Check the network and try again."
+        case .relay(let code):
+            Self.mapRelayCode(code).errorDescription
+                ?? ProductSyncPolicy.privateSyncUnreachableMessage
         case .pairingDeclined:
-            "Pairing was cancelled."
+            ProductSyncPolicy.otherPhoneCancelledMessage
         case .invitationExpired:
-            "The one-time invitation expired. Create a new one."
+            ProductSyncPolicy.invitationExpiredMessage
+        case .privateSyncUnreachable:
+            ProductSyncPolicy.privateSyncUnreachableMessage
         case .archiveTooLarge:
             "This task list is too large to share in the proof of concept (280 KiB limit). Remove tasks or reset the link, then try again."
         case .localStorageUnavailable:
@@ -81,6 +89,50 @@ enum SyncAppError: Error, LocalizedError {
         case .pairingRecoveryJournalDamaged:
             "Saved pairing recovery data is damaged. Your tasks are safe — keep them and reset Private Sync before creating another link."
         }
+    }
+
+    /// Map relay control codes into the product error taxonomy.
+    static func mapRelayCode(_ code: String) -> SyncAppError {
+        switch code {
+        case "waitingExpired":
+            .invitationExpired
+        case "peerLeft":
+            .pairingDeclined
+        case "routeFull", "relayBusy":
+            .privateSyncUnreachable
+        default:
+            .privateSyncUnreachable
+        }
+    }
+
+    static func fromTransport(_ error: Error) -> Error {
+        if let sync = error as? SyncAppError {
+            return sync
+        }
+        if let relay = error as? RelaySocketError {
+            switch relay {
+            case .peerLeft:
+                return SyncAppError.pairingDeclined
+            case .connectionTimedOut, .notConnected, .invalidRelayURL:
+                return SyncAppError.privateSyncUnreachable
+            default:
+                return SyncAppError.privateSyncUnreachable
+            }
+        }
+        if error is URLError {
+            return SyncAppError.privateSyncUnreachable
+        }
+        if let mailbox = error as? MailboxTransportError {
+            switch mailbox {
+            case .rejected(_, let code) where code == "waitingExpired":
+                return SyncAppError.invitationExpired
+            case .insecureTransport, .invalidURL:
+                return SyncAppError.privateSyncUnreachable
+            default:
+                break
+            }
+        }
+        return error
     }
 }
 
@@ -122,12 +174,15 @@ final class SyncAppModel: ObservableObject {
     @Published private(set) var showsLinkCompleteCelebration = false
     @Published private(set) var inboundArrivalCue: String?
     @Published private(set) var lastSyncConfidenceText: String?
+    /// Host vs joiner for the in-flight pairing attempt (presentation only).
+    @Published private(set) var activePairingRole: DeviceRole?
 
     let relayURL: URL
     let mailboxURL: URL
 
     private let credentialStore: CredentialStore
     private let mailboxTransport: any MailboxTransport
+    private let backgroundMailboxScheduler: any BackgroundMailboxScheduling
     private let deviceID: ReplicaDeviceID
     private let persistenceURL: URL
     private let pairingArtifactsDirectory: URL
@@ -202,12 +257,15 @@ final class SyncAppModel: ObservableObject {
         relayURL: URL = SyncProtocol.defaultRelayURL,
         mailboxURL: URL = SyncProtocol.defaultMailboxURL,
         mailboxTransport: (any MailboxTransport)? = nil,
+        backgroundMailboxScheduler: (any BackgroundMailboxScheduling)? = nil,
         pairingRetryDelayNanoseconds: UInt64 = 1_000_000_000
     ) {
         self.relayURL = relayURL
         self.mailboxURL = mailboxURL
         self.mailboxTransport = mailboxTransport
             ?? HTTPMailboxTransport(baseURL: mailboxURL)
+        self.backgroundMailboxScheduler =
+            backgroundMailboxScheduler ?? SystemBackgroundMailboxScheduler.shared
         self.pairingRetryDelayNanoseconds = pairingRetryDelayNanoseconds
         let resolvedCredentialStore = CredentialStore(keychain: keychain)
         credentialStore = resolvedCredentialStore
@@ -457,6 +515,12 @@ final class SyncAppModel: ObservableObject {
                 self?.startTerminalPairingLoop()
             }
         }
+        self.backgroundMailboxScheduler.register { [weak self] in
+            await self?.performBackgroundMailboxFlushWork()
+        }
+        if let pending = pendingPairForRecovery {
+            activePairingRole = pending.role
+        }
     }
 
     var syncNotice: SyncNotice? {
@@ -512,7 +576,7 @@ final class SyncAppModel: ObservableObject {
             isHostApprovalPending: isHostApprovalPending,
             hasPairingReplicaConflict: hasPairingReplicaConflict,
             finalizationState: pendingPairForRecovery?.finalizationState,
-            role: pendingPairForRecovery?.role,
+            role: activePairingRole ?? pendingPairForRecovery?.role,
             errorMessage: errorMessage
         )
     }
@@ -646,10 +710,11 @@ final class SyncAppModel: ObservableObject {
             invitationPhrase = invitation.phrase
             invitationURL = invitation.url
             invitationExpiresAt = Date().addingTimeInterval(
-                ProductSyncPolicy.invitationTimeToLive
+                ProductSyncPolicy.pairingWindowTimeToLive
             )
             safetyCode = nil
             errorMessage = nil
+            activePairingRole = .host
             phase = .waitingForPeer
             let attemptID = UUID()
             pairingAttemptID = attemptID
@@ -661,6 +726,7 @@ final class SyncAppModel: ObservableObject {
                     try await Task.sleep(
                         nanoseconds: ProductSyncPolicy.invitationTimeToLiveNanoseconds
                     )
+                    // Client-side pairing window (aligned with relay waiting-room TTL).
                     guard
                         let self,
                         self.pairingAttemptID == attemptID,
@@ -792,6 +858,7 @@ final class SyncAppModel: ObservableObject {
         invitationExpiresAt = nil
         safetyCode = nil
         isHostApprovalPending = false
+        activePairingRole = nil
         do {
             try rollbackPendingPairing()
             errorMessage = nil
@@ -1056,7 +1123,9 @@ final class SyncAppModel: ObservableObject {
             lastSyncConfidenceText = nil
             showsSavingNotice = false
             pendingMailboxSince = nil
+            activePairingRole = nil
             cancelPresentationTasks()
+            backgroundMailboxScheduler.cancelFlush()
             phase = .unpaired
         } catch {
             fail(error)
@@ -1189,6 +1258,8 @@ final class SyncAppModel: ObservableObject {
         lastSyncConfidenceText = nil
         showsSavingNotice = false
         pendingMailboxSince = nil
+        activePairingRole = nil
+        backgroundMailboxScheduler.cancelFlush()
         phase = .unpaired
         if !resetsPairingRecovery {
             startTerminalPairingLoop()
@@ -1242,7 +1313,50 @@ final class SyncAppModel: ObservableObject {
             phase = .finalizing
         } else if isPaired {
             phase = .offline
+            // Immediate best-effort upload window, then OS-scheduled retry.
             startBackgroundMailboxFlush()
+            backgroundMailboxScheduler.scheduleFlushIfNeeded(
+                pendingOperationCount: pendingMailboxOperationCount
+            )
+        }
+    }
+
+    /// Invoked by BGProcessingTask and UIBackgroundTask flush loops.
+    func performBackgroundMailboxFlushWork() async {
+        guard isPaired, credentials != nil, hasDurableStorage else {
+            backgroundMailboxScheduler.cancelFlush()
+            return
+        }
+        refreshPendingMailboxCount()
+        guard pendingMailboxOperationCount > 0 else {
+            backgroundMailboxScheduler.cancelFlush()
+            return
+        }
+        // Keep cycling until empty or the OS cancels this work unit.
+        var attempts = 0
+        while
+            !Task.isCancelled,
+            pendingMailboxOperationCount > 0,
+            attempts < 8
+        {
+            attempts += 1
+            requestMailboxCycle(force: true, allowInactive: true)
+            if let cycleTask = mailboxCycleTask {
+                await cycleTask.value
+            } else {
+                break
+            }
+            refreshPendingMailboxCount()
+            if pendingMailboxOperationCount > 0 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        if pendingMailboxOperationCount > 0 {
+            backgroundMailboxScheduler.scheduleFlushIfNeeded(
+                pendingOperationCount: pendingMailboxOperationCount
+            )
+        } else {
+            backgroundMailboxScheduler.cancelFlush()
         }
     }
 
@@ -1319,6 +1433,7 @@ final class SyncAppModel: ObservableObject {
         invitationURL = nil
         safetyCode = nil
         errorMessage = nil
+        activePairingRole = .joiner
         phase = .waitingForPeer
         let attemptID = UUID()
         pairingAttemptID = attemptID
@@ -1374,7 +1489,7 @@ final class SyncAppModel: ObservableObject {
                     remoteDeviceID: nil,
                     archiveHash: Data(),
                     expiresAt: Date().addingTimeInterval(
-                        ProductSyncPolicy.invitationTimeToLive
+                        ProductSyncPolicy.pairingWindowTimeToLive
                     ),
                     finalizationState: .abortMayHaveBeenStored,
                     pairingArtifactID: pairID
@@ -1404,7 +1519,7 @@ final class SyncAppModel: ObservableObject {
                 remoteDeviceID: nil,
                 archiveHash: archiveHash,
                 expiresAt: Date().addingTimeInterval(
-                    ProductSyncPolicy.invitationTimeToLive
+                    ProductSyncPolicy.pairingWindowTimeToLive
                 ),
                 finalizationState: .provisionMayHaveBeenStored,
                 pairingArtifactID: pairID
@@ -1473,7 +1588,7 @@ final class SyncAppModel: ObservableObject {
                 remoteDeviceID: nil,
                 archiveHash: Data(),
                 expiresAt: Date().addingTimeInterval(
-                    ProductSyncPolicy.invitationTimeToLive
+                    ProductSyncPolicy.pairingWindowTimeToLive
                 ),
                 finalizationState: .waitingForProvision,
                 pairingArtifactID: pairID
@@ -2623,6 +2738,7 @@ final class SyncAppModel: ObservableObject {
         invitationExpiresAt = nil
         safetyCode = nil
         isHostApprovalPending = false
+        activePairingRole = nil
         errorMessage = nil
         uploadedLocalSequence = 0
         mailboxFailureCount = 0
@@ -2756,7 +2872,10 @@ final class SyncAppModel: ObservableObject {
                 return
             }
             phase = .failed
-            errorMessage = Self.displayMessage(for: error)
+            errorMessage = Self.displayMessage(
+                for: SyncAppError.fromTransport(error)
+            )
+            activePairingRole = nil
         }
     }
 
@@ -3266,13 +3385,8 @@ final class SyncAppModel: ObservableObject {
                 self?.endBackgroundFlush()
             }
         }
-        requestMailboxCycle(force: true, allowInactive: true)
-        guard let cycleTask = mailboxCycleTask else {
-            endBackgroundFlush()
-            return
-        }
         backgroundFlushTask = Task { [weak self] in
-            await cycleTask.value
+            await self?.performBackgroundMailboxFlushWork()
             guard !Task.isCancelled else {
                 return
             }
@@ -3442,7 +3556,7 @@ final class SyncAppModel: ObservableObject {
             case .peerReady:
                 throw RelaySocketError.unexpectedControl
             case .error(let code):
-                throw SyncAppError.relay(code)
+                throw SyncAppError.mapRelayCode(code)
             }
         }
     }
@@ -3722,7 +3836,7 @@ final class SyncAppModel: ObservableObject {
             case .peerLeft:
                 continue
             case .error(let code):
-                throw SyncAppError.relay(code)
+                throw SyncAppError.mapRelayCode(code)
             case .binary:
                 throw RelaySocketError.unexpectedControl
             }
@@ -3736,9 +3850,9 @@ final class SyncAppModel: ObservableObject {
             case .binary(let data):
                 return data
             case .peerLeft:
-                throw RelaySocketError.peerLeft
+                throw SyncAppError.pairingDeclined
             case .error(let code):
-                throw SyncAppError.relay(code)
+                throw SyncAppError.mapRelayCode(code)
             case .peerReady:
                 throw RelaySocketError.unexpectedControl
             }
@@ -4043,7 +4157,7 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func fail(_ error: Error) {
-        errorMessage = Self.displayMessage(for: error)
+        errorMessage = Self.displayMessage(for: SyncAppError.fromTransport(error))
         phase = .failed
     }
 
@@ -4241,12 +4355,18 @@ final class SyncAppModel: ObservableObject {
     }
 
     private static func displayMessage(for error: Error) -> String {
+        let mapped = SyncAppError.fromTransport(error)
+        if let localized = mapped as? LocalizedError,
+           let description = localized.errorDescription
+        {
+            return description
+        }
         if let localized = error as? LocalizedError,
            let description = localized.errorDescription
         {
             return description
         }
-        return "The connection ended unexpectedly."
+        return ProductSyncPolicy.privateSyncUnreachableMessage
     }
 
     private static func requiresMailboxRepair(_ error: Error) -> Bool {

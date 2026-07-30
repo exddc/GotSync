@@ -526,6 +526,112 @@ final class MailboxTests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundFlushUploadsPendingOutboundWhileInactive() async throws {
+        let pairRoot = Data(repeating: 0xc1, count: 32)
+        let pairID = Data(repeating: 0xc2, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xc3, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xc4, count: 16)
+        )
+        let keychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let credentialStore = CredentialStore(keychain: keychain)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let transport = MemoryMailboxTransport()
+        let scheduler = RecordingBackgroundMailboxScheduler()
+        defer {
+            try? credentialStore.clearPair()
+            try? keychain.delete(account: InstallIdentity.account)
+            try? FileManager.default.removeItem(at: baseDirectory)
+        }
+        try keychain.write(hostID.bytes, account: InstallIdentity.account)
+        try credentialStore.saveActive(
+            credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+
+        let model = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: transport,
+            backgroundMailboxScheduler: scheduler
+        )
+        XCTAssertTrue(scheduler.isRegistered)
+        XCTAssertTrue(model.addTask(title: "Upload after background"))
+        // Pause foreground so the pending op is drained by the background worker.
+        model.applicationDidEnterBackground()
+        XCTAssertFalse(scheduler.scheduleCalls.isEmpty)
+
+        let uploaded = await eventually {
+            model.pendingMailboxOperationCount == 0
+        }
+        XCTAssertTrue(
+            uploaded,
+            "Background flush must upload pending outbound while inactive"
+        )
+        await model.stopRuntimeForTesting()
+    }
+
+    @MainActor
+    func testBackgroundSchedulerHandlerDrainsPendingOutbound() async throws {
+        let pairRoot = Data(repeating: 0xc5, count: 32)
+        let pairID = Data(repeating: 0xc6, count: 16)
+        let hostID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xc7, count: 16)
+        )
+        let joinerID = try ReplicaDeviceID(
+            bytes: Data(repeating: 0xc8, count: 16)
+        )
+        let keychain = KeychainStore(
+            service: "com.gotdone.relay.tests.\(UUID().uuidString)"
+        )
+        let credentialStore = CredentialStore(keychain: keychain)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let memory = MemoryMailboxTransport()
+        let scheduler = RecordingBackgroundMailboxScheduler()
+        defer {
+            try? credentialStore.clearPair()
+            try? keychain.delete(account: InstallIdentity.account)
+            try? FileManager.default.removeItem(at: baseDirectory)
+        }
+        try keychain.write(hostID.bytes, account: InstallIdentity.account)
+        try credentialStore.saveActive(
+            credentials(
+                pairRoot: pairRoot,
+                pairID: pairID,
+                role: .host,
+                local: hostID,
+                remote: joinerID
+            )
+        )
+        let model = SyncAppModel(
+            keychain: keychain,
+            baseDirectory: baseDirectory,
+            mailboxTransport: memory,
+            backgroundMailboxScheduler: scheduler
+        )
+        XCTAssertTrue(model.addTask(title: "BG task path"))
+        model.applicationDidEnterBackground()
+        // Simulate OS firing the deferred BGProcessingTask handler.
+        await scheduler.fireHandlerForTesting()
+        let drained = await eventually {
+            model.pendingMailboxOperationCount == 0
+        }
+        XCTAssertTrue(drained)
+        await model.stopRuntimeForTesting()
+    }
+
+    @MainActor
     func testEraseWaitsForCanceledFetchBeforeForgettingRoutes() async throws {
         let pairRoot = Data(repeating: 0x91, count: 32)
         let pairID = Data(repeating: 0x92, count: 16)

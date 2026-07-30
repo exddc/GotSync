@@ -40,8 +40,9 @@ mode `0600`. Override the location with `--mailbox-database` and retention with
 
 The POC defaults to at most 256 live WebSocket connections and 128 rooms.
 Override these hard limits with `--max-connections` and `--max-rooms`. A lone
-peer may wait two minutes for its partner before it receives `waitingExpired`
-and is disconnected; configure this with `--waiting-room-ttl`. A full relay
+peer may wait **15 minutes** (900s) for its partner before it receives
+`waitingExpired` and is disconnected — aligned with the app invitation TTL;
+configure this with `--waiting-room-ttl`. A full relay
 returns `relayBusy` and closes the rejected socket without creating a room.
 
 The first client message must be a text frame no larger than 512 bytes:

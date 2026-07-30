@@ -12,29 +12,33 @@ The project contains:
 - unit and two-simulator integration verification;
 - protocol, threat-model, latency, and Got Done integration documentation.
 
-## Product delivery contract (open-to-sync POC)
+## Product delivery contract (open-to-sync receive, background send)
 
-This sample is **open-to-sync**, not set-and-forget:
+**Decision A (product truth):** open-to-sync for **receive**. The peer does not
+get push; it sees edits while Got Done is open, or the next time it opens.
+**Send** is background-capable: this iPhone uploads to the private mailbox while
+open and while iOS grants background time (`UIBackgroundTask` +
+`BGProcessingTask`), with durable retry on the next launch.
 
 - Local edits save on the editing iPhone first and never require the peer online.
 - Live delivery works while both apps are open.
-- Offline mailbox delivery is polled in the foreground; iOS background upload is
-  best effort for in-flight puts, with durable retry on the next launch.
-- There are **no push notifications**. The other iPhone sees updates while it is
-  open, or the next time it opens Got Done.
+- Outbound mailbox upload continues in the background when iOS allows it;
+  incomplete puts are durable and retry after relaunch.
+- There are **no push notifications** for inbound. Do not market “other iPhone
+  updates while locked” until push/BG receive exists.
 - Private Sync links **exactly two iPhones**. There is no account recovery for a
   third device yet.
-- Invitation QR/phrase TTL is **15 minutes** (single shared constant).
+- **Pairing window = 15 minutes** for invitation TTL, UI countdown, host expiry,
+  and relay waiting-room TTL (one product number).
 
-In-app empty states, footers, and sync notices use this contract. Do not claim
-that edits appear on a force-quit peer unless a push/background receive path is
-added.
+In-app empty states, footers, and sync notices use this contract.
 
 Implementation is intentionally narrower than a production sync service:
 
-- the foreground app owns live delivery and polls for offline delivery;
-- outbound changes checkpoint to the mailbox; incomplete puts retry after relaunch;
-- iOS background time is best effort and there are no push notifications;
+- live receive and mailbox poll run while the app is foregrounded;
+- outbound changes checkpoint to the mailbox in foreground and background;
+- incomplete puts retry after relaunch; BG processing is best effort;
+- iOS background time is not guaranteed after force-quit; there is no push;
 - mailbox envelopes expire after 365 days by default;
 - initial provisioning is limited to a 280 KiB replica archive;
 - the sample syncs small task titles and completion state;
@@ -88,11 +92,11 @@ The mailbox defaults to `relay/relay-data/mailbox.sqlite3`. Payloads are
 end-to-end encrypted, acknowledged only after device-local persistence, and
 no longer served after acknowledgement. Plain WebSocket/HTTP transport and the
 ATS exception are development-only.
-The relay defaults to 256 live sockets, 128 volatile rooms, and a two-minute
-wait for a lone peer. Its plaintext listeners are loopback-only unless an
-explicit insecure-demo override is supplied. See
-[the relay README](relay/README.md) for configurable limits and control error
-codes.
+The relay defaults to 256 live sockets, 128 volatile rooms, and a
+**15-minute** wait for a lone peer (aligned with app invitation TTL). Its
+plaintext listeners are loopback-only unless an explicit insecure-demo override
+is supplied. See [the relay README](relay/README.md) for configurable limits and
+control error codes.
 
 ## Test
 

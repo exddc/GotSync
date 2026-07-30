@@ -130,7 +130,8 @@ message-ID, or payload values.
 
 The default process limits are 256 admitted live WebSocket connections and 128
 rooms, including rooms with only one waiting peer, plus 64 concurrent mailbox
-connections. A lone peer expires after two minutes by default. The wait timer is
+connections. A lone peer expires after fifteen minutes by default (aligned with
+the product pairing window). The wait timer is
 cancelled while two peers are present and starts again for the remaining peer
 after `peerLeft`. These defaults are configurable at relay startup.
 
@@ -433,7 +434,7 @@ POC limits:
 | Relay sockets per route | 2 |
 | Relay live sockets | 256 by default, configurable |
 | Relay rooms | 128 by default, configurable |
-| Relay lone-peer wait | 120 seconds by default, configurable |
+| Relay lone-peer wait | 900 seconds (15 minutes) by default, configurable; must match app invitation TTL |
 | Per-socket forwarding queue | 16 frames or 1 MiB |
 | Relay registration deadline | 5 seconds |
 | Client WebSocket open deadline | 5 seconds |
@@ -805,7 +806,7 @@ disconnected
 
 Role A is the only hello initiator. Registration, peer wait, and handshake have
 different bounds in this POC: the client gives WebSocket opening five seconds,
-and the relay expires a lone registered peer after two minutes by default. The
+and the relay expires a lone registered peer after fifteen minutes by default. The
 cryptographic handshake has no separate per-message deadline yet. `peerLeft`,
 authentication failure, sequence failure, WebSocket closure, app suspension,
 or timeout destroys the connection's ephemeral keys, traffic keys, counters,

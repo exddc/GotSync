@@ -92,10 +92,19 @@ enum UserPairingPresentationBuilder {
 
         switch phase {
         case .waitingForPeer:
+            // Role-aware: joiners are already joining — never tell them to Join Existing Sync.
+            if role == .joiner {
+                return UserPairingPresentation(
+                    step: .waitingForOtherPhone,
+                    title: "Waiting for the main iPhone",
+                    detail: "Stay on this screen. The main iPhone finishes the safety check and shares the task list.",
+                    blockingActor: .otherPhone
+                )
+            }
             return UserPairingPresentation(
                 step: .waitingForOtherPhone,
                 title: "Waiting for the other iPhone",
-                detail: "On the other iPhone, choose Join Existing Sync and scan the code or enter the phrase.",
+                detail: "On the other iPhone, choose Join Existing Sync and scan the code or enter the phrase. This invitation is valid for 15 minutes.",
                 blockingActor: .otherPhone
             )
         case .verifying:

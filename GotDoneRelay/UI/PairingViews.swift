@@ -12,7 +12,7 @@ struct PairingInvitationView: View {
                 PairingHeaderView(
                     eyebrow: "Main iPhone",
                     title: "Pair a second iPhone",
-                    detail: "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. \(ProductSyncPolicy.twoDeviceBoundary)",
+                    detail: "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. Invitation valid for 15 minutes. \(ProductSyncPolicy.twoDeviceBoundary)",
                     symbol: "iphone.gen3.radiowaves.left.and.right"
                 )
 

@@ -4,13 +4,106 @@ import XCTest
 
 @MainActor
 final class UXSurfaceTests: XCTestCase {
-    func testInvitationTTLIsSingleLongLivedConstant() {
-        XCTAssertEqual(ProductSyncPolicy.invitationTimeToLive, 15 * 60)
-        XCTAssertGreaterThanOrEqual(ProductSyncPolicy.invitationTimeToLive, 10 * 60)
+    func testPairingWindowIsSingleProductNumber() {
+        XCTAssertEqual(ProductSyncPolicy.pairingWindowTimeToLive, 15 * 60)
+        XCTAssertEqual(
+            ProductSyncPolicy.invitationTimeToLive,
+            ProductSyncPolicy.pairingWindowTimeToLive
+        )
+        XCTAssertEqual(
+            ProductSyncPolicy.waitingRoomTimeToLive,
+            ProductSyncPolicy.pairingWindowTimeToLive
+        )
+        XCTAssertEqual(
+            ProductSyncPolicy.waitingRoomTimeToLiveSeconds,
+            900
+        )
+        XCTAssertGreaterThanOrEqual(
+            ProductSyncPolicy.pairingWindowTimeToLive,
+            10 * 60
+        )
         XCTAssertEqual(
             ProductSyncPolicy.invitationTimeToLiveNanoseconds,
-            UInt64(ProductSyncPolicy.invitationTimeToLive * 1_000_000_000)
+            UInt64(ProductSyncPolicy.pairingWindowTimeToLive * 1_000_000_000)
         )
+    }
+
+    func testErrorTaxonomyKeepsExpiredCancelledAndUnreachableDistinct() {
+        XCTAssertEqual(
+            SyncAppError.invitationExpired.errorDescription,
+            ProductSyncPolicy.invitationExpiredMessage
+        )
+        XCTAssertEqual(
+            SyncAppError.pairingDeclined.errorDescription,
+            ProductSyncPolicy.otherPhoneCancelledMessage
+        )
+        XCTAssertEqual(
+            SyncAppError.privateSyncUnreachable.errorDescription,
+            ProductSyncPolicy.privateSyncUnreachableMessage
+        )
+        XCTAssertEqual(
+            SyncAppError.mapRelayCode("waitingExpired") as SyncAppError,
+            .invitationExpired
+        )
+        XCTAssertEqual(
+            SyncAppError.mapRelayCode("peerLeft") as SyncAppError,
+            .pairingDeclined
+        )
+        XCTAssertEqual(
+            SyncAppError.mapRelayCode("relayBusy") as SyncAppError,
+            .privateSyncUnreachable
+        )
+        let surfaces = [
+            ProductSyncPolicy.invitationExpiredMessage,
+            ProductSyncPolicy.otherPhoneCancelledMessage,
+            ProductSyncPolicy.privateSyncUnreachableMessage,
+            SyncAppError.relay("waitingExpired").errorDescription!,
+            SyncAppError.relay("relayBusy").errorDescription!,
+        ]
+        XCTAssertFalse(
+            ConsumerCopyBanlist.containsBannedToken(
+                surfaces.joined(separator: " ")
+            )
+        )
+        XCTAssertTrue(
+            SyncAppError.relay("waitingExpired").errorDescription!
+                .contains("Invitation expired")
+        )
+        XCTAssertFalse(
+            SyncAppError.relay("waitingExpired").errorDescription!
+                .lowercased()
+                .contains("network")
+        )
+    }
+
+    func testJoinerWaitingCopyNeverSaysJoinExistingSync() {
+        let joiner = UserPairingPresentationBuilder.presentation(
+            phase: .waitingForPeer,
+            isHostApprovalPending: false,
+            hasPairingReplicaConflict: false,
+            finalizationState: nil,
+            role: .joiner,
+            errorMessage: nil
+        )
+        XCTAssertFalse(
+            joiner.detail.localizedCaseInsensitiveContains("Join Existing Sync")
+        )
+        XCTAssertTrue(
+            joiner.detail.localizedCaseInsensitiveContains("main iPhone")
+        )
+
+        let host = UserPairingPresentationBuilder.presentation(
+            phase: .waitingForPeer,
+            isHostApprovalPending: false,
+            hasPairingReplicaConflict: false,
+            finalizationState: nil,
+            role: .host,
+            errorMessage: nil
+        )
+        XCTAssertTrue(
+            host.detail.localizedCaseInsensitiveContains("Join Existing Sync")
+        )
+        XCTAssertTrue(host.detail.contains("15 minutes"))
     }
 
     func testCreatePrivateSyncUsesProductInvitationTTL() async throws {
