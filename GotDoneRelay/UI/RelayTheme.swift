@@ -58,8 +58,8 @@ struct PrivacyDisclosureView: View {
                     .font(.headline)
                 Text(
                     compact
-                        ? "The relay temporarily holds private packages for offline delivery. It can see timing and size, not task text."
-                        : "No account, ad tracking, or per-user analytics. The relay temporarily holds private packages for offline delivery and can see timing and size, not task text or keys."
+                        ? "The relay never sees task text. Linked iPhones share full access to this sync’s tasks."
+                        : "No account, ad tracking, or per-user analytics. The relay never sees task text or keys. Every linked iPhone can read this sync’s tasks—there is no privacy between co-members."
                 )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)

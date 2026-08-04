@@ -153,12 +153,33 @@ struct TaskDashboardView: View {
         }
         .onAppear {
             announceActionableNotice(model.syncNotice, previousKind: nil)
+            #if DEBUG
+            scheduleDebugManageSyncIfNeeded()
+            #endif
         }
+        #if DEBUG
+        .onChange(of: model.isPaired) { _, paired in
+            if paired {
+                scheduleDebugManageSyncIfNeeded()
+            }
+        }
+        #endif
         .onDisappear {
             deleteCommitTask?.cancel()
             deleteCommitTask = nil
         }
     }
+
+    #if DEBUG
+    private func scheduleDebugManageSyncIfNeeded() {
+        guard GotDoneDebugLaunch.shouldOpenManageSync, model.isPaired else {
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            isManageSyncPresented = true
+        }
+    }
+    #endif
 
     private var taskList: some View {
         List {

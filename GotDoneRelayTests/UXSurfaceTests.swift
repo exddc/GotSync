@@ -24,6 +24,38 @@ final class UXSurfaceTests: XCTestCase {
         )
     }
 
+    func testHonestSecurityCopyOnManageInviteAndSafety() {
+        XCTAssertTrue(
+            ProductSyncPolicy.sharedAccessDisclosure
+                .localizedCaseInsensitiveContains("every linked")
+        )
+        XCTAssertTrue(
+            ProductSyncPolicy.inviteDetail
+                .localizedCaseInsensitiveContains("anyone with this code")
+        )
+        XCTAssertTrue(
+            ProductSyncPolicy.leaveSyncDetail
+                .localizedCaseInsensitiveContains("not remotely wiped")
+        )
+        XCTAssertTrue(
+            ProductSyncPolicy.safetyCodeDetail
+                .localizedCaseInsensitiveContains("does not stop")
+        )
+        let surfaces = [
+            ProductSyncPolicy.sharedAccessDisclosure,
+            ProductSyncPolicy.inviteDetail,
+            ProductSyncPolicy.leaveSyncDetail,
+            ProductSyncPolicy.safetyCodeDetail,
+            ProductSyncPolicy.linkedStatusSummary(memberCount: 3),
+        ]
+        XCTAssertTrue(
+            ConsumerCopyBanlist.bannedTokens(in: surfaces).isEmpty
+        )
+        XCTAssertTrue(
+            ConsumerCopyBanlist.containsBannedToken("This is hacker-proof")
+        )
+    }
+
     func testPairingWindowIsSingleProductNumber() {
         XCTAssertEqual(ProductSyncPolicy.pairingWindowTimeToLive, 15 * 60)
         XCTAssertEqual(

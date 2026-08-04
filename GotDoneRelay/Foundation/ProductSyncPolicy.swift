@@ -66,6 +66,10 @@ enum ProductSyncPolicy {
     static let multiDeviceBoundary =
         "Private Sync can link up to \(maxDevices) iPhones on one shared link. There is no account recovery if every phone is lost."
 
+    /// C1 product honesty: co-members share full task access for this sync.
+    static let sharedAccessDisclosure =
+        "Every linked iPhone can read and edit this sync’s tasks. There is no privacy between co-members."
+
     static let groupFullMessage =
         "This sync already has \(maxDevices) iPhones. Leave a phone or start a new sync."
 
@@ -73,17 +77,23 @@ enum ProductSyncPolicy {
 
     static let inviteAnotherIPhone = "Invite another iPhone"
 
+    /// C4: live invite is full admission capability while valid.
     static let inviteDetail =
-        "Show this code on phones you trust. Valid for 15 minutes. They join this sync."
+        "Anyone with this code can join this sync and see its tasks. Show it only on phones you trust. Valid for 15 minutes; one successful join uses it up."
 
     static let leaveSyncTitle = "Leave sync and keep tasks"
 
+    /// C3: no remote wipe; remaining members rekey so a left phone cannot decrypt new traffic.
     static let leaveSyncDetail =
-        "Tasks stay on this iPhone. Other phones keep syncing with each other."
+        "Tasks stay on this iPhone. Other phones drop this phone and rotate keys so it cannot read new edits. Past data already on a phone is not remotely wiped."
+
+    /// M3: safety code is accidental cross-pair protection, not invite-theft defense.
+    static let safetyCodeDetail =
+        "Compare this code with the other iPhone. Matching digits confirm the two phones are in the same setup. This does not stop someone who already has your live invite code."
 
     static func linkedStatusSummary(memberCount: Int) -> String {
         let phones = memberCount == 1 ? "1 iPhone" : "\(memberCount) iPhones"
-        return "Linked with \(phones). Edits save here first; others see them when they open Got Done."
+        return "Linked with \(phones). \(sharedAccessDisclosure) Edits save here first; others see them when they open Got Done."
     }
 
     // MARK: - Error taxonomy (consumer-facing)
@@ -111,6 +121,13 @@ enum ConsumerCopyBanlist {
         "rtt",
         "check network",
         "check the network",
+        // M3 / marketing overclaims
+        "hacker-proof",
+        "hacker proof",
+        "military-grade",
+        "unbreakable",
+        "completely private from linked",
+        "members cannot read",
     ]
 
     static func containsBannedToken(_ text: String) -> Bool {

@@ -50,5 +50,15 @@ enum GotDoneDebugLaunch {
     static var shouldSeedGroupUI: Bool {
         ProcessInfo.processInfo.arguments.contains("-GotDoneDebugSeedGroupUI")
     }
+
+    /// After seeding/linking, open Manage Sync sheet (screenshot helper).
+    static var shouldOpenManageSync: Bool {
+        ProcessInfo.processInfo.arguments.contains("-GotDoneDebugOpenManageSync")
+    }
+
+    /// After seeding/linking, open group invite UI (screenshot helper).
+    static var shouldOpenGroupInvite: Bool {
+        ProcessInfo.processInfo.arguments.contains("-GotDoneDebugOpenGroupInvite")
+    }
 }
 #endif

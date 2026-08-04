@@ -239,28 +239,363 @@ struct GroupMailbox: Sendable {
 
 // MARK: - Membership control (side log)
 
+/// One roster entry in a signed membership snapshot (device ID + optional pubkey).
+struct GroupMembershipRosterEntry: Codable, Equatable, Sendable, Hashable {
+    let deviceID: Data
+    let signingPublicKey: Data
+
+    init(deviceID: Data, signingPublicKey: Data = Data()) {
+        self.deviceID = deviceID
+        self.signingPublicKey = signingPublicKey
+    }
+
+    init(member: GroupMember) {
+        deviceID = member.deviceID
+        signingPublicKey = member.signingPublicKey
+    }
+
+    var asGroupMember: GroupMember {
+        GroupMember(
+            deviceID: deviceID,
+            signingPublicKey: signingPublicKey
+        )
+    }
+}
+
+/// Signed membership snapshot (C2). Optional rekeySeed advances epoch (C3).
 struct GroupMembershipSnapshot: Codable, Equatable, Sendable {
+    static let currentVersion: UInt8 = 2
+
     let version: UInt8
     let groupID: Data
     let epoch: UInt64
     let membershipGeneration: UInt64
-    let members: [Data]
+    let roster: [GroupMembershipRosterEntry]
     let issuerDeviceID: Data
+    let rekeySeed: Data?
+    let signature: Data
+
+    var members: [Data] {
+        roster.map(\.deviceID)
+    }
 
     init(
         groupID: Data,
         epoch: UInt64,
         membershipGeneration: UInt64,
         members: [Data],
-        issuerDeviceID: Data
+        issuerDeviceID: Data,
+        rekeySeed: Data? = nil,
+        signature: Data = Data()
     ) {
-        version = 1
+        let roster = members
+            .sorted { $0.lexicographicallyPrecedes($1) }
+            .map { GroupMembershipRosterEntry(deviceID: $0) }
+        self.init(
+            groupID: groupID,
+            epoch: epoch,
+            membershipGeneration: membershipGeneration,
+            roster: roster,
+            issuerDeviceID: issuerDeviceID,
+            rekeySeed: rekeySeed,
+            signature: signature
+        )
+    }
+
+    init(
+        groupID: Data,
+        epoch: UInt64,
+        membershipGeneration: UInt64,
+        roster: [GroupMembershipRosterEntry],
+        issuerDeviceID: Data,
+        rekeySeed: Data? = nil,
+        signature: Data = Data()
+    ) {
+        version = Self.currentVersion
         self.groupID = groupID
         self.epoch = epoch
         self.membershipGeneration = membershipGeneration
-        self.members = members.sorted { $0.lexicographicallyPrecedes($1) }
+        self.roster = roster.sorted {
+            $0.deviceID.lexicographicallyPrecedes($1.deviceID)
+        }
         self.issuerDeviceID = issuerDeviceID
+        self.rekeySeed = rekeySeed
+        self.signature = signature
     }
+
+    static func signed(
+        groupID: Data,
+        epoch: UInt64,
+        membershipGeneration: UInt64,
+        roster: [GroupMembershipRosterEntry],
+        issuerDeviceID: Data,
+        rekeySeed: Data? = nil,
+        signingKey: Curve25519.Signing.PrivateKey
+    ) throws -> GroupMembershipSnapshot {
+        let unsigned = GroupMembershipSnapshot(
+            groupID: groupID,
+            epoch: epoch,
+            membershipGeneration: membershipGeneration,
+            roster: roster,
+            issuerDeviceID: issuerDeviceID,
+            rekeySeed: rekeySeed,
+            signature: Data()
+        )
+        let body = try unsigned.unsignedCanonicalData()
+        let signature = try signingKey.signature(for: body)
+        return GroupMembershipSnapshot(
+            groupID: groupID,
+            epoch: epoch,
+            membershipGeneration: membershipGeneration,
+            roster: unsigned.roster,
+            issuerDeviceID: issuerDeviceID,
+            rekeySeed: rekeySeed,
+            signature: Data(signature)
+        )
+    }
+
+    func validate() throws {
+        let issuerInRoster = roster.contains(where: { $0.deviceID == issuerDeviceID })
+        let leaveAllowed = rekeySeed != nil && !issuerInRoster
+        guard
+            version == 1 || version == Self.currentVersion,
+            groupID.count == 16,
+            epoch >= 1,
+            membershipGeneration >= 1,
+            issuerDeviceID.count == 16,
+            roster.count >= 2,
+            roster.count <= ProductSyncPolicy.maxDevices,
+            roster.allSatisfy({ $0.deviceID.count == 16 }),
+            roster.allSatisfy({
+                $0.signingPublicKey.isEmpty || $0.signingPublicKey.count == 32
+            }),
+            Set(roster.map(\.deviceID)).count == roster.count,
+            issuerInRoster || leaveAllowed
+        else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+        if let rekeySeed {
+            guard rekeySeed.count == 32 else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+        }
+        if version >= Self.currentVersion {
+            guard signature.count == 64 else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+        }
+    }
+
+    func unsignedCanonicalData() throws -> Data {
+        try validateStructureOnly()
+        let body = GroupMembershipSnapshot(
+            groupID: groupID,
+            epoch: epoch,
+            membershipGeneration: membershipGeneration,
+            roster: roster,
+            issuerDeviceID: issuerDeviceID,
+            rekeySeed: rekeySeed,
+            signature: Data()
+        )
+        return try CanonicalJSON.encoder.encode(UnsignedMembershipBody(from: body))
+    }
+
+    func canonicalData() throws -> Data {
+        try validate()
+        return try CanonicalJSON.encoder.encode(self)
+    }
+
+    func verifySignature(publicKey: Data) throws {
+        guard publicKey.count == 32, signature.count == 64 else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+        let key = try Curve25519.Signing.PublicKey(rawRepresentation: publicKey)
+        let body = try unsignedCanonicalData()
+        guard key.isValidSignature(signature, for: body) else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+    }
+
+    static func decodeCanonical(from data: Data) throws -> GroupMembershipSnapshot {
+        if let v2 = try? CanonicalJSON.decoder.decode(
+            GroupMembershipSnapshot.self,
+            from: data
+        ), v2.version >= Self.currentVersion, !v2.roster.isEmpty {
+            try v2.validate()
+            guard try v2.canonicalData() == data else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+            return v2
+        }
+        let legacy: LegacyMembershipSnapshot
+        do {
+            legacy = try CanonicalJSON.decoder.decode(
+                LegacyMembershipSnapshot.self,
+                from: data
+            )
+        } catch {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+        try legacy.validate()
+        return GroupMembershipSnapshot(
+            version: 1,
+            groupID: legacy.groupID,
+            epoch: legacy.epoch,
+            membershipGeneration: legacy.membershipGeneration,
+            roster: legacy.members
+                .sorted { $0.lexicographicallyPrecedes($1) }
+                .map { GroupMembershipRosterEntry(deviceID: $0) },
+            issuerDeviceID: legacy.issuerDeviceID,
+            rekeySeed: nil,
+            signature: Data()
+        )
+    }
+
+    /// Apply rules relative to current credentials (C2 + C3).
+    func acceptedUpdate(
+        against credentials: GroupCredentials
+    ) throws -> GroupCredentials? {
+        guard groupID == credentials.groupID else {
+            return nil
+        }
+        guard membershipGeneration > credentials.membershipGeneration else {
+            return nil
+        }
+        guard version >= Self.currentVersion else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+        guard credentials.activeMemberDeviceIDs.contains(issuerDeviceID) else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+
+        let knownIssuerKey = credentials.activeMembers
+            .first(where: { $0.deviceID == issuerDeviceID })?
+            .signingPublicKey
+        let claimedIssuerKey = roster
+            .first(where: { $0.deviceID == issuerDeviceID })?
+            .signingPublicKey ?? Data()
+
+        if let knownIssuerKey, knownIssuerKey.count == 32 {
+            try verifySignature(publicKey: knownIssuerKey)
+        } else if claimedIssuerKey.count == 32 {
+            try verifySignature(publicKey: claimedIssuerKey)
+        } else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+
+        let previousIDs = Set(credentials.activeMemberDeviceIDs)
+        let nextIDs = Set(members)
+        let removed = previousIDs.subtracting(nextIDs)
+        let isLeave = rekeySeed != nil && !nextIDs.contains(issuerDeviceID)
+
+        // Local device removed by someone else → unlink (nil signals caller).
+        if !nextIDs.contains(credentials.localDeviceID) {
+            return nil
+        }
+
+        var nextRoot = credentials.groupRoot
+        var nextEpoch = credentials.epoch
+
+        if !removed.isEmpty || isLeave {
+            guard let rekeySeed, rekeySeed.count == 32 else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+            guard epoch == credentials.epoch &+ 1 else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+            nextRoot = SyncKeyDerivation.groupRootRekey(
+                groupRoot: credentials.groupRoot,
+                rekeySeed: rekeySeed
+            )
+            nextEpoch = epoch
+        } else {
+            guard epoch == credentials.epoch else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+            guard rekeySeed == nil else {
+                throw MailboxCryptoError.invalidEnvelope
+            }
+        }
+
+        let nextMembers = roster.map(\.asGroupMember)
+        return try credentials.replacingRoster(
+            members: nextMembers,
+            membershipGeneration: membershipGeneration,
+            epoch: nextEpoch,
+            groupRoot: nextRoot
+        )
+    }
+
+    private init(
+        version: UInt8,
+        groupID: Data,
+        epoch: UInt64,
+        membershipGeneration: UInt64,
+        roster: [GroupMembershipRosterEntry],
+        issuerDeviceID: Data,
+        rekeySeed: Data?,
+        signature: Data
+    ) {
+        self.version = version
+        self.groupID = groupID
+        self.epoch = epoch
+        self.membershipGeneration = membershipGeneration
+        self.roster = roster.sorted {
+            $0.deviceID.lexicographicallyPrecedes($1.deviceID)
+        }
+        self.issuerDeviceID = issuerDeviceID
+        self.rekeySeed = rekeySeed
+        self.signature = signature
+    }
+
+    private func validateStructureOnly() throws {
+        let issuerInRoster = roster.contains(where: { $0.deviceID == issuerDeviceID })
+        let leaveAllowed = rekeySeed != nil && !issuerInRoster
+        guard
+            groupID.count == 16,
+            epoch >= 1,
+            membershipGeneration >= 1,
+            issuerDeviceID.count == 16,
+            roster.count >= 2,
+            roster.count <= ProductSyncPolicy.maxDevices,
+            roster.allSatisfy({ $0.deviceID.count == 16 }),
+            Set(roster.map(\.deviceID)).count == roster.count,
+            issuerInRoster || leaveAllowed
+        else {
+            throw MailboxCryptoError.invalidEnvelope
+        }
+    }
+}
+
+private struct UnsignedMembershipBody: Codable {
+    let version: UInt8
+    let groupID: Data
+    let epoch: UInt64
+    let membershipGeneration: UInt64
+    let roster: [GroupMembershipRosterEntry]
+    let issuerDeviceID: Data
+    let rekeySeed: Data?
+    let signature: Data
+
+    init(from snapshot: GroupMembershipSnapshot) {
+        version = GroupMembershipSnapshot.currentVersion
+        groupID = snapshot.groupID
+        epoch = snapshot.epoch
+        membershipGeneration = snapshot.membershipGeneration
+        roster = snapshot.roster
+        issuerDeviceID = snapshot.issuerDeviceID
+        rekeySeed = snapshot.rekeySeed
+        signature = Data()
+    }
+}
+
+private struct LegacyMembershipSnapshot: Codable {
+    let version: UInt8
+    let groupID: Data
+    let epoch: UInt64
+    let membershipGeneration: UInt64
+    let members: [Data]
+    let issuerDeviceID: Data
 
     func validate() throws {
         guard
@@ -277,28 +612,6 @@ struct GroupMembershipSnapshot: Codable, Equatable, Sendable {
         else {
             throw MailboxCryptoError.invalidEnvelope
         }
-    }
-
-    func canonicalData() throws -> Data {
-        try validate()
-        return try CanonicalJSON.encoder.encode(self)
-    }
-
-    static func decodeCanonical(from data: Data) throws -> GroupMembershipSnapshot {
-        let record: GroupMembershipSnapshot
-        do {
-            record = try CanonicalJSON.decoder.decode(
-                GroupMembershipSnapshot.self,
-                from: data
-            )
-        } catch {
-            throw MailboxCryptoError.invalidEnvelope
-        }
-        try record.validate()
-        guard try record.canonicalData() == data else {
-            throw MailboxCryptoError.invalidEnvelope
-        }
-        return record
     }
 }
 

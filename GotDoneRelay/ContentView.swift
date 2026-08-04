@@ -139,7 +139,11 @@ private struct SyncRootView: View {
                     ? "Keep Tasks · Reset Link"
                     : "Unlink and Keep Tasks"
             ) {
-                model.unlinkAndKeepTasks()
+                if model.pairingRecoveryResetRequired {
+                    model.unlinkAndKeepTasks()
+                } else {
+                    model.leaveGroupAndKeepTasks()
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -194,6 +198,11 @@ private struct SyncRootView: View {
                 }
                 if GotDoneDebugLaunch.shouldSeedGroupUI {
                     model.seedGroupUIForDebug(memberCount: 3)
+                }
+                if GotDoneDebugLaunch.shouldOpenGroupInvite {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        model.inviteToGroup()
+                    }
                 }
             }
             if GotDoneDebugLaunch.shouldAutoApproveSafety {

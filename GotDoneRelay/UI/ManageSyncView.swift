@@ -11,6 +11,10 @@ struct ManageSyncView: View {
                 Section("Status") {
                     Text(model.manageSyncStatusLine)
                         .font(.body)
+                    Text(ProductSyncPolicy.sharedAccessDisclosure)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("shared-access-disclosure")
                     Text(ProductSyncPolicy.deliverySummary)
                         .font(.footnote)
                         .foregroundStyle(.secondary)

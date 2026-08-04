@@ -17,8 +17,8 @@ struct PairingInvitationView: View {
                         ? "Invite another iPhone"
                         : "Start a private sync",
                     detail: model.isIssuingGroupInvite
-                        ? "\(ProductSyncPolicy.inviteDetail) On the other iPhone, tap Join Existing Sync and scan this code."
-                        : "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. Invitation valid for 15 minutes. \(ProductSyncPolicy.multiDeviceBoundary)",
+                        ? "\(ProductSyncPolicy.inviteDetail) On the other iPhone, tap Join Existing Sync and scan this code. \(ProductSyncPolicy.sharedAccessDisclosure)"
+                        : "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. \(ProductSyncPolicy.inviteDetail) \(ProductSyncPolicy.multiDeviceBoundary)",
                     symbol: "iphone.gen3.radiowaves.left.and.right"
                 )
 
@@ -318,7 +318,7 @@ struct SafetyCodeView: View {
                 PairingHeaderView(
                     eyebrow: "Safety check",
                     title: "Do these digits match?",
-                    detail: "Compare this code with the other iPhone. A matching code confirms that nobody altered setup.",
+                    detail: ProductSyncPolicy.safetyCodeDetail,
                     symbol: "checkmark.shield.fill"
                 )
 

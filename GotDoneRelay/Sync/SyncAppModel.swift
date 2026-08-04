@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import UIKit
 
@@ -635,6 +636,13 @@ final class SyncAppModel: ObservableObject {
     }
 
     func leaveGroupAndKeepTasks() {
+        // Best-effort signed remove + rekey for remaining members (C3), then local clear.
+        if let credentials, credentials.activeMemberCount >= 3 {
+            let snapshotCredentials = credentials
+            Task { @MainActor [weak self] in
+                await self?.publishLocalLeaveMembership(snapshotCredentials)
+            }
+        }
         unlinkAndKeepTasks()
     }
 
@@ -2546,20 +2554,29 @@ final class SyncAppModel: ObservableObject {
     }
 
     private func publishMembershipSnapshot(
-        _ credentials: GroupCredentials
+        _ credentials: GroupCredentials,
+        rekeySeed: Data? = nil,
+        previousGroupRoot: Data? = nil
     ) async throws {
-        let snapshot = GroupMembershipSnapshot(
+        let signingKey = try credentials.signingPrivateKey()
+        let roster = credentials.activeMembers.map(GroupMembershipRosterEntry.init(member:))
+        let snapshot = try GroupMembershipSnapshot.signed(
             groupID: credentials.groupID,
             epoch: credentials.epoch,
             membershipGeneration: credentials.membershipGeneration,
-            members: credentials.activeMemberDeviceIDs,
-            issuerDeviceID: credentials.localDeviceID
+            roster: roster,
+            issuerDeviceID: credentials.localDeviceID,
+            rekeySeed: rekeySeed,
+            signingKey: signingKey
         )
+        // Seal under previous epoch root when rekeying so peers still on old root can open.
+        let sealRoot = previousGroupRoot ?? credentials.groupRoot
+        let sealEpoch = rekeySeed == nil ? credentials.epoch : max(1, credentials.epoch &- 1)
         for remote in credentials.remoteActiveDeviceIDs {
             let mailbox = try GroupMembershipMailbox(
-                groupRoot: credentials.groupRoot,
+                groupRoot: sealRoot,
                 groupID: credentials.groupID,
-                epoch: credentials.epoch,
+                epoch: sealEpoch,
                 senderDeviceID: credentials.localDeviceID,
                 recipientDeviceID: remote
             )
@@ -2569,6 +2586,42 @@ final class SyncAppModel: ObservableObject {
                 authorization: mailbox.authorization,
                 messages: [envelope]
             )
+        }
+    }
+
+    /// Voluntary leave: publish roster without self + rekey seed under the current root.
+    private func publishLocalLeaveMembership(
+        _ credentials: GroupCredentials
+    ) async {
+        do {
+            let leave = try credentials.preparingLocalLeave()
+            let signingKey = try credentials.signingPrivateKey()
+            let snapshot = try GroupMembershipSnapshot.signed(
+                groupID: credentials.groupID,
+                epoch: leave.nextEpoch,
+                membershipGeneration: leave.nextGeneration,
+                roster: leave.remainingMembers.map(GroupMembershipRosterEntry.init(member:)),
+                issuerDeviceID: credentials.localDeviceID,
+                rekeySeed: leave.rekeySeed,
+                signingKey: signingKey
+            )
+            for remote in leave.remainingMembers.map(\.deviceID) {
+                let mailbox = try GroupMembershipMailbox(
+                    groupRoot: credentials.groupRoot,
+                    groupID: credentials.groupID,
+                    epoch: credentials.epoch,
+                    senderDeviceID: credentials.localDeviceID,
+                    recipientDeviceID: remote
+                )
+                let envelope = try mailbox.seal(snapshot)
+                _ = try await mailboxTransport.put(
+                    route: mailbox.route,
+                    authorization: mailbox.authorization,
+                    messages: [envelope]
+                )
+            }
+        } catch {
+            // Best-effort; local leave already clears credentials.
         }
     }
 
@@ -3730,13 +3783,14 @@ final class SyncAppModel: ObservableObject {
     private func receiveMembershipUpdates(
         credentials: GroupCredentials
     ) async throws {
-        for sender in credentials.remoteActiveDeviceIDs {
+        var current = credentials
+        for sender in current.remoteActiveDeviceIDs {
             let mailbox = try GroupMembershipMailbox(
-                groupRoot: credentials.groupRoot,
-                groupID: credentials.groupID,
-                epoch: credentials.epoch,
+                groupRoot: current.groupRoot,
+                groupID: current.groupID,
+                epoch: current.epoch,
                 senderDeviceID: sender,
-                recipientDeviceID: credentials.localDeviceID
+                recipientDeviceID: current.localDeviceID
             )
             let page = try await mailboxTransport.fetch(
                 route: mailbox.route,
@@ -3749,8 +3803,13 @@ final class SyncAppModel: ObservableObject {
             }
             var highest: GroupMembershipSnapshot?
             for message in page.messages {
-                let snapshot = try mailbox.open(message.envelope)
-                guard snapshot.groupID == credentials.groupID else {
+                let snapshot: GroupMembershipSnapshot
+                do {
+                    snapshot = try mailbox.open(message.envelope)
+                } catch {
+                    continue
+                }
+                guard snapshot.groupID == current.groupID else {
                     continue
                 }
                 if let highest,
@@ -3760,20 +3819,22 @@ final class SyncAppModel: ObservableObject {
                 }
                 highest = snapshot
             }
-            if let highest,
-               highest.membershipGeneration > credentials.membershipGeneration,
-               highest.members.contains(deviceID.bytes)
-            {
-                let members = highest.members.map {
-                    GroupMember(deviceID: $0, joinedEpoch: highest.epoch)
+            if let highest {
+                do {
+                    if let updated = try highest.acceptedUpdate(against: current) {
+                        try credentialStore.saveActive(updated)
+                        self.credentials = updated
+                        current = updated
+                    } else if highest.membershipGeneration > current.membershipGeneration,
+                              !highest.members.contains(deviceID.bytes)
+                    {
+                        // Signed remove of self (stolen-phone / leave applied).
+                        unlinkAndKeepTasks()
+                        return
+                    }
+                } catch {
+                    // Reject unsigned / foreign issuer / remove without rekey (C2/C3).
                 }
-                let updated = try credentials.replacingRoster(
-                    members: members,
-                    membershipGeneration: highest.membershipGeneration,
-                    epoch: highest.epoch
-                )
-                try credentialStore.saveActive(updated)
-                self.credentials = updated
             }
             if page.nextCursor > 0 {
                 try await mailboxTransport.acknowledge(

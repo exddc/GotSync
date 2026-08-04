@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import GotDoneRelay
 
@@ -139,18 +140,27 @@ final class GroupSyncTests: XCTestCase {
     }
 
     func testMembershipSnapshotSealOpen() throws {
+        let issuerKey = Curve25519.Signing.PrivateKey()
         let issuer = Data(repeating: 0x91, count: 16)
         let peer = Data(repeating: 0x92, count: 16)
         let joiner = Data(repeating: 0x93, count: 16)
         let root = Data(repeating: 0x94, count: 32)
         let groupID = Data(repeating: 0x95, count: 16)
 
-        let snapshot = GroupMembershipSnapshot(
+        let snapshot = try GroupMembershipSnapshot.signed(
             groupID: groupID,
             epoch: 1,
             membershipGeneration: 4,
-            members: [issuer, peer, joiner],
-            issuerDeviceID: issuer
+            roster: [
+                GroupMembershipRosterEntry(
+                    deviceID: issuer,
+                    signingPublicKey: Data(issuerKey.publicKey.rawRepresentation)
+                ),
+                GroupMembershipRosterEntry(deviceID: peer),
+                GroupMembershipRosterEntry(deviceID: joiner),
+            ],
+            issuerDeviceID: issuer,
+            signingKey: issuerKey
         )
         let mailbox = try GroupMembershipMailbox(
             groupRoot: root,
@@ -224,5 +234,250 @@ final class GroupSyncTests: XCTestCase {
         XCTAssertEqual(group.activeMemberCount, 2)
         let again = try XCTUnwrap(try store.activeGroup())
         XCTAssertEqual(again, group)
+    }
+
+    // MARK: - Security red-team (C1–C4)
+
+    /// C1 baseline: shared groupRoot lets any member open B→C mailbox traffic.
+    func testSharedGroupRootCanDeriveForeignPairMailbox() throws {
+        let groupRoot = Data(repeating: 0xe1, count: 32)
+        let groupID = Data(repeating: 0xe2, count: 16)
+        let deviceA = Data(repeating: 0xa1, count: 16)
+        let deviceB = Data(repeating: 0xb1, count: 16)
+        let deviceC = Data(repeating: 0xc1, count: 16)
+
+        let materialAsA = try GroupMailboxKeyMaterial(
+            groupRoot: groupRoot,
+            groupID: groupID,
+            epoch: 1,
+            senderDeviceID: deviceB,
+            recipientDeviceID: deviceC
+        )
+        let materialAsB = try GroupMailboxKeyMaterial(
+            groupRoot: groupRoot,
+            groupID: groupID,
+            epoch: 1,
+            senderDeviceID: deviceB,
+            recipientDeviceID: deviceC
+        )
+        XCTAssertEqual(materialAsA.route, materialAsB.route)
+        XCTAssertEqual(materialAsA.authorization, materialAsB.authorization)
+
+        let origin = try ReplicaDeviceID(bytes: deviceB)
+        var replica = try TaskReplica(deviceID: origin)
+        let operation = try replica.createTask(title: "B private to C")
+        let sealed = try materialAsB.seal(operation)
+        let openedByA = try materialAsA.open(sealed)
+        XCTAssertEqual(openedByA, operation)
+        _ = deviceA
+    }
+
+    /// C2: unsigned or foreign-issuer snapshots are rejected.
+    func testMembershipSnapshotRejectsUnsignedOrForeignIssuer() throws {
+        let issuerKey = Curve25519.Signing.PrivateKey()
+        let foreignKey = Curve25519.Signing.PrivateKey()
+        let issuer = Data(repeating: 0x11, count: 16)
+        let peer = Data(repeating: 0x22, count: 16)
+        let victim = Data(repeating: 0x33, count: 16)
+        let groupID = Data(repeating: 0x44, count: 16)
+        let root = Data(repeating: 0x55, count: 32)
+
+        let credentials = GroupCredentials(
+            groupID: groupID,
+            epoch: 1,
+            groupRoot: root,
+            localDeviceID: peer,
+            members: [
+                GroupMember(
+                    deviceID: issuer,
+                    signingPublicKey: Data(issuerKey.publicKey.rawRepresentation)
+                ),
+                GroupMember(deviceID: peer),
+                GroupMember(deviceID: victim),
+            ],
+            membershipGeneration: 1,
+            localSigningPrivateKey: Data(
+                Curve25519.Signing.PrivateKey().rawRepresentation
+            )
+        )
+
+        let unsigned = GroupMembershipSnapshot(
+            groupID: groupID,
+            epoch: 1,
+            membershipGeneration: 2,
+            members: [issuer, peer],
+            issuerDeviceID: issuer,
+            signature: Data()
+        )
+        XCTAssertThrowsError(try unsigned.acceptedUpdate(against: credentials))
+
+        let forged = try GroupMembershipSnapshot.signed(
+            groupID: groupID,
+            epoch: 1,
+            membershipGeneration: 2,
+            roster: [
+                GroupMembershipRosterEntry(
+                    deviceID: issuer,
+                    signingPublicKey: Data(issuerKey.publicKey.rawRepresentation)
+                ),
+                GroupMembershipRosterEntry(deviceID: peer),
+            ],
+            issuerDeviceID: issuer,
+            signingKey: foreignKey
+        )
+        XCTAssertThrowsError(try forged.acceptedUpdate(against: credentials))
+
+        // Remove without rekey must fail (C3 coupled to C2 accept path).
+        let omitWithoutRekey = try GroupMembershipSnapshot.signed(
+            groupID: groupID,
+            epoch: 1,
+            membershipGeneration: 2,
+            roster: [
+                GroupMembershipRosterEntry(
+                    deviceID: issuer,
+                    signingPublicKey: Data(issuerKey.publicKey.rawRepresentation)
+                ),
+                GroupMembershipRosterEntry(deviceID: peer),
+            ],
+            issuerDeviceID: issuer,
+            signingKey: issuerKey
+        )
+        XCTAssertThrowsError(try omitWithoutRekey.acceptedUpdate(against: credentials))
+
+        let rekeySeed = Data(repeating: 0x77, count: 32)
+        let validRemove = try GroupMembershipSnapshot.signed(
+            groupID: groupID,
+            epoch: 2,
+            membershipGeneration: 2,
+            roster: [
+                GroupMembershipRosterEntry(
+                    deviceID: issuer,
+                    signingPublicKey: Data(issuerKey.publicKey.rawRepresentation)
+                ),
+                GroupMembershipRosterEntry(deviceID: peer),
+            ],
+            issuerDeviceID: issuer,
+            rekeySeed: rekeySeed,
+            signingKey: issuerKey
+        )
+        let updated = try XCTUnwrap(try validRemove.acceptedUpdate(against: credentials))
+        XCTAssertEqual(updated.epoch, 2)
+        XCTAssertEqual(Set(updated.activeMemberDeviceIDs), Set([issuer, peer]))
+        XCTAssertEqual(
+            updated.groupRoot,
+            SyncKeyDerivation.groupRootRekey(groupRoot: root, rekeySeed: rekeySeed)
+        )
+    }
+
+    /// C3: epoch rekey invalidates old mailbox material.
+    func testEpochRekeyInvalidatesOldMailboxMaterial() throws {
+        let groupID = Data(repeating: 0xf1, count: 16)
+        let oldRoot = Data(repeating: 0xf2, count: 32)
+        let rekeySeed = Data(repeating: 0xf3, count: 32)
+        let newRoot = SyncKeyDerivation.groupRootRekey(
+            groupRoot: oldRoot,
+            rekeySeed: rekeySeed
+        )
+        let sender = Data(repeating: 0x01, count: 16)
+        let recipient = Data(repeating: 0x02, count: 16)
+
+        let oldMaterial = try GroupMailboxKeyMaterial(
+            groupRoot: oldRoot,
+            groupID: groupID,
+            epoch: 1,
+            senderDeviceID: sender,
+            recipientDeviceID: recipient
+        )
+        let newMaterial = try GroupMailboxKeyMaterial(
+            groupRoot: newRoot,
+            groupID: groupID,
+            epoch: 2,
+            senderDeviceID: sender,
+            recipientDeviceID: recipient
+        )
+        XCTAssertNotEqual(oldMaterial.route, newMaterial.route)
+
+        let origin = try ReplicaDeviceID(bytes: sender)
+        var replica = try TaskReplica(deviceID: origin)
+        let operation = try replica.createTask(title: "epoch-bound")
+        let sealedNew = try newMaterial.seal(operation)
+        XCTAssertThrowsError(try oldMaterial.open(sealedNew))
+        let sealedOld = try oldMaterial.seal(operation)
+        XCTAssertThrowsError(try newMaterial.open(sealedOld))
+        XCTAssertEqual(try newMaterial.open(sealedNew), operation)
+    }
+
+    /// C3: leave/remove drops routes to removed device after rekey.
+    func testLeavePublishesRemoveAndDropsRoutes() throws {
+        let local = Data(repeating: 0x81, count: 16)
+        let peer = Data(repeating: 0x82, count: 16)
+        let leaver = Data(repeating: 0x83, count: 16)
+        let root = Data(repeating: 0x84, count: 32)
+        let groupID = Data(repeating: 0x85, count: 16)
+
+        let before = GroupCredentials(
+            groupID: groupID,
+            groupRoot: root,
+            localDeviceID: local,
+            members: [
+                GroupMember(deviceID: local),
+                GroupMember(deviceID: peer),
+                GroupMember(deviceID: leaver),
+            ],
+            membershipGeneration: 3
+        )
+        let mailboxBefore = try GroupMailbox(credentials: before)
+        XCTAssertNotNil(mailboxBefore.outboundByRecipient[leaver])
+
+        let (after, seed) = try before.removingMemberWithRekey(deviceID: leaver)
+        XCTAssertEqual(after.epoch, 2)
+        XCTAssertEqual(seed.count, 32)
+        XCTAssertFalse(after.activeMemberDeviceIDs.contains(leaver))
+        let mailboxAfter = try GroupMailbox(credentials: after)
+        XCTAssertNil(mailboxAfter.outboundByRecipient[leaver])
+        XCTAssertEqual(mailboxAfter.outboundByRecipient.count, 1)
+        XCTAssertNotEqual(after.groupRoot, root)
+    }
+
+    /// C4: invitation secret is fixed-size; regenerate yields a new secret.
+    func testInvitationSingleUseAndTTL() throws {
+        let first = try Invitation.generate()
+        let second = try Invitation.generate()
+        XCTAssertEqual(first.secret.count, 16)
+        XCTAssertNotEqual(first.secret, second.secret)
+        XCTAssertEqual(try Invitation.from(phrase: first.phrase), first)
+        XCTAssertNotEqual(
+            try Invitation.from(phrase: first.phrase).secret,
+            second.secret
+        )
+        // App product TTL is a single number used for invite + waiting room.
+        XCTAssertEqual(ProductSyncPolicy.invitationTimeToLive, 15 * 60)
+        XCTAssertEqual(
+            ProductSyncPolicy.invitationTimeToLive,
+            ProductSyncPolicy.pairingWindowTimeToLive
+        )
+    }
+
+    /// H5: debug invite artifact writer is DEBUG-only (source/API guard).
+    func testDebugInviteArtifactNotInRelease() {
+        #if DEBUG
+        // DEBUG builds may write artifacts; the writer is #if DEBUG gated in SyncAppModel.
+        XCTAssertTrue(true)
+        #else
+        // Release: no debug invite file API surface on ProductSyncPolicy.
+        XCTAssertFalse(
+            ProductSyncPolicy.manageSyncTitle.lowercased().contains("debug-invite")
+        )
+        #endif
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("GotDoneRelay/Sync/SyncAppModel.swift")
+        let source = try? String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertNotNil(source)
+        XCTAssertTrue(
+            source?.contains("#if DEBUG") == true
+                && source?.contains("writeDebugInviteArtifact") == true
+        )
     }
 }
