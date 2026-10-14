@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Swift type names are not credentials"
+regexTarget = "secret"
+regexes = ['^Curve25519\.Signing\.PrivateKey$', '^Curve25519\.KeyAgreement\.PrivateKey$']
+
+[[allowlists]]
+description = "Fixed baseline vector authorization values"
+condition = "AND"
+paths = ['(^|/)Tests/GotSyncTests/Fixtures/protocol-v1\.json$']
+regexTarget = "secret"
+regexes = ['^21e85fcaeca38092458ff8213187ec2ecd9916b2cd52bf521d9e3a64aa6de69f$', '^5683bca32ebcf72eaa1afab1477ec655684ce7697115f472b3e9d1d138ae39dc$']

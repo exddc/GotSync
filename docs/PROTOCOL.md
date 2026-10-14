@@ -1,6 +1,6 @@
-# Got Done Relay proof-of-concept protocol
+# GotSync protocol
 
-Status: implemented proof of concept, transport/sync version 1 and pairing
+Status: implemented task-sync protocol, transport/sync version 1 and pairing
 completion version 2.
 
 This document describes the current implementation. The code and test vectors
@@ -57,7 +57,7 @@ It cannot prevent:
   the pair root can decrypt retained envelopes.
 
 Possession of a live invitation is treated as authorization to attempt pairing
-in this POC. The safety code catches accidental cross-pairing and implementation
+in this protocol. The safety code catches accidental cross-pairing and implementation
 errors, but it does not prove physical proximity and cannot rescue a deliberately
 shared or photographed invitation. The client runs one pairing attempt for each
 live invitation, and the relay admits at most two sockets per route. Production
@@ -158,11 +158,11 @@ The manual representation maps the 17 bytes to 17 words from a fixed 256-word
 list. The QR carries the same 16-byte invitation in a versioned URL:
 
 ```text
-gotdone://pair?v=1&secret=<base64url>
+<scheme>://pair?v=1&secret=<base64url>
 ```
 
 The relay origin is configured independently and included in the authenticated
-handshake transcript. The invitation is held in memory, expires after two
+handshake transcript. The invitation is held in memory, expires after fifteen
 minutes, is limited to one confirmed attempt, and is invalidated after a
 normal successful pair, mismatch rejection, regeneration, or cancellation. It
 is never logged or intentionally written to the pasteboard. Swift cannot
@@ -417,7 +417,7 @@ never accepted as encrypted application frames. The binary handshake decoder
 enforces exact field counts and lengths; application payloads are bounded and
 their required/forbidden field combinations are checked after decoding.
 
-POC limits:
+Protocol limits:
 
 | Value | Limit or default |
 | --- | --- |
@@ -563,7 +563,7 @@ The all-zero nonce is safe here because every distinct, immutable operation
 gets a distinct pseudorandom `messageKey`; it is not reused under one key.
 Repeating the same operation intentionally reproduces the same key, nonce, AAD,
 and ciphertext so an ambiguous network retry is exact. A message-ID collision
-would also collide a 256-bit keyed HMAC and is treated as outside the POC's
+would also collide a 256-bit keyed HMAC and is treated as outside the protocol's
 practical failure model.
 
 Mailbox AAD is the normal tagged transcript encoding:
@@ -663,7 +663,7 @@ Operation {
 
 Title and completion are independent last-writer-wins registers. Stamps compare
 Lamport value first and origin device ID second. Deletion permanently removes a
-UUID in this POC. Restoring an item creates a new UUID.
+UUID in this protocol. Restoring an item creates a new UUID.
 
 Each replica persists:
 
@@ -765,7 +765,7 @@ sequence. Duplicate acknowledgements and a lost acknowledgement are harmless;
 reconnect vectors provide the durable truth. The RTT displayed by the sample UI
 is instead the encrypted ping/pong round trip.
 
-The POC retains the complete operation log and all tombstones. Production needs
+The engine retains the complete operation log and all tombstones. Production needs
 snapshot compaction, a cryptographic snapshot hash, atomic installation, and a
 causal watermark proving that every authorized device can discard old history.
 
@@ -805,7 +805,7 @@ disconnected
 ```
 
 Role A is the only hello initiator. Registration, peer wait, and handshake have
-different bounds in this POC: the client gives WebSocket opening five seconds,
+different bounds in this protocol: the client gives WebSocket opening five seconds,
 and the relay expires a lone registered peer after fifteen minutes by default. The
 cryptographic handshake has no separate per-message deadline yet. `peerLeft`,
 authentication failure, sequence failure, WebSocket closure, app suspension,
@@ -813,7 +813,7 @@ or timeout destroys the connection's ephemeral keys, traffic keys, counters,
 pending sends, and socket state. Durable operations stay in the replica.
 
 While foregrounded, reconnect uses exponential backoff with jitter, capped at
-five seconds for the local POC. A fresh connection always uses a new connection
+five seconds for the local development. A fresh connection always uses a new connection
 ID, keys, nonces, transcript, traffic keys, nonce prefixes, and counters.
 The client keeps at most one outstanding encrypted eight-byte ping ID. It sends
 one when none is pending, checks every two seconds, and cancels the socket when
@@ -821,13 +821,13 @@ the pending ping is older than six seconds. Returning to the active scene
 restarts at `registering`; entering the background closes intentionally.
 
 The stable `syncRoute` lets the relay link this pair's foreground sessions over
-time. This is accepted and disclosed POC metadata. A production route-rotation
+time. This is accepted and disclosed protocol metadata. A production route-rotation
 scheme must be recoverable on both sides before it can safely reduce that
 linkability.
 
 The mailbox loop is independent of live connection state. A successful mailbox
 upload means "durably stored for delivery," not "applied by the peer." A
-successful inbound ACK means this device durably applied the page. The POC does
+successful inbound ACK means this device durably applied the page. The engine does
 not yet send an encrypted peer receipt back to advance a sender-visible
 `peerAppliedVector`.
 
@@ -864,3 +864,11 @@ Before production:
   near the retained-log limit;
 - add an explicit encrypted export/recovery product decision;
 - re-evaluate App Store encryption declarations.
+
+## Version compatibility
+
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the version matrix and deployment order. Every new mailbox request carries `version: 1`; legacy requests that omit it are interpreted as version 1. Unsupported explicit versions return HTTP 400 `unsupportedVersion` before storage changes.
+
+## Multi-device groups
+
+Groups contain up to eight members. Founding two-member groups use the live two-socket room and durable mailbox. Groups with three or more members deliver operations through per-recipient mailboxes. A relay room accepts at most two sockets by default, independently of the group-size limit. Membership snapshots use signed version 2 records; the shared-root and signing-key limitations are documented in THREAT-MODEL.md and SECURITY-RED-TEAM.md.

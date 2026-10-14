@@ -1,0 +1,27 @@
+[build-system]
+requires = ["uv_build==0.7.22"]
+build-backend = "uv_build"
+
+[project]
+name = "gotsync-server"
+version = "0.1.0"
+description = "An opaque WebSocket relay and durable encrypted mailbox for GotSync"
+requires-python = ">=3.11"
+dependencies = ["websockets==15.0.1"]
+license = "MIT"
+license-files = ["LICENSE"]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10"]
+
+[project.scripts]
+gotsync-server = "gotsync_server.server:main"
+
+[tool.uv.build-backend]
+module-name = "gotsync_server"
+module-root = ""
+wheel-exclude = [".DS_Store"]
+source-exclude = [".DS_Store"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"

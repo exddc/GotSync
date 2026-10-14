@@ -1,109 +1,123 @@
-# Got Done Relay
+# GotSync
 
-An experimental, accountless, end-to-end encrypted two-device sync proof of
-concept for Got Done.
+GotSync is an accountless, local-first sync engine for Apple platforms. It links
+up to eight devices through encrypted live connections and a durable relay
+mailbox. The current replicated model contains task titles, completion state,
+and deletions. The engine is under development and does not offer a generic
+record schema.
 
-The project contains:
+**GotSync is the working name.** The final name is pending a decision with the
+CMO. Got Done remains a private application and can depend on this package like
+any other consumer. No Got Done application code is required by the library.
 
-- a SwiftUI iPhone sample app;
-- a reusable local-first replication and encrypted transport layer;
-- a Python relay with volatile WebSocket rooms, a durable encrypted mailbox,
-  and aggregate metrics;
-- unit and two-simulator integration verification;
-- protocol, threat-model, latency, and Got Done integration documentation.
+## Repository layout
 
-## Product delivery contract (open-to-sync receive, background send)
+| Path | Contents |
+| --- | --- |
+| `Sources/GotSync` | Swift library, pairing, recovery, replication, and transport |
+| `Tests/GotSyncTests` | Library tests and real-server integration coverage |
+| `server/` | Python relay and local Docker setup |
+| `Examples/AccountlessSync` | SwiftUI iPhone demo with a local package dependency |
+| `docs/` | Protocol, compatibility, threat model, and security findings |
 
-**Decision A (product truth):** open-to-sync for **receive**. The peer does not
-get push; it sees edits while Got Done is open, or the next time it opens.
-**Send** is background-capable: this iPhone uploads to the private mailbox while
-open and while iOS grants background time (`UIBackgroundTask` +
-`BGProcessingTask`), with durable retry on the next launch.
+The root `Package.swift` exports one product, `GotSync`. Adding this repository
+in Swift Package Manager builds the library without the example or Python
+server. It requires Swift 6, iOS 18 or macOS 14. The demo requires iOS 18.6.
 
-- Local edits save on the editing iPhone first and never require the peer online.
-- Live delivery works while both apps are open.
-- Outbound mailbox upload continues in the background when iOS allows it;
-  incomplete puts are durable and retry after relaunch.
-- There are **no push notifications** for inbound. Do not market “other iPhone
-  updates while locked” until push/BG receive exists.
-- Private Sync links **exactly two iPhones**. There is no account recovery for a
-  third device yet.
-- **Pairing window = 15 minutes** for invitation TTL, UI countdown, host expiry,
-  and relay waiting-room TTL (one product number).
+## Use the library
 
-In-app empty states, footers, and sync notices use this contract.
+Add this checkout as a local package dependency in Xcode and select `GotSync`.
 
-Implementation is intentionally narrower than a production sync service:
+Create the engine on the main actor, supply your endpoints and storage
+location, and use a separate Keychain service for each application:
 
-- live receive and mailbox poll run while the app is foregrounded;
-- outbound changes checkpoint to the mailbox in foreground and background;
-- incomplete puts retry after relaunch; BG processing is best effort;
-- iOS background time is not guaranteed after force-quit; there is no push;
-- mailbox envelopes expire after 365 days by default;
-- initial provisioning is limited to a 280 KiB replica archive;
-- the sample syncs small task titles and completion state;
-- post-handshake pairing provision, ready, commit, receipt, and cancellation
-  are durable and resume after interrupted responses or app restarts;
-- a phone with preserved local tasks can join or re-link without overwriting
-  them; matching history is reused, additive-only merges continue automatically,
-  and true conflicts require confirmation with an outcome preview;
-- consumer UI uses outcome language; protocol diagnostics stay under DEBUG;
-- the cryptographic protocol is experimental and not independently audited.
+```swift
+import Foundation
+import GotSync
 
-Read [the research](docs/RESEARCH.md) and
-[the protocol](docs/PROTOCOL.md) before using the code. The
-[architecture diagrams](docs/ARCHITECTURE.md) and
-[verification report](docs/RESULTS.md) show the implemented flow and observed
-results.
-
-## Run locally
-
-The sample targets iOS 18.6 or newer. Start the relay first:
-
-```sh
-cd relay
-uv venv .venv
-uv pip install --python .venv/bin/python -r requirements.txt pytest
-.venv/bin/python run.py
+@MainActor
+func makeEngine(storageDirectory: URL) throws -> SyncEngine {
+    let configuration = try SyncConfiguration(
+        relayURL: URL(string: "wss://sync.example.com/v1")!,
+        mailboxURL: URL(string: "https://sync.example.com/v1/mailbox")!,
+        storageDirectory: storageDirectory,
+        invitationURLScheme: "example-app-sync"
+    )
+    return SyncEngine(
+        configuration: configuration,
+        secretStore: KeychainStore(service: "com.example.app.sync")
+    )
+}
 ```
 
-Open `GotDoneRelay.xcodeproj` and run the `GotDoneRelay` scheme on two iPhone
-simulators. On one choose **Create Private Sync**. On the other choose
-**Join Existing Sync**, enter the phrase, compare the safety codes, and approve
-on the host.
+Observe `engine.states()` as an `AsyncStream<SyncState>`. Call
+`createPrivateSync()` on the first device, then `joinPrivateSync(url:)` or
+`joinPrivateSync(phrase:)` on the joining device. Compare safety codes before
+calling `approveSafetyCode()` on the inviting device. Any linked device can
+invite another device with `inviteToGroup()`.
 
-The local development endpoints are:
+Local mutations use `addTask(title:)`, `toggleTask(_:)`, and `deleteTasks(ids:)`.
+Forward application lifecycle events to `applicationDidBecomeActive()` and
+`applicationDidEnterBackground()`. An iOS consumer can inject
+`BackgroundMailboxScheduling` and grant a background execution window, as the
+demo does. Call `await engine.stop()` when disposing of an engine.
 
-- WebSocket relay: `ws://127.0.0.1:8765/v1`
-- encrypted mailbox: `http://127.0.0.1:8767/v1/mailbox`
-- loopback-only health and aggregate metrics: `http://127.0.0.1:8766`
+Production policy requires secure endpoints in every build configuration.
+Local development must explicitly select `.localDevelopment`; the library has
+no fallback endpoint, Info.plist lookup, or developer preferences. See
+[the public API](docs/API.md) for the supported surface and lifecycle rules.
 
-Debug builds fall back to those loopback endpoints. Release builds have no
-fallback and fail closed unless the build injects both:
+## Run the demo
 
-- `GOTDONE_RELAY_URL`, using `wss://` and the exact `/v1` path;
-- `GOTDONE_MAILBOX_URL`, using `https://` and the exact `/v1/mailbox` path.
+```sh
+scripts/uv.sh gotsync-server
+open Examples/AccountlessSync/AccountlessSync.xcodeproj
+```
 
-Release validation rejects loopback, plaintext, credentials in URLs, queries,
-fragments, and unresolved build-setting placeholders before the sync model
-starts. The HTTP and WebSocket transports reject redirects at request time.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first.
+`scripts/uv.sh` installs the locked dependencies automatically. It stores the
+Python environment outside the repository in a cache unique to this checkout.
+No virtual environment activation is needed.
 
-The mailbox defaults to `relay/relay-data/mailbox.sqlite3`. Payloads are
-end-to-end encrypted, acknowledged only after device-local persistence, and
-no longer served after acknowledgement. Plain WebSocket/HTTP transport and the
-ATS exception are development-only.
-The relay defaults to 256 live sockets, 128 volatile rooms, and a
-**15-minute** wait for a lone peer (aligned with app invitation TTL). Its
-plaintext listeners are loopback-only unless an explicit insecure-demo override
-is supplied. See [the relay README](relay/README.md) for configurable limits and
-control error codes.
+Run the `AccountlessSync` scheme on iPhone simulators. Choose **Create link** on
+one device and **Join link** on another. After pairing, use **Manage sync** to
+invite additional devices. Debug demo builds use loopback endpoints on the
+Mac. Physical devices require reachable endpoints.
+
+The [server README](server/README.md) covers Docker, ports, persistence, and TLS
+proxy requirements. No public hosted service is provisioned by this repository.
+
+## Delivery and security limits
+
+Edits save locally before transmission. Two-member groups use a live connection
+when both applications are open. Groups with three to eight members use
+per-recipient mailbox delivery. Receive runs while the application is active;
+there are no inbound push notifications. Background upload depends on the
+execution time the operating system grants and retries on the next launch.
+
+All linked devices share access to the group's tasks. A live invitation is an
+admission capability. The safety code protects against accidental pairing,
+but does not recover the secrecy of a stolen invitation. There is no account
+recovery when every device is lost.
+
+This protocol has known security limitations and has not received an
+independent audit. In particular, a device retaining the shared group secret
+can derive other members' mailbox keys and may follow later rekey messages.
+Leaving a group does not guarantee cryptographic exclusion or remote deletion.
+Read the [threat model](docs/THREAT-MODEL.md) and
+[red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
 
 ## Test
 
-Run the iOS tests from Xcode or XcodeBuildMCP, and the relay suite with:
-
 ```sh
-cd relay
-.venv/bin/python -m pytest tests -q
-uv pip check --python .venv/bin/python
+scripts/uv.sh pytest server/tests -q
+scripts/test-swift.sh
+scripts/test-integration.sh
 ```
+
+The integration script starts the actual Python relay with a temporary SQLite
+database, checks readiness, runs Swift tests, and stops the server on exit. Its
+integration test pairs three engines and verifies live delivery, offline
+catch-up after restart, and multi-device convergence. `scripts/test-swift.sh`
+runs unit tests and explicitly skips that integration test. Swift build files
+also stay in the external checkout cache.

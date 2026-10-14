@@ -1,0 +1,7 @@
+*
+!pyproject.toml
+!uv.lock
+!LICENSE
+!gotsync_server/
+gotsync_server/*
+!gotsync_server/*.py
