@@ -17,12 +17,15 @@ struct QRCodeView: View {
                 Image(systemName: "qrcode")
                     .resizable()
                     .scaledToFit()
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(RelayTheme.inkMuted)
                     .padding(32)
             }
         }
-        .padding(12)
-        .background(.white, in: RoundedRectangle(cornerRadius: 12))
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(RelayTheme.qrPlate)
+        )
     }
 
     private static func image(for url: URL) -> UIImage? {
@@ -43,3 +46,14 @@ struct QRCodeView: View {
         return UIImage(cgImage: cgImage)
     }
 }
+
+#if DEBUG
+#Preview("QR code") {
+    QRCodeView(url: PreviewSupport.sampleInvitationURL)
+        .frame(width: 220, height: 220)
+        .padding()
+        .background(SoftFieldBackground())
+        .preferredColorScheme(.dark)
+}
+#endif
+

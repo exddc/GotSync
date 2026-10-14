@@ -92,41 +92,41 @@ enum UserPairingPresentationBuilder {
 
         switch phase {
         case .waitingForPeer:
-            // Role-aware: joiners are already joining — never tell them to Join Existing Sync.
+            // Role-aware: joiners are already joining — never tell them to Join link.
             if role == .joiner {
                 return UserPairingPresentation(
                     step: .waitingForOtherPhone,
-                    title: "Waiting for the main iPhone",
-                    detail: "Stay on this screen. The main iPhone finishes the safety check and shares the task list.",
+                    title: "Waiting for the main phone",
+                    detail: "Stay on this screen. The main phone finishes the safety check and shares the task list.",
                     blockingActor: .otherPhone
                 )
             }
             return UserPairingPresentation(
                 step: .waitingForOtherPhone,
-                title: "Waiting for the other iPhone",
-                detail: "On the other iPhone, choose Join Existing Sync and scan the code or enter the phrase. This invitation is valid for 15 minutes.",
+                title: "Waiting for the other phone",
+                detail: "On the other phone, choose Join link and scan the code or enter the phrase. This invitation is valid for 15 minutes.",
                 blockingActor: .otherPhone
             )
         case .verifying:
             if isHostApprovalPending {
                 return UserPairingPresentation(
                     step: .waitingForYou,
-                    title: "Do these digits match?",
-                    detail: "Confirm that the same six digits appear on both devices.",
+                    title: "Do these match?",
+                    detail: "Confirm that the same six digits appear on both phones.",
                     blockingActor: .you
                 )
             }
             return UserPairingPresentation(
                 step: .waitingForOtherPhone,
                 title: "Waiting for approval",
-                detail: "The main iPhone must approve the matching safety code.",
+                detail: "The main phone must approve the matching safety code.",
                 blockingActor: .otherPhone
             )
         case .provisioning:
             return UserPairingPresentation(
                 step: .finishing,
-                title: "Creating the private link",
-                detail: "Got Done is preparing the shared task list securely.",
+                title: "Creating the link",
+                detail: "Preparing the shared task list securely.",
                 blockingActor: .background
             )
         case .finalizing:
@@ -139,20 +139,20 @@ enum UserPairingPresentationBuilder {
             return UserPairingPresentation(
                 step: .finishing,
                 title: "Connecting",
-                detail: "Looking for your other iPhone.",
+                detail: "Looking for your other phone.",
                 blockingActor: .background
             )
         case .reconciling:
             return UserPairingPresentation(
                 step: .finishing,
                 title: "Catching up",
-                detail: "Applying any changes saved while this iPhone was away.",
+                detail: "Applying any changes saved while this phone was away.",
                 blockingActor: .background
             )
         case .synced:
             return UserPairingPresentation(
                 step: .finishing,
-                title: "Private Sync is on",
+                title: "Link is live",
                 detail: ProductSyncPolicy.deliverySummary,
                 blockingActor: .background
             )
@@ -160,20 +160,20 @@ enum UserPairingPresentationBuilder {
             return UserPairingPresentation(
                 step: .finishing,
                 title: "Sync will resume",
-                detail: "Tasks stay safe on this iPhone. Upload continues when Got Done can reach the private mailbox.",
+                detail: "Tasks stay safe on this phone. Upload continues when this POC can reach the private mailbox.",
                 blockingActor: .background
             )
         case .failed:
             return UserPairingPresentation(
                 step: .waitingForYou,
                 title: "Needs attention",
-                detail: errorMessage ?? "Private Sync could not continue.",
+                detail: errorMessage ?? "Linking could not continue.",
                 blockingActor: .you
             )
         case .unpaired:
             return UserPairingPresentation(
                 step: .waitingForYou,
-                title: "Not paired",
+                title: "Not linked",
                 detail: ProductSyncPolicy.multiDeviceBoundary,
                 blockingActor: .you
             )
@@ -188,7 +188,7 @@ enum UserPairingPresentationBuilder {
         if let errorMessage {
             return UserPairingPresentation(
                 step: .finishing,
-                title: "Finishing the private link",
+                title: "Finishing the link",
                 detail: errorMessage,
                 blockingActor: .background
             )
@@ -197,15 +197,15 @@ enum UserPairingPresentationBuilder {
         case .waitingForProvision:
             return UserPairingPresentation(
                 step: .waitingForOtherPhone,
-                title: "Waiting for the main iPhone",
-                detail: "The secure handshake is saved. Waiting for the main iPhone to approve or decline.",
+                title: "Waiting for the main phone",
+                detail: "The secure handshake is saved. Waiting for the main phone to approve or decline.",
                 blockingActor: .otherPhone
             )
         case .provisionMayHaveBeenStored:
             return UserPairingPresentation(
                 step: .finishing,
                 title: "Sharing the task list",
-                detail: "Approval is saved. Got Done is making the shared list available to the other iPhone.",
+                detail: "Approval is saved. Making the shared list available to the other phone.",
                 blockingActor: .background
             )
         case .provisionStagedAwaitingMergeApproval:
@@ -220,7 +220,7 @@ enum UserPairingPresentationBuilder {
                 return UserPairingPresentation(
                     step: .waitingForOtherPhone,
                     title: "Waiting for confirmation",
-                    detail: "This iPhone imported the shared list. Waiting for the main iPhone to confirm.",
+                    detail: "This phone imported the shared list. Waiting for the main phone to confirm.",
                     blockingActor: .otherPhone
                 )
             }
@@ -233,8 +233,8 @@ enum UserPairingPresentationBuilder {
         case .abortMayHaveBeenStored:
             return UserPairingPresentation(
                 step: .finishing,
-                title: "Cancelling pairing",
-                detail: "No link will be created. Got Done is notifying the other iPhone.",
+                title: "Cancelling",
+                detail: "No link will be created. Notifying the other phone.",
                 blockingActor: .background
             )
         case .abortAcknowledgementMayHaveBeenStored:
@@ -247,8 +247,8 @@ enum UserPairingPresentationBuilder {
         case .commitMarkerMayHaveBeenStored, nil:
             return UserPairingPresentation(
                 step: .finishing,
-                title: "Finishing the private link",
-                detail: "This step is saved and resumes the next time you open Got Done.",
+                title: "Finishing the link",
+                detail: "This step is saved and resumes the next time you open Accountless Sync.",
                 blockingActor: .background
             )
         }

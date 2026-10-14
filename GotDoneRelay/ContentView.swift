@@ -2,27 +2,42 @@ import SwiftUI
 
 @MainActor
 struct ContentView: View {
-    private let configuration: SyncEndpointConfiguration?
-    private let configurationError: String?
+    @State private var configuration: SyncEndpointConfiguration?
+    @State private var configurationError: String?
+    @State private var sessionID = UUID()
 
     init(bundle: Bundle = .main) {
-        do {
-            configuration = try SyncEndpointConfiguration.load(bundle: bundle)
-            configurationError = nil
-        } catch {
-            configuration = nil
-            configurationError = Self.displayMessage(for: error)
-        }
+        let loaded = Self.loadConfiguration(bundle: bundle)
+        _configuration = State(initialValue: loaded.configuration)
+        _configurationError = State(initialValue: loaded.error)
     }
 
     var body: some View {
         if let configuration {
-            SyncRootView(configuration: configuration)
+            SyncRootView(
+                configuration: configuration,
+                onConfigurationChange: { newConfiguration in
+                    self.configuration = newConfiguration
+                    self.configurationError = nil
+                    self.sessionID = UUID()
+                }
+            )
+            .id(sessionID)
         } else {
             SyncConfigurationFailureView(
                 message: configurationError
                     ?? "This build is missing secure sync endpoints."
             )
+        }
+    }
+
+    private static func loadConfiguration(
+        bundle: Bundle = .main
+    ) -> (configuration: SyncEndpointConfiguration?, error: String?) {
+        do {
+            return (try SyncEndpointConfiguration.load(bundle: bundle), nil)
+        } catch {
+            return (nil, displayMessage(for: error))
         }
     }
 
@@ -38,6 +53,9 @@ struct ContentView: View {
 
 @MainActor
 private struct SyncRootView: View {
+    let configuration: SyncEndpointConfiguration
+    let onConfigurationChange: (SyncEndpointConfiguration) -> Void
+
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model: SyncAppModel
@@ -45,7 +63,12 @@ private struct SyncRootView: View {
     @State private var isResetConfirmationPresented = false
     @State private var isUnlinkConfirmationPresented = false
 
-    init(configuration: SyncEndpointConfiguration) {
+    init(
+        configuration: SyncEndpointConfiguration,
+        onConfigurationChange: @escaping (SyncEndpointConfiguration) -> Void
+    ) {
+        self.configuration = configuration
+        self.onConfigurationChange = onConfigurationChange
         _model = StateObject(
             wrappedValue: SyncAppModel(
                 relayURL: configuration.relayURL,
@@ -64,7 +87,6 @@ private struct SyncRootView: View {
                 } else if let phrase = model.invitationPhrase,
                           let invitationURL = model.invitationURL
                 {
-                    // Founding invite or any-member group invite.
                     PairingInvitationView(
                         model: model,
                         phrase: phrase,
@@ -75,7 +97,8 @@ private struct SyncRootView: View {
                         model: model,
                         isResetConfirmationPresented: $isResetConfirmationPresented,
                         isUnlinkConfirmationPresented: $isUnlinkConfirmationPresented,
-                        joinAction: { presentedSheet = .join }
+                        joinAction: { presentedSheet = .join },
+                        settingsAction: developerSettingsAction
                     )
                 } else if model.phase == .waitingForPeer
                             || model.phase == .provisioning
@@ -87,7 +110,8 @@ private struct SyncRootView: View {
                         model: model,
                         isResetConfirmationPresented: $isResetConfirmationPresented,
                         isUnlinkConfirmationPresented: $isUnlinkConfirmationPresented,
-                        joinAction: { presentedSheet = .join }
+                        joinAction: { presentedSheet = .join },
+                        settingsAction: developerSettingsAction
                     )
                 } else {
                     WelcomeView(
@@ -95,49 +119,56 @@ private struct SyncRootView: View {
                         joinAction: { presentedSheet = .join },
                         eraseAction: {
                             isResetConfirmationPresented = true
-                        }
+                        },
+                        settingsAction: developerSettingsAction
                     )
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(RelayTheme.background.ignoresSafeArea())
+            .background(SoftFieldBackground())
             .animation(
-                reduceMotion ? nil : .smooth(duration: 0.28),
+                reduceMotion ? nil : RelayTheme.springSoft,
                 value: model.phase
             )
         }
         .tint(RelayTheme.accent)
+        .preferredColorScheme(.dark)
         .sheet(item: $presentedSheet) { destination in
             switch destination {
             case .join:
                 JoinSyncSheet(model: model)
+            case .settings:
+                DeveloperSettingsView(
+                    currentRelayURL: model.relayURL,
+                    onRelayURLApplied: applyRelayURL
+                )
             }
         }
         .confirmationDialog(
-            "Erase this proof of concept?",
+            "Erase all local data?",
             isPresented: $isResetConfirmationPresented,
             titleVisibility: .visible
         ) {
-            Button("Erase Link and Local Tasks", role: .destructive) {
+            Button("Erase all local data", role: .destructive) {
                 model.eraseLocalProofOfConcept()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "This removes the pairing keys and every task in this sample app from this iPhone. The other iPhone is not erased."
+                "This removes the pairing keys and every task on this iPhone. The other phone is not erased."
             )
         }
         .confirmationDialog(
             model.pairingRecoveryResetRequired
                 ? "Keep tasks · reset link?"
-                : "Unlink this iPhone?",
+                : "Unlink this phone?",
             isPresented: $isUnlinkConfirmationPresented,
             titleVisibility: .visible
         ) {
             Button(
                 model.pairingRecoveryResetRequired
-                    ? "Keep Tasks · Reset Link"
-                    : "Unlink and Keep Tasks"
+                    ? "Keep tasks · reset link"
+                    : "Unlink and keep tasks"
             ) {
                 if model.pairingRecoveryResetRequired {
                     model.unlinkAndKeepTasks()
@@ -149,7 +180,7 @@ private struct SyncRootView: View {
         } message: {
             Text(
                 model.pairingRecoveryResetRequired
-                    ? "Tasks stay on this iPhone. Unfinished pairing recovery is cleared so you can create Private Sync again. Erase is not required."
+                    ? "Tasks stay on this phone. Unfinished pairing recovery is cleared so you can create a link again. Erase is not required."
                     : ProductSyncPolicy.leaveSyncDetail
             )
         }
@@ -206,7 +237,6 @@ private struct SyncRootView: View {
                 }
             }
             if GotDoneDebugLaunch.shouldAutoApproveSafety {
-                // Poll briefly for host safety-code confirmation during multi-sim demos.
                 Task { @MainActor in
                     for _ in 0..<80 {
                         if model.isHostApprovalPending {
@@ -232,6 +262,27 @@ private struct SyncRootView: View {
             }
         }
     }
+
+    private var developerSettingsAction: (() -> Void)? {
+        #if DEBUG
+        { presentedSheet = .settings }
+        #else
+        nil
+        #endif
+    }
+
+    private func applyRelayURL(_ relayURL: URL) {
+        do {
+            let next = try SyncEndpointConfiguration(
+                relayURL: relayURL,
+                mailboxURL: configuration.mailboxURL,
+                policy: .runtime
+            )
+            onConfigurationChange(next)
+        } catch {
+            // Validation already ran in DeveloperSettingsView.
+        }
+    }
 }
 
 private struct SyncConfigurationFailureView: View {
@@ -240,7 +291,7 @@ private struct SyncConfigurationFailureView: View {
     var body: some View {
         NavigationStack {
             ContentUnavailableView {
-                Label("Sync build needs configuration", systemImage: "wrench.and.screwdriver.fill")
+                Label("Build needs configuration", systemImage: "wrench.and.screwdriver.fill")
             } description: {
                 Text(message)
                 Text(
@@ -248,7 +299,7 @@ private struct SyncConfigurationFailureView: View {
                 )
             }
             .padding(24)
-            .navigationTitle("Got Done")
+            .navigationTitle(RelayTheme.displayName)
             .navigationBarTitleDisplayMode(.inline)
         }
         .tint(RelayTheme.accent)
@@ -257,6 +308,20 @@ private struct SyncConfigurationFailureView: View {
 
 private enum RelaySheet: String, Identifiable {
     case join
+    case settings
 
     var id: String { rawValue }
 }
+
+#if DEBUG
+#Preview("Content · root") {
+    ContentView()
+}
+
+#Preview("Content · missing config") {
+    SyncConfigurationFailureView(
+        message: "This build is missing the GotDoneRelayURL sync endpoint."
+    )
+    .preferredColorScheme(.dark)
+}
+#endif

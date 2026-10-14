@@ -73,21 +73,31 @@ struct SyncEndpointConfiguration: Equatable, Sendable {
                     forInfoDictionaryKey: mailboxInfoKey
                 ) as? String,
             ].compactMapValues { $0 },
-            policy: policy
+            policy: policy,
+            applyDeveloperOverrides: true
         )
     }
 
     static func load(
         values: [String: String],
-        policy: EndpointSecurityPolicy
+        policy: EndpointSecurityPolicy,
+        applyDeveloperOverrides: Bool = false
     ) throws -> SyncEndpointConfiguration {
-        let relayURL = try configuredURL(
+        var relayURL = try configuredURL(
             values[relayInfoKey],
             key: relayInfoKey,
             fallback: SyncProtocol.defaultRelayURL,
             invalid: .invalidRelay,
             policy: policy
         )
+        #if DEBUG
+        if applyDeveloperOverrides,
+           let override = DeveloperEndpointPreferences.relayURLOverride
+        {
+            try validateRelayURL(override, policy: policy)
+            relayURL = override
+        }
+        #endif
         let mailboxURL = try configuredURL(
             values[mailboxInfoKey],
             key: mailboxInfoKey,

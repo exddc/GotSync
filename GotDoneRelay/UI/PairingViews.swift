@@ -8,85 +8,85 @@ struct PairingInvitationView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 22) {
                 PairingHeaderView(
-                    eyebrow: model.isIssuingGroupInvite
-                        ? "Invite to this sync"
-                        : "Main iPhone",
                     title: model.isIssuingGroupInvite
-                        ? "Invite another iPhone"
-                        : "Start a private sync",
+                        ? "Invite another phone"
+                        : "Show this code",
                     detail: model.isIssuingGroupInvite
-                        ? "\(ProductSyncPolicy.inviteDetail) On the other iPhone, tap Join Existing Sync and scan this code. \(ProductSyncPolicy.sharedAccessDisclosure)"
-                        : "On the other iPhone, tap Join Existing Sync and scan this code. Enter the phrase only if the camera is unavailable. \(ProductSyncPolicy.inviteDetail) \(ProductSyncPolicy.multiDeviceBoundary)",
-                    symbol: "iphone.gen3.radiowaves.left.and.right"
+                        ? "On the other phone, tap Join link and scan. \(ProductSyncPolicy.sharedAccessDisclosure)"
+                        : "On the other phone, tap Join link and scan. Use the phrase only if the camera is unavailable.",
+                    symbol: "qrcode"
                 )
 
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     QRCodeView(url: invitationURL)
-                        .frame(width: 196, height: 196)
-                        .accessibilityLabel("Private sync invitation QR code")
+                        .frame(width: 220, height: 220)
+                        .accessibilityLabel("Sync invitation QR code")
 
                     if let expiresAt = model.invitationExpiresAt {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
-                            Label(
-                                remainingText(until: expiresAt, now: context.date),
-                                systemImage: "timer"
-                            )
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel(
-                                "Invitation expires at \(expiresAt.formatted(date: .omitted, time: .shortened))"
-                            )
+                            Text(remainingText(until: expiresAt, now: context.date))
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(RelayTheme.inkMuted)
+                                .accessibilityLabel(
+                                    "Invitation expires at \(expiresAt.formatted(date: .omitted, time: .shortened))"
+                                )
                         }
                     }
                 }
                 .frame(maxWidth: .infinity)
-                .relayCard()
+                .relayCard(padding: 20)
 
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("17-word phrase")
-                        .font(.headline)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Phrase")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(RelayTheme.inkMuted)
+                        .textCase(.uppercase)
+                        .tracking(0.6)
 
                     Text(phrase)
-                        .font(.system(.subheadline, design: .monospaced))
+                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                        .foregroundStyle(RelayTheme.ink)
                         .lineSpacing(5)
                         .accessibilityIdentifier("invitation-phrase")
                 }
-                .relayCard()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .relayCard(padding: 16)
 
                 Button {
                     model.regenerateInvitation()
                 } label: {
-                    Label("Generate New Code", systemImage: "arrow.clockwise")
-                        .frame(maxWidth: .infinity)
+                    HStack(alignment: .center, spacing: 8) {
+                        Image(systemName: "arrow.clockwise")
+                        
+                        Text("New code")
+                            
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
+                .pocSecondaryButtonStyle()
                 .controlSize(.large)
                 .accessibilityHint(
                     "Invalidates this invitation and creates a new one."
                 )
-
-                SyncStatusView(
-                    phase: model.phase,
-                    title: model.statusTitle,
-                    detail: model.statusDetail
-                )
-
-                Button("Cancel Pairing", role: .cancel) {
-                    model.cancelPairing()
-                }
-                .frame(maxWidth: .infinity)
-                .frame(minHeight: 44)
-                .padding(.bottom, 16)
-                .accessibilityIdentifier("cancel-pairing")
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
+            .padding(.horizontal, 22)
+            .padding(.top, 8)
+            .padding(.bottom, 16)
         }
         .scrollIndicators(.hidden)
-        .navigationTitle("Private Sync")
+        .background(SoftFieldBackground())
+        .navigationTitle("Link")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") {
+                    model.cancelPairing()
+                }
+                .accessibilityIdentifier("cancel-pairing")
+            }
+        }
     }
 
     private func remainingText(until expiresAt: Date, now: Date) -> String {
@@ -94,12 +94,12 @@ struct PairingInvitationView: View {
         if seconds >= 60 {
             let minutes = (seconds + 59) / 60
             return minutes == 1
-                ? "Invitation expires in about 1 minute"
-                : "Invitation expires in about \(minutes) minutes"
+                ? "Expires in about 1 minute"
+                : "Expires in about \(minutes) minutes"
         }
         return seconds == 1
-            ? "Invitation expires in 1 second"
-            : "Invitation expires in \(seconds) seconds"
+            ? "Expires in 1 second"
+            : "Expires in \(seconds) seconds"
     }
 }
 
@@ -110,40 +110,27 @@ struct PairingProgressView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: model.hasPairingReplicaConflict ? 16 : 24) {
-                ZStack {
-                    Circle()
-                        .fill(RelayTheme.accent.opacity(0.10))
-                        .frame(
-                            width: model.hasPairingReplicaConflict ? 80 : 112,
-                            height: model.hasPairingReplicaConflict ? 80 : 112
-                        )
-                    Image(systemName: "iphone.gen3.radiowaves.left.and.right")
-                        .font(
-                            .system(
-                                size: model.hasPairingReplicaConflict ? 32 : 42,
-                                weight: .medium
-                            )
-                        )
-                        .foregroundStyle(RelayTheme.accent)
-                }
+            VStack(spacing: model.hasPairingReplicaConflict ? 16 : 28) {
+                PairingLinkMark(
+                    isAnimating: !model.hasPairingReplicaConflict,
+                    compact: model.hasPairingReplicaConflict
+                )
                 .accessibilityHidden(true)
 
                 VStack(spacing: 10) {
                     if model.hasPairingReplicaConflict {
                         Image(systemName: "rectangle.on.rectangle.angled")
-                            .font(.title2)
-                            .foregroundStyle(RelayTheme.warning)
+                            .font(.title3)
+                            .foregroundStyle(RelayTheme.pending)
                             .accessibilityHidden(true)
-                    } else {
-                        ProgressView()
                     }
                     Text(model.statusTitle)
-                        .font(.title2.weight(.bold))
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(RelayTheme.ink)
                         .multilineTextAlignment(.center)
                     Text(model.statusDetail)
                         .font(.body)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RelayTheme.inkMuted)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -151,91 +138,87 @@ struct PairingProgressView: View {
                         UserPairingStepIndicator(
                             step: model.userPairingPresentation.step
                         )
+                        .padding(.top, 6)
                     }
                 }
-
-                PrivacyDisclosureView(compact: true)
 
                 if model.hasPairingReplicaConflict {
                     VStack(spacing: 12) {
                         if let preview = model.keepBothPreview {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("What combining will do")
-                                    .font(.headline)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(RelayTheme.ink)
                                 Text(preview.confirmationSummary)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                                    .font(.footnote)
+                                    .foregroundStyle(RelayTheme.inkMuted)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .relayCard()
+                            .relayCard(padding: 14)
                             .accessibilityIdentifier("keep-both-preview")
                         } else {
                             Text(
-                                "Both copies are still on this iPhone. Got Done checks the complete combined list before either phone commits to the link."
+                                "Both copies are still on this phone. This POC checks the combined list before either phone commits."
                             )
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                            .font(.footnote)
+                            .foregroundStyle(RelayTheme.inkMuted)
                             .multilineTextAlignment(.center)
                             .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        Button("Combine Task Lists and Finish…") {
+                        Button("Combine and finish…") {
                             isConflictConfirmationPresented = true
                         }
-                        .buttonStyle(.borderedProminent)
+                        .pocPrimaryButtonStyle()
                         .controlSize(.large)
                         .frame(maxWidth: .infinity)
                         .accessibilityIdentifier(
                             "resolve-conflicted-pairing"
                         )
 
-                        if model.canCancelPairing {
-                            Button("Cancel Pairing", role: .cancel) {
-                                model.cancelPairing()
-                            }
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: 44)
-                            .accessibilityIdentifier("cancel-pairing")
-                        }
                     }
-                } else if model.canCancelPairing {
-                    Button("Cancel Pairing", role: .cancel) {
-                        model.cancelPairing()
-                    }
-                    .frame(minHeight: 44)
-                    .accessibilityIdentifier("cancel-pairing")
-                } else {
-                    Label(
-                        "This step is saved. You can leave Got Done; it resumes the next time you open it.",
-                        systemImage: "arrow.clockwise.icloud"
+                } else if !model.canCancelPairing {
+                    Text(
+                        "This step is saved. You can leave; it resumes the next time you open Accountless Sync."
                     )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .font(.footnote)
+                    .foregroundStyle(RelayTheme.inkMuted)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("pairing-finalization-saved")
                 }
             }
             .frame(maxWidth: .infinity)
-            .padding(.horizontal, 24)
-            .padding(.vertical, model.hasPairingReplicaConflict ? 16 : 24)
+            .padding(.horizontal, 28)
+            .padding(.vertical, model.hasPairingReplicaConflict ? 16 : 28)
         }
-        .navigationTitle("Private Sync")
+        .background(SoftFieldBackground())
+        .navigationTitle("Linking")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if model.canCancelPairing {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        model.cancelPairing()
+                    }
+                    .accessibilityIdentifier("cancel-pairing")
+                }
+            }
+        }
         .confirmationDialog(
             "Combine task lists?",
             isPresented: $isConflictConfirmationPresented,
             titleVisibility: .visible
         ) {
-            Button("Combine and Finish") {
+            Button("Combine and finish") {
                 model.resolvePairingReplicaConflictKeepingBoth()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
                 model.keepBothPreview?.confirmationSummary
-                    ?? "Got Done keeps matching tasks once, adds local-only tasks, and may show conflicting versions twice. Cancel leaves this iPhone unchanged."
+                    ?? "Matching tasks are kept once; local-only tasks are added. Conflicting versions may appear twice. Cancel leaves this phone unchanged."
             )
         }
         .onAppear {
@@ -261,14 +244,55 @@ struct PairingProgressView: View {
     }
 }
 
+private struct PairingLinkMark: View {
+    var isAnimating: Bool
+    var compact: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isActive = false
+
+    private var size: CGFloat { compact ? 72 : 96 }
+    private var iconSize: CGFloat { compact ? 28 : 36 }
+
+    var body: some View {
+        let motion = isAnimating && !reduceMotion
+        ZStack {
+
+            Image(systemName: "link")
+                .font(.system(size: iconSize, weight: .medium))
+                .foregroundStyle(RelayTheme.accent)
+                .rotationEffect(.degrees(motion && isActive ? 10 : -10))
+                .scaleEffect(motion && isActive ? 1.04 : 1.0)
+        }
+        .onAppear { syncMotion() }
+        .onChange(of: isAnimating) { _, _ in syncMotion() }
+        .onChange(of: reduceMotion) { _, _ in syncMotion() }
+    }
+
+    private func syncMotion() {
+        let shouldRun = isAnimating && !reduceMotion
+        guard shouldRun else {
+            withAnimation(.easeOut(duration: 0.2)) {
+                isActive = false
+            }
+            return
+        }
+        isActive = false
+        withAnimation(
+            .easeInOut(duration: 1.6).repeatForever(autoreverses: true)
+        ) {
+            isActive = true
+        }
+    }
+}
+
 struct UserPairingStepIndicator: View {
     let step: UserPairingStep
 
     var body: some View {
-        HStack(spacing: 8) {
-            stepChip("1", title: "Other phone", active: step == .waitingForOtherPhone)
-            stepChip("2", title: "You", active: step == .waitingForYou)
-            stepChip("3", title: "Finish", active: step == .finishing)
+        HStack(spacing: 6) {
+            stepDot(active: step == .waitingForOtherPhone || step == .waitingForYou || step == .finishing)
+            stepDot(active: step == .waitingForYou || step == .finishing)
+            stepDot(active: step == .finishing)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
@@ -285,41 +309,27 @@ struct UserPairingStepIndicator: View {
         }
     }
 
-    private func stepChip(
-        _ number: String,
-        title: String,
-        active: Bool
-    ) -> some View {
-        VStack(spacing: 4) {
-            Text(number)
-                .font(.caption.weight(.bold))
-                .foregroundStyle(active ? .white : .secondary)
-                .frame(width: 22, height: 22)
-                .background(
-                    Circle().fill(active ? RelayTheme.accent : Color.secondary.opacity(0.18))
-                )
-            Text(title)
-                .font(.caption2.weight(active ? .semibold : .regular))
-                .foregroundStyle(active ? .primary : .secondary)
-        }
-        .frame(maxWidth: .infinity)
+    private func stepDot(active: Bool) -> some View {
+        Capsule()
+            .fill(active ? RelayTheme.accent : RelayTheme.inkMuted.opacity(0.22))
+            .frame(width: active ? 20 : 8, height: 4)
+            .animation(RelayTheme.springSnappy, value: active)
     }
 }
 
 struct SafetyCodeView: View {
     @ObservedObject var model: SyncAppModel
     let code: String
-    @ScaledMetric(relativeTo: .largeTitle) private var codeFontSize = 50.0
+    @ScaledMetric(relativeTo: .largeTitle) private var codeFontSize = 52.0
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 28) {
                 PairingHeaderView(
-                    eyebrow: "Safety check",
-                    title: "Do these digits match?",
+                    title: "Do these match?",
                     detail: ProductSyncPolicy.safetyCodeDetail,
-                    symbol: "checkmark.shield.fill"
+                    symbol: "checkmark.shield"
                 )
 
                 Text(displayCode)
@@ -330,70 +340,68 @@ struct SafetyCodeView: View {
                             design: .monospaced
                         )
                     )
+                    .foregroundStyle(RelayTheme.ink)
                     .minimumScaleFactor(0.75)
-                    .tracking(3)
+                    .tracking(4)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 28)
-                    .relayCard()
+                    .padding(.vertical, 32)
+                    .relayCard(padding: 20)
                     .accessibilityLabel("Safety code \(code.map(String.init).joined(separator: " "))")
                     .accessibilityIdentifier("safety-code")
-
-                SyncStatusView(
-                    phase: model.phase,
-                    title: model.statusTitle,
-                    detail: model.statusDetail
-                )
 
                 if model.isHostApprovalPending {
                     Button {
                         model.approveSafetyCode()
                     } label: {
-                        Label("Codes Match — Approve", systemImage: "checkmark.shield.fill")
+                        Text("Codes match. Approve")
                             .font(.headline)
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
+                            .padding(.vertical, 4)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .pocPrimaryButtonStyle()
                     .controlSize(.large)
                     .accessibilityIdentifier("approve-safety-code")
                 } else {
                     HStack(spacing: 10) {
                         ProgressView()
+                            .controlSize(.small)
                         Text(
                             model.phase == .provisioning
-                                ? "Importing the shared task list…"
-                                : "Waiting for approval on the main iPhone…"
+                                ? "Importing the shared list…"
+                                : "Waiting for the other phone to approve…"
                         )
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundStyle(RelayTheme.inkMuted)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
+                    .padding(.vertical, 8)
                 }
 
-                Button("Codes Don’t Match", role: .destructive) {
+                Button("Codes don’t match", role: .destructive) {
                     model.rejectSafetyCode()
                 }
-                .buttonStyle(.bordered)
+                .pocSecondaryButtonStyle()
                 .controlSize(.large)
                 .frame(maxWidth: .infinity)
                 .accessibilityHint(
                     "Cancels pairing without linking either iPhone."
                 )
                 .accessibilityIdentifier("reject-safety-code")
-
-                Button("Cancel Pairing", role: .cancel) {
-                    model.cancelPairing()
-                }
-                .frame(maxWidth: .infinity)
-                .frame(minHeight: 44)
-                .accessibilityIdentifier("cancel-pairing")
             }
-            .padding(20)
+            .padding(22)
         }
         .scrollIndicators(.hidden)
-        .navigationTitle("Verify Link")
+        .background(SoftFieldBackground())
+        .navigationTitle("Verify")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") {
+                    model.cancelPairing()
+                }
+                .accessibilityIdentifier("cancel-pairing")
+            }
+        }
     }
 
     private var formattedCode: String {
@@ -402,12 +410,65 @@ struct SafetyCodeView: View {
             return digits
         }
         let splitIndex = digits.index(digits.startIndex, offsetBy: 3)
-        return "\(digits[..<splitIndex]) \(digits[splitIndex...])"
+        return "\(digits[..<splitIndex])  \(digits[splitIndex...])"
     }
 
     private var displayCode: String {
         dynamicTypeSize.isAccessibilitySize
-            ? formattedCode.replacingOccurrences(of: " ", with: "\n")
+            ? formattedCode.replacingOccurrences(of: "  ", with: "\n")
             : formattedCode
     }
 }
+
+#if DEBUG
+#Preview("Invitation") {
+    @Previewable @StateObject var model = PreviewSupport.model()
+    NavigationStack {
+        PairingInvitationView(
+            model: model,
+            phrase: PreviewSupport.samplePhrase,
+            invitationURL: PreviewSupport.sampleInvitationURL
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Pairing progress") {
+    @Previewable @StateObject var model = PreviewSupport.model()
+    NavigationStack {
+        PairingProgressView(model: model)
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Pairing link mark") {
+    PairingLinkMark(isAnimating: true, compact: false)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(SoftFieldBackground())
+        .preferredColorScheme(.dark)
+}
+
+#Preview("Safety code") {
+    @Previewable @StateObject var model = PreviewSupport.model()
+    NavigationStack {
+        SafetyCodeView(
+            model: model,
+            code: PreviewSupport.sampleSafetyCode
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Pairing steps") {
+    VStack(spacing: 24) {
+        UserPairingStepIndicator(step: .waitingForOtherPhone)
+        UserPairingStepIndicator(step: .waitingForYou)
+        UserPairingStepIndicator(step: .finishing)
+    }
+    .padding()
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(SoftFieldBackground())
+    .preferredColorScheme(.dark)
+}
+#endif
+

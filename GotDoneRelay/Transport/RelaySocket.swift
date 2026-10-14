@@ -189,6 +189,28 @@ actor RelaySocket {
         secureSession = nil
     }
 
+    /// Opens a short-lived socket to verify the relay accepts WebSocket connections.
+    static func probeReachability(url: URL) async -> Bool {
+        guard
+            (try? SyncEndpointConfiguration.validateRelayURL(
+                url,
+                policy: .runtime
+            )) != nil
+        else {
+            return false
+        }
+        let socket = RelaySocket(url: url)
+        let route = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        do {
+            try await socket.connect(route: route)
+            await socket.cancel()
+            return true
+        } catch {
+            await socket.cancel()
+            return false
+        }
+    }
+
     static func registrationText(route: Data) throws -> String {
         guard route.count == 32 else {
             throw RelaySocketError.invalidRoute

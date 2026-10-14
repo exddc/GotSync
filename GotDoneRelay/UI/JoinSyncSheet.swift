@@ -26,20 +26,20 @@ struct JoinSyncSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     PairingHeaderView(
-                        eyebrow: "Second iPhone",
-                        title: "Join private sync",
-                        detail: "Scan the QR code on the main iPhone. Use the phrase only if the camera is unavailable. No tasks are shared until the main iPhone approves the matching safety code.",
-                        symbol: "link.badge.plus"
+                        title: "Scan to link",
+                        detail: "Scan the code on the other phone. Use the phrase only if the camera is unavailable. Nothing is shared until codes match and are approved.",
+                        symbol: "viewfinder"
                     )
 
                     if model.hasLocalReplicaHistory {
                         Label(
-                            "Your local tasks stay on this iPhone during setup. If the task lists differ, Got Done asks how to combine them before the link finishes.",
+                            "Local tasks stay on this phone during setup. If the lists differ, you’ll choose how to combine them before the link finishes.",
                             systemImage: "iphone.and.arrow.forward"
                         )
-                        .font(.subheadline)
+                        .font(.footnote)
+                        .foregroundStyle(RelayTheme.inkMuted)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .relayCard()
+                        .relayCard(padding: 14)
                         .accessibilityElement(children: .combine)
                     }
 
@@ -59,12 +59,11 @@ struct JoinSyncSheet: View {
                     case .camera:
                         cameraEntry
                     }
-
-                    PrivacyDisclosureView(compact: true)
                 }
-                .padding(20)
+                .padding(22)
             }
             .scrollDismissesKeyboard(.interactively)
+            .background(SoftFieldBackground())
             .navigationTitle("Join")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -103,7 +102,8 @@ struct JoinSyncSheet: View {
     private var phraseEntry: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("17-word phrase")
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(RelayTheme.ink)
 
             TextEditor(text: $phrase)
                 .font(.system(.body, design: .monospaced))
@@ -111,24 +111,20 @@ struct JoinSyncSheet: View {
                 .autocorrectionDisabled()
                 .focused($phraseIsFocused)
                 .frame(minHeight: 132)
-                .padding(10)
+                .padding(12)
                 .scrollContentBackground(.hidden)
                 .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .fill(RelayTheme.field)
                 )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(RelayTheme.border, lineWidth: 1)
-                }
                 .accessibilityLabel("Invitation phrase")
-                .accessibilityHint("Enter all seventeen words from the main iPhone.")
+                .accessibilityHint("Enter all seventeen words from the other phone.")
                 .accessibilityIdentifier("join-phrase-field")
 
             if let validationMessage {
                 Label(validationMessage, systemImage: "exclamationmark.circle.fill")
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(RelayTheme.danger)
                     .fixedSize(horizontal: false, vertical: true)
             } else if let phraseValidationMessage {
                 Label(
@@ -136,28 +132,28 @@ struct JoinSyncSheet: View {
                     systemImage: "exclamationmark.circle.fill"
                 )
                 .font(.footnote)
-                .foregroundStyle(.red)
+                .foregroundStyle(RelayTheme.danger)
                 .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("\(wordCount) of 17 words")
                     .font(.caption)
-                    .foregroundStyle(wordCount == 17 ? RelayTheme.success : .secondary)
+                    .foregroundStyle(wordCount == 17 ? RelayTheme.accent : RelayTheme.inkMuted)
             }
 
             Button {
                 joinWithPhrase()
             } label: {
-                Label("Continue", systemImage: "arrow.right")
+                Text("Continue")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 4)
             }
-            .buttonStyle(.borderedProminent)
+            .pocPrimaryButtonStyle()
             .controlSize(.large)
             .disabled(validatedInvitation == nil)
             .accessibilityIdentifier("join-submit")
         }
-        .relayCard()
+        .relayCard(padding: 16)
     }
 
     private var cameraEntry: some View {
@@ -168,7 +164,7 @@ struct JoinSyncSheet: View {
                         let url = URL(string: payload),
                         (try? Invitation.from(url: url)) != nil
                     else {
-                        validationMessage = "That QR code is not a Got Done invitation."
+                        validationMessage = "That QR code is not an Accountless Sync invitation."
                         return false
                     }
                     validationMessage = nil
@@ -187,27 +183,27 @@ struct JoinSyncSheet: View {
             )
             .id(scannerID)
             .frame(height: 320)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(.white.opacity(0.75), lineWidth: 2)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(RelayTheme.qrPlate.opacity(0.85), lineWidth: 1.5)
                     .padding(56)
                     .accessibilityHidden(true)
             }
 
-            Text("Point the camera at the QR code on the main iPhone.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            Text("Point the camera at the QR code on the other phone.")
+                .font(.footnote)
+                .foregroundStyle(RelayTheme.inkMuted)
                 .multilineTextAlignment(.center)
 
             if cameraAccessDenied {
                 VStack(alignment: .leading, spacing: 10) {
                     Label(
-                        "Camera access is off. You can still join with the 17-word phrase from the main iPhone, or enable camera in Settings.",
+                        "Camera is off. Join with the 17-word phrase, or enable camera in Settings.",
                         systemImage: "camera.fill"
                     )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .font(.footnote)
+                    .foregroundStyle(RelayTheme.inkMuted)
                     .fixedSize(horizontal: false, vertical: true)
 
                     HStack {
@@ -219,13 +215,13 @@ struct JoinSyncSheet: View {
                             }
                             UIApplication.shared.open(url)
                         }
-                        .buttonStyle(.borderedProminent)
+                        .pocPrimaryButtonStyle()
 
-                        Button("Enter Phrase") {
+                        Button("Enter phrase") {
                             inputMode = .phrase
                             phraseIsFocused = true
                         }
-                        .buttonStyle(.bordered)
+                        .pocSecondaryButtonStyle()
                     }
                     .controlSize(.large)
                 }
@@ -235,7 +231,7 @@ struct JoinSyncSheet: View {
             if let validationMessage {
                 Label(validationMessage, systemImage: "exclamationmark.circle.fill")
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(RelayTheme.danger)
             }
         }
     }
@@ -314,3 +310,12 @@ private enum JoinInputMode: String, CaseIterable, Identifiable {
         }
     }
 }
+
+#if DEBUG
+#Preview("Join sync") {
+    @Previewable @StateObject var model = PreviewSupport.model()
+    JoinSyncSheet(model: model)
+        .preferredColorScheme(.dark)
+}
+#endif
+

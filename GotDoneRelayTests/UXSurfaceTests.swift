@@ -16,11 +16,15 @@ final class UXSurfaceTests: XCTestCase {
         XCTAssertTrue(
             ProductSyncPolicy.groupFullMessage.contains("8")
         )
-        XCTAssertEqual(ProductSyncPolicy.manageSyncTitle, "Manage Sync")
+        XCTAssertEqual(ProductSyncPolicy.manageSyncTitle, "Manage sync")
         XCTAssertFalse(
             ConsumerCopyBanlist.containsBannedToken(
                 ProductSyncPolicy.multiDeviceBoundary
             )
+        )
+        XCTAssertFalse(
+            ProductSyncPolicy.deliverySummary
+                .localizedCaseInsensitiveContains("Got Done")
         )
     }
 
@@ -128,7 +132,45 @@ final class UXSurfaceTests: XCTestCase {
         )
     }
 
-    func testJoinerWaitingCopyNeverSaysJoinExistingSync() {
+    func testPairingTransportRetryTaxonomy() {
+        XCTAssertTrue(
+            SyncAppError.isRetriablePairingTransportFailure(
+                SyncAppError.privateSyncUnreachable
+            )
+        )
+        XCTAssertTrue(
+            SyncAppError.isRetriablePairingTransportFailure(
+                RelaySocketError.connectionTimedOut
+            )
+        )
+        XCTAssertTrue(
+            SyncAppError.isRetriablePairingTransportFailure(
+                URLError(.notConnectedToInternet)
+            )
+        )
+        XCTAssertTrue(
+            SyncAppError.isRetriablePairingTransportFailure(
+                SyncAppError.relay("relayBusy")
+            )
+        )
+        XCTAssertFalse(
+            SyncAppError.isRetriablePairingTransportFailure(
+                SyncAppError.invitationExpired
+            )
+        )
+        XCTAssertFalse(
+            SyncAppError.isRetriablePairingTransportFailure(
+                SyncAppError.pairingDeclined
+            )
+        )
+        XCTAssertFalse(
+            SyncAppError.isRetriablePairingTransportFailure(
+                SyncAppError.groupAtCapacity
+            )
+        )
+    }
+
+    func testJoinerWaitingCopyNeverSaysJoinLink() {
         let joiner = UserPairingPresentationBuilder.presentation(
             phase: .waitingForPeer,
             isHostApprovalPending: false,
@@ -138,10 +180,10 @@ final class UXSurfaceTests: XCTestCase {
             errorMessage: nil
         )
         XCTAssertFalse(
-            joiner.detail.localizedCaseInsensitiveContains("Join Existing Sync")
+            joiner.detail.localizedCaseInsensitiveContains("Join link")
         )
         XCTAssertTrue(
-            joiner.detail.localizedCaseInsensitiveContains("main iPhone")
+            joiner.detail.localizedCaseInsensitiveContains("main phone")
         )
 
         let host = UserPairingPresentationBuilder.presentation(
@@ -153,7 +195,7 @@ final class UXSurfaceTests: XCTestCase {
             errorMessage: nil
         )
         XCTAssertTrue(
-            host.detail.localizedCaseInsensitiveContains("Join Existing Sync")
+            host.detail.localizedCaseInsensitiveContains("Join link")
         )
         XCTAssertTrue(host.detail.contains("15 minutes"))
     }

@@ -10,17 +10,18 @@ struct ManageSyncView: View {
             List {
                 Section("Status") {
                     Text(model.manageSyncStatusLine)
-                        .font(.body)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(RelayTheme.ink)
                     Text(ProductSyncPolicy.sharedAccessDisclosure)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RelayTheme.inkMuted)
                         .accessibilityIdentifier("shared-access-disclosure")
                     Text(ProductSyncPolicy.deliverySummary)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RelayTheme.inkMuted)
                 }
 
-                Section("Linked iPhones") {
+                Section("Linked phones") {
                     ForEach(
                         Array(model.linkedMemberLabels.enumerated()),
                         id: \.offset
@@ -31,14 +32,14 @@ struct ManageSyncView: View {
                         "\(model.linkedMemberCount) of \(ProductSyncPolicy.maxDevices)"
                     )
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(RelayTheme.inkMuted)
                 }
 
                 Section {
                     if model.isGroupAtCapacity {
                         Text(ProductSyncPolicy.groupFullMessage)
                             .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(RelayTheme.inkMuted)
                             .accessibilityIdentifier("group-full-message")
                     } else {
                         Button {
@@ -93,3 +94,17 @@ struct ManageSyncView: View {
         .presentationDetents([.medium, .large])
     }
 }
+
+#if DEBUG
+#Preview("Manage sync") {
+    @Previewable @StateObject var model = PreviewSupport.model(
+        seedPairedGroupMemberCount: 3
+    )
+    ManageSyncView(
+        model: model,
+        isUnlinkConfirmationPresented: .constant(false)
+    )
+    .preferredColorScheme(.dark)
+}
+#endif
+

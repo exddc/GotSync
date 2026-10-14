@@ -19,6 +19,17 @@ struct QRScannerView: UIViewControllerRepresentable {
     ) {}
 }
 
+#if DEBUG
+#Preview("QR scanner") {
+    QRScannerView(
+        onPayload: { _ in true },
+        onCameraAccessDenied: {}
+    )
+    .ignoresSafeArea()
+    .preferredColorScheme(.dark)
+}
+#endif
+
 @MainActor
 final class QRScannerViewController: UIViewController {
     private let captureWorker = QRScannerCaptureWorker()

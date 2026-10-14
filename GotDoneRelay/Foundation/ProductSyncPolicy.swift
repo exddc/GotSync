@@ -2,11 +2,11 @@ import Foundation
 
 /// Product-level sync contract for this proof of concept.
 ///
-/// **Receive (open-to-sync):** linked iPhones see edits while Got Done is open,
+/// **Receive (open-to-sync):** linked iPhones see edits while Accountless Sync is open,
 /// or the next time they open. There is no push path yet.
 ///
 /// **Send (background-capable):** this iPhone uploads pending edits to the
-/// private mailbox while Got Done is open and while iOS grants background time.
+/// private mailbox while Accountless Sync is open and while iOS grants background time.
 /// Incomplete uploads are durable and retry on the next launch.
 enum ProductSyncPolicy {
     /// Single product number for invitation QR/phrase, host expiry, UI countdown,
@@ -38,12 +38,6 @@ enum ProductSyncPolicy {
     /// How long the link-complete celebration remains visible.
     static let linkCompleteCelebrationDuration: TimeInterval = 2.4
 
-    /// How long a subtle “Updated just now” confidence cue remains visible.
-    static let lastSyncConfidenceDuration: TimeInterval = 4
-
-    /// How long an inbound arrival cue remains visible.
-    static let inboundArrivalCueDuration: TimeInterval = 2.8
-
     /// Cap aligned with `ReplicaLimits.maxOrigins` (Group Sync v2).
     static let maxDevices = ReplicaLimits.maxOrigins
 
@@ -52,48 +46,48 @@ enum ProductSyncPolicy {
         "com.gotdone.relay.poc.mailbox-flush"
 
     static let deliverySummary =
-        "Edits save on this iPhone first and upload even when Got Done is in the background when iOS allows it. Other linked iPhones see them while Got Done is open, or the next time they open Got Done."
+        "Edits save on this phone first and upload in the background when iOS allows it. Other linked phones see them while Accountless Sync is open, or the next time they open it."
 
     static let senderBackgroundSummary =
-        "This iPhone uploads pending edits in the background when iOS allows it. If upload is interrupted, it retries the next time you open Got Done."
+        "This phone uploads pending edits in the background when iOS allows it. If upload is interrupted, it retries the next time you open Accountless Sync."
 
     static let pairingKeepOpenSummary =
-        "Keep both apps open while you pair them the first time. Pairing windows last 15 minutes."
+        "Keep both apps open while you pair the first time. Pairing windows last 15 minutes."
 
     /// Legacy name kept for tests; multi-device boundary is the product string.
     static let twoDeviceBoundary = multiDeviceBoundary
 
     static let multiDeviceBoundary =
-        "Private Sync can link up to \(maxDevices) iPhones on one shared link. There is no account recovery if every phone is lost."
+        "You can link up to \(maxDevices) iPhones on one shared link. There is no account recovery if every phone is lost."
 
     /// C1 product honesty: co-members share full task access for this sync.
     static let sharedAccessDisclosure =
-        "Every linked iPhone can read and edit this sync’s tasks. There is no privacy between co-members."
+        "Every linked phone can read and edit this sync’s tasks."
 
     static let groupFullMessage =
-        "This sync already has \(maxDevices) iPhones. Leave a phone or start a new sync."
+        "This sync already has \(maxDevices) phones. Leave a phone or start a new link."
 
-    static let manageSyncTitle = "Manage Sync"
+    static let manageSyncTitle = "Manage sync"
 
-    static let inviteAnotherIPhone = "Invite another iPhone"
+    static let inviteAnotherIPhone = "Invite another phone"
 
     /// C4: live invite is full admission capability while valid.
     static let inviteDetail =
-        "Anyone with this code can join this sync and see its tasks. Show it only on phones you trust. Valid for 15 minutes; one successful join uses it up."
+        "Anyone with this code can join and see its tasks. Show it only on phones you trust. Valid for 15 minutes; one successful join uses it up."
 
     static let leaveSyncTitle = "Leave sync and keep tasks"
 
     /// C3: no remote wipe; remaining members rekey so a left phone cannot decrypt new traffic.
     static let leaveSyncDetail =
-        "Tasks stay on this iPhone. Other phones drop this phone and rotate keys so it cannot read new edits. Past data already on a phone is not remotely wiped."
+        "Tasks stay on this phone. Other phones drop this phone and rotate keys so it cannot read new edits. Past data already on a phone is not remotely wiped."
 
     /// M3: safety code is accidental cross-pair protection, not invite-theft defense.
     static let safetyCodeDetail =
-        "Compare this code with the other iPhone. Matching digits confirm the two phones are in the same setup. This does not stop someone who already has your live invite code."
+        "Compare this code with the other phone. Matching digits confirm both phones are in the same setup. This does not stop someone who already has your live invite code."
 
     static func linkedStatusSummary(memberCount: Int) -> String {
-        let phones = memberCount == 1 ? "1 iPhone" : "\(memberCount) iPhones"
-        return "Linked with \(phones). \(sharedAccessDisclosure) Edits save here first; others see them when they open Got Done."
+        let phones = memberCount == 1 ? "1 phone" : "\(memberCount) phones"
+        return "Linked with \(phones)."
     }
 
     // MARK: - Error taxonomy (consumer-facing)
@@ -105,7 +99,7 @@ enum ProductSyncPolicy {
         "Other phone cancelled pairing."
 
     static let privateSyncUnreachableMessage =
-        "Can’t reach private sync. Try again in a moment."
+        "Can’t reach the link. Try again in a moment."
 }
 
 /// Tokens that must not appear in consumer-facing status surfaces.
@@ -128,6 +122,8 @@ enum ConsumerCopyBanlist {
         "unbreakable",
         "completely private from linked",
         "members cannot read",
+        // Brand residual after TW-303
+        "got done",
     ]
 
     static func containsBannedToken(_ text: String) -> Bool {

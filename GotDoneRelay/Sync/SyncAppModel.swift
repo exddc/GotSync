@@ -64,7 +64,7 @@ enum SyncAppError: Error, LocalizedError, Equatable {
         case .invalidSyncMessage:
             "A sync update could not be read. Your tasks are still safe on this iPhone."
         case .invalidCredentials:
-            "Saved Private Sync details are no longer valid. Keep your tasks and create a new link."
+            "Saved link details are no longer valid. Keep your tasks and create a new link."
         case .relay(let code):
             Self.mapRelayCode(code).errorDescription
                 ?? ProductSyncPolicy.privateSyncUnreachableMessage
@@ -85,11 +85,11 @@ enum SyncAppError: Error, LocalizedError, Equatable {
         case .pairingMergeTooLarge:
             "These task lists cannot be safely combined on this device. Nothing was linked, and your local tasks are unchanged."
         case .legacyPairingNeedsRelink:
-            "An older pairing stopped during its final step. Your tasks are safe — keep them and create Private Sync again."
+            "An older pairing stopped during its final step. Your tasks are safe. Keep them and create a link again."
         case .pairingRecoveryHistoryFull:
-            "Too many unfinished pairing steps are still saved. Keep your tasks and reset Private Sync before creating another link."
+            "Too many unfinished pairing steps are still saved. Keep your tasks and reset the link before creating another one."
         case .pairingRecoveryJournalDamaged:
-            "Saved pairing recovery data is damaged. Your tasks are safe — keep them and reset Private Sync before creating another link."
+            "Saved pairing recovery data is damaged. Your tasks are safe. Keep them and reset the link before creating another one."
         case .groupAtCapacity:
             ProductSyncPolicy.groupFullMessage
         }
@@ -138,6 +138,27 @@ enum SyncAppError: Error, LocalizedError, Equatable {
         }
         return error
     }
+
+    /// Transient failures while holding an open invite window. Retry until the
+    /// window ends instead of bouncing the user off the QR screen.
+    static func isRetriablePairingTransportFailure(_ error: Error) -> Bool {
+        let mapped = fromTransport(error)
+        guard let sync = mapped as? SyncAppError else {
+            // Unknown transport noise during wait-for-peer: keep the invite.
+            return true
+        }
+        switch sync {
+        case .privateSyncUnreachable, .relay:
+            return true
+        case .invitationExpired, .pairingDeclined, .groupAtCapacity,
+             .invalidPairMessage, .invalidCredentials, .archiveTooLarge,
+             .localStorageUnavailable, .safetyCodeMismatch,
+             .pairingReplicaConflict, .pairingMergeTooLarge,
+             .legacyPairingNeedsRelink, .pairingRecoveryHistoryFull,
+             .pairingRecoveryJournalDamaged, .invalidSyncMessage:
+            return false
+        }
+    }
 }
 
 @MainActor
@@ -176,8 +197,6 @@ final class SyncAppModel: ObservableObject {
     @Published private(set) var hasPairingReplicaConflict = false
     @Published private(set) var keepBothPreview: KeepBothPreview?
     @Published private(set) var showsLinkCompleteCelebration = false
-    @Published private(set) var inboundArrivalCue: String?
-    @Published private(set) var lastSyncConfidenceText: String?
     /// Host vs joiner for the in-flight pairing attempt (presentation only).
     @Published private(set) var activePairingRole: DeviceRole?
 
@@ -239,8 +258,6 @@ final class SyncAppModel: ObservableObject {
     private var pendingMailboxSince: Date?
     private var savingNoticeRevealTask: Task<Void, Never>?
     private var linkCompleteCelebrationTask: Task<Void, Never>?
-    private var inboundArrivalCueTask: Task<Void, Never>?
-    private var lastSyncConfidenceTask: Task<Void, Never>?
     private var showsSavingNotice = false
 
     private var pairingStagingURL: URL {
@@ -563,8 +580,8 @@ final class SyncAppModel: ObservableObject {
         if phase == .failed || mailboxRequiresRepair {
             return SyncNotice(
                 kind: .repair,
-                title: "Link ended — tasks kept",
-                detail: "Your tasks stay on this iPhone. Create Private Sync again when you are ready to link a replacement phone."
+                title: "Link ended. Tasks kept",
+                detail: "Your tasks stay on this phone. Create a link again when you are ready to link a replacement phone."
             )
         }
         if mailboxState == .unavailable {
@@ -577,17 +594,17 @@ final class SyncAppModel: ObservableObject {
             }
             return SyncNotice(
                 kind: .retrying,
-                title: "Couldn’t reach private mailbox — retrying",
+                title: "Couldn’t reach private mailbox. Retrying",
                 detail: pendingMailboxOperationCount > 0
-                    ? "Changes are saved on this iPhone. Got Done retries upload automatically."
-                    : "Tasks stay safe on this iPhone. Got Done retries when the mailbox is reachable."
+                    ? "Changes are saved on this phone. Upload retries automatically."
+                    : "Tasks stay safe on this phone. Upload retries when the mailbox is reachable."
             )
         }
         if pendingMailboxOperationCount > 0, showsSavingNotice {
             return SyncNotice(
                 kind: .saving,
                 title: "Saved on this iPhone",
-                detail: "Upload to your linked iPhones continues in the background when possible. It appears there the next time those phones open Got Done."
+                detail: "Upload to your linked phones continues in the background when possible. It appears there the next time those phones open Accountless Sync."
             )
         }
         return nil
@@ -602,7 +619,7 @@ final class SyncAppModel: ObservableObject {
             otherPhoneMustBeOpenForLocalEdit: false,
             deliveryDetail: isPaired
                 ? ProductSyncPolicy.deliverySummary
-                : "This iPhone is not linked. Local edits stay here until you create or join Private Sync."
+                : "This phone is not linked. Local edits stay here until you create or join a link."
         )
     }
 
@@ -761,10 +778,10 @@ final class SyncAppModel: ObservableObject {
                 return "Will retry private delivery"
             }
             if showsLinkCompleteCelebration {
-                return "Private Sync is on"
+                return "Link is live"
             }
             if phase == .synced {
-                return "Private Sync is on"
+                return "Link is live"
             }
             if mailboxState == .syncing {
                 return "Checking for changes"
@@ -789,11 +806,11 @@ final class SyncAppModel: ObservableObject {
         if isPaired, phase != .failed {
             if pendingMailboxOperationCount > 0 {
                 return pendingMailboxOperationCount == 1
-                    ? "One change is waiting to reach your other iPhone. It appears there the next time that iPhone opens Got Done."
-                    : "\(pendingMailboxOperationCount) changes are waiting to reach your other iPhone. They appear there the next time that iPhone opens Got Done."
+                    ? "One change is waiting to reach your other phone. It appears there the next time that phone opens Accountless Sync."
+                    : "\(pendingMailboxOperationCount) changes are waiting to reach your other phone. They appear there the next time that phone opens Accountless Sync."
             }
             if mailboxState == .unavailable {
-                return "Tasks stay safe here. Got Done retries private delivery automatically."
+                return "Tasks stay safe here. Private delivery retries automatically."
             }
             if showsLinkCompleteCelebration {
                 return ProductSyncPolicy.deliverySummary
@@ -813,7 +830,7 @@ final class SyncAppModel: ObservableObject {
             }
         }
         if phase == .offline {
-            return "Tasks stay safe on this iPhone. Upload continues when Got Done can reach the private mailbox."
+            return "Tasks stay safe on this phone. Upload continues when this POC can reach the private mailbox."
         }
         return userPairingPresentation.detail
     }
@@ -1328,8 +1345,6 @@ final class SyncAppModel: ObservableObject {
             pendingMailboxOperationCount = 0
             keepBothPreview = nil
             showsLinkCompleteCelebration = false
-            inboundArrivalCue = nil
-            lastSyncConfidenceText = nil
             showsSavingNotice = false
             pendingMailboxSince = nil
             activePairingRole = nil
@@ -1468,8 +1483,6 @@ final class SyncAppModel: ObservableObject {
         mailboxState = .idle
         pendingMailboxOperationCount = 0
         showsLinkCompleteCelebration = false
-        inboundArrivalCue = nil
-        lastSyncConfidenceText = nil
         showsSavingNotice = false
         pendingMailboxSince = nil
         activePairingRole = nil
@@ -1485,10 +1498,6 @@ final class SyncAppModel: ObservableObject {
         savingNoticeRevealTask = nil
         linkCompleteCelebrationTask?.cancel()
         linkCompleteCelebrationTask = nil
-        inboundArrivalCueTask?.cancel()
-        inboundArrivalCueTask = nil
-        lastSyncConfidenceTask?.cancel()
-        lastSyncConfidenceTask = nil
     }
 
     func applicationDidBecomeActive() {
@@ -1663,11 +1672,13 @@ final class SyncAppModel: ObservableObject {
         guard isCurrentPairingAttempt(attemptID) else {
             return
         }
-        let socket = RelaySocket(url: relayURL)
-        pairingSocket = socket
+        var socket: RelaySocket?
         do {
-            try await socket.connect(route: invitation.pairRoute)
-            try await waitForPeer(on: socket)
+            let liveSocket = try await connectPairingSocketUntilPeerReady(
+                route: invitation.pairRoute,
+                attemptID: attemptID
+            )
+            socket = liveSocket
             try requireCurrentPairingAttempt(attemptID)
             pairingExpiryTask?.cancel()
             pairingExpiryTask = nil
@@ -1680,11 +1691,11 @@ final class SyncAppModel: ObservableObject {
                 context: context,
                 psk: invitation.pairPSK
             )
-            try await socket.send(handshake.hello)
-            let response = try await nextBinary(on: socket)
+            try await liveSocket.send(handshake.hello)
+            let response = try await nextBinary(on: liveSocket)
             try requireCurrentPairingAttempt(attemptID)
             let result = try handshake.receive(response)
-            try await socket.send(result.confirm)
+            try await liveSocket.send(result.confirm)
 
             let pairRoot = try requirePairRoot(result.material)
             let pairID = try requirePairID(result.material)
@@ -1710,7 +1721,7 @@ final class SyncAppModel: ObservableObject {
                 )
                 try credentialStore.savePending(pending)
                 beginPairingFinalization(pending)
-                await socket.cancel()
+                await liveSocket.cancel()
                 pairingSocket = nil
                 await runPairingFinalization(
                     pending,
@@ -1741,16 +1752,24 @@ final class SyncAppModel: ObservableObject {
             try credentialStore.savePending(pending)
             try requireCurrentPairingAttempt(attemptID)
             beginPairingFinalization(pending)
-            await socket.cancel()
+            await liveSocket.cancel()
             pairingSocket = nil
             await runPairingFinalization(
                 pending,
                 attemptID: attemptID
             )
         } catch is CancellationError {
-            await socket.cancel()
+            if let socket {
+                await socket.cancel()
+            } else if let pairingSocket {
+                await pairingSocket.cancel()
+            }
         } catch {
-            await socket.cancel()
+            if let socket {
+                await socket.cancel()
+            } else if let pairingSocket {
+                await pairingSocket.cancel()
+            }
             guard !Task.isCancelled else {
                 return
             }
@@ -1765,26 +1784,28 @@ final class SyncAppModel: ObservableObject {
         guard isCurrentPairingAttempt(attemptID) else {
             return
         }
-        let socket = RelaySocket(url: relayURL)
-        pairingSocket = socket
+        var socket: RelaySocket?
         do {
-            try await socket.connect(route: invitation.pairRoute)
-            try await waitForPeer(on: socket)
+            let liveSocket = try await connectPairingSocketUntilPeerReady(
+                route: invitation.pairRoute,
+                attemptID: attemptID
+            )
+            socket = liveSocket
             try requireCurrentPairingAttempt(attemptID)
 
             let context = HandshakeContext.pairing(
                 relayOrigin: try relayOrigin(),
                 route: invitation.pairRoute
             )
-            let hello = try await nextBinary(on: socket)
+            let hello = try await nextBinary(on: liveSocket)
             try requireCurrentPairingAttempt(attemptID)
             let response = try ResponderHandshake.respond(
                 to: hello,
                 context: context,
                 psk: invitation.pairPSK
             )
-            try await socket.send(response.response)
-            let confirmation = try await nextBinary(on: socket)
+            try await liveSocket.send(response.response)
+            let confirmation = try await nextBinary(on: liveSocket)
             try requireCurrentPairingAttempt(attemptID)
             let material = try response.state.receive(confirmation)
 
@@ -1813,20 +1834,78 @@ final class SyncAppModel: ObservableObject {
                 pending,
                 preserveSafetyCode: true
             )
-            await socket.cancel()
+            await liveSocket.cancel()
             pairingSocket = nil
             await runPairingFinalization(
                 pending,
                 attemptID: attemptID
             )
         } catch is CancellationError {
-            await socket.cancel()
+            if let socket {
+                await socket.cancel()
+            } else if let pairingSocket {
+                await pairingSocket.cancel()
+            }
         } catch {
-            await socket.cancel()
+            if let socket {
+                await socket.cancel()
+            } else if let pairingSocket {
+                await pairingSocket.cancel()
+            }
             guard !Task.isCancelled else {
                 return
             }
             pairingFailed(error, attemptID: attemptID)
+        }
+    }
+
+    /// Keep the invite alive across flaky Wi‑Fi, app suspend, and brief relay
+    /// blips until peerReady or the pairing window ends.
+    private func connectPairingSocketUntilPeerReady(
+        route: Data,
+        attemptID: UUID
+    ) async throws -> RelaySocket {
+        var delayNanoseconds: UInt64 = 500_000_000
+        while true {
+            try requireCurrentPairingAttempt(attemptID)
+            if let expiresAt = invitationExpiresAt, Date() >= expiresAt {
+                throw SyncAppError.invitationExpired
+            }
+
+            let socket = RelaySocket(url: relayURL)
+            pairingSocket = socket
+            do {
+                try await socket.connect(route: route)
+                try requireCurrentPairingAttempt(attemptID)
+                try await waitForPeer(on: socket)
+                try requireCurrentPairingAttempt(attemptID)
+                return socket
+            } catch is CancellationError {
+                await clearPairingSocketIfCurrent(socket)
+                throw CancellationError()
+            } catch {
+                await clearPairingSocketIfCurrent(socket)
+                guard isCurrentPairingAttempt(attemptID) else {
+                    throw CancellationError()
+                }
+                if let expiresAt = invitationExpiresAt, Date() >= expiresAt {
+                    throw SyncAppError.invitationExpired
+                }
+                guard SyncAppError.isRetriablePairingTransportFailure(error) else {
+                    throw error
+                }
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+                delayNanoseconds = min(delayNanoseconds * 2, 4_000_000_000)
+            }
+        }
+    }
+
+    private func clearPairingSocketIfCurrent(_ socket: RelaySocket) async {
+        await socket.cancel()
+        if let current = pairingSocket,
+           ObjectIdentifier(current) == ObjectIdentifier(socket)
+        {
+            pairingSocket = nil
         }
     }
 
@@ -1877,7 +1956,7 @@ final class SyncAppModel: ObservableObject {
             try credentialStore.savePending(pending)
         } catch {
             errorMessage =
-                "\(Self.displayMessage(for: error)) Got Done has not cancelled pairing."
+                "\(Self.displayMessage(for: error)) Pairing has not been cancelled."
             return
         }
         pairingTask?.cancel()
@@ -1955,7 +2034,7 @@ final class SyncAppModel: ObservableObject {
                 }
                 failureCount += 1
                 errorMessage =
-                    "\(Self.displayMessage(for: error)) Got Done will retry this saved step."
+                    "\(Self.displayMessage(for: error)) This saved step will retry."
             }
             guard isCurrentPairingAttempt(attemptID) else {
                 return
@@ -3176,42 +3255,6 @@ final class SyncAppModel: ObservableObject {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
-    private func presentInboundArrivalCue(accepted: Int) {
-        guard accepted > 0 else {
-            return
-        }
-        inboundArrivalCue = accepted == 1
-            ? "New task from your other iPhone"
-            : "\(accepted) updates from your other iPhone"
-        inboundArrivalCueTask?.cancel()
-        inboundArrivalCueTask = Task { [weak self] in
-            try? await Task.sleep(
-                for: .seconds(ProductSyncPolicy.inboundArrivalCueDuration)
-            )
-            guard !Task.isCancelled else {
-                return
-            }
-            self?.inboundArrivalCue = nil
-            self?.inboundArrivalCueTask = nil
-        }
-        presentLastSyncConfidence()
-    }
-
-    private func presentLastSyncConfidence() {
-        lastSyncConfidenceText = "Updated just now"
-        lastSyncConfidenceTask?.cancel()
-        lastSyncConfidenceTask = Task { [weak self] in
-            try? await Task.sleep(
-                for: .seconds(ProductSyncPolicy.lastSyncConfidenceDuration)
-            )
-            guard !Task.isCancelled else {
-                return
-            }
-            self?.lastSyncConfidenceText = nil
-            self?.lastSyncConfidenceTask = nil
-        }
-    }
-
     private func pairingFailed(_ error: Error, attemptID: UUID) {
         guard pairingAttemptID == attemptID else {
             return
@@ -3230,7 +3273,7 @@ final class SyncAppModel: ObservableObject {
                 return
             }
             errorMessage =
-                "\(Self.displayMessage(for: error)) Got Done will retry this saved step."
+                "\(Self.displayMessage(for: error)) This saved step will retry."
             startPendingPairingFinalization()
             return
         }
@@ -3765,7 +3808,6 @@ final class SyncAppModel: ObservableObject {
                 if accepted > 0 {
                     lastMailboxReceivedAt = Date()
                     lastSyncedAt = Date()
-                    presentInboundArrivalCue(accepted: accepted)
                 }
                 try await mailboxTransport.acknowledge(
                     route: material.route,
@@ -4079,7 +4121,6 @@ final class SyncAppModel: ObservableObject {
             try requireActiveSync(credentials: credentials, socket: socket)
             if accepted > 0 {
                 lastSyncedAt = Date()
-                presentInboundArrivalCue(accepted: accepted)
             }
         case .acknowledgement:
             guard

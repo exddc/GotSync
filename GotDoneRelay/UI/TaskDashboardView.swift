@@ -6,6 +6,7 @@ struct TaskDashboardView: View {
     @Binding var isResetConfirmationPresented: Bool
     @Binding var isUnlinkConfirmationPresented: Bool
     let joinAction: () -> Void
+    var settingsAction: (() -> Void)? = nil
     @State private var draftTitle = ""
     @State private var pendingDeletion: PendingDeletion?
     @State private var deleteCommitTask: Task<Void, Never>?
@@ -30,7 +31,7 @@ struct TaskDashboardView: View {
                         .transition(
                             reduceMotion
                                 ? .opacity
-                                : .move(edge: .top).combined(with: .opacity)
+                                : .opacity.combined(with: .offset(y: -6))
                         )
                 } else if let notice = model.syncNotice {
                     SyncNoticeView(
@@ -42,28 +43,6 @@ struct TaskDashboardView: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 10)
                     .padding(.bottom, 8)
-                } else if let cue = model.inboundArrivalCue {
-                    SoftCueBanner(
-                        text: cue,
-                        systemImage: "iphone.badge.play"
-                    )
-                    .padding(.horizontal, 20)
-                    .padding(.top, 10)
-                    .padding(.bottom, 8)
-                    .transition(
-                        reduceMotion
-                            ? .opacity
-                            : .move(edge: .top).combined(with: .opacity)
-                    )
-                } else if let confidence = model.lastSyncConfidenceText {
-                    SoftCueBanner(
-                        text: confidence,
-                        systemImage: "checkmark.circle"
-                    )
-                    .padding(.horizontal, 20)
-                    .padding(.top, 8)
-                    .padding(.bottom, 4)
-                    .transition(.opacity)
                 }
             }
 
@@ -73,10 +52,11 @@ struct TaskDashboardView: View {
                 taskList
             }
         }
+        .background(SoftFieldBackground())
         .safeAreaInset(edge: .bottom) {
             taskComposer
         }
-        .navigationTitle("Got Done")
+        .navigationTitle(RelayTheme.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -123,8 +103,14 @@ struct TaskDashboardView: View {
                         #endif
                     }
 
+                    if let settingsAction {
+                        Button("Settings", systemImage: "gearshape") {
+                            settingsAction()
+                        }
+                    }
+
                     Button(
-                        "Erase Link and Local Tasks",
+                        "Erase all local data",
                         systemImage: "trash",
                         role: .destructive
                     ) {
@@ -132,8 +118,10 @@ struct TaskDashboardView: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(RelayTheme.inkMuted)
                 }
-                .accessibilityLabel("Private sync options")
+                .accessibilityLabel("Sync options")
             }
         }
         .sheet(isPresented: $isManageSyncPresented) {
@@ -196,7 +184,7 @@ struct TaskDashboardView: View {
                         }
                     )
                     .listRowInsets(
-                        EdgeInsets(top: 5, leading: 20, bottom: 5, trailing: 20)
+                        EdgeInsets(top: 4, leading: 20, bottom: 4, trailing: 20)
                     )
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -205,20 +193,17 @@ struct TaskDashboardView: View {
                 .onDelete(perform: stageDeletion)
             } header: {
                 HStack {
-                    Text(model.isPaired ? "Shared tasks" : "Local tasks")
+                    Text(model.isPaired ? "Shared demo tasks" : "On this phone")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(RelayTheme.inkMuted)
+                        .textCase(.uppercase)
+                        .tracking(1.2)
                     Spacer()
                     Text("\(visibleTasks.count)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(RelayTheme.inkMuted)
+                        .monospacedDigit()
                 }
-            } footer: {
-                Label(
-                    model.isPaired
-                        ? ProductSyncPolicy.deliverySummary
-                        : "New edits are not syncing and stay on this iPhone until you create a new private sync.",
-                    systemImage: model.isPaired ? "lock.fill" : "iphone"
-                )
-                .font(.footnote)
-                .textCase(nil)
-                .padding(.top, 6)
             }
         }
         .listStyle(.plain)
@@ -229,22 +214,42 @@ struct TaskDashboardView: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label(
-                model.isPaired ? "Nothing to sync yet" : "No visible tasks",
-                systemImage: "checkmark.circle"
-            )
-        } description: {
+        VStack(spacing: 14) {
+            Spacer(minLength: 24)
+
+            Image(systemName: model.isPaired ? "link" : "checklist")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(RelayTheme.accent)
+                .symbolRenderingMode(.monochrome)
+                .frame(width: 48, height: 48)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(RelayTheme.border, lineWidth: 1)
+                }
+                .accessibilityHidden(true)
+
+            Text(model.isPaired ? "READY TO SYNC" : "NO DEMO TASKS")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .tracking(1.4)
+                .foregroundStyle(RelayTheme.ink)
+
             Text(
                 model.isPaired
-                    ? "Add a task below. It is saved on this iPhone first, then appears on the other iPhone the next time that phone opens Got Done."
+                    ? "Add a demo task. Appears on linked phones when in sync."
                     : model.canEditLocalTasks
-                        ? "Add a local task below or create Private Sync for a replacement iPhone."
-                        : "Restart Got Done or erase local data to recover from the storage error."
+                        ? "Thin task list. The sync engine is the product. Add a task, or create a link."
+                        : "Restart Accountless Sync or erase local data to recover from the storage error."
             )
+            .font(.footnote)
+            .foregroundStyle(RelayTheme.inkMuted)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 12)
+
+            Spacer(minLength: 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 28)
+        .padding(.horizontal, 32)
     }
 
     private var taskComposer: some View {
@@ -257,14 +262,16 @@ struct TaskDashboardView: View {
                             : "\(pendingDeletion.taskIDs.count) tasks removed",
                         systemImage: "trash"
                     )
-                    .font(.subheadline.weight(.semibold))
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(RelayTheme.ink)
 
                     Spacer()
 
                     Button("Undo") {
                         undoDeletion()
                     }
-                    .font(.subheadline.weight(.bold))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(RelayTheme.accent)
                     .frame(minWidth: 44, minHeight: 44)
                     .accessibilityHint(
                         model.isPaired
@@ -273,18 +280,19 @@ struct TaskDashboardView: View {
                     )
                 }
                 .padding(.horizontal, 4)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .transition(.opacity)
             }
 
             HStack(spacing: 10) {
                 TextField(
-                    model.isPaired ? "Add a shared task" : "Add a local task",
+                    model.isPaired ? "New shared demo task" : "New demo task",
                     text: $draftTitle,
                     axis: .vertical
                 )
                     .lineLimit(1...3)
                     .submitLabel(.done)
                     .focused($composerIsFocused)
+                    .foregroundStyle(RelayTheme.ink)
                     .onSubmit(addTask)
                     .onChange(of: draftTitle) {
                         model.clearLocalEditError()
@@ -292,63 +300,94 @@ struct TaskDashboardView: View {
                     .accessibilityIdentifier("task-title-field")
 
                 Button(action: addTask) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 17, weight: .bold))
-                        .frame(width: 44, height: 44)
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(
+                            canSubmitDraft
+                                ? RelayTheme.onAccent
+                                : RelayTheme.inkMuted
+                        )
+                        .frame(width: 36, height: 36)
+                        .background {
+                            Circle()
+                                .fill(
+                                    canSubmitDraft
+                                        ? RelayTheme.accent
+                                        : RelayTheme.field
+                                )
+                                .overlay {
+                                    Circle()
+                                        .strokeBorder(
+                                            canSubmitDraft
+                                                ? Color.clear
+                                                : RelayTheme.border,
+                                            lineWidth: 1
+                                        )
+                                }
+                        }
                 }
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.circle)
-                .disabled(normalizedDraft.isEmpty)
+                .buttonStyle(.plain)
+                .disabled(!canSubmitDraft)
                 .accessibilityLabel("Add task")
                 .accessibilityIdentifier("add-task")
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .modifier(
+                GlassSurfaceModifier(
+                    cornerRadius: RelayTheme.cornerControl,
+                    interactive: true
+                )
+            )
             .disabled(!model.canEditLocalTasks)
 
             if let message = model.localEditErrorMessage {
                 Label(message, systemImage: "exclamationmark.circle.fill")
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(RelayTheme.danger)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(.regularMaterial)
-        .overlay(alignment: .top) {
-            Divider()
-        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
     }
 
     private var normalizedDraft: String {
         draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var canSubmitDraft: Bool {
+        !normalizedDraft.isEmpty && model.canEditLocalTasks
+    }
+
     private var localTasksNotice: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(
                 model.phase == .failed
-                    ? "Private Sync needs attention"
+                    ? "Link needs attention"
                     : "Not syncing",
                 systemImage: model.phase == .failed
                     ? "exclamationmark.triangle.fill"
                     : "iphone"
             )
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(RelayTheme.ink)
 
             if model.phase == .failed {
-                Text(model.errorMessage ?? "Private Sync could not continue.")
-                    .font(.subheadline)
-                    .foregroundStyle(.red)
+                Text(model.errorMessage ?? "Linking could not continue.")
+                    .font(.footnote)
+                    .foregroundStyle(RelayTheme.danger)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             Text(
                 model.canEditLocalTasks
-                    ? "Link ended or never started — tasks stay on this iPhone. Create Private Sync for a replacement phone, or join an invitation from your other iPhone."
-                    : "Local storage is unavailable, so these tasks cannot be edited right now. Restart Got Done or erase local data to start over."
+                    ? "Link ended or never started. Tasks stay on this phone. Create a link for a replacement, or join from your other iPhone."
+                    : "Local storage is unavailable. Restart Accountless Sync or erase local data to start over."
             )
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
+            .font(.footnote)
+            .foregroundStyle(RelayTheme.inkMuted)
             .fixedSize(horizontal: false, vertical: true)
 
             if model.canEditLocalTasks {
@@ -359,51 +398,40 @@ struct TaskDashboardView: View {
                         model.createPrivateSync()
                     }
                 } label: {
-                    Label(
+                    Text(
                         model.pairingRecoveryResetRequired
-                            ? "Keep Tasks · Reset Link"
+                            ? "Keep tasks · reset link"
                             : model.phase == .failed
-                                ? "Create Private Sync for Replacement"
-                                : "Create Private Sync",
-                        systemImage: "qrcode"
+                                ? "Create link for replacement"
+                                : "Create link"
                     )
+                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .pocPrimaryButtonStyle()
                 .controlSize(.large)
                 .disabled(pendingDeletion != nil)
-                .accessibilityHint(
-                    pendingDeletion == nil
-                        ? model.pairingRecoveryResetRequired
-                            ? "Keeps local tasks and asks before clearing damaged or unfinished sync recovery data."
-                            : "Creates a one-time invitation for a replacement iPhone."
-                        : "Undo the pending deletion or wait for it to finish first."
-                )
 
                 Button(action: joinAction) {
-                    Label("Join Existing Sync", systemImage: "viewfinder")
+                    Text("Join link")
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
+                .pocSecondaryButtonStyle()
                 .controlSize(.large)
                 .disabled(
                     pendingDeletion != nil || !model.canJoinExistingSync
                 )
-                .accessibilityHint(
-                    pendingDeletion == nil
-                        ? "Opens the phrase and QR code join options. If the task lists differ, local tasks stay here until you confirm how to combine them."
-                        : "Undo the pending deletion or wait for it to finish first."
-                )
             }
 
             if model.phase == .failed {
-                Button("Erase Local Data…", role: .destructive) {
+                Button("Erase local data…", role: .destructive) {
                     isResetConfirmationPresented = true
                 }
-                .buttonStyle(.bordered)
+                .pocSecondaryButtonStyle()
                 .controlSize(.large)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .relayCard()
+        .relayCard(padding: 14)
         .accessibilityElement(children: .contain)
     }
 
@@ -530,7 +558,7 @@ private struct RelayTaskRow: View {
     let deleteAction: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 14) {
             Button(action: toggleAction) {
                 completionIndicator
                     .frame(width: 44, height: 44)
@@ -544,21 +572,20 @@ private struct RelayTaskRow: View {
 
             Text(title)
                 .font(.body.weight(.medium))
-                .foregroundStyle(isCompleted ? .secondary : .primary)
-                .strikethrough(isCompleted, color: .secondary.opacity(0.6))
+                .foregroundStyle(isCompleted ? RelayTheme.inkMuted : RelayTheme.ink)
+                .strikethrough(isCompleted, color: RelayTheme.inkMuted.opacity(0.7))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(12)
-        .frame(minHeight: 58)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(RelayTheme.card)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(minHeight: 56)
+        .modifier(
+            GlassSurfaceModifier(
+                cornerRadius: RelayTheme.cornerRow,
+                interactive: isEditable
+            )
         )
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(RelayTheme.border, lineWidth: 1)
-        }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: "Delete") {
             if isEditable {
@@ -573,14 +600,16 @@ private struct RelayTaskRow: View {
         if isCompleted {
             ZStack {
                 Circle()
-                    .fill(RelayTheme.success)
+                    .fill(RelayTheme.accent)
                 Image(systemName: "checkmark")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(RelayTheme.onAccent)
             }
+            .frame(width: 24, height: 24)
         } else {
             Circle()
-                .strokeBorder(.secondary, lineWidth: 1.6)
+                .strokeBorder(RelayTheme.inkMuted.opacity(0.55), lineWidth: 1.5)
+                .frame(width: 24, height: 24)
         }
     }
 
@@ -605,31 +634,12 @@ private struct PendingDeletion: Equatable, Identifiable {
 
 private struct LinkCompleteBanner: View {
     var body: some View {
-        Label("Private Sync is on", systemImage: "checkmark.seal.fill")
-            .font(.headline)
-            .foregroundStyle(RelayTheme.success)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .relayCard()
-            .accessibilityIdentifier("link-complete-banner")
-    }
-}
-
-private struct SoftCueBanner: View {
-    let text: String
-    let systemImage: String
-
-    var body: some View {
-        Label(text, systemImage: systemImage)
+        Label("Link is live", systemImage: "checkmark.circle.fill")
             .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(RelayTheme.accent)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(RelayTheme.card)
-            )
-            .accessibilityIdentifier("soft-sync-cue")
+            .relayCard(padding: 14)
+            .accessibilityIdentifier("link-complete-banner")
     }
 }
 
@@ -647,20 +657,23 @@ struct SupportStatusSheet: View {
                     Text(summary.pendingLine)
                     Text(summary.localEditLine)
                 }
-                Section("When does the other iPhone see edits?") {
+                Section("When do other phones see edits?") {
                     Text(summary.deliveryDetail)
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RelayTheme.inkMuted)
                 }
                 Section {
                     Text(ProductSyncPolicy.multiDeviceBoundary)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RelayTheme.inkMuted)
                     if model.isPaired {
                         Text(model.manageSyncStatusLine)
                             .font(.footnote)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(RelayTheme.inkMuted)
                     }
+                    Text(RelayTheme.proofLabel)
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(RelayTheme.inkMuted)
                 }
             }
             .navigationTitle("Sync status")
@@ -674,3 +687,58 @@ struct SupportStatusSheet: View {
         .presentationDetents([.medium, .large])
     }
 }
+
+#if DEBUG
+#Preview("Dashboard empty") {
+    @Previewable @StateObject var model = PreviewSupport.model()
+    NavigationStack {
+        TaskDashboardView(
+            model: model,
+            isResetConfirmationPresented: .constant(false),
+            isUnlinkConfirmationPresented: .constant(false),
+            joinAction: {}
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Dashboard with tasks") {
+    @Previewable @StateObject var model = PreviewSupport.model(
+        seedTaskTitles: ["Buy milk", "Ship TW-303", "Review design"]
+    )
+    NavigationStack {
+        TaskDashboardView(
+            model: model,
+            isResetConfirmationPresented: .constant(false),
+            isUnlinkConfirmationPresented: .constant(false),
+            joinAction: {}
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Dashboard linked") {
+    @Previewable @StateObject var model = PreviewSupport.model(
+        seedTaskTitles: ["Shared task"],
+        seedPairedGroupMemberCount: 3
+    )
+    NavigationStack {
+        TaskDashboardView(
+            model: model,
+            isResetConfirmationPresented: .constant(false),
+            isUnlinkConfirmationPresented: .constant(false),
+            joinAction: {}
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Support status") {
+    @Previewable @StateObject var model = PreviewSupport.model(
+        seedPairedGroupMemberCount: 2
+    )
+    SupportStatusSheet(model: model)
+        .preferredColorScheme(.dark)
+}
+#endif
+

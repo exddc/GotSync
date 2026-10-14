@@ -4,50 +4,67 @@ struct WelcomeView: View {
     @ObservedObject var model: SyncAppModel
     let joinAction: () -> Void
     let eraseAction: () -> Void
+    var settingsAction: (() -> Void)? = nil
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Your tasks.")
-                        .font(.system(.title, design: .rounded, weight: .regular))
-                    Text("On your devices.")
-                        .font(.system(.title, design: .rounded, weight: .regular))
-                    Text("No account.")
-                        .font(.system(.title, design: .rounded, weight: .black))
-                        .foregroundStyle(RelayTheme.accent)
+        VStack {
+            VStack(alignment: .leading, spacing: 28) {
+                HStack {
+                    Spacer(minLength: 0)
+                    if let settingsAction {
+                        Button(action: settingsAction) {
+                            Image(systemName: "gearshape")
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(RelayTheme.inkMuted)
+                                .frame(minWidth: 44, minHeight: 44)
+                        }
+                        .accessibilityLabel("Settings")
+                        .accessibilityIdentifier("open-settings")
+                    }
                 }
-                .padding(.top, 12)
-                .accessibilityElement(children: .combine)
+                .padding(.top, 8)
 
-                Text(
-                    "Link up to \(ProductSyncPolicy.maxDevices) iPhones with a one-time QR code or phrase. Changes travel end-to-end encrypted. \(ProductSyncPolicy.deliverySummary)"
-                )
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Sync without\nan account.")
+                        .font(.largeTitle.bold())
+                        .tracking(-0.8)
+                        .foregroundStyle(RelayTheme.ink)
+                        .lineSpacing(0)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text(
+                        "Limited demo · up to \(ProductSyncPolicy.maxDevices) devices · E2E sync"
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(RelayTheme.inkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                
+                Spacer()
 
                 VStack(spacing: 10) {
                     Button {
                         model.createPrivateSync()
                     } label: {
-                        Label("Create Private Sync", systemImage: "qrcode")
-                            .font(.headline)
+                        Text("Create link")
+                            .font(.subheadline.weight(.semibold))
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 3)
+                            .padding(.vertical, 4)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .pocPrimaryButtonStyle()
                     .controlSize(.large)
                     .accessibilityIdentifier("create-private-sync")
                     .accessibilityHint("Creates a one-time invitation on this iPhone.")
 
                     Button(action: joinAction) {
-                        Label("Join Existing Sync", systemImage: "viewfinder")
-                            .font(.headline)
+                        Text("Join link")
+                            .font(.subheadline.weight(.semibold))
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 3)
+                            .padding(.vertical, 4)
                     }
-                    .buttonStyle(.bordered)
+                    .pocSecondaryButtonStyle()
                     .controlSize(.large)
                     .disabled(!model.canJoinExistingSync)
                     .accessibilityIdentifier("join-private-sync")
@@ -60,12 +77,13 @@ struct WelcomeView: View {
 
                 if !model.tasks.isEmpty {
                     Label(
-                        "\(model.tasks.count) local \(model.tasks.count == 1 ? "task is" : "tasks are") still saved here. To link a replacement phone without losing \(model.tasks.count == 1 ? "it" : "them"), create Private Sync on this iPhone.",
+                        "\(model.tasks.count) local \(model.tasks.count == 1 ? "task is" : "tasks are") still on this phone. Create a link here to bring a replacement phone in without losing \(model.tasks.count == 1 ? "it" : "them").",
                         systemImage: "iphone.and.arrow.forward"
                     )
-                    .font(.subheadline)
+                    .font(.footnote)
+                    .foregroundStyle(RelayTheme.inkMuted)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .relayCard()
+                    .relayCard(padding: 14)
                     .accessibilityElement(children: .combine)
                 }
 
@@ -73,44 +91,85 @@ struct WelcomeView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Label(
                             model.errorMessage
-                                ?? "Private Sync could not continue. Your tasks are still safe if any were saved here.",
+                                ?? "Linking could not continue. Tasks already on this phone are still safe.",
                             systemImage: "exclamationmark.triangle.fill"
                         )
                         .font(.subheadline)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(RelayTheme.danger)
 
-                        Button("Create Private Sync") {
+                        Button("Create link") {
                             model.createPrivateSync()
                         }
-                        .buttonStyle(.borderedProminent)
+                        .pocPrimaryButtonStyle()
                         .controlSize(.large)
 
-                        Button("Erase Local Data…", role: .destructive) {
+                        Button("Erase local data…", role: .destructive) {
                             eraseAction()
                         }
-                        .buttonStyle(.bordered)
+                        .pocSecondaryButtonStyle()
                         .controlSize(.large)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .relayCard()
+                    .relayCard(padding: 14)
                 }
 
-                PrivacyDisclosureView()
-
-                Label(
-                    ProductSyncPolicy.pairingKeepOpenSummary,
-                    systemImage: "iphone.gen3.radiowaves.left.and.right"
-                )
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .multilineTextAlignment(.center)
-                .padding(.bottom, 12)
+                Text(ProductSyncPolicy.pairingKeepOpenSummary)
+                    .font(RelayTheme.monoCaption)
+                    .foregroundStyle(RelayTheme.inkMuted)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.bottom, 24)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 24)
         }
         .scrollIndicators(.hidden)
-        .navigationTitle("Got Done")
+        .background(SoftFieldBackground())
+        .preferredColorScheme(.dark)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
     }
 }
+
+struct POCGlassGroup<Content: View>: View {
+    var spacing: CGFloat = 24
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        if #available(iOS 26, *) {
+            GlassEffectContainer(spacing: spacing) {
+                content()
+            }
+        } else {
+            content()
+        }
+    }
+}
+
+#if DEBUG
+#Preview("Welcome") {
+    @Previewable @StateObject var model = PreviewSupport.model()
+    NavigationStack {
+        WelcomeView(
+            model: model,
+            joinAction: {},
+            eraseAction: {}
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Welcome · local tasks") {
+    @Previewable @StateObject var model = PreviewSupport.model(
+        seedTaskTitles: ["Buy milk", "Ship demo"]
+    )
+    NavigationStack {
+        WelcomeView(
+            model: model,
+            joinAction: {},
+            eraseAction: {}
+        )
+    }
+    .preferredColorScheme(.dark)
+}
+#endif
+
