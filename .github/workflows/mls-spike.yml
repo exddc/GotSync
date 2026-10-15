@@ -1,0 +1,24 @@
+name: MLS spike
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  apple:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: astral-sh/setup-uv@v6
+      - name: Build Apple XCFramework and Swift bindings
+        run: scripts/build-mls.sh
+      - name: Compile Swift for iOS and test on simulator
+        run: scripts/test-mls-ios.sh
+      - name: Test MLS against real delivery service
+        run: scripts/test-mls.sh
+      - name: Verify existing sync behavior
+        run: scripts/test-integration.sh

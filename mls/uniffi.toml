@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "GotSyncMLSBindings"
+ffi_module_name = "gotsync_mlsFFI"
+generate_module_map = true

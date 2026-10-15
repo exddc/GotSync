@@ -1,0 +1,12 @@
+[package]
+name = "gotsync-mls-rs-comparison"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+mls-rs = { version = "=0.56.0", default-features = false, features = ["std", "rfc_compliant"] }
+mls-rs-crypto-rustcrypto = "=0.22.1"
