@@ -50,7 +50,10 @@ enum ProductSyncPolicy {
         "Keep both apps open while you pair the first time. Pairing windows last 15 minutes."
 
     static let multiDeviceBoundary =
-        "You can link up to \(maxDevices) iPhones on one shared link. There is no account recovery if every phone is lost."
+        "You can link up to \(maxDevices) iPhones on one shared link. \(dataRecoveryDisclosure)"
+
+    static let dataRecoveryDisclosure =
+        "If every linked phone is lost, your synced tasks are permanently lost. There is no recovery option."
 
     /// C1 product honesty: co-members share full task access for this sync.
     static let sharedAccessDisclosure =
