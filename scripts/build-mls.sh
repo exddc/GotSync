@@ -3,6 +3,7 @@ set -euo pipefail
 source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
 export CARGO_TARGET_DIR="$GOTSYNC_CACHE_DIR/rust-mls"
+python3 scripts/package-mls.py --record-inputs
 GOTSYNC_MLS_PACKAGE="$GOTSYNC_REPO_ROOT/Packages/GotSyncMLS"
 GOTSYNC_MLS_GENERATED="$GOTSYNC_CACHE_DIR/mls-bindings"
 GOTSYNC_MLS_ARTIFACTS="$GOTSYNC_MLS_PACKAGE/Artifacts"
@@ -30,4 +31,5 @@ for target in "${GOTSYNC_MLS_TARGETS[@]}"; do
 done
 rm -rf "$GOTSYNC_MLS_ARTIFACTS/GotSyncMLSFFI.xcframework"
 xcodebuild -create-xcframework "${GOTSYNC_MLS_XCARGS[@]}" -output "$GOTSYNC_MLS_ARTIFACTS/GotSyncMLSFFI.xcframework"
+python3 scripts/package-mls.py --record-build
 touch "$GOTSYNC_MLS_ARTIFACTS/.built"

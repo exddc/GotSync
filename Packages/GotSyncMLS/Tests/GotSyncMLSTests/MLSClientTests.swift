@@ -78,12 +78,13 @@ final class MLSClientTests: XCTestCase {
         guard let endpoint = ProcessInfo.processInfo.environment["GOTSYNC_MLS_URL"], let url = URL(string: endpoint) else {
             throw XCTSkip("Run scripts/test-mls.sh for the real relay test")
         }
-        let relay = SpikeRelay(url: url)
         let alice = try client(1)
+        let relay = SpikeRelay(url: url, authorization: try await alice.transportAuthorization())
         let bob = try client(2)
         let charlie = try client(3)
         let group = UUID().uuidString.data(using: .utf8)!.prefix(32)
         try await alice.createGroup(id: group)
+        _ = try await relay.post("create", ["group": group.b64], authorization: alice.transportAuthorization())
         let unpublished = try await bob.joiningIdentity()
         let refusedAdd = try await alice.prepareAdd(keyPackage: unpublished.keyPackage, verifiedFingerprint: unpublished.fingerprint, reference: Data(SHA256.hash(data: unpublished.keyPackage)))
         do {
@@ -97,7 +98,7 @@ final class MLSClientTests: XCTestCase {
 
         func add(_ joining: MLSClient, observers: [MLSClient]) async throws {
             let identity = try await joining.joiningIdentity()
-            let reference = try await relay.publish(identity.keyPackage)
+            let reference = try await relay.publish(identity.keyPackage, writer: joining.transportAuthorization())
             let fetched = try await relay.keyPackage(reference)
             XCTAssertEqual(fetched, identity.keyPackage)
             let pending = try await alice.prepareAdd(keyPackage: fetched, verifiedFingerprint: identity.fingerprint, reference: reference)
@@ -117,7 +118,7 @@ final class MLSClientTests: XCTestCase {
         let fromAlice = try await alice.prepareMessage(Data("from Alice".utf8))
         let fromBob = try await bob.prepareMessage(Data("from Bob".utf8))
         _ = try await relay.append(fromAlice)
-        _ = try await relay.append(fromBob)
+        _ = try await relay.append(fromBob, authorization: bob.transportAuthorization())
         try await catchUp(alice, group: group, relay: relay)
         try await catchUp(bob, group: group, relay: relay)
         try await catchUp(charlie, group: group, relay: relay)
@@ -138,9 +139,11 @@ final class MLSClientTests: XCTestCase {
         let compromised = try MLSClient(directory: compromisedDirectory, deviceID: Data(repeating: 2, count: 16))
         let pending = try await alice.prepareRemove(fingerprint: bob.fingerprint())
         let competing = try await charlie.prepareRemove(fingerprint: bob.fingerprint())
+        let bobWriter = try await alice.members().first { $0.deviceID == Data(repeating: 2, count: 16) }
+        XCTAssertEqual(pending.removeWriter, try XCTUnwrap(bobWriter).writerHash)
         _ = try await relay.append(pending)
         do {
-            _ = try await relay.append(competing)
+            _ = try await relay.append(competing, authorization: charlie.transportAuthorization())
             XCTFail("Relay accepted two commits at one epoch")
         } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 409) }
         try await catchUp(alice, group: group, relay: relay)
@@ -161,9 +164,9 @@ final class MLSClientTests: XCTestCase {
         XCTAssertFalse(compromisedInbox.contains { $0.plaintext == Data("new epoch".utf8) })
         let stale = try await compromised.prepareRemove(fingerprint: charlie.fingerprint())
         do {
-            _ = try await relay.append(stale)
+            _ = try await relay.append(stale, authorization: compromised.transportAuthorization())
             XCTFail("Relay accepted stale commit")
-        } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 409) }
+        } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 403) }
     }
 
     private func paired() async throws -> (MLSClient, MLSClient, Data) {
@@ -312,12 +315,14 @@ private struct SpikeRelay {
         let epoch: UInt64?
     }
     let url: URL
+    let authorization: Data
 
-    func post(_ operation: String, _ values: [String: Any]) async throws -> [String: Any] {
+    func post(_ operation: String, _ values: [String: Any], authorization: Data? = nil) async throws -> [String: Any] {
         var request = URLRequest(url: url.appendingPathComponent(operation))
         request.httpMethod = "POST"
         request.timeoutInterval = 5
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let authorization { request.setValue("Bearer \(authorization.b64)", forHTTPHeaderField: "Authorization") }
         request.httpBody = try JSONSerialization.data(withJSONObject: values.merging(["version": 2]) { _, new in new })
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as! HTTPURLResponse).statusCode
@@ -325,17 +330,19 @@ private struct SpikeRelay {
         guard status == 200 else { throw Error(status: status, code: document["error"] as? String, epoch: document["epoch"] as? UInt64) }
         return document
     }
-    func publish(_ payload: Data) async throws -> Data {
-        try await decode(post("key-package/publish", ["payload": payload.b64])["reference"])
+    func publish(_ payload: Data, writer: Data) async throws -> Data {
+        try await decode(post("key-package/publish", ["payload": payload.b64], authorization: writer)["reference"])
     }
     func keyPackage(_ reference: Data) async throws -> Data {
         try await decode(post("key-package/fetch", ["reference": reference.b64])["payload"])
     }
-    func append(_ delivery: MLSDelivery) async throws -> UInt64 {
+    func append(_ delivery: MLSDelivery, authorization: Data? = nil) async throws -> UInt64 {
         var values: [String: Any] = ["group": delivery.group.b64, "epoch": delivery.epoch, "kind": delivery.kind.rawValue, "payload": delivery.payload.b64]
         values["welcome"] = delivery.welcome?.b64
         values["reference"] = delivery.keyPackageReference?.b64
-        let response = try await post("append", values)
+        values["removeWriter"] = delivery.removeWriter?.b64
+        values["addWriter"] = delivery.addWriter?.b64
+        let response = try await post("append", values, authorization: authorization ?? self.authorization)
         return (response["entry"] as! [String: Any])["cursor"] as! UInt64
     }
     func fetch(group: Data, after: UInt64) async throws -> (MLSDelivery, UInt64)? {

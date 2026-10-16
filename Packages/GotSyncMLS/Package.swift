@@ -7,9 +7,8 @@ let package = Package(
     products: [.library(name: "GotSyncMLS", targets: ["GotSyncMLS"])],
     targets: [
         .binaryTarget(name: "gotsync_mlsFFI", path: "Artifacts/GotSyncMLSFFI.xcframework"),
-        .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3"),
         .target(name: "GotSyncMLSBindings", dependencies: ["gotsync_mlsFFI"]),
-        .target(name: "GotSyncMLS", dependencies: ["GotSyncMLSBindings", "CSQLite"]),
+        .target(name: "GotSyncMLS", dependencies: ["GotSyncMLSBindings"]),
         .executableTarget(name: "MLSSmoke", dependencies: ["GotSyncMLS"]),
         .executableTarget(name: "BaselineSmoke"),
         .testTarget(name: "GotSyncMLSTests", dependencies: ["GotSyncMLS", "GotSyncMLSBindings"]),

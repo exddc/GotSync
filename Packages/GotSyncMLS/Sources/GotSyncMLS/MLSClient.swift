@@ -22,14 +22,18 @@ public struct MLSDelivery: Codable, Equatable, Sendable {
     public let payload: Data
     public let welcome: Data?
     public let keyPackageReference: Data?
+    public let addWriter: Data?
+    public let removeWriter: Data?
 
-    public init(group: Data, epoch: UInt64, kind: Kind, payload: Data, welcome: Data? = nil, keyPackageReference: Data? = nil) {
+    public init(group: Data, epoch: UInt64, kind: Kind, payload: Data, welcome: Data? = nil, keyPackageReference: Data? = nil, addWriter: Data? = nil, removeWriter: Data? = nil) {
         self.group = group
         self.epoch = epoch
         self.kind = kind
         self.payload = payload
         self.welcome = welcome
         self.keyPackageReference = keyPackageReference
+        self.addWriter = addWriter
+        self.removeWriter = removeWriter
     }
 }
 
@@ -39,10 +43,17 @@ public struct MLSInboxMessage: Codable, Equatable, Sendable {
     public let plaintext: Data
 }
 
+public struct MLSMember: Equatable, Sendable {
+    public let deviceID: Data
+    public let fingerprint: Data
+    public let writerHash: Data
+}
+
 struct ClientRecord: Codable {
     var state: Data
     var deviceID: Data
     var identity: IdentityRecord
+    var writerToken: Data
     var group: Data?
     var epoch: UInt64 = 0
     var cursor: UInt64 = 0
@@ -71,7 +82,8 @@ public actor MLSClient {
                 let identity = try createIdentity(deviceId: deviceID)
                 record = ClientRecord(
                     state: Data(identity.state), deviceID: deviceID,
-                    identity: IdentityRecord(keyPackage: Data(identity.keyPackage), fingerprint: Data(identity.fingerprint))
+                    identity: IdentityRecord(keyPackage: Data(identity.keyPackage), fingerprint: Data(identity.fingerprint)),
+                    writerToken: Data(identity.writerToken)
                 )
             }
         }
@@ -84,6 +96,16 @@ public actor MLSClient {
     }
 
     public func fingerprint() throws -> Data { try store.read().identity.fingerprint }
+    public func transportAuthorization() throws -> Data {
+        let record = try store.read()
+        guard !record.removed, record.writerToken.count == 32 else { throw MLSClientError.invalidState }
+        return record.writerToken
+    }
+    public func members() throws -> [MLSMember] {
+        try GotSyncMLSBindings.members(state: store.read().state).map {
+            MLSMember(deviceID: $0.deviceId, fingerprint: $0.fingerprint, writerHash: $0.writerHash)
+        }
+    }
     public func cursor() throws -> UInt64 { try store.read().cursor }
     public func epoch() throws -> UInt64 { try store.read().epoch }
     public func pendingDelivery() throws -> MLSDelivery? { try store.read().pending }
@@ -106,7 +128,7 @@ public actor MLSClient {
             guard record.pending == nil, reference == Data(SHA256.hash(data: keyPackage)) else { throw MLSClientError.invalidState }
             let transition = try GotSyncMLSBindings.prepareAdd(state: record.state, keyPackage: keyPackage, verifiedFingerprint: verifiedFingerprint)
             Self.apply(transition, to: &record)
-            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output), welcome: transition.welcome, keyPackageReference: reference)
+            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output), welcome: transition.welcome, keyPackageReference: reference, addWriter: transition.addedWriter)
             record.pending = delivery
             return delivery
         }
@@ -117,7 +139,7 @@ public actor MLSClient {
             guard record.pending == nil else { throw MLSClientError.invalidState }
             let transition = try GotSyncMLSBindings.prepareRemove(state: record.state, memberFingerprint: fingerprint)
             Self.apply(transition, to: &record)
-            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output), welcome: nil, keyPackageReference: nil)
+            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output), removeWriter: transition.removedWriter)
             record.pending = delivery
             return delivery
         }
@@ -186,6 +208,7 @@ public actor MLSClient {
                 if transition.removed {
                     record.removed = true
                     record.state = Data()
+                    record.writerToken = Data()
                     record.pending = nil
                     record.pendingPlaintext = nil
                 } else if let retryPlaintext {

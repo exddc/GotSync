@@ -1,4 +1,4 @@
-import CSQLite
+import SQLite3
 import Foundation
 
 final class MLSStore {

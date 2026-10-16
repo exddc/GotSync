@@ -5,9 +5,11 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::random::OpenMlsRand;
 use openmls_traits::storage::StorageProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
@@ -54,6 +56,8 @@ pub struct MlsTransition {
     pub epoch: u64,
     pub sender: Option<Vec<u8>>,
     pub removed: bool,
+    pub added_writer: Option<Vec<u8>>,
+    pub removed_writer: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record)]
@@ -61,6 +65,52 @@ pub struct MlsIdentity {
     pub state: Vec<u8>,
     pub key_package: Vec<u8>,
     pub fingerprint: Vec<u8>,
+    pub writer_token: Vec<u8>,
+}
+
+#[derive(uniffi::Record)]
+pub struct MlsMember {
+    pub device_id: Vec<u8>,
+    pub fingerprint: Vec<u8>,
+    pub writer_hash: Vec<u8>,
+}
+
+fn roster(group: &MlsGroup) -> Result<Vec<MlsMember>> {
+    let mut identities = HashSet::new();
+    let mut keys = HashSet::new();
+    let mut writers = HashSet::new();
+    let mut members = Vec::new();
+    for member in group.members() {
+        let credential =
+            BasicCredential::try_from(member.credential).map_err(|_| MlsError::InvalidInput)?;
+        let identity = credential.identity();
+        if identity.len() != 48 {
+            return Err(MlsError::InvalidInput);
+        }
+        let device_id = identity[..16].to_vec();
+        let writer_hash = identity[16..].to_vec();
+        if !writers.insert(writer_hash.clone())
+            || member.signature_key.len() != 32
+            || !identities.insert(device_id.clone())
+            || !keys.insert(member.signature_key.clone())
+        {
+            return Err(MlsError::InvalidInput);
+        }
+        members.push(MlsMember {
+            device_id,
+            fingerprint: key_fingerprint(&member.signature_key),
+            writer_hash,
+        });
+    }
+    if members.is_empty() || members.len() > 8 {
+        return Err(MlsError::InvalidInput);
+    }
+    Ok(members)
+}
+
+#[uniffi::export]
+pub fn members(state: Vec<u8>) -> Result<Vec<MlsMember>> {
+    roster(&Client::load(state)?.group()?)
 }
 
 struct Client {
@@ -77,7 +127,7 @@ impl Client {
         }
         let mut snapshot: Snapshot =
             serde_json::from_slice(&bytes).map_err(|_| MlsError::InvalidInput)?;
-        if snapshot.version != 2 || snapshot.identity.len() != 16 || snapshot.public_key.len() != 32
+        if snapshot.version != 3 || snapshot.identity.len() != 48 || snapshot.public_key.len() != 32
         {
             return Err(MlsError::InvalidInput);
         }
@@ -156,6 +206,8 @@ impl Client {
             epoch,
             sender,
             removed,
+            added_writer: None,
+            removed_writer: None,
         })
     }
 
@@ -202,14 +254,17 @@ pub fn create_identity(device_id: Vec<u8>) -> Result<MlsIdentity> {
         return Err(MlsError::InvalidInput);
     }
     let provider = OpenMlsRustCrypto::default();
+    let writer_token = protocol(provider.rand().random_vec(32))?;
+    let mut identity = device_id;
+    identity.extend_from_slice(&Sha256::digest(&writer_token));
     let signer = protocol(SignatureKeyPair::new(SUITE.signature_algorithm()))?;
     protocol(signer.store(provider.storage()))?;
     let public_key = signer.to_public_vec();
     let fingerprint = key_fingerprint(&public_key);
     let mut client = Client {
         snapshot: Snapshot {
-            version: 2,
-            identity: device_id,
+            version: 3,
+            identity,
             public_key,
             group_id: None,
             pending_commit: None,
@@ -232,6 +287,7 @@ pub fn create_identity(device_id: Vec<u8>) -> Result<MlsIdentity> {
         state: transition.state,
         key_package,
         fingerprint,
+        writer_token,
     })
 }
 
@@ -277,15 +333,27 @@ pub fn prepare_add(
     let kp =
         KeyPackageIn::tls_deserialize_exact(key_package).map_err(|_| MlsError::InvalidInput)?;
     let kp = protocol(kp.validate(client.provider.crypto(), ProtocolVersion::Mls10))?;
+    if BasicCredential::try_from(kp.leaf_node().credential().clone())
+        .map_err(|_| MlsError::InvalidInput)?
+        .identity()
+        .len()
+        != 48
+    {
+        return Err(MlsError::InvalidInput);
+    }
     verify_key(
         kp.leaf_node().signature_key().as_slice(),
         &verified_fingerprint,
     )?;
     let mut group = client.group()?;
+    let writer_hash = kp.leaf_node().credential().serialized_content()[16..].to_vec();
     if group.members().count() >= 8
         || group.members().any(|m| {
             m.signature_key == kp.leaf_node().signature_key().as_slice()
-                || m.credential == *kp.leaf_node().credential()
+                || m.credential.serialized_content()[..16]
+                    == kp.leaf_node().credential().serialized_content()[..16]
+                || m.credential.serialized_content()[16..]
+                    == kp.leaf_node().credential().serialized_content()[16..]
         })
     {
         return Err(MlsError::InvalidState);
@@ -294,7 +362,9 @@ pub fn prepare_add(
         protocol(group.add_members(&client.provider, &client.signer, &[kp]))?;
     let commit = encode(&commit)?;
     client.snapshot.pending_commit = Some(commit.clone());
-    client.save(commit, Some(encode(&welcome)?), Some(&group), None, false)
+    let mut transition = client.save(commit, Some(encode(&welcome)?), Some(&group), None, false)?;
+    transition.added_writer = Some(writer_hash);
+    Ok(transition)
 }
 
 #[uniffi::export]
@@ -309,11 +379,14 @@ pub fn prepare_remove(state: Vec<u8>, member_fingerprint: Vec<u8>) -> Result<Mls
     if member.index == group.own_leaf_index() {
         return Err(MlsError::InvalidInput);
     }
+    let writer_hash = member.credential.serialized_content()[16..].to_vec();
     let (commit, _, _) =
         protocol(group.remove_members(&client.provider, &client.signer, &[member.index]))?;
     let commit = encode(&commit)?;
     client.snapshot.pending_commit = Some(commit.clone());
-    client.save(commit, None, Some(&group), None, false)
+    let mut transition = client.save(commit, None, Some(&group), None, false)?;
+    transition.removed_writer = Some(writer_hash);
+    Ok(transition)
 }
 
 #[uniffi::export]
@@ -324,6 +397,7 @@ pub fn accept_commit(state: Vec<u8>, accepted_commit: Vec<u8>) -> Result<MlsTran
     }
     let mut group = client.group()?;
     protocol(group.merge_pending_commit(&client.provider))?;
+    roster(&group)?;
     client.snapshot.pending_commit = None;
     client.save(vec![], None, Some(&group), None, false)
 }
@@ -367,6 +441,7 @@ pub fn join_group(
         &inviter_fingerprint,
     )?;
     let group = protocol(staged.into_group(&client.provider))?;
+    roster(&group)?;
     if group.group_id().as_slice() != expected_group_id {
         return Err(MlsError::InvalidInput);
     }
@@ -415,11 +490,110 @@ pub fn receive_message(state: Vec<u8>, message: Vec<u8>) -> Result<MlsTransition
             false,
         ),
         ProcessedMessageContent::StagedCommitMessage(commit) => {
+            if commit.queued_proposals().any(|queued| {
+                !matches!(
+                    queued.proposal(),
+                    Proposal::Add(_) | Proposal::Remove(_) | Proposal::Update(_)
+                )
+            }) {
+                return Err(MlsError::InvalidInput);
+            }
+            let removed_indices: HashSet<_> = commit
+                .remove_proposals()
+                .map(|proposal| proposal.remove_proposal().removed())
+                .collect();
+            let retained: Vec<_> = group
+                .members()
+                .filter(|member| !removed_indices.contains(&member.index))
+                .map(|member| (member.index, member.credential))
+                .collect();
             let removed = commit.self_removed();
             protocol(group.merge_staged_commit(&client.provider, *commit))?;
+            roster(&group)?;
+            for member in group.members() {
+                if retained.iter().any(|(index, credential)| {
+                    *index == member.index && *credential != member.credential
+                }) {
+                    return Err(MlsError::InvalidInput);
+                }
+            }
             client.snapshot.pending_commit = None;
             client.save(vec![], None, Some(&group), None, removed)
         }
         _ => Err(MlsError::InvalidInput),
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn unchecked_add(state: Vec<u8>, key_package: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+        let client = Client::load(state).unwrap();
+        let mut group = client.group().unwrap();
+        let kp = KeyPackageIn::tls_deserialize_exact(key_package)
+            .unwrap()
+            .validate(client.provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
+        let (commit, _, _) = group
+            .add_members(&client.provider, &client.signer, &[kp])
+            .unwrap();
+        group.merge_pending_commit(&client.provider).unwrap();
+        let transition = client
+            .save(encode(&commit).unwrap(), None, Some(&group), None, false)
+            .unwrap();
+        (transition.state, transition.output)
+    }
+
+    #[test]
+    fn received_duplicate_identity_and_ninth_member_are_rejected() {
+        let alice = create_identity(vec![1; 16]).unwrap();
+        let bob = create_identity(vec![2; 16]).unwrap();
+        let group = create_group(alice.state, vec![7; 32]).unwrap();
+        let pending = prepare_add(group.state, bob.key_package, bob.fingerprint).unwrap();
+        let mut receiver = join_group(
+            bob.state,
+            pending.welcome.unwrap(),
+            vec![7; 32],
+            alice.fingerprint,
+        )
+        .unwrap()
+        .state;
+        let mut sender = accept_commit(pending.state, pending.output).unwrap().state;
+        let mut attacker = Client::load(sender.clone()).unwrap();
+        attacker.snapshot.identity[0] ^= 0xff;
+        let mut changed = attacker.group().unwrap();
+        let update = changed
+            .self_update(
+                &attacker.provider,
+                &attacker.signer,
+                LeafNodeParameters::builder()
+                    .with_credential_with_key(attacker.credential())
+                    .build(),
+            )
+            .unwrap();
+        assert!(matches!(
+            receive_message(receiver.clone(), encode(update.commit()).unwrap()),
+            Err(MlsError::InvalidInput)
+        ));
+        let duplicate = create_identity(vec![2; 16]).unwrap();
+        let (_, invalid) = unchecked_add(sender.clone(), duplicate.key_package);
+        assert!(matches!(
+            receive_message(receiver.clone(), invalid),
+            Err(MlsError::InvalidInput)
+        ));
+        for id in 3..=8 {
+            let joiner = create_identity(vec![id; 16]).unwrap();
+            let (next, commit) = unchecked_add(sender, joiner.key_package);
+            receiver = receive_message(receiver, commit).unwrap().state;
+            sender = next;
+        }
+        assert_eq!(members(receiver.clone()).unwrap().len(), 8);
+        let ninth = create_identity(vec![9; 16]).unwrap();
+        let (_, invalid) = unchecked_add(sender, ninth.key_package);
+        assert!(matches!(
+            receive_message(receiver, invalid),
+            Err(MlsError::InvalidInput)
+        ));
     }
 }

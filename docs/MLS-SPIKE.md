@@ -14,9 +14,9 @@ UniFFI 0.32.2 generates synchronous Swift bindings that compile in Swift 6 mode.
 The wrapper supports a group, verified admission, removal, pending commits,
 and durable application delivery without defining cryptographic primitives.
 
-The alternative comparison uses mls-rs 0.56.0 with its RustCrypto provider.
-The checked-in comparison pairs two clients and delivers an application
-message on the host; its library also cross-compiles for arm64 iOS. This is a
+The completed alternative comparison used mls-rs 0.56.0 with its RustCrypto provider.
+The disposable comparison paired two clients and delivered an application
+message on the host; its library also cross-compiled for arm64 iOS. This was a
 smaller evaluation than the OpenMLS implementation, not a comparative audit
 or a complete CryptoKit-provider benchmark.
 
@@ -27,7 +27,15 @@ requires its Swift-to-C bridge as well as Rust-to-Swift bindings. That extra
 integration is a reason to continue the primary candidate, not evidence that
 mls-rs performs worse. Its [security notice](https://github.com/awslabs/mls-rs/blob/main/mls-rs/README.md#security-notice)
 says conformance validation does not constitute a full third-party audit.
-Revisit the choice if OpenMLS fails the device, size, or storage gates.
+Revisit the choice if OpenMLS fails the device, size, or storage gates. The
+comparison crate has been removed after evaluation. Rust itself is acceptable;
+the selection criteria are reliability, security, and maintenance effort.
+
+Wire CoreCrypto is being implemented independently on
+`feature/tw-531-wire-corecrypto`, from `main`. Compare supported behavior,
+application glue, persistence and recovery, library updates, and build/release
+operations. Compare authored production code separately from tests, generated
+bindings, and dependency lockfiles. Both alternatives use Rust.
 
 [OpenMLS documents](https://github.com/openmls/openmls#supported-platforms)
 that its iOS target is built but not tested upstream. The application must own
@@ -45,16 +53,41 @@ resolve it. Generated bindings and XCFrameworks are excluded from Git.
 scripts/build-mls.sh                 # arm64 macOS, iOS device, iOS Simulator
 scripts/test-mls.sh                  # Rust, Python, Swift + real delivery service
 scripts/measure-mls.sh               # macOS executable size and initialization
-cargo test --locked --manifest-path mls/comparison/Cargo.toml
-cargo build --locked --release --target aarch64-apple-ios \
-  --manifest-path mls/comparison/Cargo.toml
+python3 scripts/package-mls.py /tmp/gotsync-mls-package
 ```
 
-Requires Rust 1.91 or newer, Swift 6, Xcode, and uv. Measurements below used
-Rust 1.99.0 and Apple Swift 6.4. The lockfiles pin the Rust dependency graphs.
+Building from source uses the pinned Rust 1.99.0 toolchain, Swift 6, Xcode,
+and uv. The crate's minimum Rust version is 1.91. Measurements below used
+Rust 1.99.0 and Apple Swift 6.4. The lockfile pins the Rust dependency graph.
 The build script sets iOS 18 and macOS 14 deployment targets. Intel slices are
 not included in this arm64 spike. `scripts/build-mls.sh --host-only` shortens
 local iteration; run the full script before an iOS build.
+
+### Consume the prebuilt package
+
+CI uploads `GotSyncMLS-apple`, containing `GotSyncMLS.zip` and its SHA-256
+checksum. The ZIP contains a complete local Swift package: Swift wrapper,
+generated UniFFI bindings, all three XCFramework slices, tests, dependency
+notices/source links, and a provenance manifest. After downloading and checking
+the checksum, extract it and add the resulting `GotSyncMLS` directory as a
+local package dependency in Xcode, or use `.package(path: "/path/to/GotSyncMLS")`.
+Consumers need Swift and Xcode; they do not need Rust, Cargo, or UniFFI.
+
+CI tests this extracted package with Cargo removed from `PATH`. The packaging
+command refuses a host-only framework. A fresh local extraction passed ten
+Swift tests without Rust on 16 October 2026; its real-relay test was skipped
+because that separate check did not start a server. The ordinary MLS test job
+runs the real-relay test.
+
+This is a downloadable CI package, not a published versioned SwiftPM Git
+dependency. After library selection, publishing immutable binary assets and
+matching generated bindings is still required for URL-based SwiftPM releases.
+The checksum detects a damaged download; trust in the build still depends on
+the source revision and CI. The provenance manifest records source/output
+hashes and whether the checkout was dirty. It is not a signature or an
+independent reproduction of the build. Maintain dependency notices and source
+links when updating Rust dependencies; review distribution obligations before
+publishing releases.
 
 For an unlocked development device, use Xcode's `GotSyncMLS-Package` test
 scheme from the experimental package. For simulator tests:
@@ -94,6 +127,12 @@ Measured on 15 October 2026:
   including three clients against the real experimental relay. The full Python
   suite passed all 58 tests. All 114 existing Swift tests passed, including the
   original real-relay integration test.
+
+Validation on 16 October 2026 after membership and transport hardening: six
+Rust tests, twelve MLS relay tests, eleven Swift MLS tests including the real
+three-client relay, and all sixty-three Python tests passed. The existing Swift
+suite passed all 114 tests on rerun after an earlier transient failure. The
+generic iOS device build also passed. Physical-device execution remains pending.
 
 ## State and delivery contract
 
@@ -158,7 +197,13 @@ Every member may admit a QR-verified device and remove another member, as in
 the existing no-administrator policy. MLS authenticates existing members; it
 does not make a malicious co-member trustworthy. Basic credentials provide
 no external identity authority. `prepareAdd` rejects duplicate signing keys
-and credential IDs. Removing oneself is rejected; a leave flow needs
+and credential IDs. Received commits and Welcomes enforce the same eight-member
+limit, basic credentials containing a 16-byte device ID and 32-byte writer
+credential hash, and unique signing keys, device IDs, and writer hashes.
+Received commits permit Add, Remove, and Update proposals. A retained leaf cannot
+change its device ID or writer hash. MLS-authenticated signing key updates are
+permitted; the MLS tree supplies continuity after initial QR verification.
+Removing oneself is rejected; a leave flow needs
 another member to commit the removal.
 
 The chosen suite is RFC 9420's
@@ -184,15 +229,36 @@ Identical retransmission returns the original cursor, even after the epoch
 changes. Another commit at that epoch gets 409. Fetch is nondestructive, so
 one reader cannot erase another reader's offline history.
 
-This loopback spike has no append authorization, route rotation, retention,
-or public-service abuse controls. Group IDs are routes. A removed member
-cannot decrypt the new epoch but can still deny service with invalid log
-entries. A stale removed-member commit gets 409; that is ordering enforcement,
-not revocation of network access. Production requires an admission/routing
-policy that works for offline members without sending MLS encryption keys
-to the server. The service caps history at 10,000 entries/64 MiB and the
+The loopback service now has per-device write authorization. Before publishing
+an invitation, the creator registers its random 32-byte bearer credential.
+A joining device authenticates its KeyPackage publication with its own bearer
+credential. The service stores its hash. That same hash is part of the device's
+signed MLS BasicCredential and is available through `members()`, so removers can
+select the authenticated writer mapping. `prepareAdd` journals that hash as
+`addWriter`. The relay requires it to match the KeyPackage publisher before
+enabling the writer. A mismatch is a terminal, journaled KeyPackage refusal;
+it leaves the package unconsumed and cannot later accept the same commit.
+Accepting the Add atomically enables that writer. A Remove atomically revokes
+the credential hash journaled by `prepareRemove`. Unknown removal targets fail
+before changing the log. Both writer fields are part of exact-request retries.
+HTTP requests carry the bearer
+credential in the Authorization header; the database stores only hashes.
+These credentials authorize transport writes and are separate from MLS content
+keys. Rust generates these credentials randomly; Swift journals them with the
+MLS identity and clears the local credential on authenticated removal. Production
+clients must use HTTPS. The integration test uses the three clients' persisted
+credentials and the authenticated MLS roster to select the removal target.
+
+Unauthorized and revoked writers cannot advance the log, even with the current
+epoch. Authorized members and the relay can still deny service. The relay does
+not validate MLS commits or cryptographically bind writer metadata to them.
+Fetching ciphertext remains public to anyone who knows the group route.
+The loopback service still lacks retention and public-service abuse controls.
+The service caps history at 10,000 entries/64 MiB and the
 KeyPackage directory at 128 entries with 15-minute expiry. The terminal
-rejection journal also caps at 10,000 entries. Fetch returns one
+rejection journal also caps at 10,000 entries. It permits at most 128 groups and
+eight writers per group. Earlier experimental databases and snapshots need to
+be deleted and devices re-paired after these schema/credential changes. Fetch returns one
 entry per request. These are test limits, not a production retention policy.
 
 ## Remaining acceptance gates

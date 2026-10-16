@@ -21,4 +21,3 @@ server/relay-data/
 mls/target/
 Packages/GotSyncMLS/Artifacts/
 Packages/GotSyncMLS/Sources/GotSyncMLSBindings/
-mls/comparison/target/
