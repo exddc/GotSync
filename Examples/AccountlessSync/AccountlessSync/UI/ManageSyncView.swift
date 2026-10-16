@@ -22,6 +22,13 @@ struct ManageSyncView: View {
                         .foregroundStyle(RelayTheme.inkMuted)
                 }
 
+                Section("Data recovery") {
+                    Text(ProductSyncPolicy.dataRecoveryDisclosure)
+                        .font(.footnote)
+                        .foregroundStyle(RelayTheme.inkMuted)
+                        .accessibilityIdentifier("data-recovery-disclosure")
+                }
+
                 Section("Linked phones") {
                     ForEach(
                         Array(model.linkedMemberLabels.enumerated()),
