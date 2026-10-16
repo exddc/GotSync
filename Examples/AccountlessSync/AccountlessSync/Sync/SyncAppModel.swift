@@ -28,13 +28,12 @@ final class SyncAppModel: ObservableObject {
         baseDirectory: URL? = nil,
         relayURL: URL = DemoEndpoints.relayURL,
         mailboxURL: URL = DemoEndpoints.mailboxURL,
-        mailboxTransport: (any MailboxTransport)? = nil,
         backgroundMailboxScheduler: (any BackgroundMailboxScheduling)? = nil,
         pairingRetryDelayNanoseconds: UInt64 = 1_000_000_000
     ) {
         let directory = baseDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("AccountlessSync", isDirectory: true)
         let configuration = try! SyncConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, storageDirectory: directory, invitationURLScheme: DemoEndpoints.invitationURLScheme, endpointPolicy: DemoEndpoints.policy)
-        engine = SyncEngine(configuration: configuration, secretStore: keychain, mailboxTransport: mailboxTransport, backgroundMailboxScheduler: backgroundMailboxScheduler ?? SystemBackgroundMailboxScheduler.shared, pairingRetryDelayNanoseconds: pairingRetryDelayNanoseconds)
+        engine = SyncEngine(configuration: configuration, secretStore: keychain, backgroundMailboxScheduler: backgroundMailboxScheduler ?? SystemBackgroundMailboxScheduler.shared, pairingRetryDelayNanoseconds: pairingRetryDelayNanoseconds)
         snapshot = engine.state
         let states = engine.states()
         observationTask = Task { [weak self] in

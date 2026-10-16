@@ -580,8 +580,7 @@ struct TaskReplica: Sendable {
             withIntermediateDirectories: true,
             attributes: ProtectedStorage.directoryAttributes
         )
-        try archive.canonicalData().write(to: persistenceURL, options: .atomic)
-        try FileManager.default.setAttributes(ProtectedStorage.fileAttributes, ofItemAtPath: persistenceURL.path)
+        try durableWrite(archive.canonicalData(), to: persistenceURL)
     }
 
     private static func validateBatchBounds(_ operations: [TaskOperation]) throws {

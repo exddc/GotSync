@@ -3,14 +3,6 @@ import XCTest
 @testable import GotSync
 
 final class ProtocolCompatibilityTests: XCTestCase {
-    func testWireVersionIsRejectedBeforeUnknownKind() throws {
-        for body in [#"{"version":2,"kind":"future"}"#, #"{"version":0,"kind":"hello"}"#, #"{"kind":"hello"}"#, #"{"version":true,"kind":"hello"}"#] {
-            XCTAssertThrowsError(try WireCodec.decode(SyncWireMessage.self, from: Data(body.utf8))) { error in
-                XCTAssertEqual(error as? WireMessageError, .invalidVersion)
-            }
-        }
-    }
-
     func testConfigurationDefaultsToProductionInEveryBuild() {
         XCTAssertThrowsError(try SyncConfiguration(relayURL: TestEndpoints.relayURL, mailboxURL: TestEndpoints.mailboxURL, storageDirectory: FileManager.default.temporaryDirectory, invitationURLScheme: "gotsync-tests"))
         XCTAssertNoThrow(try SyncConfiguration(relayURL: TestEndpoints.relayURL, mailboxURL: TestEndpoints.mailboxURL, storageDirectory: FileManager.default.temporaryDirectory, invitationURLScheme: "gotsync-tests", endpointPolicy: .localDevelopment))

@@ -40,6 +40,7 @@ from .mailbox import (
     encode_base64url,
 )
 
+from .mls import MLSStore
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
 WEBSOCKET_PATH = "/v1"
 DEFAULT_MAILBOX_DATABASE_PATH = "relay-data/mailbox.sqlite3"
@@ -650,6 +651,7 @@ class RelayServer:
         if mailbox_clock is not None:
             mailbox_options["clock"] = mailbox_clock
         self.mailbox = MailboxStore(mailbox_database_path, **mailbox_options)
+        self.mls = MLSStore(mailbox_database_path)
         self._websocket_server: Any | None = None
         self._metrics_server: asyncio.Server | None = None
         self._mailbox_server: asyncio.Server | None = None
@@ -824,6 +826,14 @@ class RelayServer:
                 ):
                     raise MailboxError("content type must be application/json")
                 document = _parse_mailbox_json(body)
+                if target == "/v3/mls":
+                    try:
+                        response = await asyncio.to_thread(self.mls.handle, document)
+                        await _write_http_response(writer, 200, response)
+                    except (ValueError, KeyError, TypeError) as error:
+                        code = str(error) if str(error) in ("historyUnavailable", "unauthorized", "expired") else "mlsRejected"
+                        await _write_http_response(writer, 400, {"error": code})
+                    return
                 _require_mailbox_version(document)
 
                 if target == "/v1/mailbox/put":

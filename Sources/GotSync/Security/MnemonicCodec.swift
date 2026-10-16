@@ -28,22 +28,6 @@ public struct Invitation: Equatable, Sendable {
         MnemonicCodec.encode(secret)
     }
 
-    var pairRoute: Data {
-        SyncKeyDerivation.derive(
-            input: secret,
-            label: "\(ProtocolDomains.namespace)/pair-route/v1",
-            count: 32
-        )
-    }
-
-    var pairPSK: Data {
-        SyncKeyDerivation.derive(
-            input: secret,
-            label: "\(ProtocolDomains.namespace)/pair-psk/v1",
-            count: 32
-        )
-    }
-
     public func url(scheme: String) throws -> URL {
         try Self.validateURLScheme(scheme)
         var components = URLComponents()

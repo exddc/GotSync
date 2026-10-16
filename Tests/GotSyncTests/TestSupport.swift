@@ -22,13 +22,12 @@ extension SyncEngine {
         baseDirectory: URL? = nil,
         relayURL: URL = TestEndpoints.relayURL,
         mailboxURL: URL = TestEndpoints.mailboxURL,
-        mailboxTransport: (any MailboxTransport)? = nil,
         backgroundMailboxScheduler: (any BackgroundMailboxScheduling)? = nil,
         pairingRetryDelayNanoseconds: UInt64 = 1_000_000_000
     ) {
         let directory = baseDirectory ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let configuration = try! SyncConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, storageDirectory: directory, invitationURLScheme: "gotsync-tests", endpointPolicy: .localDevelopment)
-        self.init(configuration: configuration, secretStore: keychain, mailboxTransport: mailboxTransport, backgroundMailboxScheduler: backgroundMailboxScheduler, pairingRetryDelayNanoseconds: pairingRetryDelayNanoseconds)
+        self.init(configuration: configuration, secretStore: keychain, backgroundMailboxScheduler: backgroundMailboxScheduler, pairingRetryDelayNanoseconds: pairingRetryDelayNanoseconds)
     }
 }
 

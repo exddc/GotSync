@@ -68,17 +68,17 @@ enum ProductSyncPolicy {
 
     /// C4: live invite is full admission capability while valid.
     static let inviteDetail =
-        "Anyone with this code can join and see its tasks. Show it only on phones you trust. Valid for 15 minutes; one successful join uses it up."
+        "Both phones scan a code to verify each other before linking. Show codes only on phones you trust. The invitation expires after 15 minutes."
 
     static let leaveSyncTitle = "Leave sync and keep tasks"
 
     /// C3: no remote wipe; remaining members rekey so a left phone cannot decrypt new traffic.
     static let leaveSyncDetail =
-        "Tasks stay on this phone. Other phones may update their membership and rotate keys. A phone that retained the shared secret may still read future traffic. Past data is not remotely wiped."
+        "Tasks stay on this phone. Another linked phone must come online to finish removing this phone. Past data is not remotely wiped."
 
     /// M3: safety code is accidental cross-pair protection, not invite-theft defense.
     static let safetyCodeDetail =
-        "Compare this code with the other phone. Matching digits confirm both phones are in the same setup. This does not stop someone who already has your live invite code."
+        "Scan the invitation, then scan the response to verify both phones. This does not stop a trusted linked phone from reading shared tasks."
 
     static func linkedStatusSummary(memberCount: Int) -> String {
         let phones = memberCount == 1 ? "1 phone" : "\(memberCount) phones"

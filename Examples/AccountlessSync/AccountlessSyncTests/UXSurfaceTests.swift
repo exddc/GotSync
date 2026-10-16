@@ -36,7 +36,7 @@ final class UXSurfaceTests: XCTestCase {
         )
         XCTAssertTrue(
             ProductSyncPolicy.inviteDetail
-                .localizedCaseInsensitiveContains("anyone with this code")
+                .localizedCaseInsensitiveContains("both phones")
         )
         XCTAssertTrue(
             ProductSyncPolicy.leaveSyncDetail
@@ -131,7 +131,7 @@ final class UXSurfaceTests: XCTestCase {
         )
         XCTAssertTrue(
             SyncError.isRetriablePairingTransportFailure(
-                RelaySocketError.connectionTimedOut
+                URLError(.timedOut)
             )
         )
         XCTAssertTrue(
@@ -210,12 +210,15 @@ final class UXSurfaceTests: XCTestCase {
             account: InstallIdentity.account
         )
 
+        guard let endpoint = ProcessInfo.processInfo.environment["GOTSYNC_WIRE_RELAY"], let url = URL(string: endpoint) else { throw XCTSkip("Requires real relay") }
         let model = SyncAppModel(
             keychain: keychain,
             baseDirectory: baseDirectory,
-            mailboxTransport: NoopMailboxTransport()
+            mailboxURL: url.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("v1/mailbox")
         )
         model.createPrivateSync()
+        let deadline = Date().addingTimeInterval(5)
+        while model.invitationExpiresAt == nil && Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
         let expiresAt = try XCTUnwrap(model.invitationExpiresAt)
         let remaining = expiresAt.timeIntervalSinceNow
         XCTAssertGreaterThan(remaining, 14 * 60)
@@ -244,8 +247,7 @@ final class UXSurfaceTests: XCTestCase {
 
         let model = SyncAppModel(
             keychain: keychain,
-            baseDirectory: baseDirectory,
-            mailboxTransport: NoopMailboxTransport()
+            baseDirectory: baseDirectory
         )
         model.createPrivateSync()
 
@@ -362,8 +364,7 @@ final class UXSurfaceTests: XCTestCase {
         )
         let model = SyncAppModel(
             keychain: keychain,
-            baseDirectory: baseDirectory,
-            mailboxTransport: NoopMailboxTransport()
+            baseDirectory: baseDirectory
         )
         XCTAssertFalse(model.supportStatusSummary.otherPhoneMustBeOpenForLocalEdit)
         XCTAssertTrue(
@@ -371,37 +372,5 @@ final class UXSurfaceTests: XCTestCase {
                 .contains("not required online")
         )
         await model.engine.stop()
-    }
-}
-
-/// Transport that never succeeds; used only for UI-surface unit tests.
-private actor NoopMailboxTransport: MailboxTransport {
-    func put(
-        route: Data,
-        authorization: Data,
-        messages: [StoredMailboxEnvelope]
-    ) async throws -> [MailboxStoredReceipt] {
-        throw URLError(.notConnectedToInternet)
-    }
-
-    func fetch(
-        route: Data,
-        authorization: Data,
-        after cursor: UInt64,
-        limit: Int
-    ) async throws -> MailboxFetchPage {
-        throw URLError(.notConnectedToInternet)
-    }
-
-    func acknowledge(
-        route: Data,
-        authorization: Data,
-        through cursor: UInt64
-    ) async throws {
-        throw URLError(.notConnectedToInternet)
-    }
-
-    func forget(route: Data, authorization: Data) async throws {
-        throw URLError(.notConnectedToInternet)
     }
 }

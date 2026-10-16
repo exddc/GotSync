@@ -1,0 +1,4 @@
+module LibCoreCrypto {
+    header "core_crypto_ffiFFI.h"
+    export *
+}

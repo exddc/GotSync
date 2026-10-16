@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
         A10000000000000000000001 = {isa = PBXBuildFile; productRef = A10000000000000000000003; };
+        A20000000000000000000002 = {isa = PBXBuildFile; productRef = A10000000000000000000003; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -49,6 +50,11 @@
 			path = AccountlessSyncTests;
 			sourceTree = "<group>";
 		};
+        A20000000000000000000001 /* GotSyncTests */ = {
+            isa = PBXFileSystemSynchronizedRootGroup;
+            path = ../../Tests/GotSyncTests;
+            sourceTree = "<group>";
+        };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -64,6 +70,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                A20000000000000000000002,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -75,6 +82,7 @@
 			children = (
 				A00000000000000000000004 /* AccountlessSync */,
 				A00000000000000000000005 /* AccountlessSyncTests */,
+                A20000000000000000000001 /* GotSyncTests */,
 				A00000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -129,9 +137,11 @@
 			);
 			fileSystemSynchronizedGroups = (
 				A00000000000000000000005 /* AccountlessSyncTests */,
+                A20000000000000000000001 /* GotSyncTests */,
 			);
 			name = AccountlessSyncTests;
 			packageProductDependencies = (
+                A10000000000000000000003,
 			);
 			productName = AccountlessSyncTests;
 			productReference = A00000000000000000000007 /* AccountlessSyncTests.xctest */;
@@ -343,6 +353,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
+                CODE_SIGN_ENTITLEMENTS = AccountlessSync/AccountlessSync.entitlements;
 				GOTSYNC_MAILBOX_URL = "";
 				GOTSYNC_RELAY_URL = "";
 				INFOPLIST_FILE = AccountlessSync/Info.plist;
@@ -370,6 +381,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
+                CODE_SIGN_ENTITLEMENTS = AccountlessSync/AccountlessSync.entitlements;
 				GOTSYNC_MAILBOX_URL = "";
 				GOTSYNC_RELAY_URL = "";
 				INFOPLIST_FILE = AccountlessSync/Info.plist;

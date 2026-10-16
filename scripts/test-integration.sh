@@ -23,4 +23,9 @@ done
 if [ ! -f "$GOTSYNC_TEST_DIR/endpoints.env" ]; then cat "$GOTSYNC_TEST_DIR/server.log"; exit 1; fi
 source "$GOTSYNC_TEST_DIR/endpoints.env"
 export GOTSYNC_RELAY_URL GOTSYNC_MAILBOX_URL GOTSYNC_INTEGRATION=1 GOTSYNC_REQUIRE_INTEGRATION=1
+export GOTSYNC_WIRE_RELAY="${GOTSYNC_MAILBOX_URL%/v1/mailbox}/v3/mls"
+if [ -z "${GOTSYNC_WIRE_HOST:-}" ]; then
+    "$GOTSYNC_REPO_ROOT/scripts/build-wire-host.sh"
+    export GOTSYNC_WIRE_HOST="${GOTSYNC_WIRE_BUILD:-$GOTSYNC_REPO_ROOT/.build/wire-host}/source/target/release"
+fi
 swift test --scratch-path "$GOTSYNC_SWIFT_SCRATCH_PATH" "$@"

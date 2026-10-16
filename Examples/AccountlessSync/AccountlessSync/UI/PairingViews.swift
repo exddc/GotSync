@@ -321,103 +321,58 @@ struct UserPairingStepIndicator: View {
 struct SafetyCodeView: View {
     @ObservedObject var model: SyncAppModel
     let code: String
-    @ScaledMetric(relativeTo: .largeTitle) private var codeFontSize = 52.0
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var scanning = false
+
+    private var isHost: Bool { model.activePairingRole == .host }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: 22) {
                 PairingHeaderView(
-                    title: "Do these match?",
-                    detail: ProductSyncPolicy.safetyCodeDetail,
+                    title: isHost ? "Scan back to verify" : "Show this response",
+                    detail: isHost
+                        ? "First, let the other phone scan this invitation. Then scan its response to verify both phones."
+                        : "On the first phone, tap Scan response and scan this code. Keep both apps open until linking finishes.",
                     symbol: "checkmark.shield"
                 )
-
-                Text(displayCode)
-                    .font(
-                        .system(
-                            size: codeFontSize,
-                            weight: .bold,
-                            design: .monospaced
-                        )
-                    )
-                    .foregroundStyle(RelayTheme.ink)
-                    .minimumScaleFactor(0.75)
-                    .tracking(4)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 32)
-                    .relayCard(padding: 20)
-                    .accessibilityLabel("Safety code \(code.map(String.init).joined(separator: " "))")
-                    .accessibilityIdentifier("safety-code")
-
-                if model.isHostApprovalPending {
-                    Button {
-                        model.approveSafetyCode()
-                    } label: {
-                        Text("Codes match. Approve")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 4)
-                    }
-                    .pocPrimaryButtonStyle()
-                    .controlSize(.large)
-                    .accessibilityIdentifier("approve-safety-code")
+                if let url = model.invitationURL {
+                    QRCodeView(url: url)
+                        .frame(width: 240, height: 240)
+                        .accessibilityLabel(isHost ? "Sync invitation QR code" : "Sync verification response QR code")
+                        .frame(maxWidth: .infinity)
+                        .relayCard(padding: 20)
+                }
+                if isHost {
+                    Button("Scan response") { scanning = true }
+                        .pocPrimaryButtonStyle()
+                        .controlSize(.large)
+                        .accessibilityIdentifier("scan-pairing-response")
                 } else {
-                    HStack(spacing: 10) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text(
-                            model.phase == .provisioning
-                                ? "Importing the shared list…"
-                                : "Waiting for the other phone to approve…"
-                        )
-                        .font(.footnote)
-                        .foregroundStyle(RelayTheme.inkMuted)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
+                    ProgressView("Waiting for the first phone to scan…")
+                        .frame(maxWidth: .infinity)
                 }
-
-                Button("Codes don’t match", role: .destructive) {
-                    model.rejectSafetyCode()
-                }
-                .pocSecondaryButtonStyle()
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
-                .accessibilityHint(
-                    "Cancels pairing without linking either iPhone."
-                )
-                .accessibilityIdentifier("reject-safety-code")
+                Button("Cancel", role: .cancel) { model.cancelPairing() }
+                    .pocSecondaryButtonStyle()
+                    .controlSize(.large)
             }
             .padding(22)
         }
-        .scrollIndicators(.hidden)
         .background(SoftFieldBackground())
-        .navigationTitle("Verify")
+        .navigationTitle("Verify phones")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") {
-                    model.cancelPairing()
-                }
-                .accessibilityIdentifier("cancel-pairing")
+        .sheet(isPresented: $scanning) {
+            NavigationStack {
+                QRScannerView(onPayload: { payload in
+                    guard let url = URL(string: payload),
+                          let qr = try? MLSQR.from(url: url, scheme: DemoEndpoints.invitationURLScheme), qr.isResponse else { return false }
+                    model.joinPrivateSync(url: url)
+                    scanning = false
+                    return true
+                }, onCameraAccessDenied: {})
+                .navigationTitle("Scan response")
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
             }
         }
-    }
-
-    private var formattedCode: String {
-        let digits = code.filter(\.isNumber)
-        guard digits.count > 3 else {
-            return digits
-        }
-        let splitIndex = digits.index(digits.startIndex, offsetBy: 3)
-        return "\(digits[..<splitIndex])  \(digits[splitIndex...])"
-    }
-
-    private var displayCode: String {
-        dynamicTypeSize.isAccessibilitySize
-            ? formattedCode.replacingOccurrences(of: "  ", with: "\n")
-            : formattedCode
     }
 }
 

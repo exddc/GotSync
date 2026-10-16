@@ -18,3 +18,6 @@ xcuserdata/
 server/relay-data/
 .env
 .env.*
+
+Packages/WireCoreCrypto/HostSwift/
+Packages/WireCoreCrypto/HostFFI/core_crypto_ffiFFI.h
