@@ -21,7 +21,11 @@ enum PreviewSupport {
     }
 
     static var sampleInvitationURL: URL {
-        try! Invitation(secret: Data(0..<16)).url(scheme: DemoEndpoints.invitationURLScheme)
+        try! Invitation(
+            secret: Data(0..<16),
+            groupID: Data(repeating: 0x01, count: 32),
+            inviterFingerprint: Data(repeating: 0x02, count: 32)
+        ).url(scheme: DemoEndpoints.invitationURLScheme)
     }
 
     static let samplePhrase =

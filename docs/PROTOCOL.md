@@ -1,12 +1,100 @@
 # GotSync protocol
 
-Status: implemented task-sync protocol, transport/sync version 1 and pairing
-completion version 2.
+Status: `SyncEngine` uses the version 2 MLS protocol described in the next
+section. The version 1 sections after it describe the custom protocol that the
+engine no longer runs. Its code is still compiled and tested until it is
+removed.
 
-This document describes the current implementation. The code and test vectors
-must stay consistent with it. The construction uses standard CryptoKit
-primitives, but the composition has not received an independent security audit
-and must not be treated as production cryptography.
+## Version 2: MLS pairing and replication
+
+Each linked set of devices is one MLS group (RFC 9420, ciphersuite
+`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) of two to eight members. The
+OpenMLS state, signing key, and epoch secrets live in `Packages/GotSyncMLS`.
+A member's fingerprint is the SHA-256 of its MLS signature public key. The
+relay's `/v2/mls` delivery service holds KeyPackages and an ordered,
+per-group log of commits and application messages.
+
+### Invitation
+
+An invitation holds a 16-byte random `secret`. The URL form is
+`<scheme>://pair?v=2&secret=…&group=…&fingerprint=…`, with canonical
+base64url values: the 32-byte group ID and the inviter's 32-byte fingerprint.
+The phrase is the version 1 mnemonic of `secret` alone (16 words plus a
+checksum word). A phrase is a lookup key: the joiner learns the group ID and
+fingerprint from the inviter's offer. Extending the mnemonic to carry them
+would need 81 words.
+
+Each value below is HKDF-SHA256 over `secret` with no salt, a 32-byte output,
+and the info string `com.gotdone.sync/<label>`:
+
+| Label | Use |
+| --- | --- |
+| `mls-pairing-token/v2` | KeyPackage pairing token; the relay stores its SHA-256 |
+| `mls-pairing-route/v2` | Relay WebSocket pairing room |
+| `mls-pairing-offer/v2` | ChaCha20-Poly1305 key for frames from the inviter |
+| `mls-pairing-response/v2` | ChaCha20-Poly1305 key for frames from the joiner |
+
+### Pairing frames
+
+Both devices join the `/v1` WebSocket room for the route. Each binary frame is
+one kind byte followed by the ChaCha20-Poly1305 combined box (nonce,
+ciphertext, tag). The associated data is
+`com.gotdone.sync/mls-pairing-frame/v2` followed by the kind byte.
+
+| Kind | Direction | Plaintext |
+| --- | --- | --- |
+| 1 offer | inviter to joiner | group ID ‖ inviter fingerprint |
+| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint |
+| 3 decision | either | one byte: 1 added, 0 declined or cancelled |
+
+The inviter sends the offer on each `peerReady`. A joiner holding a URL
+rejects an offer whose group ID or fingerprint differs from the URL. The
+joiner publishes a KeyPackage under the pairing token, sends the response, and
+shows the safety code. The inviter fetches the KeyPackage, checks that its
+SHA-256 equals the reference, and shows the safety code.
+
+The safety code is the first four bytes of SHA-256 over
+`com.gotdone.sync/mls-safety-code/v2` ‖ group ID ‖ inviter fingerprint ‖ joiner
+fingerprint, read big-endian, modulo 1,000,000, printed as six digits.
+
+After approval, a founding inviter creates the group, then commits an Add with
+the joiner fingerprint behind the code as the verified fingerprint. OpenMLS
+rejects a KeyPackage whose signature key does not match. The inviter retries a
+superseded Add up to three times. The joiner polls the log until a commit
+carries a Welcome for its KeyPackage reference and joins only if the Welcome
+signer's fingerprint equals the inviter fingerprint.
+
+### Replication
+
+Application message plaintext is canonical JSON with `version: 2`:
+
+- `operations` carries up to 256 task operations from any origin.
+- `hello` carries the sender's version vector and an optional `provider`
+  fingerprint.
+
+A receiver applies each operation whose origin sequence is next. It repeats
+until nothing more applies, then sends a `hello` without a provider if
+operations still wait on a gap. On a `hello`, a member sends its own
+operations up to its upload position that the sender lacks. The member named
+as `provider` also sends every other missing origin.
+
+After joining, a device sends a `hello` that names its inviter as provider and
+then all retained operations. Each device then uploads its own operations in
+sequence. The engine applies received operations and persists the replica
+before it answers hellos and acknowledges the MLS inbox. A replay after a
+crash is idempotent.
+
+`sync-v2.json` in the storage directory records the group ID, member device
+IDs, the highest own sequence uploaded, and whether the join announcement is
+pending. The MLS state remains the source of truth: on launch, a group with at
+least two members is linked even if the file is missing.
+
+An application message that fails MLS validation is skipped. A commit that
+fails validation stops the cursor, and the engine reports
+`SyncError.syncHistoryBlocked` rather than skipping it. The engine polls the
+log every two seconds while active. No WebSocket carries task changes.
+
+# Version 1 reference
 
 ## Goals and invariants
 

@@ -431,11 +431,13 @@ final class GroupSyncTests: XCTestCase {
 
     /// C4: invitation secret is fixed-size; regenerate yields a new secret.
     func testInvitationSingleUseAndTTL() throws {
-        let first = try Invitation.generate()
-        let second = try Invitation.generate()
+        let group = Data(repeating: 0x01, count: 32)
+        let fingerprint = Data(repeating: 0x02, count: 32)
+        let first = try Invitation.generate(groupID: group, inviterFingerprint: fingerprint)
+        let second = try Invitation.generate(groupID: group, inviterFingerprint: fingerprint)
         XCTAssertEqual(first.secret.count, 16)
         XCTAssertNotEqual(first.secret, second.secret)
-        XCTAssertEqual(try Invitation.from(phrase: first.phrase), first)
+        XCTAssertEqual(try Invitation.from(phrase: first.phrase).secret, first.secret)
         XCTAssertNotEqual(
             try Invitation.from(phrase: first.phrase).secret,
             second.secret

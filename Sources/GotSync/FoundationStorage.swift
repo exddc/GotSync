@@ -16,4 +16,12 @@ enum ProtectedStorage {
         #endif
         return attributes
     }
+
+    static var backgroundFileAttributes: [FileAttributeKey: Any] {
+        var attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o600]
+        #if os(iOS)
+        attributes[.protectionKey] = FileProtectionType.completeUntilFirstUserAuthentication
+        #endif
+        return attributes
+    }
 }

@@ -1,10 +1,22 @@
 import Foundation
 import Security
 
+public enum SecretAccessibility: Sendable {
+    case whenUnlockedThisDeviceOnly
+    case afterFirstUnlockThisDeviceOnly
+}
+
 public protocol SecretStore: Sendable {
     func read(account: String) throws -> Data?
     func write(_ data: Data, account: String) throws
+    func write(_ data: Data, account: String, accessibility: SecretAccessibility) throws
     func delete(account: String) throws
+}
+
+extension SecretStore {
+    public func write(_ data: Data, account: String, accessibility: SecretAccessibility) throws {
+        try write(data, account: account)
+    }
 }
 
 public enum KeychainError: Error, Equatable {
@@ -40,6 +52,10 @@ public struct KeychainStore: SecretStore {
     }
 
     public func write(_ data: Data, account: String) throws {
+        try write(data, account: account, accessibility: .whenUnlockedThisDeviceOnly)
+    }
+
+    public func write(_ data: Data, account: String, accessibility: SecretAccessibility) throws {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -48,7 +64,9 @@ public struct KeychainStore: SecretStore {
         ]
         let attributes: [CFString: Any] = [
             kSecValueData: data,
-            kSecAttrAccessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecAttrAccessible: accessibility == .afterFirstUnlockThisDeviceOnly
+                ? kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                : kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecAttrSynchronizable: false,
         ]
 
@@ -791,6 +809,14 @@ struct CredentialStore: Sendable {
         try saveTerminalPairingJournal(
             TerminalPairingActionJournal(actions: [action])
         )
+    }
+
+    func hasPairingData() throws -> Bool {
+        let accounts = [
+            activeAccount, activeGroupAccount, pendingAccount, mailboxCheckpointAccount,
+            Self.terminalPairingActionsAccount, Self.damagedTerminalPairingActionsAccount,
+        ]
+        return try accounts.contains { try keychain.read(account: $0) != nil }
     }
 
     func clearCurrentPair() throws {

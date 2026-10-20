@@ -9,7 +9,7 @@ final class ProtocolVectorTests: XCTestCase {
         let sender = Data(repeating: 0x11, count: 16)
         let recipient = Data(repeating: 0x22, count: 16)
         let pairID = Data(repeating: 0x33, count: 16)
-        let invitation = try Invitation(secret: Data(0..<16))
+        let invitation = try LegacyInvitation(secret: Data(0..<16))
         let device = try ReplicaDeviceID(bytes: sender)
         var replica = try TaskReplica(deviceID: device)
         let operation = try replica.createTask(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, title: "Vector task")
