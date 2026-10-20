@@ -29,4 +29,21 @@ public struct SyncState: Sendable {
     public let showsSavingNotice: Bool
     public let pairingFinalizationState: PairingFinalizationState?
     public let linkedMemberCount: Int
+    public let linkedDevices: [LinkedDevice]
+}
+
+/// A device in the linked group, identified by its MLS signature key.
+public struct LinkedDevice: Equatable, Hashable, Identifiable, Sendable {
+    public var id: Data { fingerprint }
+    public let deviceID: Data
+    /// SHA-256 of the device's MLS signature key.
+    public let fingerprint: Data
+    public let isCurrentDevice: Bool
+    /// `removeDevice` was requested and the removal commit is not yet accepted.
+    public let isRemovalPending: Bool
+
+    /// The first four fingerprint bytes as hex, for telling devices apart.
+    public var shortFingerprint: String {
+        fingerprint.prefix(4).map { String(format: "%02X", $0) }.joined()
+    }
 }

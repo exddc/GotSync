@@ -47,6 +47,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case relinkRequired
     case syncHistoryBlocked
     case removedFromGroup
+    case approvalExpired
 
     public var errorDescription: String? {
         switch self {
@@ -91,6 +92,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "Sync stopped at an update this iPhone could not verify. Your tasks are safe. Unlink and create a new link to keep syncing."
         case .removedFromGroup:
             "This iPhone was removed from the sync group. Your tasks are safe on this iPhone."
+        case .approvalExpired:
+            "The safety code was not confirmed in time. Nothing was linked. Create a new invitation and try again."
         }
     }
 
@@ -165,7 +168,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
              .pairingReplicaConflict, .pairingMergeTooLarge,
              .legacyPairingNeedsRelink, .pairingRecoveryHistoryFull,
              .pairingRecoveryJournalDamaged, .invalidSyncMessage, .unsupportedProtocolVersion,
-             .relinkRequired, .syncHistoryBlocked, .removedFromGroup:
+             .relinkRequired, .syncHistoryBlocked, .removedFromGroup, .approvalExpired:
             return false
         }
     }
@@ -206,7 +209,8 @@ public final class SyncEngine {
             activePairingRole: activePairingRole,
             showsSavingNotice: showsSavingNotice,
             pairingFinalizationState: pairingFinalizationState,
-            linkedMemberCount: linkedMemberCount
+            linkedMemberCount: linkedMemberCount,
+            linkedDevices: linkedDevices
         )
     }
 
@@ -235,8 +239,11 @@ public final class SyncEngine {
         pairingMergedFilename,
         pairingConflictBackupFilename,
     ]
+    static let departuresDirectoryName = "mls-v2-departing"
     private static let maximumGroupSize = 8
     private static let maximumAddAttempts = 3
+    private static let maximumRemovalAttempts = 8
+    private static let maximumDepartures = 8
 
     public private(set) var phase: SyncPhase = .unpaired { didSet { publishState() } }
     public private(set) var tasks: [ReplicatedTask] = [] { didSet { publishState() } }
@@ -278,7 +285,9 @@ public final class SyncEngine {
     private let deviceID: ReplicaDeviceID
     private let persistenceURL: URL
     private let checkpointURL: URL
-    private let mlsDirectory: URL
+    private let mlsRoot: URL
+    private var mlsDirectory: URL
+    private let departuresDirectory: URL
     private let hasDurableIdentity: Bool
     private var hasDurableStorage: Bool
     private var replica: TaskReplica
@@ -286,6 +295,8 @@ public final class SyncEngine {
     private var checkpoint: ReplicationCheckpoint? { didSet { publishState() } }
     private let pairingRetryDelayNanoseconds: UInt64
     private let syncIntervalNanoseconds: UInt64
+    private let approvalTimeoutNanoseconds: UInt64
+    private let provisionalMemberWindow: TimeInterval
 
     private var pairingAttemptID: UUID?
     private var pairingDeadline: Date?
@@ -294,12 +305,13 @@ public final class SyncEngine {
     private var pairingReaderTask: Task<Void, Never>?
     private var pairingConnection: (any PairingConnection)?
     private var activeInvitation: Invitation?
-    private var approvalContinuation: CheckedContinuation<Bool, Never>?
+    private var approvalContinuation: CheckedContinuation<ApprovalOutcome, Never>?
     private var peerDecision: Bool?
     private var reconcileTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var syncCycleTask: Task<Void, Never>?
     private var backgroundFlushTask: Task<Void, Never>?
+    private var departureTask: Task<Void, Never>?
     private var syncCycleID: UUID?
     private var syncCycleRequested = false
     private var syncFailureCount = 0
@@ -334,7 +346,9 @@ public final class SyncEngine {
         pairingRetryDelayNanoseconds: UInt64,
         mlsTransport: (any MLSRelayTransport)?,
         rendezvous: (any PairingRendezvous)?,
-        syncIntervalNanoseconds: UInt64 = 2_000_000_000
+        syncIntervalNanoseconds: UInt64 = 2_000_000_000,
+        approvalTimeoutNanoseconds: UInt64 = SyncTiming.approvalTimeoutNanoseconds,
+        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow
     ) {
         let baseDirectory = configuration.storageDirectory
         relayURL = configuration.endpoints.relayURL
@@ -348,10 +362,14 @@ public final class SyncEngine {
         self.backgroundMailboxScheduler = backgroundMailboxScheduler ?? NoopBackgroundMailboxScheduler()
         self.pairingRetryDelayNanoseconds = pairingRetryDelayNanoseconds
         self.syncIntervalNanoseconds = syncIntervalNanoseconds
+        self.approvalTimeoutNanoseconds = approvalTimeoutNanoseconds
+        self.provisionalMemberWindow = provisionalMemberWindow
         credentialStore = CredentialStore(keychain: secretStore)
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
-        mlsDirectory = MLSSession.directory(in: baseDirectory)
+        mlsRoot = MLSSession.directory(in: baseDirectory)
+        mlsDirectory = Self.currentMLSDirectory(in: mlsRoot)
+        departuresDirectory = baseDirectory.appendingPathComponent(Self.departuresDirectoryName, isDirectory: true)
 
         var bootError: Error?
         let installData: Data
@@ -373,6 +391,8 @@ public final class SyncEngine {
                     withIntermediateDirectories: true,
                     attributes: ProtectedStorage.directoryAttributes
                 )
+                try FileManager.default.setAttributes(ProtectedStorage.directoryAttributes, ofItemAtPath: baseDirectory.path)
+                try? FileManager.default.setAttributes(ProtectedStorage.fileAttributes, ofItemAtPath: persistenceURL.path)
                 let markerURL = baseDirectory.appendingPathComponent(Self.eraseMarkerFilename)
                 if FileManager.default.fileExists(atPath: markerURL.path) {
                     replica = try Self.completeErase(
@@ -381,7 +401,7 @@ public final class SyncEngine {
                         deviceID: deviceID,
                         persistenceURL: persistenceURL,
                         checkpointURL: checkpointURL,
-                        mlsDirectory: mlsDirectory,
+                        mlsRoot: mlsRoot,
                         markerURL: markerURL
                     )
                 } else {
@@ -414,7 +434,7 @@ public final class SyncEngine {
                 do {
                     session = try openSession()
                 } catch let error where Self.isUnrecoverableSessionState(error) {
-                    try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
+                    try eraseCurrentMLSState()
                     session = try openSession()
                     if checkpoint != nil {
                         try ReplicationCheckpoint.remove(at: checkpointURL)
@@ -446,6 +466,7 @@ public final class SyncEngine {
                 await self?.reconcileSession()
             }
         }
+        startDepartures()
         self.backgroundMailboxScheduler.register { [weak self] in
             await self?.performBackgroundMailboxFlushWork()
         }
@@ -463,8 +484,52 @@ public final class SyncEngine {
         linkedMemberCount >= Self.maximumGroupSize
     }
 
+    public var linkedDevices: [LinkedDevice] {
+        guard isPaired, let checkpoint else { return [] }
+        return checkpoint.members.map {
+            LinkedDevice(
+                deviceID: $0.deviceID,
+                fingerprint: $0.fingerprint,
+                isCurrentDevice: $0.deviceID == deviceID.bytes,
+                isRemovalPending: checkpoint.pendingRemovals.contains($0.fingerprint)
+            )
+        }
+    }
+
     public func leaveGroupAndKeepTasks() {
         unlinkAndKeepTasks()
+    }
+
+    /// Removes another device from the group with an MLS commit. The request
+    /// is saved first and retried by sync cycles, including after a restart,
+    /// until the device is no longer a member.
+    @discardableResult
+    public func removeDevice(_ device: LinkedDevice) -> Bool {
+        removeDevice(fingerprint: device.fingerprint)
+    }
+
+    @discardableResult
+    public func removeDevice(fingerprint: Data) -> Bool {
+        guard
+            hasDurableStorage,
+            isPaired,
+            var current = checkpoint,
+            let member = current.members.first(where: { $0.fingerprint == fingerprint }),
+            member.deviceID != deviceID.bytes
+        else {
+            return false
+        }
+        if !current.pendingRemovals.contains(fingerprint) {
+            current.pendingRemovals.append(fingerprint)
+            do {
+                try saveCheckpoint(current)
+            } catch {
+                handleLocalMutationFailure(error)
+                return false
+            }
+        }
+        requestSyncCycle(force: true, allowInactive: true)
+        return true
     }
 
     /// Whether the invitation UI is an in-group invite (vs founding).
@@ -540,9 +605,7 @@ public final class SyncEngine {
         guard isHostApprovalPending else {
             return
         }
-        isHostApprovalPending = false
-        approvalContinuation?.resume(returning: true)
-        approvalContinuation = nil
+        resolveApproval(.approved)
     }
 
     public func rejectSafetyCode() {
@@ -550,9 +613,7 @@ public final class SyncEngine {
             return
         }
         if isHostApprovalPending {
-            isHostApprovalPending = false
-            approvalContinuation?.resume(returning: false)
-            approvalContinuation = nil
+            resolveApproval(.rejected)
             return
         }
         cancelPairing(preserveLink: isPaired)
@@ -577,13 +638,15 @@ public final class SyncEngine {
             return
         }
         if isHostApprovalPending {
-            isHostApprovalPending = false
-            approvalContinuation?.resume(returning: false)
-            approvalContinuation = nil
+            resolveApproval(.rejected)
             return
         }
+        let wasJoining = activePairingRole == .joiner
         declinePeer()
         endPairingAttempt()
+        if wasJoining && !isPaired {
+            try? resetSession()
+        }
         errorMessage = nil
         restorePhaseAfterPairing()
     }
@@ -656,6 +719,8 @@ public final class SyncEngine {
         cancelAllWork()
         hasDurableStorage = false
         do {
+            session = nil
+            try stageDeparture()
             let markerURL = persistenceURL.deletingLastPathComponent()
                 .appendingPathComponent(Self.eraseMarkerFilename)
             try Self.persistEraseMarker(at: markerURL)
@@ -665,9 +730,10 @@ public final class SyncEngine {
                 deviceID: deviceID,
                 persistenceURL: persistenceURL,
                 checkpointURL: checkpointURL,
-                mlsDirectory: mlsDirectory,
+                mlsRoot: mlsRoot,
                 markerURL: markerURL
             )
+            mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
             session = try openSession()
             hasDurableStorage = true
             tasks = []
@@ -676,17 +742,29 @@ public final class SyncEngine {
         } catch {
             fail(error)
         }
+        startDepartures()
     }
 
+    /// Leaves the group and keeps local tasks. The MLS state moves to a
+    /// departure journal until the relay accepts a proposal removing this
+    /// device, then it is erased.
     public func unlinkAndKeepTasks() {
         guard hasDurableIdentity, isPaired else {
             return
         }
+        dropLink(departing: true)
+    }
+
+    private func dropLink(departing: Bool) {
         cancelAllWork()
         do {
             try credentialStore.clearAllPairingData()
+            session = nil
+            if departing {
+                try stageDeparture()
+            }
             try ReplicationCheckpoint.remove(at: checkpointURL)
-            try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
+            try eraseCurrentMLSState()
             session = try openSession()
         } catch {
             checkpoint = nil
@@ -696,6 +774,9 @@ public final class SyncEngine {
             return
         }
         resetLinkState()
+        if departing {
+            startDepartures()
+        }
     }
 
     public func waitForBackgroundWork() async {
@@ -711,6 +792,7 @@ public final class SyncEngine {
         appIsActive = true
         backgroundFlushTask?.cancel()
         backgroundFlushTask = nil
+        startDepartures()
         if isPaired {
             isHistoryBlocked = false
             nextSyncAttemptAt = .distantPast
@@ -764,13 +846,12 @@ public final class SyncEngine {
     public func stop() async {
         appIsActive = false
         pairingAttemptID = nil
-        approvalContinuation?.resume(returning: false)
-        approvalContinuation = nil
+        resolveApproval(.rejected)
         cancelPresentationTasks()
         syncCycleRequested = false
         let running = [
             pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask,
-            syncLoopTask, syncCycleTask, backgroundFlushTask,
+            syncLoopTask, syncCycleTask, backgroundFlushTask, departureTask,
         ].compactMap { $0 }
         for task in running {
             task.cancel()
@@ -790,6 +871,7 @@ public final class SyncEngine {
         syncCycleTask = nil
         syncCycleID = nil
         backgroundFlushTask = nil
+        departureTask = nil
         for subscriber in stateSubscribers.values { subscriber.finish() }
         stateSubscribers.removeAll()
     }
@@ -866,9 +948,12 @@ public final class SyncEngine {
 
             let offer = try PairingFrame.offer(groupID: groupID, inviterFingerprint: fingerprint)
                 .seal(for: invitation, from: .fromInviter)
-            let (connection, reference, joinerFingerprint) = try await awaitJoinerResponse(
-                invitation: invitation, offer: offer, attemptID: attemptID
+            let response = try await awaitJoinerResponse(
+                invitation: invitation, groupID: groupID, inviterFingerprint: fingerprint, offer: offer, attemptID: attemptID
             )
+            let connection = response.connection
+            let reference = response.keyPackageReference
+            let joinerFingerprint = response.joinerFingerprint
             pairingExpiryTask?.cancel()
             pairingExpiryTask = nil
             guard
@@ -882,20 +967,27 @@ public final class SyncEngine {
             invitationURL = nil
             invitationExpiresAt = nil
             safetyCode = PairingSafetyCode.code(
-                groupID: groupID, inviterFingerprint: fingerprint, joinerFingerprint: joinerFingerprint
+                groupID: groupID,
+                inviterFingerprint: fingerprint,
+                joinerFingerprint: joinerFingerprint,
+                inviterNonce: response.inviterNonce,
+                joinerNonce: response.joinerNonce
             )
             isHostApprovalPending = true
             phase = .verifying
             listenForJoinerCancellation(on: connection, invitation: invitation, attemptID: attemptID)
-            let approved = await waitForApproval(attemptID: attemptID)
-            pairingReaderTask?.cancel()
-            pairingReaderTask = nil
+            let outcome = await waitForApproval(attemptID: attemptID)
             try requireCurrentPairingAttempt(attemptID)
-            guard approved else {
+            guard outcome == .approved else {
+                pairingReaderTask?.cancel()
+                pairingReaderTask = nil
                 if let frame = try? PairingFrame.decision(approved: false).seal(for: invitation, from: .fromInviter) {
                     try? await connection.send(frame)
                 }
                 await connection.cancel()
+                if outcome == .expired {
+                    throw SyncError.approvalExpired
+                }
                 if peerDecision == false {
                     throw SyncError.pairingDeclined
                 }
@@ -905,7 +997,10 @@ public final class SyncEngine {
             }
 
             phase = .provisioning
-            if !linked {
+            if linked {
+                try await session.synchronize()
+                try await processRemovals(session: session)
+            } else {
                 try await session.createGroup(groupID)
             }
             var added = false
@@ -918,31 +1013,60 @@ public final class SyncEngine {
                 }
             }
             guard added else { throw SyncError.invalidPairMessage }
+            pairingReaderTask?.cancel()
+            pairingReaderTask = nil
+            let declined = peerDecision == false
+            if declined && !linked {
+                await connection.cancel()
+                try resetSession()
+                throw SyncError.pairingDeclined
+            }
+            let roster = try await session.members().map(ReplicationCheckpoint.Member.init)
+            var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
+                ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
+            current.members = roster
+            if declined {
+                current.pendingRemovals.append(joinerFingerprint)
+            } else {
+                current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
+                    fingerprint: joinerFingerprint, deadline: Date().addingTimeInterval(provisionalMemberWindow)
+                ))
+            }
+            try saveCheckpoint(current)
+            if declined {
+                await connection.cancel()
+                throw SyncError.pairingDeclined
+            }
             if let frame = try? PairingFrame.decision(approved: true).seal(for: invitation, from: .fromInviter) {
                 try? await connection.send(frame)
             }
             await connection.cancel()
-            let roster = try await session.members()
-            if var current = checkpoint, current.group == groupID {
-                current.memberDeviceIDs = roster.map(\.deviceID)
-                try saveCheckpoint(current)
-            } else {
-                try saveCheckpoint(ReplicationCheckpoint(
-                    group: groupID, memberDeviceIDs: roster.map(\.deviceID), joinPending: false, provider: nil
-                ))
-            }
             finishPairing(attemptID: attemptID)
         } catch {
             pairingFailed(error, attemptID: attemptID)
         }
     }
 
+    private struct JoinerResponse {
+        let connection: any PairingConnection
+        let keyPackageReference: Data
+        let joinerFingerprint: Data
+        let inviterNonce: Data
+        let joinerNonce: Data
+    }
+
+    /// Accepts exactly one joiner commitment per invitation and answers it
+    /// with the same nonce on every reconnect, so the joiner cannot pick its
+    /// KeyPackage after seeing the nonce.
     private func awaitJoinerResponse(
         invitation: Invitation,
+        groupID: Data,
+        inviterFingerprint: Data,
         offer: Data,
         attemptID: UUID
-    ) async throws -> (any PairingConnection, Data, Data) {
+    ) async throws -> JoinerResponse {
         var delayNanoseconds: UInt64 = 500_000_000
+        var bound: (commitment: Data, nonce: Data)?
         while true {
             let connection = try await connectPairing(route: invitation.route, attemptID: attemptID)
             do {
@@ -956,11 +1080,33 @@ public final class SyncEngine {
                         continue
                     case .binary(let frame):
                         switch try PairingFrame.open(frame, for: invitation, from: .fromJoiner) {
-                        case .response(let reference, let fingerprint):
-                            return (connection, reference, fingerprint)
+                        case .commitment(let commitment):
+                            if let bound, bound.commitment != commitment {
+                                throw SyncError.invalidPairMessage
+                            }
+                            let nonce = try bound?.nonce ?? Data.secureRandom(count: 32)
+                            bound = (commitment, nonce)
+                            try await connection.send(PairingFrame.nonce(nonce).seal(for: invitation, from: .fromInviter))
+                        case .response(let reference, let fingerprint, let joinerNonce):
+                            guard let bound, PairingSafetyCode.commitment(
+                                groupID: groupID,
+                                inviterFingerprint: inviterFingerprint,
+                                keyPackageReference: reference,
+                                joinerFingerprint: fingerprint,
+                                joinerNonce: joinerNonce
+                            ) == bound.commitment else {
+                                throw SyncError.invalidPairMessage
+                            }
+                            return JoinerResponse(
+                                connection: connection,
+                                keyPackageReference: reference,
+                                joinerFingerprint: fingerprint,
+                                inviterNonce: bound.nonce,
+                                joinerNonce: joinerNonce
+                            )
                         case .decision:
                             throw SyncError.pairingDeclined
-                        case .offer:
+                        case .offer, .nonce:
                             throw SyncError.invalidPairMessage
                         }
                     case .error(let code):
@@ -978,11 +1124,7 @@ public final class SyncEngine {
 
     private func runJoinerPairing(_ invitation: Invitation, session: MLSSession, attemptID: UUID) async {
         do {
-            let hasGroup = try await session.group() != nil
-            let wasRemoved = try await session.isRemoved()
-            if hasGroup || wasRemoved {
-                try resetSession()
-            }
+            try resetSession()
             guard let session = self.session else { throw SyncError.localStorageUnavailable }
             let (connection, groupID, inviterFingerprint) = try await awaitInviterOffer(
                 invitation: invitation, attemptID: attemptID
@@ -995,12 +1137,31 @@ public final class SyncEngine {
             }
             let published = try await session.publishKeyPackage(pairingToken: invitation.pairingToken)
             try requireCurrentPairingAttempt(attemptID)
+            let joinerNonce = try Data.secureRandom(count: 32)
+            let commitment = try PairingFrame.commitment(PairingSafetyCode.commitment(
+                groupID: groupID,
+                inviterFingerprint: inviterFingerprint,
+                keyPackageReference: published.reference,
+                joinerFingerprint: published.fingerprint,
+                joinerNonce: joinerNonce
+            )).seal(for: invitation, from: .fromJoiner)
+            try await connection.send(commitment)
+            let inviterNonce = try await awaitInviterNonce(
+                on: connection, invitation: invitation, commitment: commitment, attemptID: attemptID
+            )
             try await connection.send(
-                PairingFrame.response(keyPackageReference: published.reference, joinerFingerprint: published.fingerprint)
-                    .seal(for: invitation, from: .fromJoiner)
+                PairingFrame.response(
+                    keyPackageReference: published.reference,
+                    joinerFingerprint: published.fingerprint,
+                    joinerNonce: joinerNonce
+                ).seal(for: invitation, from: .fromJoiner)
             )
             safetyCode = PairingSafetyCode.code(
-                groupID: groupID, inviterFingerprint: inviterFingerprint, joinerFingerprint: published.fingerprint
+                groupID: groupID,
+                inviterFingerprint: inviterFingerprint,
+                joinerFingerprint: published.fingerprint,
+                inviterNonce: inviterNonce,
+                joinerNonce: joinerNonce
             )
             phase = .verifying
             listenForInviterDecision(on: connection, invitation: invitation, attemptID: attemptID)
@@ -1030,11 +1191,45 @@ public final class SyncEngine {
             try requireCurrentPairingAttempt(attemptID)
             let roster = try await session.members()
             try saveCheckpoint(ReplicationCheckpoint(
-                group: groupID, memberDeviceIDs: roster.map(\.deviceID), joinPending: true, provider: inviterFingerprint
+                group: groupID,
+                members: roster.map(ReplicationCheckpoint.Member.init),
+                joinPending: true,
+                provider: inviterFingerprint
             ))
             finishPairing(attemptID: attemptID)
         } catch {
             pairingFailed(error, attemptID: attemptID)
+        }
+    }
+
+    private func awaitInviterNonce(
+        on connection: any PairingConnection,
+        invitation: Invitation,
+        commitment: Data,
+        attemptID: UUID
+    ) async throws -> Data {
+        while true {
+            let event = try await connection.receive()
+            try requireCurrentPairingAttempt(attemptID)
+            switch event {
+            case .peerReady:
+                try await connection.send(commitment)
+            case .peerLeft:
+                continue
+            case .binary(let frame):
+                switch try PairingFrame.open(frame, for: invitation, from: .fromInviter) {
+                case .nonce(let nonce):
+                    return nonce
+                case .offer:
+                    continue
+                case .decision:
+                    throw SyncError.pairingDeclined
+                case .commitment, .response:
+                    throw SyncError.invalidPairMessage
+                }
+            case .error(let code):
+                throw SyncError.mapRelayCode(code)
+            }
         }
     }
 
@@ -1058,7 +1253,7 @@ public final class SyncEngine {
                             return (connection, group, fingerprint)
                         case .decision:
                             throw SyncError.pairingDeclined
-                        case .response:
+                        case .commitment, .nonce, .response:
                             throw SyncError.invalidPairMessage
                         }
                     case .error(let code):
@@ -1117,11 +1312,9 @@ public final class SyncEngine {
                 else {
                     continue
                 }
-                guard let self, self.pairingAttemptID == attemptID, self.isHostApprovalPending else { return }
+                guard let self, self.pairingAttemptID == attemptID else { return }
                 self.peerDecision = false
-                self.isHostApprovalPending = false
-                self.approvalContinuation?.resume(returning: false)
-                self.approvalContinuation = nil
+                self.resolveApproval(.rejected)
                 return
             }
         }
@@ -1145,11 +1338,38 @@ public final class SyncEngine {
         }
     }
 
-    private func waitForApproval(attemptID: UUID) async -> Bool {
-        guard isCurrentPairingAttempt(attemptID) else { return false }
+    private enum ApprovalOutcome {
+        case approved
+        case rejected
+        case expired
+    }
+
+    /// The wait ends before the relay discards the joiner's KeyPackage, so an
+    /// approval can always be provisioned.
+    private func waitForApproval(attemptID: UUID) async -> ApprovalOutcome {
+        guard isCurrentPairingAttempt(attemptID) else { return .rejected }
+        let timeout = approvalTimeoutNanoseconds
+        let timer = Task { [weak self] in
+            guard (try? await Task.sleep(nanoseconds: timeout)) != nil,
+                  let self, self.pairingAttemptID == attemptID
+            else {
+                return
+            }
+            self.resolveApproval(.expired)
+        }
+        defer { timer.cancel() }
         return await withCheckedContinuation { continuation in
             approvalContinuation = continuation
         }
+    }
+
+    private func resolveApproval(_ outcome: ApprovalOutcome) {
+        if isHostApprovalPending {
+            isHostApprovalPending = false
+        }
+        guard let continuation = approvalContinuation else { return }
+        approvalContinuation = nil
+        continuation.resume(returning: outcome)
     }
 
     private func isCurrentPairingAttempt(_ attemptID: UUID) -> Bool {
@@ -1183,8 +1403,7 @@ public final class SyncEngine {
         if let pairingConnection {
             Task { await pairingConnection.cancel() }
         }
-        approvalContinuation?.resume(returning: false)
-        approvalContinuation = nil
+        resolveApproval(.rejected)
         pairingAttemptID = nil
         pairingDeadline = nil
         pairingTask = nil
@@ -1223,8 +1442,12 @@ public final class SyncEngine {
             return
         }
         pairingTask = nil
+        let wasJoining = activePairingRole == .joiner
         declinePeer()
         endPairingAttempt()
+        if wasJoining && !isPaired {
+            try? resetSession()
+        }
         let mapped = SyncError.fromTransport(error)
         errorMessage = Self.displayMessage(for: mapped is SyncError ? mapped : SyncError.invalidPairMessage)
         if isPaired {
@@ -1277,13 +1500,16 @@ public final class SyncEngine {
             guard self.session === session, pairingTask == nil || isPaired else {
                 return
             }
-            if let group, roster.count >= 2 {
+            if let group, roster.count >= 2 || checkpoint?.group == group {
                 if var current = checkpoint, current.group == group {
-                    current.memberDeviceIDs = roster.map(\.deviceID)
+                    current.members = roster.map(ReplicationCheckpoint.Member.init)
                     try saveCheckpoint(current)
                 } else {
                     try saveCheckpoint(ReplicationCheckpoint(
-                        group: group, memberDeviceIDs: roster.map(\.deviceID), joinPending: true, provider: nil
+                        group: group,
+                        members: roster.map(ReplicationCheckpoint.Member.init),
+                        joinPending: true,
+                        provider: nil
                     ))
                 }
                 if !isPaired {
@@ -1457,7 +1683,7 @@ public final class SyncEngine {
             throw MLSSessionError.removed
         }
         try await drainInbox(session: session)
-        try await refreshMembers(session: session)
+        try await processRemovals(session: session)
         if checkpoint?.joinPending == true {
             try await announceJoin(session: session)
         }
@@ -1470,6 +1696,11 @@ public final class SyncEngine {
             return
         }
         let fingerprint = try await session.fingerprint()
+        let senders = Set(messages.map(\.sender))
+        if var current = checkpoint, current.provisionalMembers.contains(where: { senders.contains($0.fingerprint) }) {
+            current.provisionalMembers.removeAll { senders.contains($0.fingerprint) }
+            try saveCheckpoint(current)
+        }
         var pool: [TaskOperation] = []
         var hellos: [ReplicationMessage] = []
         for message in messages where message.sender != fingerprint {
@@ -1619,14 +1850,41 @@ public final class SyncEngine {
         }
     }
 
-    private func refreshMembers(session: MLSSession) async throws {
+    @discardableResult
+    private func refreshMembers(session: MLSSession) async throws -> [MLSMember] {
         let roster = try await session.members()
-        let deviceIDs = roster.map(\.deviceID)
-        guard var current = checkpoint, current.memberDeviceIDs != deviceIDs else {
-            return
+        let fingerprints = roster.map(\.fingerprint)
+        guard var current = checkpoint else {
+            return roster
         }
-        current.memberDeviceIDs = deviceIDs
-        try saveCheckpoint(current)
+        let previous = current
+        current.members = roster.map(ReplicationCheckpoint.Member.init)
+        current.pendingRemovals.removeAll { !fingerprints.contains($0) }
+        current.provisionalMembers.removeAll { !fingerprints.contains($0.fingerprint) }
+        if current != previous {
+            try saveCheckpoint(current)
+        }
+        return roster
+    }
+
+    /// Commits removals requested with `removeDevice`, members whose leave
+    /// proposal this device received, and added members that never joined.
+    private func processRemovals(session: MLSSession) async throws {
+        for _ in 0..<Self.maximumRemovalAttempts {
+            let roster = try await refreshMembers(session: session)
+            guard let current = checkpoint else { return }
+            let now = Date()
+            let candidates = current.pendingRemovals
+                + (try await session.departures())
+                + current.provisionalMembers.filter { $0.deadline <= now }.map(\.fingerprint)
+            guard let target = candidates.first(where: { candidate in
+                roster.contains { $0.fingerprint == candidate && $0.deviceID != deviceID.bytes }
+            }) else {
+                return
+            }
+            _ = try await session.remove(fingerprint: target)
+        }
+        try await refreshMembers(session: session)
     }
 
     private func handleRemoval() {
@@ -1634,11 +1892,97 @@ public final class SyncEngine {
             try? resetSession()
             return
         }
-        if !isPaired {
-            isPaired = true
-        }
-        unlinkAndKeepTasks()
+        dropLink(departing: false)
         errorMessage = Self.displayMessage(for: SyncError.removedFromGroup)
+    }
+
+    // MARK: - Departures
+
+    private static func departureKeyAccount(_ name: String) -> String {
+        "\(SecretStoreMLSStateKey.account).departing.\(name)"
+    }
+
+    private func departureSlots() -> [URL] {
+        let slots = (try? FileManager.default.contentsOfDirectory(
+            at: departuresDirectory,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        )) ?? []
+        return slots.sorted {
+            let lhs = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let rhs = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return lhs < rhs
+        }
+    }
+
+    /// Moves the MLS state and its key into a new departure slot.
+    private func stageDeparture() throws {
+        guard FileManager.default.fileExists(atPath: mlsDirectory.path) else { return }
+        guard let key = try secretStore.read(account: SecretStoreMLSStateKey.account) else {
+            try eraseCurrentMLSState()
+            return
+        }
+        for stale in departureSlots().dropLast(Self.maximumDepartures - 1) {
+            try MLSSession.erase(
+                directory: stale, secretStore: secretStore, keyAccount: Self.departureKeyAccount(stale.lastPathComponent)
+            )
+        }
+        let name = UUID().uuidString.lowercased()
+        try FileManager.default.createDirectory(
+            at: departuresDirectory,
+            withIntermediateDirectories: true,
+            attributes: ProtectedStorage.directoryAttributes
+        )
+        try secretStore.write(key, account: Self.departureKeyAccount(name), accessibility: .afterFirstUnlockThisDeviceOnly)
+        try FileManager.default.moveItem(at: mlsDirectory, to: departuresDirectory.appendingPathComponent(name, isDirectory: true))
+        mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
+        try secretStore.delete(account: SecretStoreMLSStateKey.account)
+    }
+
+    private func startDepartures() {
+        guard hasDurableIdentity, departureTask == nil, !departureSlots().isEmpty else { return }
+        departureTask = Task { [weak self] in
+            var delayNanoseconds: UInt64 = 1_000_000_000
+            for _ in 0..<6 {
+                guard let self, !Task.isCancelled else { return }
+                if await self.publishDepartures() { break }
+                guard (try? await Task.sleep(nanoseconds: delayNanoseconds)) != nil else { return }
+                delayNanoseconds = min(delayNanoseconds * 2, 30_000_000_000)
+            }
+            self?.departureTask = nil
+        }
+    }
+
+    /// Returns whether every departure slot was published or discarded.
+    private func publishDepartures() async -> Bool {
+        var complete = true
+        for slot in departureSlots() {
+            let account = Self.departureKeyAccount(slot.lastPathComponent)
+            do {
+                let departing = try MLSSession(
+                    directory: slot, deviceID: deviceID.bytes, secretStore: secretStore, keyAccount: account, transport: mlsTransport
+                )
+                try await departing.leave()
+            } catch is CancellationError {
+                return false
+            } catch let error where Self.isRetriableDeparture(error) {
+                complete = false
+                continue
+            } catch {}
+            try? MLSSession.erase(directory: slot, secretStore: secretStore, keyAccount: account)
+        }
+        return complete
+    }
+
+    private static func isRetriableDeparture(_ error: Error) -> Bool {
+        switch error {
+        case MLSRelayError.unauthorized, MLSRelayError.invalidRequest, MLSRelayError.unsupportedVersion:
+            return false
+        case MLSSessionError.unresolvedConflict, MLSClientError.storageUnavailable:
+            return true
+        default:
+            return isTransientTransportFailure(error)
+        }
     }
 
     private func startBackgroundMailboxFlush() {
@@ -1668,8 +2012,35 @@ public final class SyncEngine {
 
     private func resetSession() throws {
         session = nil
-        try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
+        try eraseCurrentMLSState()
         session = try openSession()
+    }
+
+    /// Each session generation gets a new directory. A closed-over session
+    /// that is still open can then never create journal files next to the
+    /// database of the session that replaced it.
+    private func eraseCurrentMLSState() throws {
+        try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
+        mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
+    }
+
+    private static func freshMLSDirectory(in root: URL) -> URL {
+        root.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+    }
+
+    private static func currentMLSDirectory(in root: URL) -> URL {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        )) ?? []
+        let generations = entries.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+        let newest = generations.max {
+            let lhs = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let rhs = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return lhs < rhs
+        }
+        return newest ?? freshMLSDirectory(in: root)
     }
 
     private func saveCheckpoint(_ value: ReplicationCheckpoint) throws {
@@ -1836,13 +2207,13 @@ public final class SyncEngine {
         deviceID: ReplicaDeviceID,
         persistenceURL: URL,
         checkpointURL: URL,
-        mlsDirectory: URL,
+        mlsRoot: URL,
         markerURL: URL
     ) throws -> TaskReplica {
         try store.clearPair()
         try removeAllPairingArtifacts(in: persistenceURL.deletingLastPathComponent())
         try ReplicationCheckpoint.remove(at: checkpointURL)
-        try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
+        try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
         }
@@ -1902,6 +2273,13 @@ private enum SyncCycleError: Error {
     case notDelivered
 }
 
+extension ReplicationCheckpoint.Member {
+    init(_ member: MLSMember) {
+        self.init(deviceID: member.deviceID, fingerprint: member.fingerprint)
+    }
+}
+
 extension SyncEngine {
     var mlsSessionForTesting: MLSSession? { session }
+    var mlsDirectoryForTesting: URL { mlsDirectory }
 }

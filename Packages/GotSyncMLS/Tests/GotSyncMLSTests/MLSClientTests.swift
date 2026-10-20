@@ -435,6 +435,34 @@ final class MLSClientTests: XCTestCase {
         XCTAssertEqual(inbox.last?.plaintext, Data("survives failure".utf8))
     }
 
+    func testLeaveProposalIsRecordedUntilAnotherMemberCommitsRemoval() async throws {
+        let (alice, bob, group) = try await paired()
+        let garbage = MLSDelivery(group: group, epoch: 1, kind: .proposal, payload: Data("garbage".utf8))
+        try await alice.process(garbage, cursor: 2)
+        let rejected = try await alice.rejectedApplicationCursors()
+        XCTAssertEqual(rejected, [2])
+        let leave = try await bob.prepareLeave()
+        XCTAssertEqual(leave.kind, .proposal)
+        XCTAssertEqual(leave.epoch, 1)
+        try await alice.process(leave, cursor: 3)
+        let bobFingerprint = try await bob.fingerprint()
+        let departures = try await alice.departures()
+        XCTAssertEqual(departures, [bobFingerprint])
+        let inbox = try await alice.inbox()
+        XCTAssertTrue(inbox.isEmpty)
+        do { _ = try await alice.prepareMessage(Data("blocked".utf8)); XCTFail("Sent with a pending proposal") } catch {}
+        let removal = try await alice.prepareRemove(fingerprint: bobFingerprint)
+        try await alice.process(removal, cursor: 4)
+        let remaining = try await alice.departures()
+        XCTAssertEqual(remaining, [])
+        let members = try await alice.members()
+        XCTAssertEqual(members.count, 1)
+        try await bob.process(leave, cursor: 3)
+        try await bob.process(removal, cursor: 4)
+        let removed = try await bob.isRemoved()
+        XCTAssertTrue(removed)
+    }
+
     func testRelabeledCommitAndEpochGapFailWithoutAdvancingCursor() async throws {
         let (alice, bob, group) = try await paired()
         let commit = try await alice.prepareRemove(fingerprint: bob.fingerprint())

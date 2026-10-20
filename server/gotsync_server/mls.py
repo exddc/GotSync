@@ -215,12 +215,12 @@ class MLSDeliveryStore:
                 raise DeliveryCapacity("rejection journal full")
             self._db.execute("INSERT INTO mls_rejections VALUES (?,?,?)", (route, digest, entry[0]))
             return {"error": "keyPackageUnavailable", "epoch": entry[0]}
-        return self._accept_entry(route, entry)
+        return self._accept_entry(route, entry, writer)
 
     def _parse_entry(self, doc: dict, writer: bytes) -> tuple:
         epoch = number(doc, "epoch")
         kind = doc.get("kind")
-        if kind not in ("commit", "application"):
+        if kind not in ("commit", "application", "proposal"):
             raise MailboxError("invalid kind")
         payload = blob(doc, "payload")
         welcome = blob(doc, "welcome") if doc.get("welcome") is not None else None
@@ -231,11 +231,13 @@ class MLSDeliveryStore:
             raise MailboxError("invalid writer removal")
         if (welcome is None) != (package is None) or (welcome is None) != (added_writer is None) or (welcome is not None and kind != "commit"):
             raise MailboxError("Welcome requires commit and KeyPackage reference")
+        if kind == "proposal" and removed_writer is not None:
+            raise MailboxError("a proposal can only remove its sender")
         return epoch, kind, payload, welcome, package, removed_writer, added_writer
 
     def _check_membership(self, route: bytes, entry: tuple) -> bool:
         _, _, _, _, package, removed_writer, added_writer = entry
-        if removed_writer and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=? AND removal IS NULL", (route, removed_writer)).fetchone():
+        if removed_writer and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=?", (route, removed_writer)).fetchone():
             raise MailboxError("writer removal target is unknown")
         joining = self._db.execute("SELECT writer FROM mls_packages WHERE reference=?", (package,)).fetchone() if package else None
         if package and (not joining or joining[0] != added_writer):
@@ -245,7 +247,7 @@ class MLSDeliveryStore:
                 raise DeliveryCapacity("writer directory full")
         return True
 
-    def _accept_entry(self, route: bytes, entry: tuple) -> dict:
+    def _accept_entry(self, route: bytes, entry: tuple, writer: bytes) -> dict:
         epoch, kind, payload, welcome, package, removed_writer, added_writer = entry
         count, size = self._db.execute(
             "SELECT COUNT(*),COALESCE(SUM(LENGTH(payload)+COALESCE(LENGTH(welcome),0)+COALESCE(LENGTH(package),0)),0) FROM mls_entries WHERE route=?", (route,)
@@ -260,8 +262,9 @@ class MLSDeliveryStore:
         if package:
             self._db.execute("INSERT OR REPLACE INTO mls_writers(route,digest,ack) VALUES (?,?,?)", (route, added_writer, cursor - 1))
             self._db.execute("DELETE FROM mls_packages WHERE reference=?", (package,))
-        if removed_writer:
-            self._db.execute("UPDATE mls_writers SET removal=?,removed_at=? WHERE route=? AND digest=?", (cursor, time.time(), route, removed_writer))
+        for removed in (removed_writer, writer if kind == "proposal" else None):
+            if removed:
+                self._db.execute("UPDATE mls_writers SET removal=?,removed_at=? WHERE route=? AND digest=? AND removal IS NULL", (cursor, time.time(), route, removed))
         return {"entry": self._entry((cursor, *entry))}
 
     @staticmethod

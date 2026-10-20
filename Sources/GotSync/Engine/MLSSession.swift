@@ -6,14 +6,15 @@ struct SecretStoreMLSStateKey: MLSStateKeyProvider {
     static let account = "mls-state-key-v2"
 
     let store: any SecretStore
+    var account = Self.account
 
     func key() throws -> SymmetricKey {
-        if let existing = try store.read(account: Self.account) {
+        if let existing = try store.read(account: account) {
             guard existing.count == 32 else { throw MLSStoreError.unreadable }
             return SymmetricKey(data: existing)
         }
         let generated = try Data.secureRandom(count: 32)
-        try store.write(generated, account: Self.account, accessibility: .afterFirstUnlockThisDeviceOnly)
+        try store.write(generated, account: account, accessibility: .afterFirstUnlockThisDeviceOnly)
         return SymmetricKey(data: generated)
     }
 }
@@ -48,6 +49,7 @@ actor MLSSession {
         directory: URL,
         deviceID: Data,
         secretStore: any SecretStore,
+        keyAccount: String = SecretStoreMLSStateKey.account,
         transport: any MLSRelayTransport,
         fetchLimit: Int = 8
     ) throws {
@@ -55,7 +57,7 @@ actor MLSSession {
         client = try MLSClient(
             directory: directory,
             deviceID: deviceID,
-            stateKey: SecretStoreMLSStateKey(store: secretStore)
+            stateKey: SecretStoreMLSStateKey(store: secretStore, account: keyAccount)
         )
         self.transport = transport
         self.fetchLimit = fetchLimit
@@ -65,11 +67,15 @@ actor MLSSession {
         storageDirectory.appendingPathComponent(directoryName, isDirectory: true)
     }
 
-    static func erase(directory: URL, secretStore: any SecretStore) throws {
+    static func erase(
+        directory: URL,
+        secretStore: any SecretStore,
+        keyAccount: String = SecretStoreMLSStateKey.account
+    ) throws {
         if FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.removeItem(at: directory)
         }
-        try secretStore.delete(account: SecretStoreMLSStateKey.account)
+        try secretStore.delete(account: keyAccount)
     }
 
     func fingerprint() async throws -> Data { try await client.fingerprint() }
@@ -82,6 +88,7 @@ actor MLSSession {
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
     func inbox() async throws -> [MLSInboxMessage] { try await client.inbox() }
     func rejectedApplicationCursors() async throws -> [UInt64] { try await client.rejectedApplicationCursors() }
+    func departures() async throws -> [Data] { try await client.departures() }
 
     func acknowledgeInbox(through cursor: UInt64) async throws {
         try await client.acknowledgeInbox(through: cursor)
@@ -126,13 +133,52 @@ actor MLSSession {
 
     func remove(fingerprint: Data) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit { try await $0.prepareRemove(fingerprint: fingerprint) }
+            try await session.submit { client in
+                guard try await client.members().contains(where: { $0.fingerprint == fingerprint }) else {
+                    return nil
+                }
+                return try await client.prepareRemove(fingerprint: fingerprint)
+            }
         }
     }
 
     func send(_ plaintext: Data) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit { try await $0.prepareMessage(plaintext) }
+            try await session.commitDepartures()
+            return try await session.submit { try await $0.prepareMessage(plaintext) }
+        }
+    }
+
+    /// Publishes a proposal removing this member and revokes its relay
+    /// access. Another member commits the removal.
+    func leave() async throws {
+        try await exclusive { session in
+            guard let group = try await session.client.group() else { throw MLSSessionError.notInGroup }
+            let authorization = try await session.client.transportAuthorization()
+            for _ in 0..<Self.maximumSubmitAttempts {
+                if try await session.client.isRemoved() { throw MLSSessionError.removed }
+                if let pending = try await session.client.pendingDelivery(), pending.kind != .proposal {
+                    _ = try await session.deliverPending()
+                    continue
+                }
+                let proposal: MLSDelivery
+                if let pending = try await session.client.pendingDelivery() {
+                    proposal = pending
+                } else {
+                    proposal = try await session.client.prepareLeave()
+                }
+                let result: MLSAppendResult
+                do {
+                    result = try await session.transport.append(proposal, authorization: authorization)
+                } catch MLSRelayError.epochConflict {
+                    _ = try await session.catchUp()
+                    continue
+                }
+                guard case .accepted(let cursor) = result else { throw MLSRelayError.invalidResponse }
+                try? await session.transport.acknowledge(group: group, through: cursor, authorization: authorization)
+                return
+            }
+            throw MLSSessionError.unresolvedConflict
         }
     }
 
@@ -182,11 +228,22 @@ actor MLSSession {
         }
     }
 
-    private func submit(_ prepare: (MLSClient) async throws -> MLSDelivery) async throws -> MLSSubmission {
+    private func commitDepartures() async throws {
+        for _ in 0..<Self.maximumSubmitAttempts {
+            guard let departed = try await client.departures().first else { return }
+            _ = try await submit { client in
+                guard try await client.members().contains(where: { $0.fingerprint == departed }) else { return nil }
+                return try await client.prepareRemove(fingerprint: departed)
+            }
+        }
+        throw MLSSessionError.unresolvedConflict
+    }
+
+    private func submit(_ prepare: (MLSClient) async throws -> MLSDelivery?) async throws -> MLSSubmission {
         if try await client.pendingDelivery() != nil {
             _ = try await deliverPending()
         }
-        _ = try await prepare(client)
+        guard try await prepare(client) != nil else { return .superseded }
         return try await deliverPending()
     }
 

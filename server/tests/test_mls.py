@@ -475,3 +475,50 @@ def test_joiner_floor_keeps_welcome_but_releases_earlier_entries(tmp_path):
     request(store, "ack", route=group, cursor=welcome["cursor"], authorization=encode_base64url(b"b" * 32))
     assert request(store, "fetch", group=group, after=0)["entries"] == []
     store.close()
+
+
+def test_leave_proposal_revokes_its_sender_and_a_later_commit_removes_it(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    removed_group(store)
+    group = encode_base64url(b"g" * 32)
+    alice = encode_base64url(b"a" * 32)
+    carol = encode_base64url(b"c" * 32)
+    carol_hash = encode_base64url(hashlib.sha256(b"c" * 32).digest())
+    package = request(store, "key-package/publish", payload=encode_base64url(b"carol package"), authorization=carol)["reference"]
+    append(store, payload=b"add carol", epoch=2, reference=package, welcome=encode_base64url(b"welcome"), addWriter=carol_hash)
+    for fields in ({"removeWriter": carol_hash}, {"addWriter": carol_hash}):
+        with pytest.raises(MailboxError):
+            append(store, payload=b"bad proposal", epoch=3, kind="proposal", authorization=carol, **fields)
+    with pytest.raises(DeliveryConflict):
+        append(store, payload=b"stale leave", epoch=2, kind="proposal", authorization=carol)
+    left = append(store, payload=b"carol leaves", epoch=3, kind="proposal", authorization=carol)["entry"]
+    assert left["kind"] == "proposal"
+    for payload, kind in ((b"carol leaves", "proposal"), (b"after leaving", "application")):
+        with pytest.raises(DeliveryUnauthorized):
+            append(store, payload=payload, epoch=3, kind=kind, authorization=carol)
+    assert request(store, "fetch", group=group, after=0, authorization=carol)["entries"][-1] == left
+    request(store, "ack", route=group, cursor=left["cursor"], authorization=carol)
+    for operation, fields in (("fetch", {"group": group, "after": 0}), ("ack", {"route": group, "cursor": left["cursor"]})):
+        with pytest.raises(DeliveryUnauthorized):
+            request(store, operation, authorization=carol, **fields)
+    committed = append(store, payload=b"commit carol removal", epoch=3, removeWriter=carol_hash, authorization=alice)["entry"]
+    assert committed["epoch"] == 3
+    after = append(store, payload=b"later epoch", epoch=4, kind="application")["entry"]
+    assert request(store, "fetch", group=group, after=0)["entries"][-2:] == [committed, after]
+    removal = store._db.execute("SELECT removal FROM mls_writers WHERE digest=?", (hashlib.sha256(b"c" * 32).digest(),)).fetchone()[0]
+    assert removal == left["cursor"]
+    store.close()
+
+
+def test_removed_writer_cannot_read_or_write_later_epochs(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    cursor = removed_group(store)
+    group = encode_base64url(b"g" * 32)
+    bob = encode_base64url(b"b" * 32)
+    append(store, payload=b"later epoch", epoch=2, kind="application")
+    assert [entry["cursor"] for entry in request(store, "fetch", group=group, after=0, authorization=bob)["entries"]][-1] == cursor
+    assert request(store, "fetch", group=group, after=cursor, authorization=bob)["entries"] == []
+    for kind in ("application", "proposal", "commit"):
+        with pytest.raises(DeliveryUnauthorized):
+            append(store, payload=b"removed " + kind.encode(), epoch=2, kind=kind, authorization=bob)
+    store.close()
