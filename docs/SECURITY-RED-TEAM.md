@@ -1,20 +1,17 @@
 # Security red-team findings
 
 This record is for engineers and consumers assessing the current protocol.
-It carries forward the internal group-sync review and distinguishes implemented
-mitigations from unresolved attacks. The repository restructure does not claim
-to fix the underlying shared-root security design. No independent audit has
-been completed.
+It distinguishes implemented mitigations from unresolved attacks. No
+independent audit has been completed.
 
-## MLS spike status
+## Experimental MLS status
 
-The isolated [OpenMLS spike](MLS-SPIKE.md) tests rejection of unknown-member
-application messages (R2a), QR fingerprint substitution, Welcome-signer
+The experimental OpenMLS package in `Packages/GotSyncMLS` tests rejection of
+unknown-member application messages (R2a), QR fingerprint substitution, Welcome-signer
 substitution, and removed-device decryption of later epochs. It also tests
 replays, tampering, commit conflicts, and durable state/inbox recovery.
 These results apply only to the experimental package. `SyncEngine` still
 uses the custom protocol, so no existing finding is marked resolved.
-The production cutover and independent integration review remain pending.
 
 ## Open findings
 

@@ -9,8 +9,6 @@ let package = Package(
         .binaryTarget(name: "gotsync_mlsFFI", path: "Artifacts/GotSyncMLSFFI.xcframework"),
         .target(name: "GotSyncMLSBindings", dependencies: ["gotsync_mlsFFI"]),
         .target(name: "GotSyncMLS", dependencies: ["GotSyncMLSBindings"]),
-        .executableTarget(name: "MLSSmoke", dependencies: ["GotSyncMLS"]),
-        .executableTarget(name: "BaselineSmoke"),
         .testTarget(name: "GotSyncMLSTests", dependencies: ["GotSyncMLS", "GotSyncMLSBindings"]),
     ]
 )

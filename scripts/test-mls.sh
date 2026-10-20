@@ -19,7 +19,7 @@ cleanup() {
     rm -rf "$GOTSYNC_MLS_TEST_DIR"
 }
 trap cleanup EXIT INT TERM
-"$UV_PROJECT_ENVIRONMENT/bin/python" scripts/run-mls-spike-server.py "$GOTSYNC_MLS_TEST_DIR" > "$GOTSYNC_MLS_TEST_DIR/server.log" 2>&1 &
+"$UV_PROJECT_ENVIRONMENT/bin/python" scripts/run-mls-server.py "$GOTSYNC_MLS_TEST_DIR" > "$GOTSYNC_MLS_TEST_DIR/server.log" 2>&1 &
 GOTSYNC_MLS_SERVER_PID=$!
 for ((attempt=0; attempt<100; attempt++)); do
     if [ -f "$GOTSYNC_MLS_TEST_DIR/endpoint" ]; then break; fi

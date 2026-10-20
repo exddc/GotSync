@@ -6,10 +6,6 @@ mailbox. The current replicated model contains task titles, completion state,
 and deletions. The engine is under development and does not offer a generic
 record schema.
 
-**GotSync is the working name.** The final name is pending a decision with the
-CMO. Got Done remains a private application and can depend on this package like
-any other consumer. No Got Done application code is required by the library.
-
 ## Repository layout
 
 | Path | Contents |
@@ -17,6 +13,8 @@ any other consumer. No Got Done application code is required by the library.
 | `Sources/GotSync` | Swift library, pairing, recovery, replication, and transport |
 | `Tests/GotSyncTests` | Library tests and real-server integration coverage |
 | `server/` | Python relay and local Docker setup |
+| `mls/`, `Packages/GotSyncMLS` | Experimental OpenMLS bindings and Swift wrapper |
+| `scripts/` | Development, build, and test scripts |
 | `Examples/AccountlessSync` | SwiftUI iPhone demo with a local package dependency |
 | `docs/` | Protocol, compatibility, threat model, and security findings |
 
@@ -106,15 +104,6 @@ can derive other members' mailbox keys and may follow later rekey messages.
 Leaving a group does not guarantee cryptographic exclusion or remote deletion.
 Read the [threat model](docs/THREAT-MODEL.md) and
 [red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
-
-## Experimental MLS migration
-
-TW-531 has an isolated OpenMLS/UniFFI spike in `Packages/GotSyncMLS` and `mls/`.
-It is not connected to `SyncEngine`; the security limits above still apply.
-See [build instructions, results, and remaining gates](docs/MLS-SPIKE.md).
-CI also packages a complete prebuilt Swift dependency for local Xcode/SwiftPM
-consumption without installing Rust.
-Run `scripts/build-mls.sh` before resolving the experimental Swift package.
 
 ## Test
 
