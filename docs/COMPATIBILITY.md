@@ -17,7 +17,8 @@ implementations.
 | Pairing handshake and completion | Version 2 | Handshake and control-record validators reject incompatible input |
 | Invitation URL | Consumer-specific scheme and `pair` host with `v=2` | Parser requires `secret`, `group`, and `fingerprint`; `v=1` fails with `unsupportedVersion` |
 | MLS delivery service | `/v2/mls`, `version: 2` | Client rejects any other response version; server rejects other request versions |
-| MLS pairing frames | Version 2 over the `/v1` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing |
+| MLS pairing frames | Version 2 over the `/v1` WebSocket room, with commitment and nonce frames | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment aborts pairing |
+| MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
 | Replication checkpoint | `sync-v2.json`, version 2 | Engine discards an unreadable checkpoint and rebuilds it from MLS state |
 | Device credentials | Pair 1, group 2 | Credential store validates or migrates pair records to group records |
