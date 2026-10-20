@@ -1,17 +1,21 @@
 # GotSync relay
 
-This relay forwards opaque live frames and stores encrypted mailbox envelopes for GotSync.
-It provides two transports:
+This relay carries opaque traffic for GotSync. It serves three endpoints:
 
-- A volatile WebSocket path routes opaque binary messages between two live
-  peers with low latency.
-- A persistent HTTP mailbox stores opaque, end-to-end-encrypted envelopes so a
-  device can publish changes while its peer is offline.
+- The volatile WebSocket path `/v1` routes opaque binary frames between two
+  peers. Current clients use it only for the pairing exchange.
+- The MLS delivery service `/v2/mls`, on the HTTP port, keeps KeyPackages and
+  an ordered log of MLS commits, proposals, and application messages per
+  group. Current clients send all task changes through it. PROTOCOL.md
+  describes its requests.
+- The version 1 HTTP mailbox `/v1/mailbox` stores encrypted envelopes for
+  version 1 clients. No current client calls it. It stays for the server-first
+  rollout described in docs/COMPATIBILITY.md.
 
-The relay does not encrypt, decrypt, or inspect application envelopes. Live
-frames are never persisted or buffered before a peer arrives. The mailbox
-persists only opaque bytes, random identifiers, cursors, hashes needed for
-idempotency, and expiry timestamps.
+The relay does not encrypt, decrypt, or inspect application payloads.
+WebSocket frames are never persisted or buffered before a peer arrives. The
+HTTP stores persist only opaque bytes, random identifiers, cursors, hashes
+needed for authorization and idempotency, and expiry timestamps.
 
 ## Run
 
