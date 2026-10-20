@@ -145,8 +145,10 @@ durable storage. A failed transaction leaves the previous snapshot usable.
 Snapshots use a version byte (4) followed by postcard binary data, capped at
 16 MiB; older snapshots are rejected and require re-pairing. Identity creation
 publishes no KeyPackage. `joiningIdentity()` transactionally creates a fresh
-seven-day package and replaces any unused package and its private material.
-Only the newest published package can be used to join.
+seven-day package, discards invalid packages and their private material, and
+retains up to eight valid packages, dropping the oldest first at capacity.
+Any retained unexpired published package can join; creating or joining a group
+discards all published packages and their private material.
 
 Creating a message advances the sender ratchet and journals the exact
 ciphertext plus its plaintext for epoch-conflict recovery. The spike allows

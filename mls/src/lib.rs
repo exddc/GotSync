@@ -46,7 +46,7 @@ struct Snapshot {
     public_key: Vec<u8>,
     group_id: Option<Vec<u8>>,
     pending_commit: Option<Vec<u8>>,
-    key_package: Option<Vec<u8>>,
+    key_package: Vec<Vec<u8>>,
     values: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -216,14 +216,18 @@ impl Client {
         })
     }
 
-    fn discard_key_package(&mut self) -> Result<()> {
-        if let Some(bytes) = self.snapshot.key_package.take() {
-            let reference = protocol(openmls::ciphersuite::hash_ref::make_key_package_ref(
-                &bytes,
-                SUITE,
-                self.provider.crypto(),
-            ))?;
-            protocol(self.provider.storage().delete_key_package(&reference))?;
+    fn discard_key_package(&self, bytes: &[u8]) -> Result<()> {
+        let reference = protocol(openmls::ciphersuite::hash_ref::make_key_package_ref(
+            bytes,
+            SUITE,
+            self.provider.crypto(),
+        ))?;
+        protocol(self.provider.storage().delete_key_package(&reference))
+    }
+
+    fn discard_key_packages(&mut self) -> Result<()> {
+        for bytes in std::mem::take(&mut self.snapshot.key_package) {
+            self.discard_key_package(&bytes)?;
         }
         Ok(())
     }
@@ -284,7 +288,7 @@ pub fn create_identity(device_id: Vec<u8>) -> Result<MlsIdentity> {
             public_key,
             group_id: None,
             pending_commit: None,
-            key_package: None,
+            key_package: vec![],
             values: vec![],
         },
         provider,
@@ -308,14 +312,28 @@ fn publish_with_lifetime(state: Vec<u8>, lifetime: u64) -> Result<MlsTransition>
     if client.snapshot.group_id.is_some() {
         return Err(MlsError::InvalidState);
     }
-    client.discard_key_package()?;
+    for bytes in std::mem::take(&mut client.snapshot.key_package) {
+        let kp = KeyPackageIn::tls_deserialize_exact(&bytes).map_err(|_| MlsError::InvalidState)?;
+        if kp
+            .validate(client.provider.crypto(), ProtocolVersion::Mls10)
+            .is_ok()
+        {
+            client.snapshot.key_package.push(bytes);
+        } else {
+            client.discard_key_package(&bytes)?;
+        }
+    }
+    if client.snapshot.key_package.len() >= 8 {
+        let oldest = client.snapshot.key_package.remove(0);
+        client.discard_key_package(&oldest)?;
+    }
     let bundle = protocol(
         KeyPackage::builder()
             .key_package_lifetime(Lifetime::new(lifetime))
             .build(SUITE, &client.provider, &client.signer, client.credential()),
     )?;
     let bytes = protocol(bundle.key_package().tls_serialize_detached())?;
-    client.snapshot.key_package = Some(bytes.clone());
+    client.snapshot.key_package.push(bytes.clone());
     client.save(bytes, None, None, None, false)
 }
 
@@ -325,7 +343,6 @@ pub fn create_group(state: Vec<u8>, group_id: Vec<u8>) -> Result<MlsTransition> 
     if client.snapshot.group_id.is_some() || group_id.len() != 32 {
         return Err(MlsError::InvalidState);
     }
-    client.discard_key_package()?;
     let group = protocol(MlsGroup::new_with_group_id(
         &client.provider,
         &client.signer,
@@ -333,6 +350,7 @@ pub fn create_group(state: Vec<u8>, group_id: Vec<u8>) -> Result<MlsTransition> 
         GroupId::from_slice(&group_id),
         client.credential(),
     ))?;
+    client.discard_key_packages()?;
     client.snapshot.group_id = Some(group_id);
     client.save(vec![], None, Some(&group), None, false)
 }
@@ -455,7 +473,7 @@ pub fn join_group(
         return Err(MlsError::InvalidInput);
     }
     client.snapshot.group_id = Some(expected_group_id);
-    client.snapshot.key_package = None;
+    client.discard_key_packages()?;
     client.save(vec![], None, Some(&group), None, false)
 }
 
@@ -540,44 +558,100 @@ pub fn receive_message(state: Vec<u8>, message: Vec<u8>) -> Result<MlsTransition
 mod policy_tests {
     use super::*;
 
-    #[test]
-    fn publication_replaces_expired_private_material() {
-        let identity = create_identity(vec![2; 16]).unwrap();
-        let client = Client::load(identity.state.clone()).unwrap();
-        assert!(client.snapshot.key_package.is_none());
-        let short = publish_with_lifetime(identity.state, 2).unwrap();
+    fn has_package(client: &Client, bytes: &[u8]) -> bool {
         let reference = openmls::ciphersuite::hash_ref::make_key_package_ref(
-            &short.output,
+            bytes,
             SUITE,
-            OpenMlsRustCrypto::default().crypto(),
+            client.provider.crypto(),
         )
         .unwrap();
+        client
+            .provider
+            .storage()
+            .key_package::<_, KeyPackageBundle>(&reference)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn publication_discards_expired_packages_and_retains_valid_packages() {
+        let identity = create_identity(vec![2; 16]).unwrap();
+        assert!(
+            Client::load(identity.state.clone())
+                .unwrap()
+                .snapshot
+                .key_package
+                .is_empty()
+        );
+        let short = publish_with_lifetime(identity.state, 2).unwrap();
+        let valid = publish_key_package(short.state).unwrap();
         let host = create_identity(vec![1; 16]).unwrap();
         let group = create_group(host.state, vec![7; 32]).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(2));
         let error = prepare_add(
             group.state.clone(),
-            short.output,
+            short.output.clone(),
             identity.fingerprint.clone(),
         )
         .err()
         .unwrap();
         assert!(matches!(error, MlsError::LibraryRejected { ref code } if !code.is_empty()));
-        let created = create_group(short.state.clone(), vec![8; 32]).unwrap();
-        let fresh = publish_key_package(short.state).unwrap();
-        for state in [created.state, fresh.state.clone()] {
+        let fresh = publish_key_package(valid.state).unwrap();
+        let client = Client::load(fresh.state).unwrap();
+        assert_eq!(
+            client.snapshot.key_package,
+            vec![valid.output.clone(), fresh.output]
+        );
+        assert!(!has_package(&client, &short.output));
+        assert!(has_package(&client, &valid.output));
+        assert!(prepare_add(group.state, valid.output, identity.fingerprint).is_ok());
+    }
+
+    #[test]
+    fn create_and_join_discard_all_published_private_material() {
+        let identity = create_identity(vec![2; 16]).unwrap();
+        let first = publish_key_package(identity.state).unwrap();
+        let second = publish_key_package(first.state).unwrap();
+        let created = create_group(second.state.clone(), vec![8; 32]).unwrap();
+        let host = create_identity(vec![1; 16]).unwrap();
+        let group = create_group(host.state, vec![7; 32]).unwrap();
+        let pending = prepare_add(group.state, first.output.clone(), identity.fingerprint).unwrap();
+        let joined = join_group(
+            second.state,
+            pending.welcome.unwrap(),
+            vec![7; 32],
+            host.fingerprint,
+        )
+        .unwrap();
+        for state in [created.state, joined.state] {
             let client = Client::load(state).unwrap();
-            assert!(
-                client
-                    .provider
-                    .storage()
-                    .key_package::<_, KeyPackageBundle>(&reference)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(client.snapshot.key_package.is_empty());
+            assert!(!has_package(&client, &first.output));
+            assert!(!has_package(&client, &second.output));
         }
-        let pending = prepare_add(group.state, fresh.output, identity.fingerprint).unwrap();
-        assert!(pending.welcome.is_some());
+    }
+
+    #[test]
+    fn publication_drops_oldest_package_at_capacity() {
+        let mut state = create_identity(vec![2; 16]).unwrap().state;
+        let mut packages = Vec::new();
+        for _ in 0..9 {
+            let published = publish_key_package(state).unwrap();
+            packages.push(published.output);
+            state = published.state;
+        }
+        let client = Client::load(state).unwrap();
+        assert_eq!(client.snapshot.key_package, packages[1..]);
+        assert!(!has_package(&client, &packages[0]));
+        assert!(
+            packages[1..]
+                .iter()
+                .all(|bytes| has_package(&client, bytes))
+        );
+    }
+
+    #[test]
+    fn library_error_text_is_truncated_to_200_characters() {
         let error = protocol::<(), _>(Err("é".repeat(201))).unwrap_err();
         assert!(matches!(error, MlsError::LibraryRejected { code } if code.chars().count() == 200));
     }

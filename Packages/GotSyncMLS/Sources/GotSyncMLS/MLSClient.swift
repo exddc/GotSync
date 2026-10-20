@@ -66,7 +66,6 @@ struct ClientRecord: Codable {
 }
 
 struct IdentityRecord: Codable {
-    var keyPackage: Data
     var fingerprint: Data
 }
 
@@ -82,7 +81,7 @@ public actor MLSClient {
                 let identity = try createIdentity(deviceId: deviceID)
                 record = ClientRecord(
                     state: Data(identity.state), deviceID: deviceID,
-                    identity: IdentityRecord(keyPackage: Data(), fingerprint: Data(identity.fingerprint)),
+                    identity: IdentityRecord(fingerprint: Data(identity.fingerprint)),
                     writerToken: Data(identity.writerToken)
                 )
             }
@@ -94,8 +93,7 @@ public actor MLSClient {
             guard record.group == nil else { throw MLSClientError.invalidState }
             let transition = try publishKeyPackage(state: record.state)
             record.state = Data(transition.state)
-            record.identity.keyPackage = Data(transition.output)
-            return MLSJoiningIdentity(keyPackage: record.identity.keyPackage, fingerprint: record.identity.fingerprint)
+            return MLSJoiningIdentity(keyPackage: Data(transition.output), fingerprint: record.identity.fingerprint)
         }
     }
 
@@ -123,7 +121,6 @@ public actor MLSClient {
             guard record.group == nil else { throw MLSClientError.invalidState }
             let transition = try GotSyncMLSBindings.createGroup(state: record.state, groupId: id)
             Self.apply(transition, to: &record)
-            record.identity.keyPackage = Data()
         }
     }
 
@@ -162,7 +159,6 @@ public actor MLSClient {
             let transition = try joinGroup(state: record.state, welcome: welcome, expectedGroupId: group, inviterFingerprint: verifiedInviterFingerprint)
             Self.apply(transition, to: &record)
             record.cursor = cursor
-            record.identity.keyPackage = Data()
         }
     }
 

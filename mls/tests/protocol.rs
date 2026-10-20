@@ -173,7 +173,7 @@ fn snapshot_version_and_reload_preserve_group_identity() {
 }
 
 #[test]
-fn only_newest_published_package_can_join() {
+fn any_unexpired_published_package_can_join() {
     let alice = identity(1);
     let bob = identity(2);
     let fresh = publish_key_package(bob.state.clone()).unwrap();
@@ -190,7 +190,7 @@ fn only_newest_published_package_can_join() {
             vec![7; 32],
             alice.fingerprint.clone()
         )
-        .is_err()
+        .is_ok()
     );
     let pending = prepare_add(group(&alice).state, fresh.output, bob.fingerprint).unwrap();
     assert!(

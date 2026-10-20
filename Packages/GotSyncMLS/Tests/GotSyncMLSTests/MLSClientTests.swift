@@ -30,17 +30,12 @@ final class MLSClientTests: XCTestCase {
         try await alice.createGroup(id: group)
         let old = try await alice.prepareAdd(keyPackage: first.keyPackage, verifiedFingerprint: first.fingerprint, reference: Data(SHA256.hash(data: first.keyPackage)))
         let reopened = try client(2)
-        do {
-            try await reopened.join(welcome: XCTUnwrap(old.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: 1)
-            XCTFail("Superseded package accepted")
-        } catch let MlsError.LibraryRejected(code) {
-            XCTAssertFalse(code.isEmpty)
-            XCTAssertTrue(MlsError.LibraryRejected(code: code).localizedDescription.contains(code))
-        }
-        let host = try client(3)
-        try await host.createGroup(id: group)
-        let pending = try await host.prepareAdd(keyPackage: fresh.keyPackage, verifiedFingerprint: fresh.fingerprint, reference: Data(SHA256.hash(data: fresh.keyPackage)))
-        try await reopened.join(welcome: XCTUnwrap(pending.welcome), group: group, verifiedInviterFingerprint: host.fingerprint(), cursor: 1)
+        try await alice.process(old, cursor: 1)
+        try await reopened.join(welcome: XCTUnwrap(old.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: 1)
+        let message = try await alice.prepareMessage(Data("paired using first package".utf8))
+        try await reopened.process(message, cursor: 2)
+        let inbox = try await reopened.inbox()
+        XCTAssertEqual(inbox.last?.plaintext, Data("paired using first package".utf8))
     }
 
     func testPendingCommitAndInboxSurviveReopening() async throws {
