@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
-from gotsync_server.mls_spike import MLSDeliveryServer, MLSDeliveryStore
+from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore
 
 
 async def main() -> None:

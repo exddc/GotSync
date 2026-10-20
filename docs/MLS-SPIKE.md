@@ -161,12 +161,22 @@ relay durably records this refusal before responding and will never accept
 those commit bytes later, even if the KeyPackage is republished. Do not call
 this method after an epoch conflict, timeout, or ambiguous network failure.
 
+Fetch with the member's bearer writer token and `{"group": route, "after": cursor}`.
+The optional `limit` defaults to 16 and accepts 1 through 32. Responses contain
+an ordered `entries` list, which is empty at the end of the retained log.
 Call `process` only in the sequence returned by `fetch`, starting at `cursor()`.
 An append response is a delivery receipt, not permission to skip earlier log
 entries. Applying an incoming message stores plaintext in the protected inbox
 with the consumed message secrets and cursor. After applying that inbox item
 durably to the application, call `acknowledgeInbox`. Redelivery after a crash
-is harmless; decryption is not repeated. The future engine must make replica
+is harmless; decryption is not repeated. After persisting each processed delivery,
+send `ack` with `{"route": route, "cursor": cursor}` and the same bearer token.
+The relay tracks each writer's greatest acknowledged cursor and prunes entries
+through the minimum cursor across current writers and pending removed writers.
+Acknowledgements cannot exceed the route's head or a removed writer's removal
+cursor. Cache the bearer token before processing removal because `MLSClient`
+clears its local credential. Send the final acknowledgement with that cached token.
+The future engine must make replica
 updates idempotent because a crash can occur before acknowledging the inbox.
 
 Incoming sender identity is the SHA-256 fingerprint of the authenticated MLS
@@ -217,23 +227,33 @@ its persisted group snapshot after authenticated removal.
 
 ## Experimental relay limits
 
-`MLSDeliveryServer` binds only to loopback, uses separate tables/database, and
-is not registered in the production server. It stores public KeyPackages,
+`MLSDeliveryServer` supplies the loopback test server and the production
+`POST /v2/mls/<operation>` handler on the mailbox HTTP listener. Production stores
+MLS data in `mls.sqlite3` next to the mailbox database, with separate tables.
+It stores public KeyPackages,
 opaque Commit/Welcome/application bytes, and routing metadata. It receives no
 MLS signing, HPKE, or epoch encryption keys. Clients authenticate MLS contents;
 the relay does not parse or certify ciphertext.
 
 One SQLite transaction conditionally accepts a commit at the current epoch,
 appends Commit and Welcome, consumes the KeyPackage, and advances the epoch.
-Identical retransmission returns the original cursor, even after the epoch
-changes. Another commit at that epoch gets 409. Fetch is nondestructive, so
+Identical retransmission returns the original cursor while the entry is retained,
+even after the epoch changes. Retry before acknowledging delivery. Another
+commit at that epoch gets 409. Fetch is nondestructive, so
 one reader cannot erase another reader's offline history.
 
-The loopback service now has per-device write authorization. Before publishing
+The service has per-device bearer authorization. Before publishing
 an invitation, the creator registers its random 32-byte bearer credential.
 A joining device authenticates its KeyPackage publication with its own bearer
-credential. The service stores its hash. That same hash is part of the device's
-signed MLS BasicCredential and is available through `members()`, so removers can
+credential and supplies `pairingHash`, the SHA-256 hash of the host's random
+32-byte pairing token from the host QR. The service stores both hashes.
+`key-package/fetch` requires the reference and `pairingToken`. A successful read
+atomically consumes the package payload. A second read returns a null payload.
+Publisher metadata remains until Add consumes it or the original 900-second
+expiry passes, so Add still verifies the joiner's writer hash. Republishing the
+same package cannot reset its expiry or restore a consumed payload.
+
+The writer hash is part of the device's signed MLS BasicCredential and is available through `members()`, so removers can
 select the authenticated writer mapping. `prepareAdd` journals that hash as
 `addWriter`. The relay requires it to match the KeyPackage publisher before
 enabling the writer. A mismatch is a terminal, journaled KeyPackage refusal;
@@ -243,8 +263,8 @@ the credential hash journaled by `prepareRemove`. Unknown removal targets fail
 before changing the log. Both writer fields are part of exact-request retries.
 HTTP requests carry the bearer
 credential in the Authorization header; the database stores only hashes.
-These credentials authorize transport writes and are separate from MLS content
-keys. Rust generates these credentials randomly; Swift journals them with the
+These credentials authorize transport reads, writes, and acknowledgements.
+They are separate from MLS content keys. Rust generates these credentials randomly; Swift journals them with the
 MLS identity and clears the local credential on authenticated removal. Production
 clients must use HTTPS. The integration test uses the three clients' persisted
 credentials and the authenticated MLS roster to select the removal target.
@@ -252,14 +272,24 @@ credentials and the authenticated MLS roster to select the removal target.
 Unauthorized and revoked writers cannot advance the log, even with the current
 epoch. Authorized members and the relay can still deny service. The relay does
 not validate MLS commits or cryptographically bind writer metadata to them.
-Fetching ciphertext remains public to anyone who knows the group route.
-The loopback service still lacks retention and public-service abuse controls.
-The service caps history at 10,000 entries/64 MiB and the
-KeyPackage directory at 128 entries with 15-minute expiry. The terminal
-rejection journal also caps at 10,000 entries. It permits at most 128 groups and
-eight writers per group. Earlier experimental databases and snapshots need to
-be deleted and devices re-paired after these schema/credential changes. Fetch returns one
-entry per request. These are test limits, not a production retention policy.
+Fetch requires a current writer's bearer token. Removed writers lose append
+access immediately but can read through their removal cursor and acknowledge
+it. Their read/ack access ends after that acknowledgement or 24 hours after
+removal, whichever comes first. Until then, their last acknowledgement holds
+the pruning floor. The 24-hour deadline releases the floor even if a lost device
+never acknowledges. Current offline writers continue to hold the floor.
+
+Each route permits 10,000 retained entries and 16 MiB, counting payload,
+Welcome, and package-reference bytes. The KeyPackage directory permits 4096
+entries with 900-second expiry. Each route's terminal rejection journal caps
+at 10,000 entries. The service permits 4096 groups and eight current writers per
+group. Group creation and KeyPackage publication are open to new devices, like
+creation in the v1 mailbox. Configurable directory caps default to 4096 each;
+packages expire after 900 seconds, and groups with no accepted entries expire
+24 hours after creation, reclaiming their directory slots.
+Earlier experimental databases and snapshots need to be deleted and
+devices re-paired after these schema/credential changes. These bounds do not
+provide public-service abuse controls or a complete production retention policy.
 
 ## Remaining acceptance gates
 
