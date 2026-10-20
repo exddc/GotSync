@@ -82,7 +82,7 @@ public actor MLSClient {
                 let identity = try createIdentity(deviceId: deviceID)
                 record = ClientRecord(
                     state: Data(identity.state), deviceID: deviceID,
-                    identity: IdentityRecord(keyPackage: Data(identity.keyPackage), fingerprint: Data(identity.fingerprint)),
+                    identity: IdentityRecord(keyPackage: Data(), fingerprint: Data(identity.fingerprint)),
                     writerToken: Data(identity.writerToken)
                 )
             }
@@ -90,9 +90,13 @@ public actor MLSClient {
     }
 
     public func joiningIdentity() throws -> MLSJoiningIdentity {
-        let record = try store.read()
-        guard record.group == nil else { throw MLSClientError.invalidState }
-        return MLSJoiningIdentity(keyPackage: record.identity.keyPackage, fingerprint: record.identity.fingerprint)
+        try mutate { record in
+            guard record.group == nil else { throw MLSClientError.invalidState }
+            let transition = try publishKeyPackage(state: record.state)
+            record.state = Data(transition.state)
+            record.identity.keyPackage = Data(transition.output)
+            return MLSJoiningIdentity(keyPackage: record.identity.keyPackage, fingerprint: record.identity.fingerprint)
+        }
     }
 
     public func fingerprint() throws -> Data { try store.read().identity.fingerprint }

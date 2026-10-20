@@ -19,6 +19,30 @@ final class MLSClientTests: XCTestCase {
         try MLSClient(directory: root.appendingPathComponent(String(id)), deviceID: Data(repeating: id, count: 16))
     }
 
+    func testJoiningIdentityRefreshesPackageAndPersistsPrivateState() async throws {
+        let alice = try client(1)
+        let bob = try client(2)
+        let first = try await bob.joiningIdentity()
+        let fresh = try await bob.joiningIdentity()
+        XCTAssertNotEqual(first.keyPackage, fresh.keyPackage)
+        XCTAssertEqual(first.fingerprint, fresh.fingerprint)
+        let group = Data(repeating: 7, count: 32)
+        try await alice.createGroup(id: group)
+        let old = try await alice.prepareAdd(keyPackage: first.keyPackage, verifiedFingerprint: first.fingerprint, reference: Data(SHA256.hash(data: first.keyPackage)))
+        let reopened = try client(2)
+        do {
+            try await reopened.join(welcome: XCTUnwrap(old.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: 1)
+            XCTFail("Superseded package accepted")
+        } catch let MlsError.LibraryRejected(code) {
+            XCTAssertFalse(code.isEmpty)
+            XCTAssertTrue(MlsError.LibraryRejected(code: code).localizedDescription.contains(code))
+        }
+        let host = try client(3)
+        try await host.createGroup(id: group)
+        let pending = try await host.prepareAdd(keyPackage: fresh.keyPackage, verifiedFingerprint: fresh.fingerprint, reference: Data(SHA256.hash(data: fresh.keyPackage)))
+        try await reopened.join(welcome: XCTUnwrap(pending.welcome), group: group, verifiedInviterFingerprint: host.fingerprint(), cursor: 1)
+    }
+
     func testPendingCommitAndInboxSurviveReopening() async throws {
         let alice = try client(1)
         let bob = try client(2)
