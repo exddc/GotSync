@@ -11,11 +11,21 @@ import os
 import signal
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from .http import (
+    MAX_HTTP_HEADER_BYTES,
+    encode_json_document,
+    parse_mailbox_json,
+    read_http_head,
+    read_http_body,
+    write_http_response,
+)
+from .mls import MLSDeliveryServer, MLSDeliveryStore
 from .mailbox import (
     DEFAULT_MAILBOX_RETENTION_SECONDS,
     DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS,
@@ -31,9 +41,7 @@ from .mailbox import (
     MailboxCapacityError,
     MailboxConflictError,
     MailboxError,
-    MailboxHeadersTooLargeError,
     MailboxPutMessage,
-    MailboxRequestTooLargeError,
     MailboxStore,
     authorize_mailbox,
     decode_canonical_base64url,
@@ -43,7 +51,6 @@ from .mailbox import (
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
 WEBSOCKET_PATH = "/v1"
 DEFAULT_MAILBOX_DATABASE_PATH = "relay-data/mailbox.sqlite3"
-MAX_HTTP_HEADER_BYTES = 8192
 MAX_REGISTRATION_BYTES = 512
 MAX_BINARY_MESSAGE_BYTES = 512 * 1024
 MAX_FORWARD_QUEUE_FRAMES = 16
@@ -650,6 +657,7 @@ class RelayServer:
         if mailbox_clock is not None:
             mailbox_options["clock"] = mailbox_clock
         self.mailbox = MailboxStore(mailbox_database_path, **mailbox_options)
+        self.mls = MLSDeliveryServer(MLSDeliveryStore(Path(mailbox_database_path).with_name("mls.sqlite3")))
         self._websocket_server: Any | None = None
         self._metrics_server: asyncio.Server | None = None
         self._mailbox_server: asyncio.Server | None = None
@@ -737,6 +745,7 @@ class RelayServer:
                 await self._websocket_server.wait_closed()
                 self._websocket_server = None
             self.mailbox.close()
+            self.mls.store.close()
             raise
 
     async def close(self) -> None:
@@ -768,6 +777,7 @@ class RelayServer:
             websocket_server.close(close_connections=True)
             await websocket_server.wait_closed()
         self.mailbox.close()
+        self.mls.store.close()
 
     async def __aenter__(self) -> RelayServer:
         await self.start()
@@ -812,18 +822,22 @@ class RelayServer:
         self.service.metrics.increment("mailbox_requests")
         try:
             try:
-                method, target, headers, body = await _read_http_json_request(
-                    reader,
-                    maximum_body_bytes=MAX_MAILBOX_REQUEST_BYTES,
+                method, target, headers = await read_http_head(reader)
+                body = await read_http_body(
+                    reader, headers,
+                    maximum_body_bytes=1024 * 1024 if target.startswith("/v2/mls/") else MAX_MAILBOX_REQUEST_BYTES,
                 )
+                if method == "POST" and target.startswith("/v2/mls/"):
+                    await self.mls.handle_request(target, headers, body, writer)
+                    return
                 if method != "POST":
-                    await _write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
+                    await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
                     return
                 if headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
                     "application/json"
                 ):
                     raise MailboxError("content type must be application/json")
-                document = _parse_mailbox_json(body)
+                document = parse_mailbox_json(body)
                 _require_mailbox_version(document)
 
                 if target == "/v1/mailbox/put":
@@ -835,33 +849,33 @@ class RelayServer:
                 elif target == "/v1/mailbox/forget":
                     response = await self._mailbox_forget(document)
                 else:
-                    await _write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
+                    await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
                     return
-                await _write_http_response(writer, 200, response)
+                await write_http_response(writer, 200, response)
             except MailboxAuthorizationError as error:
                 self.service.metrics.increment("mailbox_authorization_rejections")
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     error.status,
                     {"error": error.code, "version": PROTOCOL_VERSION},
                 )
             except MailboxConflictError as error:
                 self.service.metrics.increment("mailbox_conflicts")
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     error.status,
                     {"error": error.code, "version": PROTOCOL_VERSION},
                 )
             except MailboxCapacityError as error:
                 self.service.metrics.increment("mailbox_capacity_rejections")
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     error.status,
                     {"error": error.code, "version": PROTOCOL_VERSION},
                 )
             except MailboxError as error:
                 self.service.metrics.increment("mailbox_bad_requests")
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     error.status,
                     {"error": error.code, "version": PROTOCOL_VERSION},
@@ -871,7 +885,7 @@ class RelayServer:
         except Exception:
             self.service.metrics.increment("internal_errors")
             try:
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     500,
                     {"error": "internalError", "version": PROTOCOL_VERSION},
@@ -967,7 +981,7 @@ class RelayServer:
             }
 
         response = response_for(len(message_documents))
-        if len(_encode_json_document(response)) > MAX_MAILBOX_RESPONSE_BYTES:
+        if len(encode_json_document(response)) > MAX_MAILBOX_RESPONSE_BYTES:
             lower_bound = 1
             upper_bound = len(message_documents) - 1
             selected_count = 0
@@ -975,7 +989,7 @@ class RelayServer:
                 candidate_count = (lower_bound + upper_bound) // 2
                 candidate = response_for(candidate_count)
                 if (
-                    len(_encode_json_document(candidate))
+                    len(encode_json_document(candidate))
                     <= MAX_MAILBOX_RESPONSE_BYTES
                 ):
                     selected_count = candidate_count
@@ -1027,21 +1041,21 @@ class RelayServer:
             except (TimeoutError, asyncio.IncompleteReadError):
                 return
             except asyncio.LimitOverrunError:
-                await _write_http_response(writer, 431, {"error": "headers too large"})
+                await write_http_response(writer, 431, {"error": "headers too large"})
                 return
 
             try:
                 request_line = raw_request.split(b"\r\n", 1)[0].decode("ascii")
                 method, target, version = request_line.split(" ")
             except (UnicodeDecodeError, ValueError):
-                await _write_http_response(writer, 400, {"error": "bad request"})
+                await write_http_response(writer, 400, {"error": "bad request"})
                 return
             if version != "HTTP/1.1":
-                await _write_http_response(writer, 400, {"error": "bad request"})
+                await write_http_response(writer, 400, {"error": "bad request"})
                 return
 
             if method == "GET" and target == "/healthz":
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     200,
                     {"status": "ok", "version": PROTOCOL_VERSION, "supportedVersions": SUPPORTED_VERSIONS},
@@ -1054,7 +1068,7 @@ class RelayServer:
                     )
                 except TimeoutError:
                     ready = False
-                await _write_http_response(
+                await write_http_response(
                     writer,
                     200 if ready else 503,
                     {
@@ -1063,12 +1077,12 @@ class RelayServer:
                     },
                 )
             elif method == "GET" and target == "/metrics":
-                await _write_http_response(writer, 200, self.service.metrics.snapshot())
+                await write_http_response(writer, 200, self.service.metrics.snapshot())
             elif method == "POST" and target == "/metrics/reset":
                 self.service.metrics.reset_counters()
-                await _write_http_response(writer, 200, self.service.metrics.snapshot())
+                await write_http_response(writer, 200, self.service.metrics.snapshot())
             else:
-                await _write_http_response(writer, 404, {"error": "not found", "version": PROTOCOL_VERSION})
+                await write_http_response(writer, 404, {"error": "not found", "version": PROTOCOL_VERSION})
         except ConnectionError:
             pass
         except Exception:
@@ -1079,105 +1093,6 @@ class RelayServer:
                 await writer.wait_closed()
             except ConnectionError:
                 pass
-
-
-async def _read_http_json_request(
-    reader: asyncio.StreamReader,
-    *,
-    maximum_body_bytes: int,
-) -> tuple[str, str, dict[str, str], bytes]:
-    try:
-        raw_headers = await asyncio.wait_for(
-            reader.readuntil(b"\r\n\r\n"),
-            timeout=2,
-        )
-    except TimeoutError as error:
-        raise MailboxError("request timed out") from error
-    except asyncio.IncompleteReadError as error:
-        raise MailboxError("incomplete request") from error
-    except asyncio.LimitOverrunError as error:
-        raise MailboxHeadersTooLargeError("headers are too large") from error
-    if len(raw_headers) > MAX_HTTP_HEADER_BYTES:
-        raise MailboxHeadersTooLargeError("headers are too large")
-
-    lines = raw_headers[:-4].split(b"\r\n")
-    try:
-        request_line = lines[0].decode("ascii")
-        method, target, version = request_line.split(" ")
-    except (UnicodeDecodeError, ValueError) as error:
-        raise MailboxError("invalid request line") from error
-    if version != "HTTP/1.1" or not target.startswith("/"):
-        raise MailboxError("invalid request line")
-    if "?" in target or "#" in target:
-        raise MailboxError("mailbox endpoint cannot contain a query")
-
-    headers: dict[str, str] = {}
-    valid_header_name_bytes = frozenset(
-        b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    )
-    for raw_line in lines[1:]:
-        if b":" not in raw_line:
-            raise MailboxError("invalid header")
-        raw_name, raw_value = raw_line.split(b":", 1)
-        if not raw_name or any(
-            byte not in valid_header_name_bytes for byte in raw_name
-        ):
-            raise MailboxError("invalid header")
-        try:
-            name = raw_name.decode("ascii").lower()
-            value = raw_value.decode("ascii").strip()
-        except UnicodeDecodeError as error:
-            raise MailboxError("invalid header") from error
-        if name in headers:
-            raise MailboxError("duplicate or invalid header")
-        headers[name] = value
-
-    if "transfer-encoding" in headers:
-        raise MailboxError("transfer encoding is unsupported")
-    raw_content_length = headers.get("content-length")
-    if raw_content_length is None or not raw_content_length.isdigit():
-        raise MailboxError("valid content length is required")
-    if len(raw_content_length) > 10:
-        raise MailboxRequestTooLargeError("request body is too large")
-    content_length = int(raw_content_length)
-    if content_length > maximum_body_bytes:
-        raise MailboxRequestTooLargeError("request body is too large")
-    try:
-        body = await asyncio.wait_for(
-            reader.readexactly(content_length),
-            timeout=2,
-        )
-    except TimeoutError as error:
-        raise MailboxError("request body timed out") from error
-    except asyncio.IncompleteReadError as error:
-        raise MailboxError("incomplete request body") from error
-    return method, target, headers, body
-
-
-def _parse_mailbox_json(body: bytes) -> dict[str, Any]:
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise MailboxError("JSON contains duplicate fields")
-            result[key] = value
-        return result
-
-    try:
-        document = json.loads(
-            body.decode("utf-8"),
-            object_pairs_hook=unique_object,
-        )
-    except (
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        RecursionError,
-        ValueError,
-    ) as error:
-        raise MailboxError("request body is not valid JSON") from error
-    if not isinstance(document, dict):
-        raise MailboxError("request body must be an object")
-    return document
 
 
 class MailboxVersionError(MailboxError):
@@ -1231,46 +1146,6 @@ def _require_loopback(host: str, *, label: str) -> None:
         raise ValueError(f"{label} must be a loopback address") from error
     if not address.is_loopback:
         raise ValueError(f"{label} must be a loopback address")
-
-
-async def _write_http_response(
-    writer: asyncio.StreamWriter, status: int, document: dict[str, Any]
-) -> None:
-    reasons = {
-        200: "OK",
-        400: "Bad Request",
-        401: "Unauthorized",
-        403: "Forbidden",
-        404: "Not Found",
-        409: "Conflict",
-        413: "Content Too Large",
-        429: "Too Many Requests",
-        431: "Request Header Fields Too Large",
-        500: "Internal Server Error",
-        503: "Service Unavailable",
-    }
-    body = _encode_json_document(document)
-    headers = (
-        f"HTTP/1.1 {status} {reasons[status]}\r\n"
-        "Content-Type: application/json\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    ).encode("ascii")
-    writer.write(headers + body)
-    try:
-        await writer.drain()
-    except ConnectionError:
-        pass
-
-
-def _encode_json_document(document: dict[str, Any]) -> bytes:
-    return json.dumps(
-        document,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
 
 
 def _argument_parser() -> argparse.ArgumentParser:
