@@ -149,6 +149,10 @@ seven-day package, discards invalid packages and their private material, and
 retains up to eight valid packages, dropping the oldest first at capacity.
 Any retained unexpired published package can join; creating or joining a group
 discards all published packages and their private material.
+The record uses AES-256-GCM with an authenticated format version and a 32 MiB ciphertext cap.
+The app supplies a device-only, non-synchronizing data-protection Keychain key, accessible after first unlock.
+iOS files use complete-until-first-user-authentication protection for locked background sync.
+Key loss or authentication failure throws `MLSStoreError.unreadable`; wipe local state and relink.
 
 Creating a message advances the sender ratchet and journals the exact
 ciphertext plus its plaintext for epoch-conflict recovery. The spike allows
@@ -281,8 +285,7 @@ claims based on this spike. Completion requires:
 3. Production delivery authorization, retention, conflict retry UX, durable
    application outbox/replica integration, and a fork/re-pair path.
 4. Review of protected storage, backup/restore/rollback behavior, signing-key
-   storage, and residual secret copies. SQLite secure-delete and iOS complete
-   file protection do not prove erasure of historical APFS blocks or Swift/Rust
-   memory copies. Complete protection deliberately prevents locked background use.
+   storage, and residual secret copies. SQLite secure-delete and iOS file
+   protection do not prove erasure of historical APFS blocks or Swift/Rust memory copies.
 5. Independent integration review, linked report, fixed high/critical findings,
    and re-testing of every crypto finding against the engine after cutover.

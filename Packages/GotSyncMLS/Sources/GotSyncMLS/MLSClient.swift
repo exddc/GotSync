@@ -72,8 +72,8 @@ struct IdentityRecord: Codable {
 public actor MLSClient {
     private let store: MLSStore
 
-    public init(directory: URL, deviceID: Data) throws {
-        store = try MLSStore(directory: directory)
+    public init(directory: URL, deviceID: Data, stateKey: MLSStateKeyProvider) throws {
+        store = try MLSStore(directory: directory, stateKey: stateKey)
         try store.update { record in
             if let record {
                 guard record.deviceID == deviceID else { throw MLSClientError.invalidState }
