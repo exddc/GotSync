@@ -217,6 +217,33 @@ extension View {
     }
 }
 
+struct LinkEndedNotice: View {
+    let reason: SyncError
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: reason == .removedFromGroup ? "iphone.slash" : "link.badge.plus")
+                .font(.body.weight(.semibold))
+                .frame(width: 22, height: 22)
+                .foregroundStyle(RelayTheme.pending)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(ProductSyncPolicy.linkEndedTitle(for: reason))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(RelayTheme.ink)
+                Text(ProductSyncPolicy.linkEndedDetail(for: reason))
+                    .font(.footnote)
+                    .foregroundStyle(RelayTheme.inkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("link-ended-notice")
+    }
+}
+
 struct SyncNoticeView: View {
     let notice: SyncNotice
     let repairAction: () -> Void
@@ -305,7 +332,7 @@ struct SyncStatusView: View {
         switch phase {
         case .synced:
             return RelayTheme.live
-        case .waitingForPeer, .verifying, .provisioning, .finalizing,
+        case .waitingForPeer, .verifying, .provisioning,
              .connecting, .reconciling:
             return RelayTheme.pending
         case .failed:
@@ -424,7 +451,7 @@ struct PairingHeaderView: View {
             notice: SyncNotice(
                 kind: .retrying,
                 title: "Retrying upload",
-                detail: "Will try again when the mailbox is reachable."
+                detail: "Will try again when the sync service is reachable."
             ),
             repairAction: {}
         )

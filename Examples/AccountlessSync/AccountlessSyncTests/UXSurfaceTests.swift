@@ -165,8 +165,6 @@ final class UXSurfaceTests: XCTestCase {
         let joiner = UserPairingPresentationBuilder.presentation(
             phase: .waitingForPeer,
             isHostApprovalPending: false,
-            hasPairingReplicaConflict: false,
-            finalizationState: nil,
             role: .joiner,
             errorMessage: nil
         )
@@ -180,8 +178,6 @@ final class UXSurfaceTests: XCTestCase {
         let host = UserPairingPresentationBuilder.presentation(
             phase: .waitingForPeer,
             isHostApprovalPending: false,
-            hasPairingReplicaConflict: false,
-            finalizationState: nil,
             role: .host,
             errorMessage: nil
         )
@@ -268,76 +264,34 @@ final class UXSurfaceTests: XCTestCase {
         await model.engine.stop()
     }
 
-    func testUserPairingStepsCollapseFinalizationEnums() {
-        let waiting = UserPairingPresentationBuilder.presentation(
-            phase: .finalizing,
+    func testHostApprovalWaitsForYouAndJoinerWaitsForHost() {
+        let host = UserPairingPresentationBuilder.presentation(
+            phase: .verifying,
+            isHostApprovalPending: true,
+            role: .host,
+            errorMessage: nil
+        )
+        XCTAssertEqual(host.step, .waitingForYou)
+        XCTAssertTrue(host.voiceOverAnnouncement.contains("Waiting for you"))
+
+        let joiner = UserPairingPresentationBuilder.presentation(
+            phase: .verifying,
             isHostApprovalPending: false,
-            hasPairingReplicaConflict: false,
-            finalizationState: .waitingForProvision,
             role: .joiner,
             errorMessage: nil
         )
-        XCTAssertEqual(waiting.step, .waitingForOtherPhone)
-        XCTAssertFalse(waiting.title.lowercased().contains("waitingfor"))
-        XCTAssertTrue(waiting.voiceOverAnnouncement.contains("other iPhone"))
-
-        let conflict = UserPairingPresentationBuilder.presentation(
-            phase: .finalizing,
-            isHostApprovalPending: false,
-            hasPairingReplicaConflict: true,
-            finalizationState: .provisionStagedAwaitingMergeApproval,
-            role: .joiner,
-            errorMessage: nil
-        )
-        XCTAssertEqual(conflict.step, .waitingForYou)
-        XCTAssertEqual(conflict.title, "Combine task lists?")
-        XCTAssertFalse(conflict.title.lowercased().contains("recover"))
+        XCTAssertEqual(joiner.step, .waitingForOtherPhone)
+        XCTAssertTrue(joiner.voiceOverAnnouncement.contains("other iPhone"))
     }
 
-    func testKeepBothPreviewCountsMatchOutcomes() throws {
-        let sharedID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
-        let conflictID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-        let localOnlyID = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
-        let stagedOnlyID = UUID(uuidString: "00000000-0000-0000-0000-000000000004")!
-        let device = try ReplicaDeviceID(bytes: Data(repeating: 0x33, count: 16))
-
-        var staged = try TaskReplica(deviceID: device)
-        try staged.createTask(id: sharedID, title: "Shared", completed: true)
-        try staged.createTask(id: conflictID, title: "Host")
-        try staged.createTask(id: stagedOnlyID, title: "Host only")
-
-        var local = try TaskReplica(deviceID: device)
-        try local.createTask(id: sharedID, title: "Shared", completed: true)
-        try local.createTask(id: conflictID, title: "Local", completed: true)
-        try local.createTask(id: localOnlyID, title: "Local only")
-
-        let preview = try TaskReplica.keepBothPreview(staged: staged, local: local)
-        XCTAssertEqual(preview.reusedCount, 1)
-        XCTAssertEqual(preview.localOnlyCount, 1)
-        XCTAssertEqual(preview.conflictCount, 1)
-        XCTAssertEqual(preview.sharedOnlyCount, 1)
-        XCTAssertFalse(preview.isAdditiveOnly)
-        XCTAssertTrue(preview.confirmationSummary.contains("shared"))
-        XCTAssertTrue(preview.confirmationSummary.contains("twice"))
-    }
-
-    func testAdditiveOnlyPreviewIsAutoContinueEligible() throws {
-        let sharedID = UUID(uuidString: "00000000-0000-0000-0000-000000000011")!
-        let localOnlyID = UUID(uuidString: "00000000-0000-0000-0000-000000000012")!
-        let device = try ReplicaDeviceID(bytes: Data(repeating: 0x44, count: 16))
-
-        var staged = try TaskReplica(deviceID: device)
-        try staged.createTask(id: sharedID, title: "Shared", completed: false)
-
-        var local = try TaskReplica(deviceID: device)
-        try local.createTask(id: sharedID, title: "Shared", completed: false)
-        try local.createTask(id: localOnlyID, title: "Only here")
-
-        let preview = try TaskReplica.keepBothPreview(staged: staged, local: local)
-        XCTAssertEqual(preview.conflictCount, 0)
-        XCTAssertTrue(preview.isAdditiveOnly)
-        XCTAssertEqual(preview.localOnlyCount, 1)
-        XCTAssertEqual(preview.reusedCount, 1)
+    func testLinkEndedCopyExplainsRemovalWithoutJargon() {
+        XCTAssertEqual(ProductSyncPolicy.linkEndedTitle(for: .removedFromGroup), "Removed from sync")
+        XCTAssertEqual(ProductSyncPolicy.linkEndedTitle(for: .relinkRequired), "Link again to sync")
+        let surfaces = [SyncError.removedFromGroup, .relinkRequired].flatMap {
+            [ProductSyncPolicy.linkEndedTitle(for: $0), ProductSyncPolicy.linkEndedDetail(for: $0)]
+        }
+        XCTAssertTrue(ProductSyncPolicy.linkEndedDetail(for: .removedFromGroup).contains("tasks stay on this iPhone"))
+        XCTAssertTrue(ConsumerCopyBanlist.bannedTokens(in: surfaces).isEmpty)
     }
 
     func testSupportStatusSaysLocalEditDoesNotNeedPeerOnline() async throws {

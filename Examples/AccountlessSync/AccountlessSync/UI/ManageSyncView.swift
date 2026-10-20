@@ -87,10 +87,10 @@ struct ManageSyncView: View {
                 #if DEBUG
                 Section("Diagnostics") {
                     Text("Members: \(model.linkedMemberCount)")
-                    Text("Live relay: \(model.relayURL.host() ?? "local")")
-                    Text("Mailbox: \(model.mailboxURL.host() ?? "local")")
+                    Text("Sync service: \(model.mailboxURL.host() ?? "local")")
+                    Text("Pairing relay: \(model.relayURL.host() ?? "local")")
                     if let error = model.mailboxErrorMessage {
-                        Text("Mailbox error: \(error)")
+                        Text("Last sync error: \(error)")
                     }
                 }
                 #endif

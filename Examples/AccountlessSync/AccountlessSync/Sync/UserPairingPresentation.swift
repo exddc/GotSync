@@ -32,7 +32,7 @@ struct SupportStatusSummary: Equatable, Sendable {
     }
 }
 
-/// Collapsed pairing steps for humans — never mirrors raw finalization enums.
+/// Collapsed pairing steps for humans.
 enum UserPairingStep: Equatable, Sendable {
     case waitingForOtherPhone
     case waitingForYou
@@ -67,21 +67,9 @@ enum UserPairingPresentationBuilder {
     static func presentation(
         phase: SyncPhase,
         isHostApprovalPending: Bool,
-        hasPairingReplicaConflict: Bool,
-        finalizationState: PairingFinalizationState?,
         role: DeviceRole?,
         errorMessage: String?
     ) -> UserPairingPresentation {
-        if hasPairingReplicaConflict {
-            return UserPairingPresentation(
-                step: .waitingForYou,
-                title: "Combine task lists?",
-                detail: errorMessage
-                    ?? "Both copies are still on this iPhone. Review the preview, then combine them to finish the link.",
-                blockingActor: .you
-            )
-        }
-
         if let errorMessage, phase == .failed {
             return UserPairingPresentation(
                 step: .waitingForYou,
@@ -130,12 +118,6 @@ enum UserPairingPresentationBuilder {
                 detail: "Preparing the shared task list securely.",
                 blockingActor: .background
             )
-        case .finalizing:
-            return finalizingPresentation(
-                state: finalizationState,
-                role: role,
-                errorMessage: errorMessage
-            )
         case .connecting:
             return UserPairingPresentation(
                 step: .finishing,
@@ -161,7 +143,7 @@ enum UserPairingPresentationBuilder {
             return UserPairingPresentation(
                 step: .finishing,
                 title: "Sync will resume",
-                detail: "Tasks stay safe on this phone. Upload continues when the app can reach the private mailbox.",
+                detail: "Tasks stay safe on this phone. Upload continues when the app can reach the sync service.",
                 blockingActor: .background
             )
         case .failed:
@@ -177,80 +159,6 @@ enum UserPairingPresentationBuilder {
                 title: "Not linked",
                 detail: ProductSyncPolicy.multiDeviceBoundary,
                 blockingActor: .you
-            )
-        }
-    }
-
-    private static func finalizingPresentation(
-        state: PairingFinalizationState?,
-        role: DeviceRole?,
-        errorMessage: String?
-    ) -> UserPairingPresentation {
-        if let errorMessage {
-            return UserPairingPresentation(
-                step: .finishing,
-                title: "Finishing the link",
-                detail: errorMessage,
-                blockingActor: .background
-            )
-        }
-        switch state {
-        case .waitingForProvision:
-            return UserPairingPresentation(
-                step: .waitingForOtherPhone,
-                title: "Waiting for the main phone",
-                detail: "The secure handshake is saved. Waiting for the main phone to approve or decline.",
-                blockingActor: .otherPhone
-            )
-        case .provisionMayHaveBeenStored:
-            return UserPairingPresentation(
-                step: .finishing,
-                title: "Sharing the task list",
-                detail: "Approval is saved. Making the shared list available to the other phone.",
-                blockingActor: .background
-            )
-        case .provisionStagedAwaitingMergeApproval:
-            return UserPairingPresentation(
-                step: .waitingForYou,
-                title: "Combine task lists?",
-                detail: "Nothing is linked until you confirm how to combine both lists.",
-                blockingActor: .you
-            )
-        case .readyMayHaveBeenStored:
-            if role == .joiner {
-                return UserPairingPresentation(
-                    step: .waitingForOtherPhone,
-                    title: "Waiting for confirmation",
-                    detail: "This phone imported the shared list. Waiting for the main phone to confirm.",
-                    blockingActor: .otherPhone
-                )
-            }
-            return UserPairingPresentation(
-                step: .finishing,
-                title: "Confirming the imported list",
-                detail: "The imported copy is safe. Waiting for encrypted confirmation.",
-                blockingActor: .background
-            )
-        case .abortMayHaveBeenStored:
-            return UserPairingPresentation(
-                step: .finishing,
-                title: "Cancelling",
-                detail: "No link will be created. Notifying the other phone.",
-                blockingActor: .background
-            )
-        case .abortAcknowledgementMayHaveBeenStored:
-            return UserPairingPresentation(
-                step: .finishing,
-                title: "Confirming cancellation",
-                detail: "No link will be created. Cancellation is being acknowledged.",
-                blockingActor: .background
-            )
-        case .commitMarkerMayHaveBeenStored, nil:
-            return UserPairingPresentation(
-                step: .finishing,
-                title: "Finishing the link",
-                detail: "This step is saved and resumes the next time you open Accountless Sync.",
-                blockingActor: .background
             )
         }
     }

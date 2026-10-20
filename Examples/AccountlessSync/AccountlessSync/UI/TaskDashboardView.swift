@@ -86,17 +86,11 @@ struct TaskDashboardView: View {
 
                         #if DEBUG
                         Menu("Diagnostics") {
-                            Text("End-to-end encrypted")
+                            Text("End-to-end encrypted with MLS")
                             Text(
                                 "Linked iPhones: \(model.linkedMemberCount)"
                             )
-                            Text("Live relay: \(model.relayURL.host() ?? "local")")
-                            Text("Offline mailbox: \(model.mailboxURL.host() ?? "local")")
-                            if let roundTrip = model.lastRoundTripMilliseconds {
-                                Text(
-                                    "Live round trip: \(roundTrip, specifier: "%.1f") ms"
-                                )
-                            }
+                            Text("Sync service: \(model.mailboxURL.host() ?? "local")")
                             if let error = model.mailboxErrorMessage {
                                 Text("Last sync error: \(error)")
                             }
@@ -343,16 +337,20 @@ struct TaskDashboardView: View {
 
     private var localTasksNotice: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(
-                model.phase == .failed
-                    ? "Link needs attention"
-                    : "Not syncing",
-                systemImage: model.phase == .failed
-                    ? "exclamationmark.triangle.fill"
-                    : "iphone"
-            )
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(RelayTheme.ink)
+            if model.phase != .failed, let reason = model.linkEndedReason {
+                LinkEndedNotice(reason: reason)
+            } else {
+                Label(
+                    model.phase == .failed
+                        ? "Link needs attention"
+                        : "Not syncing",
+                    systemImage: model.phase == .failed
+                        ? "exclamationmark.triangle.fill"
+                        : "iphone"
+                )
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(RelayTheme.ink)
+            }
 
             if model.phase == .failed {
                 Text(model.errorMessage ?? "Linking could not continue.")
@@ -363,7 +361,9 @@ struct TaskDashboardView: View {
 
             Text(
                 model.canEditLocalTasks
-                    ? "Link ended or never started. Tasks stay on this phone. Create a link for a replacement, or join from your other iPhone."
+                    ? model.linkEndedReason == nil
+                        ? "Link ended or never started. Tasks stay on this phone. Create a link for a replacement, or join from your other iPhone."
+                        : "Create a new link, or join from a phone that is still linked."
                     : "Local storage is unavailable. Restart Accountless Sync or erase local data to start over."
             )
             .font(.footnote)
@@ -372,18 +372,12 @@ struct TaskDashboardView: View {
 
             if model.canEditLocalTasks {
                 Button {
-                    if model.pairingRecoveryResetRequired {
-                        isUnlinkConfirmationPresented = true
-                    } else {
-                        model.createPrivateSync()
-                    }
+                    model.createPrivateSync()
                 } label: {
                     Text(
-                        model.pairingRecoveryResetRequired
-                            ? "Keep tasks · reset link"
-                            : model.phase == .failed
-                                ? "Create link for replacement"
-                                : "Create link"
+                        model.phase == .failed
+                            ? "Create link for replacement"
+                            : "Create link"
                     )
                     .frame(maxWidth: .infinity)
                 }

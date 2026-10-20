@@ -66,7 +66,6 @@ final class SyncAppModel: ObservableObject {
     func regenerateInvitation() { engine.regenerateInvitation() }
     func inviteToGroup() { engine.inviteToGroup() }
     func cancelPairing(preserveLink: Bool = false) { engine.cancelPairing(preserveLink: preserveLink) }
-    func resolvePairingReplicaConflictKeepingBoth() { engine.resolvePairingReplicaConflictKeepingBoth() }
     func addTask(title: String) -> Bool { engine.addTask(title: title) }
     func clearLocalEditError() { engine.clearLocalEditError() }
     func toggleTask(_ task: ReplicatedTask) { engine.toggleTask(task) }
@@ -74,7 +73,6 @@ final class SyncAppModel: ObservableObject {
     func deleteTasks(ids: [UUID]) { engine.deleteTasks(ids: ids) }
     func eraseLocalData() { endBackgroundFlush(); engine.eraseLocalData() }
     func unlinkAndKeepTasks() { endBackgroundFlush(); engine.unlinkAndKeepTasks() }
-    func leaveGroupAndKeepTasks() { endBackgroundFlush(); engine.leaveGroupAndKeepTasks() }
     func removeDevice(_ device: LinkedDevice) { engine.removeDevice(device) }
     func applicationDidBecomeActive() {
         endBackgroundFlush()
@@ -82,7 +80,7 @@ final class SyncAppModel: ObservableObject {
     }
     func applicationDidEnterBackground() {
         endBackgroundFlush()
-        backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "Encrypted mailbox flush") { [weak self] in
+        backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "Sync upload") { [weak self] in
             Task { @MainActor in
                 await self?.engine.stopBackgroundWork()
                 self?.endBackgroundFlush()
@@ -115,16 +113,16 @@ final class SyncAppModel: ObservableObject {
             if self.mailboxCapacityReached {
                 return SyncNotice(
                     kind: .retrying,
-                    title: "Private mailbox is full",
-                    detail: "Changes are saved on this iPhone. Trim tasks or reset the link, then retry. Erase is not required."
+                    title: "Sync service is full",
+                    detail: "Changes are saved on this iPhone. Upload retries automatically. Erase is not required."
                 )
             }
             return SyncNotice(
                 kind: .retrying,
-                title: "Couldn’t reach private mailbox. Retrying",
+                title: "Couldn’t reach the sync service. Retrying",
                 detail: self.pendingMailboxOperationCount > 0
                     ? "Changes are saved on this phone. Upload retries automatically."
-                    : "Tasks stay safe on this phone. Upload retries when the mailbox is reachable."
+                    : "Tasks stay safe on this phone. Sync retries when the service is reachable."
             )
         }
         if self.pendingMailboxOperationCount > 0, self.showsSavingNotice {
@@ -167,18 +165,9 @@ final class SyncAppModel: ObservableObject {
         UserPairingPresentationBuilder.presentation(
             phase: self.phase,
             isHostApprovalPending: self.isHostApprovalPending,
-            hasPairingReplicaConflict: self.hasPairingReplicaConflict,
-            finalizationState: self.pairingFinalizationState,
             role: self.activePairingRole,
             errorMessage: self.errorMessage
         )
-    }
-
-    var finalizationAnnouncement: String? {
-        guard self.isPairingFinalizationLocked else {
-            return nil
-        }
-        return userPairingPresentation.voiceOverAnnouncement
     }
 
     var statusTitle: String {
@@ -187,7 +176,7 @@ final class SyncAppModel: ObservableObject {
                 return "Saved on this iPhone"
             }
             if self.mailboxState == .unavailable {
-                return "Will retry private delivery"
+                return "Sync will retry"
             }
             if self.showsLinkCompleteCelebration {
                 return "Link is live"
@@ -204,9 +193,9 @@ final class SyncAppModel: ObservableObject {
             case .syncing:
                 return "Checking for changes"
             case .available:
-                return "Ready for offline delivery"
+                return "Linked"
             case .unavailable:
-                return "Will retry private delivery"
+                return "Sync will retry"
             case .idle:
                 break
             }
@@ -222,7 +211,7 @@ final class SyncAppModel: ObservableObject {
                     : "\(self.pendingMailboxOperationCount) changes are waiting to reach your other phone. They appear there the next time that phone opens Accountless Sync."
             }
             if self.mailboxState == .unavailable {
-                return "Tasks stay safe here. Private delivery retries automatically."
+                return "Tasks stay safe here. Sync retries automatically."
             }
             if self.showsLinkCompleteCelebration {
                 return ProductSyncPolicy.deliverySummary
@@ -242,7 +231,7 @@ final class SyncAppModel: ObservableObject {
             }
         }
         if self.phase == .offline {
-            return "Tasks stay safe on this phone. Upload continues when the app can reach the private mailbox."
+            return "Tasks stay safe on this phone. Upload continues when the app can reach the sync service."
         }
         return userPairingPresentation.detail
     }

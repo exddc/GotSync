@@ -106,25 +106,14 @@ struct PairingInvitationView: View {
 
 struct PairingProgressView: View {
     @ObservedObject var model: SyncAppModel
-    @State private var lastAccessibilityAnnouncement: String?
-    @State private var isConflictConfirmationPresented = false
 
     var body: some View {
         ScrollView {
-            VStack(spacing: model.hasPairingReplicaConflict ? 16 : 28) {
-                PairingLinkMark(
-                    isAnimating: !model.hasPairingReplicaConflict,
-                    compact: model.hasPairingReplicaConflict
-                )
-                .accessibilityHidden(true)
+            VStack(spacing: 28) {
+                PairingLinkMark(isAnimating: true, compact: false)
+                    .accessibilityHidden(true)
 
                 VStack(spacing: 10) {
-                    if model.hasPairingReplicaConflict {
-                        Image(systemName: "rectangle.on.rectangle.angled")
-                            .font(.title3)
-                            .foregroundStyle(RelayTheme.pending)
-                            .accessibilityHidden(true)
-                    }
                     Text(model.statusTitle)
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(RelayTheme.ink)
@@ -135,64 +124,15 @@ struct PairingProgressView: View {
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    if !model.hasPairingReplicaConflict {
-                        UserPairingStepIndicator(
-                            step: model.userPairingPresentation.step
-                        )
-                        .padding(.top, 6)
-                    }
-                }
-
-                if model.hasPairingReplicaConflict {
-                    VStack(spacing: 12) {
-                        if let preview = model.keepBothPreview {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("What combining will do")
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(RelayTheme.ink)
-                                Text(preview.confirmationSummary)
-                                    .font(.footnote)
-                                    .foregroundStyle(RelayTheme.inkMuted)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .relayCard(padding: 14)
-                            .accessibilityIdentifier("keep-both-preview")
-                        } else {
-                            Text(
-                                "Both copies are still on this phone. This POC checks the combined list before either phone commits."
-                            )
-                            .font(.footnote)
-                            .foregroundStyle(RelayTheme.inkMuted)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        Button("Combine and finish…") {
-                            isConflictConfirmationPresented = true
-                        }
-                        .pocPrimaryButtonStyle()
-                        .controlSize(.large)
-                        .frame(maxWidth: .infinity)
-                        .accessibilityIdentifier(
-                            "resolve-conflicted-pairing"
-                        )
-
-                    }
-                } else if !model.canCancelPairing {
-                    Text(
-                        "This step is saved. You can leave; it resumes the next time you open Accountless Sync."
+                    UserPairingStepIndicator(
+                        step: model.userPairingPresentation.step
                     )
-                    .font(.footnote)
-                    .foregroundStyle(RelayTheme.inkMuted)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("pairing-finalization-saved")
+                    .padding(.top, 6)
                 }
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 28)
-            .padding(.vertical, model.hasPairingReplicaConflict ? 16 : 28)
+            .padding(.vertical, 28)
         }
         .background(SoftFieldBackground())
         .navigationTitle("Linking")
@@ -207,41 +147,6 @@ struct PairingProgressView: View {
                 }
             }
         }
-        .confirmationDialog(
-            "Combine task lists?",
-            isPresented: $isConflictConfirmationPresented,
-            titleVisibility: .visible
-        ) {
-            Button("Combine and finish") {
-                model.resolvePairingReplicaConflictKeepingBoth()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(
-                model.keepBothPreview?.confirmationSummary
-                    ?? "Matching tasks are kept once; local-only tasks are added. Conflicting versions may appear twice. Cancel leaves this phone unchanged."
-            )
-        }
-        .onAppear {
-            announceFinalizationStatus(model.finalizationAnnouncement)
-        }
-        .onChange(of: model.finalizationAnnouncement) { _, announcement in
-            announceFinalizationStatus(announcement)
-        }
-    }
-
-    private func announceFinalizationStatus(_ announcement: String?) {
-        guard
-            let announcement,
-            announcement != lastAccessibilityAnnouncement
-        else {
-            return
-        }
-        lastAccessibilityAnnouncement = announcement
-        UIAccessibility.post(
-            notification: .announcement,
-            argument: announcement
-        )
     }
 }
 

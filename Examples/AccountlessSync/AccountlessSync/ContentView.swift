@@ -83,8 +83,6 @@ private struct SyncRootView: View {
             Group {
                 if let safetyCode = model.safetyCode {
                     SafetyCodeView(model: model, code: safetyCode)
-                } else if model.isPairingFinalizationLocked {
-                    PairingProgressView(model: model)
                 } else if let phrase = model.invitationPhrase,
                           let invitationURL = model.invitationURL
                 {
@@ -103,7 +101,6 @@ private struct SyncRootView: View {
                     )
                 } else if model.phase == .waitingForPeer
                             || model.phase == .provisioning
-                            || model.phase == .finalizing
                 {
                     PairingProgressView(model: model)
                 } else if model.hasLocalReplicaHistory {
@@ -156,34 +153,20 @@ private struct SyncRootView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "This removes the pairing keys and every task on this iPhone. The other phone is not erased."
+                "This removes the sync keys and every task on this iPhone. Other linked phones are not erased."
             )
         }
         .confirmationDialog(
-            model.pairingRecoveryResetRequired
-                ? "Keep tasks · reset link?"
-                : "Unlink this phone?",
+            "Unlink this phone?",
             isPresented: $isUnlinkConfirmationPresented,
             titleVisibility: .visible
         ) {
-            Button(
-                model.pairingRecoveryResetRequired
-                    ? "Keep tasks · reset link"
-                    : "Unlink and keep tasks"
-            ) {
-                if model.pairingRecoveryResetRequired {
-                    model.unlinkAndKeepTasks()
-                } else {
-                    model.leaveGroupAndKeepTasks()
-                }
+            Button("Unlink and keep tasks") {
+                model.unlinkAndKeepTasks()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(
-                model.pairingRecoveryResetRequired
-                    ? "Tasks stay on this phone. Unfinished pairing recovery is cleared so you can create a link again. Erase is not required."
-                    : ProductSyncPolicy.leaveSyncDetail
-            )
+            Text(ProductSyncPolicy.leaveSyncDetail)
         }
         .onOpenURL { url in
             model.joinPrivateSync(url: url)
