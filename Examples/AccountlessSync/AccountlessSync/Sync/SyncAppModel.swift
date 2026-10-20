@@ -75,6 +75,7 @@ final class SyncAppModel: ObservableObject {
     func eraseLocalData() { endBackgroundFlush(); engine.eraseLocalData() }
     func unlinkAndKeepTasks() { endBackgroundFlush(); engine.unlinkAndKeepTasks() }
     func leaveGroupAndKeepTasks() { endBackgroundFlush(); engine.leaveGroupAndKeepTasks() }
+    func removeDevice(_ device: LinkedDevice) { engine.removeDevice(device) }
     func applicationDidBecomeActive() {
         endBackgroundFlush()
         engine.applicationDidBecomeActive()
@@ -148,19 +149,14 @@ final class SyncAppModel: ObservableObject {
         )
     }
 
-    var linkedMemberLabels: [String] {
-        guard self.isPaired else {
-            return self.isPaired ? ["This iPhone", "Other iPhone"] : []
+    static func label(for device: LinkedDevice) -> String {
+        if device.isCurrentDevice {
+            return "This iPhone"
         }
-        return engine.linkedDeviceIDs.map { memberID in
-            if memberID == engine.localDeviceID {
-                return "This iPhone"
-            }
-            let short = memberID.prefix(4).map {
-                String(format: "%02x", $0)
-            }.joined()
-            return "iPhone · \(short)"
-        }
+        let short = device.deviceID.prefix(4).map {
+            String(format: "%02x", $0)
+        }.joined()
+        return "iPhone · \(short)"
     }
 
     var manageSyncStatusLine: String {
