@@ -98,9 +98,12 @@ final class MLSClientTests: XCTestCase {
 
         func add(_ joining: MLSClient, observers: [MLSClient]) async throws {
             let identity = try await joining.joiningIdentity()
-            let reference = try await relay.publish(identity.keyPackage, writer: joining.transportAuthorization())
-            let fetched = try await relay.keyPackage(reference)
+            let pairingToken = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
+            let reference = try await relay.publish(identity.keyPackage, writer: joining.transportAuthorization(), pairingToken: pairingToken)
+            let fetched = try await relay.keyPackage(reference, pairingToken: pairingToken)
             XCTAssertEqual(fetched, identity.keyPackage)
+            let consumed = try await relay.post("key-package/fetch", ["reference": reference.b64, "pairingToken": pairingToken.b64])
+            XCTAssertTrue(consumed["payload"] is NSNull)
             let pending = try await alice.prepareAdd(keyPackage: fetched, verifiedFingerprint: identity.fingerprint, reference: reference)
             let cursor = try await relay.append(pending)
             let retryCursor = try await relay.append(pending)
@@ -111,6 +114,7 @@ final class MLSClientTests: XCTestCase {
             try await catchUp(reopened, group: group, relay: relay)
             for observer in observers { try await catchUp(observer, group: group, relay: relay) }
             try await joining.join(welcome: XCTUnwrap(pending.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: cursor)
+            try await relay.ack(group: group, cursor: cursor, authorization: joining.transportAuthorization())
         }
 
         try await add(bob, observers: [])
@@ -151,6 +155,10 @@ final class MLSClientTests: XCTestCase {
         try await catchUp(reopenedBob, group: group, relay: relay)
         let removed = try await reopenedBob.isRemoved()
         XCTAssertTrue(removed)
+        do {
+            _ = try await relay.fetch(group: group, after: 0, authorization: compromised.transportAuthorization())
+            XCTFail("Relay allowed reads after removal acknowledgement")
+        } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 403) }
         let afterRemoval = try await alice.prepareMessage(Data("new epoch".utf8))
         let cursor = try await relay.append(afterRemoval)
         try await catchUp(charlie, group: group, relay: relay)
@@ -299,9 +307,15 @@ final class MLSClientTests: XCTestCase {
     }
 
     private func catchUp(_ client: MLSClient, group: Data, relay: SpikeRelay) async throws {
+        let authorization = try await client.transportAuthorization()
         for _ in 0..<100 {
-            guard let (delivery, cursor) = try await relay.fetch(group: group, after: client.cursor()) else { return }
-            try await client.process(delivery, cursor: cursor)
+            let entries = try await relay.fetch(group: group, after: client.cursor(), authorization: authorization)
+            guard !entries.isEmpty else { return }
+            for (delivery, cursor) in entries {
+                try await client.process(delivery, cursor: cursor)
+                try await relay.ack(group: group, cursor: cursor, authorization: authorization)
+                if try await client.isRemoved() { return }
+            }
         }
         XCTFail("Unexpected log length")
     }
@@ -330,11 +344,11 @@ private struct SpikeRelay {
         guard status == 200 else { throw Error(status: status, code: document["error"] as? String, epoch: document["epoch"] as? UInt64) }
         return document
     }
-    func publish(_ payload: Data, writer: Data) async throws -> Data {
-        try await decode(post("key-package/publish", ["payload": payload.b64], authorization: writer)["reference"])
+    func publish(_ payload: Data, writer: Data, pairingToken: Data) async throws -> Data {
+        try await decode(post("key-package/publish", ["payload": payload.b64, "pairingHash": Data(SHA256.hash(data: pairingToken)).b64], authorization: writer)["reference"])
     }
-    func keyPackage(_ reference: Data) async throws -> Data {
-        try await decode(post("key-package/fetch", ["reference": reference.b64])["payload"])
+    func keyPackage(_ reference: Data, pairingToken: Data) async throws -> Data {
+        try await decode(post("key-package/fetch", ["reference": reference.b64, "pairingToken": pairingToken.b64])["payload"])
     }
     func append(_ delivery: MLSDelivery, authorization: Data? = nil) async throws -> UInt64 {
         var values: [String: Any] = ["group": delivery.group.b64, "epoch": delivery.epoch, "kind": delivery.kind.rawValue, "payload": delivery.payload.b64]
@@ -345,11 +359,15 @@ private struct SpikeRelay {
         let response = try await post("append", values, authorization: authorization ?? self.authorization)
         return (response["entry"] as! [String: Any])["cursor"] as! UInt64
     }
-    func fetch(group: Data, after: UInt64) async throws -> (MLSDelivery, UInt64)? {
-        let response = try await post("fetch", ["group": group.b64, "after": after])
-        guard let entry = (response["entries"] as! [[String: Any]]).first else { return nil }
-        let delivery = MLSDelivery(group: group, epoch: entry["epoch"] as! UInt64, kind: MLSDelivery.Kind(rawValue: entry["kind"] as! String)!, payload: try decode(entry["payload"]), welcome: try optional(entry["welcome"]), keyPackageReference: try optional(entry["reference"]))
-        return (delivery, entry["cursor"] as! UInt64)
+    func ack(group: Data, cursor: UInt64, authorization: Data) async throws {
+        _ = try await post("ack", ["route": group.b64, "cursor": cursor], authorization: authorization)
+    }
+    func fetch(group: Data, after: UInt64, authorization: Data) async throws -> [(MLSDelivery, UInt64)] {
+        let response = try await post("fetch", ["group": group.b64, "after": after], authorization: authorization)
+        return try (response["entries"] as! [[String: Any]]).map { entry in
+            let delivery = MLSDelivery(group: group, epoch: entry["epoch"] as! UInt64, kind: MLSDelivery.Kind(rawValue: entry["kind"] as! String)!, payload: try decode(entry["payload"]), welcome: try optional(entry["welcome"]), keyPackageReference: try optional(entry["reference"]), addWriter: try optional(entry["addWriter"]), removeWriter: try optional(entry["removeWriter"]))
+            return (delivery, entry["cursor"] as! UInt64)
+        }
     }
     func decode(_ value: Any?) throws -> Data {
         let text = try XCTUnwrap(value as? String)

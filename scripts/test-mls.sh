@@ -4,7 +4,7 @@ source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
 export CARGO_TARGET_DIR="$GOTSYNC_CACHE_DIR/rust-mls"
 cargo test --locked --manifest-path mls/Cargo.toml
-scripts/uv.sh pytest server/tests/test_mls_spike.py -q
+scripts/uv.sh pytest server/tests/test_mls.py -q
 GOTSYNC_MLS_MARKER="Packages/GotSyncMLS/Artifacts/.built"
 if [ ! -f "$GOTSYNC_MLS_MARKER" ] || [ -n "$(find mls/src mls/Cargo.toml mls/Cargo.lock mls/uniffi.toml scripts/build-mls.sh -type f -newer "$GOTSYNC_MLS_MARKER" -print -quit 2>/dev/null)" ]; then
     scripts/build-mls.sh --host-only
