@@ -21,10 +21,14 @@ record schema.
 The root `Package.swift` exports one product, `GotSync`. Adding this repository
 in Swift Package Manager builds the library without the example or Python
 server. It requires Swift 6, iOS 18 or macOS 14. The demo requires iOS 18.6.
+`GotSync` depends on the local `Packages/GotSyncMLS` package, whose
+XCFramework is built from `mls/` and not checked in.
 
 ## Use the library
 
-Add this checkout as a local package dependency in Xcode and select `GotSync`.
+Run `scripts/build-mls.sh` once to build the OpenMLS XCFramework for macOS and
+iOS (requires the Rust toolchain in `rust-toolchain.toml`). Then add this
+checkout as a local package dependency in Xcode and select `GotSync`.
 
 Create the engine on the main actor, supply your endpoints and storage
 location, and use a separate Keychain service for each application:

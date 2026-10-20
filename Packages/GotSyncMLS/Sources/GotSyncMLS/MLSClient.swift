@@ -108,6 +108,7 @@ public actor MLSClient {
             MLSMember(deviceID: $0.deviceId, fingerprint: $0.fingerprint, writerHash: $0.writerHash)
         }
     }
+    public func group() throws -> Data? { try store.read().group }
     public func cursor() throws -> UInt64 { try store.read().cursor }
     public func epoch() throws -> UInt64 { try store.read().epoch }
     public func pendingDelivery() throws -> MLSDelivery? { try store.read().pending }
