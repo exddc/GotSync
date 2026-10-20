@@ -1286,6 +1286,96 @@ final class MailboxTests: XCTestCase {
         await model.stop()
     }
 
+    func testHTTPMailboxRetriesRateLimitedRequestsAfterRetryAfter() async throws {
+        let rateLimited = Data(#"{"error":"rateLimited","version":1}"#.utf8)
+        let page = Data(#"{"hasMore":false,"messages":[],"nextCursor":0,"version":1}"#.utf8)
+        MailboxURLProtocol.setResponses([
+            (rateLimited, 429, ["Retry-After": "0"]),
+            (rateLimited, 429, ["Retry-After": "0"]),
+            (page, 200, [:]),
+        ])
+        let (transport, session) = makeStubbedTransport()
+        defer { session.invalidateAndCancel() }
+
+        let fetched = try await transport.fetch(
+            route: Data(repeating: 0x01, count: 32),
+            authorization: Data(repeating: 0x02, count: 32),
+            after: 0,
+            limit: 1
+        )
+
+        XCTAssertEqual(fetched.messages, [])
+        XCTAssertEqual(MailboxURLProtocol.requestCount, 3)
+    }
+
+    func testHTTPMailboxStopsRetryingRateLimitedRequestsAfterLimit() async throws {
+        let rateLimited = Data(#"{"error":"rateLimited","version":1}"#.utf8)
+        MailboxURLProtocol.setResponses(
+            Array(repeating: (rateLimited, 429, ["Retry-After": "0"]), count: 5)
+        )
+        let (transport, session) = makeStubbedTransport()
+        defer { session.invalidateAndCancel() }
+
+        do {
+            try await transport.forget(
+                route: Data(repeating: 0x01, count: 32),
+                authorization: Data(repeating: 0x02, count: 32)
+            )
+            XCTFail("Expected rate limit rejection")
+        } catch {
+            XCTAssertEqual(
+                error as? MailboxTransportError,
+                .rejected(status: 429, code: "rateLimited")
+            )
+        }
+        XCTAssertEqual(
+            MailboxURLProtocol.requestCount,
+            HTTPMailboxTransport.maximumRateLimitRetries + 1
+        )
+    }
+
+    func testHTTPMailboxDoesNotRetryCapacityOrLongRetryAfter() async throws {
+        let cases: [([String: String], String)] = [
+            ([:], "mailboxCapacity"),
+            (["Retry-After": "3600"], "rateLimited"),
+            (["Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"], "rateLimited"),
+        ]
+        for (headers, code) in cases {
+            MailboxURLProtocol.setResponses([
+                (Data(#"{"error":"\#(code)","version":1}"#.utf8), 429, headers),
+            ])
+            let (transport, session) = makeStubbedTransport()
+            defer { session.invalidateAndCancel() }
+            do {
+                try await transport.forget(
+                    route: Data(repeating: 0x01, count: 32),
+                    authorization: Data(repeating: 0x02, count: 32)
+                )
+                XCTFail("Expected rejection")
+            } catch {
+                XCTAssertEqual(
+                    error as? MailboxTransportError,
+                    .rejected(status: 429, code: code)
+                )
+            }
+            XCTAssertEqual(MailboxURLProtocol.requestCount, 1)
+        }
+    }
+
+    private func makeStubbedTransport() -> (HTTPMailboxTransport, URLSession) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MailboxURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        return (
+            HTTPMailboxTransport(
+                baseURL: TestEndpoints.mailboxURL,
+                session: session,
+                policy: .localDevelopment
+            ),
+            session
+        )
+    }
+
     @MainActor
     func testUnsupportedServerVersionDoesNotRequireRepair() async throws {
         MailboxURLProtocol.setResponseBody(Data(#"{"error":"unsupportedVersion","version":1}"#.utf8), status: 400)
@@ -1583,12 +1673,29 @@ private final class MailboxURLProtocol: URLProtocol, @unchecked Sendable {
     private static let responseLock = NSLock()
     nonisolated(unsafe) private static var responseBody = Data()
     nonisolated(unsafe) private static var responseStatus = 200
+    nonisolated(unsafe) private static var queuedResponses: [(Data, Int, [String: String])] = []
+    nonisolated(unsafe) private static var startedRequests = 0
 
     static func setResponseBody(_ data: Data, status: Int = 200) {
         responseLock.lock()
         responseBody = data
         responseStatus = status
+        queuedResponses = []
+        startedRequests = 0
         responseLock.unlock()
+    }
+
+    static func setResponses(_ responses: [(Data, Int, [String: String])]) {
+        responseLock.lock()
+        queuedResponses = responses
+        startedRequests = 0
+        responseLock.unlock()
+    }
+
+    static var requestCount: Int {
+        responseLock.lock()
+        defer { responseLock.unlock() }
+        return startedRequests
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -1603,8 +1710,16 @@ private final class MailboxURLProtocol: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         Self.responseLock.lock()
-        let body = Self.responseBody
-        let status = Self.responseStatus
+        var body = Self.responseBody
+        var status = Self.responseStatus
+        var headers = ["Content-Type": "application/json"]
+        if !Self.queuedResponses.isEmpty {
+            let queued = Self.queuedResponses.removeFirst()
+            body = queued.0
+            status = queued.1
+            headers.merge(queued.2) { _, new in new }
+        }
+        Self.startedRequests += 1
         Self.responseLock.unlock()
         guard
             let url = request.url,
@@ -1612,7 +1727,7 @@ private final class MailboxURLProtocol: URLProtocol, @unchecked Sendable {
                 url: url,
                 statusCode: status,
                 httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Type": "application/json"]
+                headerFields: headers
             )
         else {
             client?.urlProtocol(

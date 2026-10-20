@@ -151,6 +151,9 @@ public final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
         let error: String
     }
 
+    static let maximumRateLimitRetries = 2
+    static let maximumRetryAfterSeconds: UInt64 = 10
+
     private let baseURL: URL
     private let policy: EndpointSecurityPolicy
     private let session: URLSession
@@ -368,6 +371,49 @@ public final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue("GotSync/1", forHTTPHeaderField: "User-Agent")
 
+        var retries = 0
+        while true {
+            let (http, data) = try await send(request, to: url)
+            if http.statusCode == 200 {
+                return try decodeResponse(data)
+            }
+            if http.statusCode == 429,
+               retries < Self.maximumRateLimitRetries,
+               let delay = Self.retryAfterSeconds(http),
+               delay <= Self.maximumRetryAfterSeconds
+            {
+                retries += 1
+                try await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                continue
+            }
+            let code = (
+                try? CanonicalJSON.decoder.decode(ErrorResponse.self, from: data)
+            )?.error ?? "http\(http.statusCode)"
+            if code == "unsupportedVersion" { throw MailboxTransportError.unsupportedVersion }
+            throw MailboxTransportError.rejected(
+                status: http.statusCode,
+                code: code
+            )
+        }
+    }
+
+    static func retryAfterSeconds(_ response: HTTPURLResponse) -> UInt64? {
+        guard
+            let value = response.value(forHTTPHeaderField: "Retry-After")?
+                .trimmingCharacters(in: .whitespaces),
+            !value.isEmpty,
+            value.allSatisfy(\.isASCII),
+            value.allSatisfy(\.isNumber)
+        else {
+            return nil
+        }
+        return UInt64(value)
+    }
+
+    private func send(
+        _ request: URLRequest,
+        to url: URL
+    ) async throws -> (HTTPURLResponse, Data) {
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do {
@@ -414,16 +460,10 @@ public final class HTTPMailboxTransport: MailboxTransport, @unchecked Sendable {
         } catch {
             throw error
         }
-        guard http.statusCode == 200 else {
-            let code = (
-                try? CanonicalJSON.decoder.decode(ErrorResponse.self, from: data)
-            )?.error ?? "http\(http.statusCode)"
-            if code == "unsupportedVersion" { throw MailboxTransportError.unsupportedVersion }
-            throw MailboxTransportError.rejected(
-                status: http.statusCode,
-                code: code
-            )
-        }
+        return (http, data)
+    }
+
+    private func decodeResponse<Response: Decodable>(_ data: Data) throws -> Response {
         let version: Int
         do { version = try CanonicalJSON.decoder.decode(MailboxResponseVersion.self, from: data).version }
         catch { throw MailboxTransportError.invalidResponse }
