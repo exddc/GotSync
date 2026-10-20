@@ -10,13 +10,8 @@ final class MLSStore {
 
     init(directory: URL, stateKey: MLSStateKeyProvider) throws {
         let file = directory.appendingPathComponent("mls-v2.sqlite3")
-        do {
-            key = try stateKey.key()
-        } catch {
-            if FileManager.default.fileExists(atPath: file.path) { throw MLSStoreError.unreadable }
-            throw error
-        }
-        guard key.bitCount == 256 else { throw MLSStoreError.unreadable }
+        key = try stateKey.key()
+        guard key.bitCount == 256 else { throw MLSClientError.storageUnavailable }
         let manager = FileManager.default
         var directoryAttributes: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
         #if os(iOS)
@@ -92,14 +87,19 @@ final class MLSStore {
             let count = sqlite3_column_bytes(statement, 0)
             guard count > 0, count <= 32 * 1024 * 1024,
                   let bytes = sqlite3_column_blob(statement, 0) else { throw MLSStoreError.unreadable }
+            let plaintext: Data
             do {
                 let blob = Data(bytes: bytes, count: Int(count))
                 guard blob.prefix(1) == version else { throw MLSStoreError.unreadable }
                 let sealed = try AES.GCM.SealedBox(combined: blob.dropFirst())
-                let plaintext = try AES.GCM.open(sealed, using: key, authenticating: version)
-                return try JSONDecoder().decode(ClientRecord.self, from: plaintext)
+                plaintext = try AES.GCM.open(sealed, using: key, authenticating: version)
             } catch {
                 throw MLSStoreError.unreadable
+            }
+            do {
+                return try JSONDecoder().decode(ClientRecord.self, from: plaintext)
+            } catch {
+                throw MLSClientError.storageUnavailable
             }
         case SQLITE_DONE: return nil
         default: throw MLSClientError.storageUnavailable

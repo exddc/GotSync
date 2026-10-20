@@ -84,6 +84,43 @@ final class MLSClientTests: XCTestCase {
         }
     }
 
+    func testEncryptedStorePreservesRecordAfterKeyProviderFailure() throws {
+        struct UnavailableStateKeyProvider: MLSStateKeyProvider {
+            func key() throws -> SymmetricKey { throw MLSClientError.storageUnavailable }
+        }
+        let stateKey = InMemoryStateKeyProvider()
+        let record = storedRecord()
+        do {
+            let store = try MLSStore(directory: root, stateKey: stateKey)
+            try store.update { $0 = record }
+        }
+        XCTAssertThrowsError(try MLSStore(directory: root, stateKey: UnavailableStateKeyProvider())) { error in
+            guard case MLSClientError.storageUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let reopened = try MLSStore(directory: root, stateKey: stateKey)
+        XCTAssertEqual(try reopened.read().state, record.state)
+        XCTAssertEqual(try reopened.read().deviceID, record.deviceID)
+    }
+
+    func testEncryptedStoreRejectsInvalidProviderKeySize() throws {
+        let stateKey = InMemoryStateKeyProvider(key: SymmetricKey(size: .bits128))
+        XCTAssertThrowsError(try MLSStore(directory: root, stateKey: stateKey)) { error in
+            guard case MLSClientError.storageUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testEncryptedStoreReportsAuthenticatedDecodeFailureAsStorageUnavailable() throws {
+        let stateKey = InMemoryStateKeyProvider()
+        let store = try MLSStore(directory: root, stateKey: stateKey)
+        try store.update { $0 = storedRecord() }
+        let version = Data([1])
+        let combined = try XCTUnwrap(AES.GCM.seal(Data("not a record".utf8), using: stateKey.key(), authenticating: version).combined)
+        try rewriteStoredBlob { $0 = version + combined }
+        XCTAssertThrowsError(try store.read()) { error in
+            guard case MLSClientError.storageUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
     func testEncryptedStoreCapsCiphertextAndPreservesPreviousRecord() throws {
         let store = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
         let original = storedRecord()
