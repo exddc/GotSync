@@ -5,16 +5,25 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   apple:
     runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      GOTSYNC_CACHE_DIR: ${{ github.workspace }}/../gotsync-cache
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.99.0
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
-      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: mls -> ../../gotsync-cache/rust-mls
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Build Apple XCFramework and Swift bindings
         run: scripts/build-mls.sh
       - name: Compile Swift for iOS and test on simulator

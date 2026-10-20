@@ -14,6 +14,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 GOTSYNC_MLS_TEST_SIM="$(xcrun simctl create "GotSync MLS tests" "${GOTSYNC_MLS_SIMULATOR_TYPE:-com.apple.CoreSimulator.SimDeviceType.iPhone-16}")"
-xcodebuild -scheme GotSyncMLS-Package \
+xcodebuild -scheme GotSyncMLS \
     -destination "platform=iOS Simulator,id=$GOTSYNC_MLS_TEST_SIM" \
     -derivedDataPath "$GOTSYNC_CACHE_DIR/mls-ios-tests" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES test
