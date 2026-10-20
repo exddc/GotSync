@@ -51,11 +51,15 @@ observe it and follow rotation. Leaving is best effort and does not guarantee
 exclusion, deletion of a former member's local data, or a remote wipe. There is
 no forward secrecy for retained mailbox data after root compromise.
 
-The relay can deny service. Anonymous clients can exhaust capacity despite
-bounded rooms, queues, request bodies, and mailbox quotas. Admission controls,
-perimeter rate limits, backup policy, and deployment monitoring are operator
-responsibilities. Public service hardening remains separate from this
-repository restructure.
+The relay can deny service. The relay enforces per-source connection and
+request rate limits, per-source concurrency limits, and optional deployment
+admission by network allowlist or proxy-injected token. These bound what one
+address or IPv6 `/64` can consume, but anonymous clients spread across many
+addresses can still exhaust capacity despite bounded rooms, queues, request
+bodies, and mailbox quotas. Operators remain responsible for the TLS proxy,
+trusted-proxy configuration, perimeter rate limits and DDoS protection,
+firewalling the relay ports, backup policy, and deployment monitoring. See the
+relay README for the perimeter checklist.
 
 ## Delivery and loss
 

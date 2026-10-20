@@ -142,6 +142,14 @@ Relay capacity and route control failures use small text frames:
 | `routeFull` | A third socket attempted to join an existing route | 1008 |
 | `relayBusy` | The global connection or room limit is full | 1013 |
 | `waitingExpired` | A route had only one peer for the waiting TTL | 1008 |
+| `rateLimited` | The source already holds its concurrent-socket limit | 1013 |
+
+Per-source admission and rate limits run before registration. A handshake over
+the connection-rate limit receives HTTP 429 with `Retry-After`; a handshake that
+fails deployment admission receives HTTP 403. Mailbox and MLS requests receive
+the same statuses with JSON bodies `{"error":"rateLimited"}` or
+`{"error":"admissionDenied"}`. Rejected requests change no room, mailbox, or
+delivery state, so a client may retry them unchanged after `Retry-After`.
 
 Only aggregate process counters are exposed. Metrics and logs contain no route,
 IP, user agent, device ID, or payload.

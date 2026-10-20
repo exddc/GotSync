@@ -1,3 +1,4 @@
+from .admission import AdmissionConfig, RateLimit
 from .mailbox import (
     DEFAULT_MAILBOX_RETENTION_SECONDS,
     DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS,
@@ -36,6 +37,8 @@ from .server import (
 )
 
 __all__ = [
+    "AdmissionConfig",
+    "RateLimit",
     "DEFAULT_MAILBOX_DATABASE_PATH",
     "DEFAULT_MAX_MAILBOX_CONNECTIONS",
     "DEFAULT_MAILBOX_RETENTION_SECONDS",
