@@ -24,4 +24,5 @@ wheel-exclude = [".DS_Store"]
 source-exclude = [".DS_Store"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 addopts = "-p no:cacheprovider"

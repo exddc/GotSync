@@ -1,0 +1,35 @@
+name: MLS spike
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  apple:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: astral-sh/setup-uv@v6
+      - name: Build Apple XCFramework and Swift bindings
+        run: scripts/build-mls.sh
+      - name: Compile Swift for iOS and test on simulator
+        run: scripts/test-mls-ios.sh
+      - name: Test MLS against real delivery service
+        run: scripts/test-mls.sh
+      - name: Verify existing sync behavior
+        run: scripts/test-integration.sh
+      - name: Package Swift dependency without Rust requirement
+        run: python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
+      - name: Test packaged dependency without Cargo
+        run: |
+          unzip -q "$RUNNER_TEMP/mls-package/GotSyncMLS.zip" -d "$RUNNER_TEMP/mls-consumer"
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin swift test --package-path "$RUNNER_TEMP/mls-consumer/GotSyncMLS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GotSyncMLS-apple
+          path: ${{ runner.temp }}/mls-package/

@@ -107,6 +107,15 @@ Leaving a group does not guarantee cryptographic exclusion or remote deletion.
 Read the [threat model](docs/THREAT-MODEL.md) and
 [red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
 
+## Experimental MLS migration
+
+TW-531 has an isolated OpenMLS/UniFFI spike in `Packages/GotSyncMLS` and `mls/`.
+It is not connected to `SyncEngine`; the security limits above still apply.
+See [build instructions, results, and remaining gates](docs/MLS-SPIKE.md).
+CI also packages a complete prebuilt Swift dependency for local Xcode/SwiftPM
+consumption without installing Rust.
+Run `scripts/build-mls.sh` before resolving the experimental Swift package.
+
 ## Test
 
 ```sh
