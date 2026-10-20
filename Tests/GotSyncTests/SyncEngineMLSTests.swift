@@ -483,22 +483,19 @@ final class SyncEngineMLSTests: XCTestCase {
             persistenceURL: directory.appendingPathComponent("replica-v1.json")
         )
         try replica.createTask(title: "From version 1")
-        let credentialStore = CredentialStore(keychain: store)
-        try credentialStore.saveActive(PairCredentials(
-            pairRoot: Data(repeating: 0x11, count: 32),
-            pairID: Data(repeating: 0x22, count: 16),
-            role: .host,
-            localDeviceID: identity.deviceID,
-            remoteDeviceID: Data(repeating: 0x33, count: 16)
-        ))
+        for account in LegacyLinkCredentials.accounts {
+            try store.write(Data("version 1".utf8), account: account)
+        }
 
         let upgraded = engine("legacy")
         XCTAssertFalse(upgraded.isPaired)
         XCTAssertEqual(upgraded.phase, .unpaired)
         XCTAssertEqual(upgraded.tasks.map(\.titleValue), ["From version 1"])
         XCTAssertEqual(upgraded.errorMessage, SyncError.relinkRequired.errorDescription)
-        XCTAssertNil(try credentialStore.activeGroup())
-        XCTAssertFalse(try credentialStore.hasPairingData())
+        XCTAssertEqual(upgraded.linkEndedReason, .relinkRequired)
+        for account in LegacyLinkCredentials.accounts {
+            XCTAssertNil(try store.read(account: account), account)
+        }
     }
 
     func testMLSStateKeyAllowsBackgroundAccessOnThisDeviceOnly() async throws {
@@ -621,6 +618,7 @@ final class SyncEngineMLSTests: XCTestCase {
             let removedDevice = size == 3 ? engine(names[1]) : target
             try await wait("removal detected") { !removedDevice.isPaired }
             XCTAssertEqual(removedDevice.errorMessage, SyncError.removedFromGroup.errorDescription)
+            XCTAssertEqual(removedDevice.linkEndedReason, .removedFromGroup)
             XCTAssertFalse(removedDevice.tasks.contains { $0.titleValue == title })
             let erasedGroup = try await removedDevice.mlsSessionForTesting?.group()
             XCTAssertNil(erasedGroup)
@@ -674,6 +672,72 @@ final class SyncEngineMLSTests: XCTestCase {
             XCTAssertTrue(leaver.addTask(title: title))
             try await wait("converged") { linked.allSatisfy { $0.tasks.contains { $0.titleValue == title } } }
         }
+    }
+
+    /// The member is offline while the host writes. One copy of its state
+    /// shows those messages were readable; another skips them, processes only
+    /// the commit, and must then fail to open them.
+    func testStateAfterEpochChangeCannotDecryptEarlierEpochs() async throws {
+        let names = ["epoch-0", "epoch-1"]
+        let linked = try await linkedGroup(names)
+        let host = linked[0]
+        let group = try await groupID(host)
+        await linked[1].stop()
+        let title = "Written before the epoch change"
+        XCTAssertTrue(host.addTask(title: title))
+        try await wait("uploaded") { host.pendingMailboxOperationCount == 0 }
+
+        let control = try await retainedState(of: names[1], engine: linked[1], copy: "epoch-control")
+        let skipping = try await retainedState(of: names[1], engine: linked[1], copy: "epoch-skipping")
+        let earlierEpoch = try await control.epoch()
+        let controlCursor = try await control.cursor()
+        let unread = await relay.log(group: group).filter { $0.delivery.kind == .application && $0.cursor > controlCursor }
+        XCTAssertFalse(unread.isEmpty)
+        for entry in unread {
+            try await control.process(entry.delivery, cursor: entry.cursor)
+        }
+        let opened = Set(try await control.inbox().map(\.cursor))
+        XCTAssertTrue(Set(unread.map(\.cursor)).isSubset(of: opened))
+
+        try await pair(host, engine("epoch-2"))
+        let member = engine(names[1])
+        try await wait("epoch change received") {
+            member.linkedMemberCount == 3 && member.tasks.contains { $0.titleValue == title }
+        }
+        let commits = await relay.log(group: group).filter { $0.delivery.kind == .commit && $0.cursor > controlCursor }
+        XCTAssertFalse(commits.isEmpty)
+        for entry in commits {
+            try await skipping.process(entry.delivery, cursor: entry.cursor)
+        }
+        let skippedEpoch = try await skipping.epoch()
+        XCTAssertGreaterThan(skippedEpoch, earlierEpoch)
+        var skippedCursor = try await skipping.cursor()
+        var skipped: [UInt64] = []
+        for entry in unread {
+            skippedCursor += 1
+            skipped.append(skippedCursor)
+            try await skipping.process(entry.delivery, cursor: skippedCursor)
+        }
+        let skippedInbox = Set(try await skipping.inbox().map(\.cursor))
+        XCTAssertTrue(skippedInbox.isDisjoint(with: skipped), "state retained an earlier epoch's keys")
+
+        let snapshot = try await retainedState(of: names[1], engine: member, copy: "epoch-snapshot")
+        let currentEpoch = try await snapshot.epoch()
+        XCTAssertGreaterThan(currentEpoch, earlierEpoch)
+        let earlier = await relay.log(group: group).filter { $0.delivery.kind == .application && $0.delivery.epoch < currentEpoch }
+        XCTAssertTrue(Set(unread.map(\.cursor)).isSubset(of: Set(earlier.map(\.cursor))))
+
+        var cursor = try await snapshot.cursor()
+        var replayed: [UInt64] = []
+        for entry in earlier {
+            cursor += 1
+            replayed.append(cursor)
+            try await snapshot.process(entry.delivery, cursor: cursor)
+        }
+        let inbox = Set(try await snapshot.inbox().map(\.cursor))
+        XCTAssertTrue(inbox.isDisjoint(with: replayed), "a post-change snapshot decrypted an earlier epoch")
+        let rejected = Set(try await snapshot.rejectedApplicationCursors())
+        XCTAssertTrue(Set(replayed).isSubset(of: rejected))
     }
 
     func testDeviceRemovalSurvivesRestartAndConcurrentRemoval() async throws {

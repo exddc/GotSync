@@ -7,7 +7,6 @@ public enum SyncPhase: Equatable, Sendable {
     case waitingForPeer
     case verifying
     case provisioning
-    case finalizing
     case connecting
     case reconciling
     case synced
@@ -24,7 +23,6 @@ public enum MailboxSyncState: Equatable, Sendable {
 
 public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case invalidPairMessage
-    case invalidSyncMessage
     case invalidCredentials
     /// Opaque/unmapped relay code — still user-outcome wording, not “check network.”
     case relay(String)
@@ -34,14 +32,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case invitationExpired
     /// Distinct taxonomy: cannot reach private sync infrastructure.
     case privateSyncUnreachable
-    case archiveTooLarge
     case localStorageUnavailable
-    case safetyCodeMismatch
-    case pairingReplicaConflict
-    case pairingMergeTooLarge
-    case legacyPairingNeedsRelink
-    case pairingRecoveryHistoryFull
-    case pairingRecoveryJournalDamaged
     case groupAtCapacity
     case unsupportedProtocolVersion
     case relinkRequired
@@ -53,8 +44,6 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         switch self {
         case .invalidPairMessage:
             "Pairing could not continue. Create a new invitation and try again."
-        case .invalidSyncMessage:
-            "A sync update could not be read. Your tasks are still safe on this iPhone."
         case .invalidCredentials:
             "Saved link details are no longer valid. Keep your tasks and create a new link."
         case .relay(let code):
@@ -66,22 +55,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "The invitation expired."
         case .privateSyncUnreachable:
             "Cannot reach the sync service."
-        case .archiveTooLarge:
-            "This task list is too large to share in the sync protocol (280 KiB limit). Remove tasks or reset the link, then try again."
         case .localStorageUnavailable:
             "Local storage is unavailable. Restart the app after fixing storage."
-        case .safetyCodeMismatch:
-            "The safety codes did not match. Nothing was linked. Create a new invitation and try again."
-        case .pairingReplicaConflict:
-            "Both phones already have tasks. Review how to combine the lists before the link finishes."
-        case .pairingMergeTooLarge:
-            "These task lists cannot be safely combined on this device. Nothing was linked, and your local tasks are unchanged."
-        case .legacyPairingNeedsRelink:
-            "An older pairing stopped during its final step. Your tasks are safe. Keep them and create a link again."
-        case .pairingRecoveryHistoryFull:
-            "Too many unfinished pairing steps are still saved. Keep your tasks and reset the link before creating another one."
-        case .pairingRecoveryJournalDamaged:
-            "Saved pairing recovery data is damaged. Your tasks are safe. Keep them and reset the link before creating another one."
         case .groupAtCapacity:
             "The group is at its device limit."
         case .unsupportedProtocolVersion:
@@ -136,18 +111,6 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
                 return SyncError.privateSyncUnreachable
             }
         }
-        if let mailbox = error as? MailboxTransportError {
-            switch mailbox {
-            case .rejected(_, let code) where code == "waitingExpired":
-                return SyncError.invitationExpired
-            case .unsupportedVersion:
-                return SyncError.unsupportedProtocolVersion
-            case .insecureTransport, .invalidURL:
-                return SyncError.privateSyncUnreachable
-            default:
-                break
-            }
-        }
         return error
     }
 
@@ -163,12 +126,9 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         case .privateSyncUnreachable, .relay:
             return true
         case .invitationExpired, .pairingDeclined, .groupAtCapacity,
-             .invalidPairMessage, .invalidCredentials, .archiveTooLarge,
-             .localStorageUnavailable, .safetyCodeMismatch,
-             .pairingReplicaConflict, .pairingMergeTooLarge,
-             .legacyPairingNeedsRelink, .pairingRecoveryHistoryFull,
-             .pairingRecoveryJournalDamaged, .invalidSyncMessage, .unsupportedProtocolVersion,
-             .relinkRequired, .syncHistoryBlocked, .removedFromGroup, .approvalExpired:
+             .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
+             .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
+             .removedFromGroup, .approvalExpired:
             return false
         }
     }
@@ -178,8 +138,6 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
 public final class SyncEngine {
     private var stateSubscribers: [UUID: AsyncStream<SyncState>.Continuation] = [:]
 
-    public var pairingFinalizationState: PairingFinalizationState? { nil }
-
     public var state: SyncState {
         SyncState(
             phase: phase,
@@ -188,7 +146,6 @@ public final class SyncEngine {
             invitationURL: invitationURL,
             invitationExpiresAt: invitationExpiresAt,
             safetyCode: safetyCode,
-            lastRoundTripMilliseconds: lastRoundTripMilliseconds,
             lastSyncedAt: lastSyncedAt,
             errorMessage: errorMessage,
             isPaired: isPaired,
@@ -202,13 +159,10 @@ public final class SyncEngine {
             mailboxErrorMessage: mailboxErrorMessage,
             mailboxRequiresRepair: mailboxRequiresRepair,
             mailboxCapacityReached: mailboxCapacityReached,
-            isPairingFinalizationLocked: isPairingFinalizationLocked,
-            hasPairingReplicaConflict: hasPairingReplicaConflict,
-            keepBothPreview: keepBothPreview,
             showsLinkCompleteCelebration: showsLinkCompleteCelebration,
             activePairingRole: activePairingRole,
             showsSavingNotice: showsSavingNotice,
-            pairingFinalizationState: pairingFinalizationState,
+            linkEndedReason: linkEndedReason,
             linkedMemberCount: linkedMemberCount,
             linkedDevices: linkedDevices
         )
@@ -251,7 +205,6 @@ public final class SyncEngine {
     public private(set) var invitationURL: URL? = nil { didSet { publishState() } }
     public private(set) var invitationExpiresAt: Date? = nil { didSet { publishState() } }
     public private(set) var safetyCode: String? = nil { didSet { publishState() } }
-    public private(set) var lastRoundTripMilliseconds: Double? = nil { didSet { publishState() } }
     public private(set) var lastSyncedAt: Date? = nil { didSet { publishState() } }
     public private(set) var errorMessage: String? = nil { didSet { publishState() } }
     public private(set) var isPaired = false { didSet { publishState() } }
@@ -265,19 +218,18 @@ public final class SyncEngine {
     public private(set) var mailboxErrorMessage: String? = nil { didSet { publishState() } }
     public private(set) var mailboxRequiresRepair = false { didSet { publishState() } }
     public private(set) var mailboxCapacityReached = false { didSet { publishState() } }
-    public private(set) var isPairingFinalizationLocked = false { didSet { publishState() } }
-    public private(set) var hasPairingReplicaConflict = false { didSet { publishState() } }
-    public private(set) var keepBothPreview: KeepBothPreview? = nil { didSet { publishState() } }
     public private(set) var showsLinkCompleteCelebration = false { didSet { publishState() } }
     /// Host vs joiner for the in-flight pairing attempt (presentation only).
     public private(set) var activePairingRole: DeviceRole? = nil { didSet { publishState() } }
     public private(set) var showsSavingNotice = false { didSet { publishState() } }
+    /// Why this device stopped being linked without the user unlinking it:
+    /// `.removedFromGroup` or `.relinkRequired`. Cleared when pairing starts.
+    public private(set) var linkEndedReason: SyncError? = nil { didSet { publishState() } }
 
     public let relayURL: URL
     public let mailboxURL: URL
 
     private let secretStore: any SecretStore
-    private let credentialStore: CredentialStore
     private let mlsTransport: any MLSRelayTransport
     private let rendezvous: any PairingRendezvous
     private let backgroundMailboxScheduler: any BackgroundMailboxScheduling
@@ -364,7 +316,6 @@ public final class SyncEngine {
         self.syncIntervalNanoseconds = syncIntervalNanoseconds
         self.approvalTimeoutNanoseconds = approvalTimeoutNanoseconds
         self.provisionalMemberWindow = provisionalMemberWindow
-        credentialStore = CredentialStore(keychain: secretStore)
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
         mlsRoot = MLSSession.directory(in: baseDirectory)
@@ -396,7 +347,6 @@ public final class SyncEngine {
                 let markerURL = baseDirectory.appendingPathComponent(Self.eraseMarkerFilename)
                 if FileManager.default.fileExists(atPath: markerURL.path) {
                     replica = try Self.completeErase(
-                        store: credentialStore,
                         secretStore: secretStore,
                         deviceID: deviceID,
                         persistenceURL: persistenceURL,
@@ -420,8 +370,8 @@ public final class SyncEngine {
 
         if hasDurableStorage {
             do {
-                if try credentialStore.hasPairingData() {
-                    try credentialStore.clearAllPairingData()
+                if try LegacyLinkCredentials.exist(in: secretStore) {
+                    try LegacyLinkCredentials.erase(from: secretStore)
                     notice = .relinkRequired
                 }
                 try Self.removeAllPairingArtifacts(in: baseDirectory)
@@ -460,6 +410,7 @@ public final class SyncEngine {
         } else {
             phase = .unpaired
             errorMessage = notice.map { Self.displayMessage(for: $0) }
+            linkEndedReason = notice
         }
         if session != nil {
             reconcileTask = Task { [weak self] in
@@ -536,8 +487,6 @@ public final class SyncEngine {
     public var isIssuingGroupInvite: Bool {
         isPaired && invitationPhrase != nil
     }
-
-    public var pairingRecoveryResetRequired: Bool { false }
 
     public var hasLocalReplicaHistory: Bool {
         !replica.isEmpty
@@ -651,8 +600,6 @@ public final class SyncEngine {
         restorePhaseAfterPairing()
     }
 
-    public func resolvePairingReplicaConflictKeepingBoth() {}
-
     @discardableResult
     public func addTask(title: String) -> Bool {
         guard canEditLocalTasks else {
@@ -725,7 +672,6 @@ public final class SyncEngine {
                 .appendingPathComponent(Self.eraseMarkerFilename)
             try Self.persistEraseMarker(at: markerURL)
             replica = try Self.completeErase(
-                store: credentialStore,
                 secretStore: secretStore,
                 deviceID: deviceID,
                 persistenceURL: persistenceURL,
@@ -758,7 +704,7 @@ public final class SyncEngine {
     private func dropLink(departing: Bool) {
         cancelAllWork()
         do {
-            try credentialStore.clearAllPairingData()
+            try LegacyLinkCredentials.erase(from: secretStore)
             session = nil
             if departing {
                 try stageDeparture()
@@ -886,6 +832,7 @@ public final class SyncEngine {
         let deadline = Date().addingTimeInterval(SyncTiming.invitationTimeToLive)
         safetyCode = nil
         errorMessage = nil
+        linkEndedReason = nil
         invitationExpiresAt = deadline
         activePairingRole = .host
         phase = .waitingForPeer
@@ -913,6 +860,7 @@ public final class SyncEngine {
         invitationExpiresAt = nil
         safetyCode = nil
         errorMessage = nil
+        linkEndedReason = nil
         activePairingRole = .joiner
         phase = .waitingForPeer
         activeInvitation = invitation
@@ -1523,6 +1471,7 @@ public final class SyncEngine {
                 isPaired = false
                 phase = .unpaired
                 errorMessage = Self.displayMessage(for: SyncError.relinkRequired)
+                linkEndedReason = .relinkRequired
             }
         } catch is CancellationError {
             return
@@ -1894,6 +1843,7 @@ public final class SyncEngine {
         }
         dropLink(departing: false)
         errorMessage = Self.displayMessage(for: SyncError.removedFromGroup)
+        linkEndedReason = .removedFromGroup
     }
 
     // MARK: - Departures
@@ -2064,13 +2014,13 @@ public final class SyncEngine {
     }
 
     private func resetLinkState() {
+        linkEndedReason = nil
         checkpoint = nil
         isPaired = false
         isHistoryBlocked = false
         lastCycleSucceeded = false
         syncFailureCount = 0
         nextSyncAttemptAt = .distantPast
-        lastRoundTripMilliseconds = nil
         lastSyncedAt = nil
         lastMailboxStoredAt = nil
         lastMailboxReceivedAt = nil
@@ -2080,8 +2030,6 @@ public final class SyncEngine {
         mailboxRequiresRepair = false
         mailboxCapacityReached = false
         mailboxState = .idle
-        keepBothPreview = nil
-        hasPairingReplicaConflict = false
         showsLinkCompleteCelebration = false
         showsSavingNotice = false
         pendingMailboxSince = nil
@@ -2202,7 +2150,6 @@ public final class SyncEngine {
     }
 
     private static func completeErase(
-        store: CredentialStore,
         secretStore: any SecretStore,
         deviceID: ReplicaDeviceID,
         persistenceURL: URL,
@@ -2210,7 +2157,7 @@ public final class SyncEngine {
         mlsRoot: URL,
         markerURL: URL
     ) throws -> TaskReplica {
-        try store.clearPair()
+        try LegacyLinkCredentials.erase(from: secretStore)
         try removeAllPairingArtifacts(in: persistenceURL.deletingLastPathComponent())
         try ReplicationCheckpoint.remove(at: checkpointURL)
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)

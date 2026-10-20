@@ -340,3 +340,41 @@ fn departing_install_can_rejoin_in_the_commit_that_removes_it() {
         b"welcome back"
     );
 }
+
+#[test]
+fn state_after_epoch_change_cannot_decrypt_earlier_epoch_messages() {
+    let alice = identity(1);
+    let bob = identity(2);
+    let charlie = identity(3);
+    let (a, b, _) = add(group(&alice).state, &bob, &alice);
+    let read = seal_message(a, b"read before".to_vec()).unwrap();
+    let unread = seal_message(read.state, b"unread before".to_vec()).unwrap();
+    let from_bob = seal_message(b, b"from bob".to_vec()).unwrap();
+    let b = receive_message(from_bob.state, read.output.clone())
+        .unwrap()
+        .state;
+    assert_eq!(
+        receive_message(b.clone(), unread.output.clone())
+            .unwrap()
+            .output,
+        b"unread before"
+    );
+    assert_eq!(
+        receive_message(unread.state.clone(), from_bob.output.clone())
+            .unwrap()
+            .output,
+        b"from bob"
+    );
+
+    let (a, _, commit) = add(unread.state, &charlie, &alice);
+    let snapshot = receive_message(b, commit).unwrap().state;
+    assert!(receive_message(snapshot.clone(), read.output).is_err());
+    assert!(receive_message(snapshot.clone(), unread.output).is_err());
+    assert!(receive_message(a.clone(), from_bob.output).is_err());
+
+    let current = seal_message(a, b"current epoch".to_vec()).unwrap();
+    assert_eq!(
+        receive_message(snapshot, current.output).unwrap().output,
+        b"current epoch"
+    );
+}
