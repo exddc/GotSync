@@ -10,14 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .mailbox import MailboxError, decode_canonical_base64url, encode_base64url
-from .server import read_http_json_request, parse_mailbox_json, write_http_response
+from .http import read_http_json_request, parse_mailbox_json, write_http_response
 
 VERSION = 2
 MAX_PAYLOAD = 448 * 1024
 MAX_ENTRIES = 10_000
 MAX_BYTES = 16 * 1024 * 1024
-MAX_PACKAGES = 128
-MAX_GROUPS = 128
+DEFAULT_MAX_PACKAGES = 4096
+DEFAULT_MAX_GROUPS = 4096
 
 
 class DeliveryConflict(MailboxError):
@@ -42,20 +42,24 @@ def blob(doc: dict, name: str, size: int | None = None, maximum: int = MAX_PAYLO
     return result
 
 
-def number(doc: dict, name: str) -> int:
-    result = doc.get(name)
+def number(doc: dict, name: str, default: int | None = None) -> int:
+    result = doc.get(name, default)
     if type(result) is not int or not 0 <= result < 2**53:
         raise MailboxError(f"invalid {name}")
     return result
 
 
 class MLSDeliveryStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, max_groups: int = DEFAULT_MAX_GROUPS, max_packages: int = DEFAULT_MAX_PACKAGES) -> None:
+        if type(max_groups) is not int or type(max_packages) is not int or min(max_groups, max_packages) <= 0:
+            raise ValueError("directory limits must be positive integers")
+        self.max_groups = max_groups
+        self.max_packages = max_packages
         self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS mls_groups (route BLOB PRIMARY KEY, epoch INTEGER NOT NULL, head INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS mls_groups (route BLOB PRIMARY KEY, epoch INTEGER NOT NULL, head INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS mls_writers (
                 route BLOB NOT NULL, digest BLOB NOT NULL, ack INTEGER NOT NULL DEFAULT 0,
                 removal INTEGER, removed_at REAL, PRIMARY KEY(route, digest)
@@ -85,6 +89,7 @@ class MLSDeliveryStore:
             raise MailboxError("unsupported version")
         with self._lock, self._db:
             self._db.execute("DELETE FROM mls_packages WHERE expires <= ?", (time.time(),))
+            self._expire_empty_groups()
             self._prune()
             result = self._request(operation, document)
             return {"version": VERSION, **result}
@@ -108,7 +113,7 @@ class MLSDeliveryStore:
         if existing and existing != (writer, pairing):
             raise DeliveryConflict("package publisher differs")
         if not existing:
-            if self._db.execute("SELECT COUNT(*) FROM mls_packages").fetchone()[0] >= MAX_PACKAGES:
+            if self._db.execute("SELECT COUNT(*) FROM mls_packages").fetchone()[0] >= self.max_packages:
                 raise DeliveryCapacity("package directory full")
             self._db.execute("INSERT INTO mls_packages VALUES (?,?,?,?,?)", (reference, package, time.time() + 900, writer, pairing))
         return {"reference": encode_base64url(reference)}
@@ -132,9 +137,9 @@ class MLSDeliveryStore:
             if not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=? AND removal IS NULL", (route, writer)).fetchone():
                 raise DeliveryConflict("group already registered")
         else:
-            if self._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0] >= MAX_GROUPS:
+            if self._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0] >= self.max_groups:
                 raise DeliveryCapacity("group directory full")
-            self._db.execute("INSERT INTO mls_groups(route,epoch) VALUES (?,0)", (route,))
+            self._db.execute("INSERT INTO mls_groups(route,epoch,created_at) VALUES (?,0,?)", (route, time.time()))
             self._db.execute("INSERT INTO mls_writers(route,digest) VALUES (?,?)", (route, writer))
         return {}
 
@@ -152,7 +157,7 @@ class MLSDeliveryStore:
         route = blob(doc, "group", 32)
         _, removal = self._authorize(doc, route)
         after = number(doc, "after")
-        limit = number({"limit": doc.get("limit", 16)}, "limit")
+        limit = number(doc, "limit", default=16)
         if not 1 <= limit <= 32:
             raise MailboxError("invalid limit")
         rows = self._db.execute(
@@ -171,6 +176,15 @@ class MLSDeliveryStore:
         self._db.execute("UPDATE mls_writers SET ack=MAX(ack,?) WHERE route=? AND digest=?", (cursor, route, writer))
         self._prune()
         return {}
+
+    def _expire_empty_groups(self) -> None:
+        expired = self._db.execute(
+            "SELECT route FROM mls_groups WHERE head=0 AND created_at<=?", (time.time() - 86400,)
+        ).fetchall()
+        for route in expired:
+            self._db.execute("DELETE FROM mls_writers WHERE route=?", route)
+            self._db.execute("DELETE FROM mls_rejections WHERE route=?", route)
+            self._db.execute("DELETE FROM mls_groups WHERE route=?", route)
 
     def _prune(self) -> None:
         self._db.execute(
@@ -244,7 +258,7 @@ class MLSDeliveryStore:
         ).lastrowid
         self._db.execute("UPDATE mls_groups SET head=?,epoch=epoch+? WHERE route=?", (cursor, int(kind == "commit"), route))
         if package:
-            self._db.execute("INSERT OR REPLACE INTO mls_writers(route,digest,ack) VALUES (?,?,?)", (route, added_writer, 0))
+            self._db.execute("INSERT OR REPLACE INTO mls_writers(route,digest,ack) VALUES (?,?,?)", (route, added_writer, cursor - 1))
             self._db.execute("DELETE FROM mls_packages WHERE reference=?", (package,))
         if removed_writer:
             self._db.execute("UPDATE mls_writers SET removal=?,removed_at=? WHERE route=? AND digest=?", (cursor, time.time(), route, removed_writer))

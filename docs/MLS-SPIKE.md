@@ -280,10 +280,14 @@ the pruning floor. The 24-hour deadline releases the floor even if a lost device
 never acknowledges. Current offline writers continue to hold the floor.
 
 Each route permits 10,000 retained entries and 16 MiB, counting payload,
-Welcome, and package-reference bytes. The KeyPackage directory permits 128
+Welcome, and package-reference bytes. The KeyPackage directory permits 4096
 entries with 900-second expiry. Each route's terminal rejection journal caps
-at 10,000 entries. The service permits 128 groups and eight current writers per
-group. Earlier experimental databases and snapshots need to be deleted and
+at 10,000 entries. The service permits 4096 groups and eight current writers per
+group. Group creation and KeyPackage publication are open to new devices, like
+creation in the v1 mailbox. Configurable directory caps default to 4096 each;
+packages expire after 900 seconds, and groups with no accepted entries expire
+24 hours after creation, reclaiming their directory slots.
+Earlier experimental databases and snapshots need to be deleted and
 devices re-paired after these schema/credential changes. These bounds do not
 provide public-service abuse controls or a complete production retention policy.
 

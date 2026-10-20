@@ -78,7 +78,7 @@ def test_no_crypto_secrets_in_delivery_schema(tmp_path):
     with sqlite3.connect(path) as db:
         columns = {row[1] for table in ("mls_groups", "mls_entries", "mls_packages", "mls_rejections", "mls_writers")
                    for row in db.execute(f"PRAGMA table_info({table})")}
-        assert columns == {"route", "epoch", "cursor", "kind", "payload", "welcome", "package", "reference", "expires", "digest", "writer", "removed_writer", "added_writer", "head", "ack", "removal", "removed_at", "pairing"}
+        assert columns == {"route", "epoch", "cursor", "kind", "payload", "welcome", "package", "reference", "expires", "digest", "writer", "removed_writer", "added_writer", "head", "ack", "removal", "removed_at", "pairing", "created_at"}
         assert db.execute("SELECT payload FROM mls_entries").fetchone()[0] == b"opaque MLS bytes"
 
 
@@ -128,7 +128,7 @@ def test_writer_metadata_retries_and_group_capacity(tmp_path, monkeypatch):
     assert append(store, payload=b"remove bob", epoch=1, removeWriter=removed) == accepted
     with pytest.raises(DeliveryConflict):
         append(store, payload=b"remove bob", epoch=1)
-    monkeypatch.setattr("gotsync_server.mls.MAX_GROUPS", 1)
+    store.max_groups = 1
     with pytest.raises(DeliveryCapacity):
         request(store, "create", group=encode_base64url(b"new".ljust(32, b"!")), authorization=encode_base64url(b"a" * 32))
     store.close()
@@ -424,3 +424,54 @@ def test_http_mount_auth_paging_ack_and_threaded_store(tmp_path, monkeypatch, pr
             await server.close()
 
     asyncio.run(run())
+
+
+def test_directory_constructor_limits_and_package_expiry(tmp_path, monkeypatch):
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: 1000)
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3", max_groups=1, max_packages=1)
+    append(store, kind="application")
+    with pytest.raises(DeliveryCapacity):
+        request(store, "create", group=encode_base64url(b"h" * 32), authorization=encode_base64url(b"a" * 32))
+    request(store, "key-package/publish", payload=encode_base64url(b"first package"))
+    with pytest.raises(DeliveryCapacity):
+        request(store, "key-package/publish", payload=encode_base64url(b"second package"))
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: 1900)
+    request(store, "key-package/publish", payload=encode_base64url(b"second package"))
+    store.close()
+
+
+def test_empty_groups_expire_without_deleting_used_groups(tmp_path, monkeypatch):
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: 1000)
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    assert store.max_groups == store.max_packages == 4096
+    empty = encode_base64url(b"h" * 32)
+    token = encode_base64url(b"a" * 32)
+    request(store, "create", group=empty, authorization=token)
+    entry = append(store, kind="application")["entry"]
+    group = encode_base64url(b"g" * 32)
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: 1000 + 86399)
+    assert request(store, "fetch", group=group, after=0)["entries"] == [entry]
+    assert store._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0] == 2
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: 1000 + 86400)
+    assert request(store, "fetch", group=group, after=0)["entries"] == [entry]
+    assert store._db.execute("SELECT route FROM mls_groups").fetchall() == [(b"g" * 32,)]
+    assert store._db.execute("SELECT route FROM mls_writers").fetchall() == [(b"g" * 32,)]
+    request(store, "ack", route=group, cursor=entry["cursor"])
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: 1000 + 2 * 86400)
+    assert request(store, "fetch", group=group, after=0)["entries"] == []
+    assert store._db.execute("SELECT route FROM mls_groups").fetchall() == [(b"g" * 32,)]
+    request(store, "create", group=empty, authorization=encode_base64url(b"c" * 32))
+    store.close()
+
+
+def test_joiner_floor_keeps_welcome_but_releases_earlier_entries(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    append(store, payload=b"before welcome", kind="application")
+    reference = request(store, "key-package/publish", payload=encode_base64url(b"package"))["reference"]
+    welcome = append(store, reference=reference, welcome=encode_base64url(b"welcome"))["entry"]
+    group = encode_base64url(b"g" * 32)
+    request(store, "ack", route=group, cursor=welcome["cursor"])
+    assert request(store, "fetch", group=group, after=0)["entries"] == [welcome]
+    request(store, "ack", route=group, cursor=welcome["cursor"], authorization=encode_base64url(b"b" * 32))
+    assert request(store, "fetch", group=group, after=0)["entries"] == []
+    store.close()
