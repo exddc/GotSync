@@ -726,9 +726,9 @@ delete
 8. After every accepted new operation, advance that origin's contiguous vector
    and update the materialized task.
 
-These rules describe only the sample schema. Got Done's correlated completion
-date and status need one compound register; habit completion history needs
-set/map semantics; ordering needs rank or sequence semantics; notifications are
+These rules describe only the sample schema. A richer task model's correlated
+completion date and status need one compound register; habit completion
+history needs set/map semantics; ordering needs rank or sequence semantics; notifications are
 derived local state; images need a blob path; recurring occurrences need
 deterministic IDs.
 
@@ -857,7 +857,8 @@ Before production:
 - add encrypted peer receipts if the UI must distinguish server acceptance from
   remote-device application;
 - consider ciphertext padding if message-size leakage is unacceptable;
-- add deterministic recurrence IDs and field-appropriate CRDTs for Got Done;
+- add deterministic recurrence IDs and field-appropriate CRDTs for richer task
+  models;
 - implement content-addressed blob transfer separately from operations;
 - replace whole-archive JSON rewrites and linear lookups with an indexed
   SQLite/WAL store after measuring local commit and durable remote-ack latency

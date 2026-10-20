@@ -239,7 +239,7 @@ final class MLSClientTests: XCTestCase {
             throw XCTSkip("Run scripts/test-mls.sh for the real relay test")
         }
         let alice = try client(1)
-        let relay = SpikeRelay(url: url, authorization: try await alice.transportAuthorization())
+        let relay = TestRelay(url: url, authorization: try await alice.transportAuthorization())
         let bob = try client(2)
         let charlie = try client(3)
         let group = UUID().uuidString.data(using: .utf8)!.prefix(32)
@@ -250,7 +250,7 @@ final class MLSClientTests: XCTestCase {
         do {
             _ = try await relay.append(refusedAdd)
             XCTFail("Unpublished KeyPackage accepted")
-        } catch let error as SpikeRelay.Error {
+        } catch let error as TestRelay.Error {
             XCTAssertEqual(error.status, 409)
             XCTAssertEqual(error.code, "keyPackageUnavailable")
             try await alice.rejectAddForUnavailableKeyPackage(commit: refusedAdd.payload, rejectedEpoch: XCTUnwrap(error.epoch))
@@ -309,7 +309,7 @@ final class MLSClientTests: XCTestCase {
         do {
             _ = try await relay.append(competing, authorization: charlie.transportAuthorization())
             XCTFail("Relay accepted two commits at one epoch")
-        } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 409) }
+        } catch let error as TestRelay.Error { XCTAssertEqual(error.status, 409) }
         try await catchUp(alice, group: group, relay: relay)
         try await catchUp(charlie, group: group, relay: relay)
         try await catchUp(reopenedBob, group: group, relay: relay)
@@ -318,7 +318,7 @@ final class MLSClientTests: XCTestCase {
         do {
             _ = try await relay.fetch(group: group, after: 0, authorization: compromised.transportAuthorization())
             XCTFail("Relay allowed reads after removal acknowledgement")
-        } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 403) }
+        } catch let error as TestRelay.Error { XCTAssertEqual(error.status, 403) }
         let afterRemoval = try await alice.prepareMessage(Data("new epoch".utf8))
         let cursor = try await relay.append(afterRemoval)
         try await catchUp(charlie, group: group, relay: relay)
@@ -334,7 +334,7 @@ final class MLSClientTests: XCTestCase {
         do {
             _ = try await relay.append(stale, authorization: compromised.transportAuthorization())
             XCTFail("Relay accepted stale commit")
-        } catch let error as SpikeRelay.Error { XCTAssertEqual(error.status, 403) }
+        } catch let error as TestRelay.Error { XCTAssertEqual(error.status, 403) }
     }
 
     private func paired() async throws -> (MLSClient, MLSClient, Data) {
@@ -466,7 +466,7 @@ final class MLSClientTests: XCTestCase {
         _ = try await alice.prepareMessage(Data("not stuck".utf8))
     }
 
-    private func catchUp(_ client: MLSClient, group: Data, relay: SpikeRelay) async throws {
+    private func catchUp(_ client: MLSClient, group: Data, relay: TestRelay) async throws {
         let authorization = try await client.transportAuthorization()
         for _ in 0..<100 {
             let entries = try await relay.fetch(group: group, after: client.cursor(), authorization: authorization)
@@ -482,7 +482,7 @@ final class MLSClientTests: XCTestCase {
 }
 
 @MainActor
-private struct SpikeRelay {
+private struct TestRelay {
     struct Error: Swift.Error {
         let status: Int
         let code: String?
