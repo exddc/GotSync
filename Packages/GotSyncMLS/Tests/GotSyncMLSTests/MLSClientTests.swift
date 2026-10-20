@@ -1,14 +1,17 @@
 import CryptoKit
 import Foundation
 import XCTest
+import SQLite3
 import GotSyncMLSBindings
 @testable import GotSyncMLS
 
 @MainActor
 final class MLSClientTests: XCTestCase {
     private var root: URL!
+    private var stateKeys: [UInt8: InMemoryStateKeyProvider] = [:]
 
     override func setUp() async throws {
+        stateKeys = [:]
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
@@ -16,7 +19,145 @@ final class MLSClientTests: XCTestCase {
     override func tearDown() async throws { try FileManager.default.removeItem(at: root) }
 
     private func client(_ id: UInt8) throws -> MLSClient {
-        try MLSClient(directory: root.appendingPathComponent(String(id)), deviceID: Data(repeating: id, count: 16))
+        let stateKey = stateKeys[id] ?? InMemoryStateKeyProvider()
+        stateKeys[id] = stateKey
+        return try MLSClient(directory: root.appendingPathComponent(String(id)), deviceID: Data(repeating: id, count: 16), stateKey: stateKey)
+    }
+
+    private func storedRecord() -> ClientRecord {
+        ClientRecord(
+            state: Data("stored MLS state".utf8), deviceID: Data("private-device-identifier".utf8),
+            identity: IdentityRecord(fingerprint: Data("private-identity-fingerprint".utf8)),
+            writerToken: Data(repeating: 9, count: 32)
+        )
+    }
+
+    private func rewriteStoredBlob(_ transform: (inout Data) -> Void) throws {
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(root.appendingPathComponent("mls-v2.sqlite3").path, &database), SQLITE_OK)
+        defer { sqlite3_close(database) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(database, "SELECT record FROM client WHERE id=1", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let pointer = try XCTUnwrap(sqlite3_column_blob(statement, 0))
+        var blob = Data(bytes: pointer, count: Int(sqlite3_column_bytes(statement, 0)))
+        transform(&blob)
+        XCTAssertEqual(sqlite3_exec(database, "UPDATE client SET record=X'\(blob.map { String(format: "%02x", $0) }.joined())' WHERE id=1", nil, nil, nil), SQLITE_OK)
+    }
+
+    func testEncryptedStoreReopenRoundTrip() throws {
+        let stateKey = InMemoryStateKeyProvider()
+        let record = storedRecord()
+        do {
+            let store = try MLSStore(directory: root, stateKey: stateKey)
+            try store.update { $0 = record }
+        }
+        let reopened = try MLSStore(directory: root, stateKey: stateKey)
+        let recovered = try reopened.read()
+        XCTAssertEqual(recovered.state, record.state)
+        XCTAssertEqual(recovered.deviceID, record.deviceID)
+        XCTAssertEqual(recovered.identity.fingerprint, record.identity.fingerprint)
+        XCTAssertEqual(recovered.writerToken, record.writerToken)
+    }
+
+    func testEncryptedStoreRejectsModifiedCiphertext() throws {
+        let store = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
+        try store.update { $0 = storedRecord() }
+        try rewriteStoredBlob { $0[$0.count / 2] ^= 1 }
+        XCTAssertThrowsError(try store.read()) { error in
+            XCTAssertEqual(error as? MLSStoreError, .unreadable)
+        }
+    }
+
+    func testEncryptedStoreRejectsDifferentKey() throws {
+        do {
+            let store = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
+            try store.update { $0 = storedRecord() }
+        }
+        let reopened = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
+        XCTAssertThrowsError(try reopened.read()) { error in
+            XCTAssertEqual(error as? MLSStoreError, .unreadable)
+        }
+        XCTAssertThrowsError(try MLSClient(directory: root, deviceID: storedRecord().deviceID, stateKey: InMemoryStateKeyProvider())) { error in
+            XCTAssertEqual(error as? MLSStoreError, .unreadable)
+        }
+    }
+
+    func testEncryptedStorePreservesRecordAfterKeyProviderFailure() throws {
+        struct UnavailableStateKeyProvider: MLSStateKeyProvider {
+            func key() throws -> SymmetricKey { throw MLSClientError.storageUnavailable }
+        }
+        let stateKey = InMemoryStateKeyProvider()
+        let record = storedRecord()
+        do {
+            let store = try MLSStore(directory: root, stateKey: stateKey)
+            try store.update { $0 = record }
+        }
+        XCTAssertThrowsError(try MLSStore(directory: root, stateKey: UnavailableStateKeyProvider())) { error in
+            guard case MLSClientError.storageUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let reopened = try MLSStore(directory: root, stateKey: stateKey)
+        XCTAssertEqual(try reopened.read().state, record.state)
+        XCTAssertEqual(try reopened.read().deviceID, record.deviceID)
+    }
+
+    func testEncryptedStoreRejectsInvalidProviderKeySize() throws {
+        let stateKey = InMemoryStateKeyProvider(key: SymmetricKey(size: .bits128))
+        XCTAssertThrowsError(try MLSStore(directory: root, stateKey: stateKey)) { error in
+            guard case MLSClientError.storageUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testEncryptedStoreReportsAuthenticatedDecodeFailureAsStorageUnavailable() throws {
+        let stateKey = InMemoryStateKeyProvider()
+        let store = try MLSStore(directory: root, stateKey: stateKey)
+        try store.update { $0 = storedRecord() }
+        let version = Data([1])
+        let combined = try XCTUnwrap(AES.GCM.seal(Data("not a record".utf8), using: stateKey.key(), authenticating: version).combined)
+        try rewriteStoredBlob { $0 = version + combined }
+        XCTAssertThrowsError(try store.read()) { error in
+            guard case MLSClientError.storageUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testEncryptedStoreCapsCiphertextAndPreservesPreviousRecord() throws {
+        let store = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
+        let original = storedRecord()
+        try store.update { $0 = original }
+        var oversized = original
+        oversized.state = Data()
+        let overhead = try JSONEncoder().encode(oversized).count
+        oversized.state = Data(repeating: 0, count: ((32 * 1024 * 1024 - overhead) / 4) * 3)
+        let plaintextCount = try JSONEncoder().encode(oversized).count
+        XCTAssertLessThanOrEqual(plaintextCount, 32 * 1024 * 1024)
+        XCTAssertGreaterThan(plaintextCount + 29, 32 * 1024 * 1024)
+        XCTAssertThrowsError(try store.update { $0 = oversized }) { error in
+            guard case MLSClientError.capacityReached = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(try store.read().state, original.state)
+    }
+
+    func testEncryptedStoreHidesIdentityInSQLiteFile() throws {
+        let record = storedRecord()
+        do {
+            let store = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
+            try store.update { $0 = record }
+        }
+        let bytes = try Data(contentsOf: root.appendingPathComponent("mls-v2.sqlite3"))
+        for secret in [record.deviceID, record.identity.fingerprint] {
+            XCTAssertNil(bytes.range(of: secret))
+            XCTAssertNil(bytes.range(of: Data(secret.base64EncodedString().utf8)))
+        }
+    }
+
+    func testEncryptedStoreRejectsUnknownVersion() throws {
+        let store = try MLSStore(directory: root, stateKey: InMemoryStateKeyProvider())
+        try store.update { $0 = storedRecord() }
+        try rewriteStoredBlob { $0[0] ^= 1 }
+        XCTAssertThrowsError(try store.read()) { error in
+            XCTAssertEqual(error as? MLSStoreError, .unreadable)
+        }
     }
 
     func testJoiningIdentityRefreshesPackageAndPersistsPrivateState() async throws {
@@ -66,7 +207,7 @@ final class MLSClientTests: XCTestCase {
     func testStorageFailureRollsBackEntireTransition() async throws {
         let alice = try client(1)
         try await alice.createGroup(id: Data(repeating: 7, count: 32))
-        let store = try MLSStore(directory: root.appendingPathComponent("1"))
+        let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: try XCTUnwrap(stateKeys[1]))
         let before = try store.read().state
         enum Injected: Error { case failure }
         XCTAssertThrowsError(try store.update { record in
@@ -155,7 +296,7 @@ final class MLSClientTests: XCTestCase {
 
         let compromisedDirectory = root.appendingPathComponent("compromised")
         try FileManager.default.copyItem(at: root.appendingPathComponent("2"), to: compromisedDirectory)
-        let compromised = try MLSClient(directory: compromisedDirectory, deviceID: Data(repeating: 2, count: 16))
+        let compromised = try MLSClient(directory: compromisedDirectory, deviceID: Data(repeating: 2, count: 16), stateKey: try XCTUnwrap(stateKeys[2]))
         let pending = try await alice.prepareRemove(fingerprint: bob.fingerprint())
         let competing = try await charlie.prepareRemove(fingerprint: bob.fingerprint())
         let bobWriter = try await alice.members().first { $0.deviceID == Data(repeating: 2, count: 16) }
@@ -270,7 +411,7 @@ final class MLSClientTests: XCTestCase {
     func testDecryptionBeforeStorageFailureCanBeRetried() async throws {
         let (alice, bob, _) = try await paired()
         let message = try await bob.prepareMessage(Data("survives failure".utf8))
-        let store = try MLSStore(directory: root.appendingPathComponent("1"))
+        let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: try XCTUnwrap(stateKeys[1]))
         let before = try store.read().state
         enum Injected: Error { case failure }
         XCTAssertThrowsError(try store.update { record in
