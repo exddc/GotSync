@@ -87,7 +87,7 @@ public actor RelaySocket {
             delegateQueue: nil
         )
         var request = URLRequest(url: url)
-        request.setValue("GotSync/1", forHTTPHeaderField: "User-Agent")
+        request.setValue("GotSync/2", forHTTPHeaderField: "User-Agent")
         let socket = session.webSocketTask(with: request)
         socket.maximumMessageSize = ProtocolLimits.webSocketMessageBytes
         openObserver = observer

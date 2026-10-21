@@ -357,19 +357,21 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(after, before)
     }
 
-    func testMLSEndpointDerivesFromMailboxOrigin() throws {
+    func testEndpointsRequireVersionTwoPaths() throws {
         let configuration = try SyncEndpointConfiguration(
-            relayURL: XCTUnwrap(URL(string: "wss://sync.example.com/v1")),
-            mailboxURL: XCTUnwrap(URL(string: "https://sync.example.com:8443/v1/mailbox")),
+            relayURL: XCTUnwrap(URL(string: "wss://sync.example.com/v2/pairing")),
+            mailboxURL: XCTUnwrap(URL(string: "https://sync.example.com:8443/v2/mls")),
             policy: .production
         )
-        XCTAssertEqual(configuration.mlsURL.absoluteString, "https://sync.example.com:8443/v2/mls")
-        XCTAssertNoThrow(try SyncEndpointConfiguration.validateMLSURL(configuration.mlsURL, policy: .production))
+        XCTAssertEqual(configuration.mailboxURL.absoluteString, "https://sync.example.com:8443/v2/mls")
         let local = try XCTUnwrap(URL(string: "http://127.0.0.1:9000/v2/mls"))
-        XCTAssertThrowsError(try SyncEndpointConfiguration.validateMLSURL(local, policy: .production))
-        XCTAssertNoThrow(try SyncEndpointConfiguration.validateMLSURL(local, policy: .localDevelopment))
-        XCTAssertThrowsError(try SyncEndpointConfiguration.validateMLSURL(
+        XCTAssertThrowsError(try SyncEndpointConfiguration.validateMailboxURL(local, policy: .production))
+        XCTAssertNoThrow(try SyncEndpointConfiguration.validateMailboxURL(local, policy: .localDevelopment))
+        XCTAssertThrowsError(try SyncEndpointConfiguration.validateMailboxURL(
             XCTUnwrap(URL(string: "https://sync.example.com/v1/mailbox")), policy: .production
+        ))
+        XCTAssertThrowsError(try SyncEndpointConfiguration.validateRelayURL(
+            XCTUnwrap(URL(string: "wss://sync.example.com/v1")), policy: .production
         ))
     }
 
@@ -392,7 +394,7 @@ final class MLSSessionTests: XCTestCase {
         let mailboxURL = try XCTUnwrap(URL(string: ProcessInfo.processInfo.environment["GOTSYNC_MAILBOX_URL"] ?? ""))
         let relayURL = try XCTUnwrap(URL(string: ProcessInfo.processInfo.environment["GOTSYNC_RELAY_URL"] ?? ""))
         let endpoints = try SyncEndpointConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, policy: .localDevelopment)
-        let relay = HTTPMLSRelayTransport(baseURL: endpoints.mlsURL, policy: .localDevelopment)
+        let relay = HTTPMLSRelayTransport(baseURL: endpoints.mailboxURL, policy: .localDevelopment)
 
         let (alice, bob, group) = try await pair(relay)
         let token = try Data.secureRandom(count: 32)

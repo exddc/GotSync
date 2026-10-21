@@ -3,7 +3,7 @@ import Foundation
 import Security
 
 enum SyncProtocol {
-    static let version: UInt8 = 1
+    static let version: UInt8 = 2
 }
 
 enum ProtocolLimits {

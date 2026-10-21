@@ -347,7 +347,7 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
 
     private func endpointURL(_ endpoint: String) throws -> URL {
         do {
-            try SyncEndpointConfiguration.validateMLSURL(baseURL, policy: policy)
+            try SyncEndpointConfiguration.validateMailboxURL(baseURL, policy: policy)
         } catch {
             if baseURL.scheme?.lowercased() == "http" { throw MLSRelayError.insecureTransport }
             throw MLSRelayError.invalidURL
