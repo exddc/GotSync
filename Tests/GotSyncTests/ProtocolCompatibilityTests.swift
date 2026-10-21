@@ -17,7 +17,11 @@ final class ProtocolCompatibilityTests: XCTestCase {
     }
 
     func testInvitationSchemeBelongsToConsumer() throws {
-        let invitation = try Invitation(secret: Data(0..<16))
+        let invitation = try Invitation(
+            secret: Data(0..<16),
+            groupID: Data(repeating: 0x01, count: 32),
+            inviterFingerprint: Data(repeating: 0x02, count: 32)
+        )
         let url = try invitation.url(scheme: "first-consumer")
         XCTAssertEqual(url.scheme, "first-consumer")
         XCTAssertEqual(try Invitation.from(url: url, scheme: "first-consumer"), invitation)

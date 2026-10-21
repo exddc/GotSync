@@ -13,7 +13,7 @@ struct SecretStoreMLSStateKey: MLSStateKeyProvider {
             return SymmetricKey(data: existing)
         }
         let generated = try Data.secureRandom(count: 32)
-        try store.write(generated, account: Self.account)
+        try store.write(generated, account: Self.account, accessibility: .afterFirstUnlockThisDeviceOnly)
         return SymmetricKey(data: generated)
     }
 }
@@ -82,6 +82,7 @@ actor MLSSession {
     func pendingDelivery() async throws -> MLSDelivery? { try await client.pendingDelivery() }
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
     func inbox() async throws -> [MLSInboxMessage] { try await client.inbox() }
+    func rejectedApplicationCursors() async throws -> [UInt64] { try await client.rejectedApplicationCursors() }
 
     func acknowledgeInbox(through cursor: UInt64) async throws {
         try await client.acknowledgeInbox(through: cursor)

@@ -1,9 +1,9 @@
 # GotSync
 
 GotSync is an accountless, local-first sync engine for Apple platforms. It links
-up to eight devices through encrypted live connections and a durable relay
-mailbox. The current replicated model contains task titles, completion state,
-and deletions. The engine is under development and does not offer a generic
+up to eight devices in one MLS group (RFC 9420, through OpenMLS). The relay
+stores and forwards only MLS ciphertext. The current replicated model contains
+task titles, completion state, and deletions. The engine is under development and does not offer a generic
 record schema.
 
 ## Repository layout
@@ -13,7 +13,7 @@ record schema.
 | `Sources/GotSync` | Swift library, pairing, recovery, replication, and transport |
 | `Tests/GotSyncTests` | Library tests and real-server integration coverage |
 | `server/` | Python relay and local Docker setup |
-| `mls/`, `Packages/GotSyncMLS` | Experimental OpenMLS bindings and Swift wrapper |
+| `mls/`, `Packages/GotSyncMLS` | OpenMLS bindings and the Swift wrapper the engine uses |
 | `scripts/` | Development, build, and test scripts |
 | `Examples/AccountlessSync` | SwiftUI iPhone demo with a local package dependency |
 | `docs/` | Protocol, compatibility, threat model, and security findings |
@@ -52,11 +52,22 @@ func makeEngine(storageDirectory: URL) throws -> SyncEngine {
 }
 ```
 
+The engine derives its MLS delivery endpoint, `/v2/mls`, from the origin of
+`mailboxURL`. The relay WebSocket is used only while pairing.
+
 Observe `engine.states()` as an `AsyncStream<SyncState>`. Call
 `createPrivateSync()` on the first device, then `joinPrivateSync(url:)` or
-`joinPrivateSync(phrase:)` on the joining device. Compare safety codes before
-calling `approveSafetyCode()` on the inviting device. Any linked device can
-invite another device with `inviteToGroup()`.
+`joinPrivateSync(phrase:)` on the joining device. The invitation URL carries the
+group ID and the inviter's MLS fingerprint. The 17-word phrase carries only a
+secret, and the joiner learns the rest from an offer sealed under that secret.
+Both devices then show a safety code derived from both fingerprints and the
+group ID. Compare the codes before calling `approveSafetyCode()` on the
+inviting device. Any linked device can invite another device with
+`inviteToGroup()`.
+
+Links created by earlier versions must be created again. On first launch the
+engine clears the old link credentials, keeps local tasks, and reports
+`SyncError.relinkRequired`.
 
 Local mutations use `addTask(title:)`, `toggleTask(_:)`, and `deleteTasks(ids:)`.
 Forward application lifecycle events to `applicationDidBecomeActive()` and
@@ -91,22 +102,26 @@ proxy requirements. No public hosted service is provisioned by this repository.
 
 ## Delivery and security limits
 
-Edits save locally before transmission. Two-member groups use a live connection
-when both applications are open. Groups with three to eight members use
-per-recipient mailbox delivery. Receive runs while the application is active;
-there are no inbound push notifications. Background upload depends on the
-execution time the operating system grants and retries on the next launch.
+Edits save locally before transmission. Every group, from two to eight
+members, sends task changes as MLS application messages through the relay's
+ordered delivery log. While the application is active, the engine polls that
+log every two seconds. There are no inbound push notifications and no live
+socket for task changes. Background upload depends on the execution time the
+operating system grants and retries on the next launch.
 
 All linked devices share access to the group's tasks. A live invitation is an
-admission capability. The safety code protects against accidental pairing,
-but does not recover the secrecy of a stolen invitation. There is no account
-recovery when every device is lost.
+admission capability. The safety code protects against accidental pairing and
+key substitution, but does not recover the secrecy of a stolen invitation.
+There is no account recovery when every device is lost.
 
-This protocol has known security limitations and has not received an
-independent audit. In particular, a device retaining the shared group secret
-can derive other members' mailbox keys and may follow later rekey messages.
-Leaving a group does not guarantee cryptographic exclusion or remote deletion.
-Read the [threat model](docs/THREAT-MODEL.md) and
+If the relay serves a commit that this device cannot verify, sync stops at that
+point and the engine reports `SyncError.syncHistoryBlocked`. Local tasks stay
+editable; unlink and pair again to keep syncing.
+
+The MLS integration has not received an independent review. There is not yet
+an operation to remove another device, and leaving only erases this device's
+MLS state; the remaining members still list it. Read the
+[threat model](docs/THREAT-MODEL.md) and
 [red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
 
 ## Test
@@ -114,12 +129,13 @@ Read the [threat model](docs/THREAT-MODEL.md) and
 ```sh
 scripts/uv.sh pytest server/tests -q
 scripts/test-swift.sh
+scripts/test-mls.sh
 scripts/test-integration.sh
 ```
 
 The integration script starts the actual Python relay with a temporary SQLite
 database, checks readiness, runs Swift tests, and stops the server on exit. Its
-integration test pairs three engines and verifies live delivery, offline
-catch-up after restart, and multi-device convergence. `scripts/test-swift.sh`
+integration test pairs three engines over MLS and verifies live delivery,
+offline catch-up after restart, and multi-device convergence. `scripts/test-swift.sh`
 runs unit tests and explicitly skips that integration test. Swift build files
 also stay in the external checkout cache.

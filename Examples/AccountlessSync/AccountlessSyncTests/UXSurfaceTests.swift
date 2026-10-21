@@ -212,8 +212,7 @@ final class UXSurfaceTests: XCTestCase {
 
         let model = SyncAppModel(
             keychain: keychain,
-            baseDirectory: baseDirectory,
-            mailboxTransport: NoopMailboxTransport()
+            baseDirectory: baseDirectory
         )
         model.createPrivateSync()
         let expiresAt = try XCTUnwrap(model.invitationExpiresAt)
@@ -244,8 +243,7 @@ final class UXSurfaceTests: XCTestCase {
 
         let model = SyncAppModel(
             keychain: keychain,
-            baseDirectory: baseDirectory,
-            mailboxTransport: NoopMailboxTransport()
+            baseDirectory: baseDirectory
         )
         model.createPrivateSync()
 
@@ -362,8 +360,7 @@ final class UXSurfaceTests: XCTestCase {
         )
         let model = SyncAppModel(
             keychain: keychain,
-            baseDirectory: baseDirectory,
-            mailboxTransport: NoopMailboxTransport()
+            baseDirectory: baseDirectory
         )
         XCTAssertFalse(model.supportStatusSummary.otherPhoneMustBeOpenForLocalEdit)
         XCTAssertTrue(
@@ -371,37 +368,5 @@ final class UXSurfaceTests: XCTestCase {
                 .contains("not required online")
         )
         await model.engine.stop()
-    }
-}
-
-/// Transport that never succeeds; used only for UI-surface unit tests.
-private actor NoopMailboxTransport: MailboxTransport {
-    func put(
-        route: Data,
-        authorization: Data,
-        messages: [StoredMailboxEnvelope]
-    ) async throws -> [MailboxStoredReceipt] {
-        throw URLError(.notConnectedToInternet)
-    }
-
-    func fetch(
-        route: Data,
-        authorization: Data,
-        after cursor: UInt64,
-        limit: Int
-    ) async throws -> MailboxFetchPage {
-        throw URLError(.notConnectedToInternet)
-    }
-
-    func acknowledge(
-        route: Data,
-        authorization: Data,
-        through cursor: UInt64
-    ) async throws {
-        throw URLError(.notConnectedToInternet)
-    }
-
-    func forget(route: Data, authorization: Data) async throws {
-        throw URLError(.notConnectedToInternet)
     }
 }

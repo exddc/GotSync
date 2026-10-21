@@ -10,21 +10,17 @@ public enum MnemonicError: Error, Equatable {
     case unsupportedVersion
 }
 
-public struct Invitation: Equatable, Sendable {
-    public let secret: Data
+struct LegacyInvitation: Equatable, Sendable {
+    let secret: Data
 
-    public init(secret: Data) throws {
+    init(secret: Data) throws {
         guard secret.count == 16 else {
             throw MnemonicError.invalidSecretLength
         }
         self.secret = secret
     }
 
-    public static func generate() throws -> Invitation {
-        try Invitation(secret: .secureRandom(count: 16))
-    }
-
-    public var phrase: String {
+    var phrase: String {
         MnemonicCodec.encode(secret)
     }
 
@@ -42,61 +38,6 @@ public struct Invitation: Equatable, Sendable {
             label: "\(ProtocolDomains.namespace)/pair-psk/v1",
             count: 32
         )
-    }
-
-    public func url(scheme: String) throws -> URL {
-        try Self.validateURLScheme(scheme)
-        var components = URLComponents()
-        components.scheme = scheme.lowercased()
-        components.host = "pair"
-        components.queryItems = [
-            URLQueryItem(name: "v", value: "1"),
-            URLQueryItem(name: "secret", value: secret.base64URLString),
-        ]
-        guard let url = components.url else { throw MnemonicError.invalidInviteURL }
-        return url
-    }
-
-    static func validateURLScheme(_ scheme: String) throws {
-        guard scheme.range(of: "\\A[A-Za-z][A-Za-z0-9+.-]*\\z", options: .regularExpression) != nil,
-              !["http", "https", "ws", "wss", "file"].contains(scheme.lowercased())
-        else { throw MnemonicError.invalidInviteURL }
-    }
-
-    public static func from(phrase: String) throws -> Invitation {
-        try Invitation(secret: MnemonicCodec.decode(phrase))
-    }
-
-    public static func from(url: URL, scheme: String) throws -> Invitation {
-        try validateURLScheme(scheme)
-        guard
-            url.scheme?.lowercased() == scheme.lowercased(),
-            url.host?.lowercased() == "pair",
-            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        else {
-            throw MnemonicError.invalidInviteURL
-        }
-
-        let items = components.queryItems ?? []
-        guard
-            items.count == 2,
-            Set(items.map(\.name)) == Set(["v", "secret"])
-        else {
-            throw MnemonicError.invalidInviteURL
-        }
-        var values: [String: String] = [:]
-        for item in items {
-            guard values.updateValue(item.value ?? "", forKey: item.name) == nil else {
-                throw MnemonicError.invalidInviteURL
-            }
-        }
-        guard values["v"] == "1" else {
-            throw MnemonicError.unsupportedVersion
-        }
-        guard let encoded = values["secret"] else {
-            throw MnemonicError.invalidInviteURL
-        }
-        return try Invitation(secret: Data(base64URL: encoded))
     }
 }
 
