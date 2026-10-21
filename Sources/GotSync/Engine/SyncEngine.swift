@@ -365,8 +365,8 @@ public final class SyncEngine {
         self.pairingRetryDelayNanoseconds = pairingRetryDelayNanoseconds
         self.syncIntervalNanoseconds = syncIntervalNanoseconds
         self.approvalTimeoutNanoseconds = approvalTimeoutNanoseconds
-        self.provisionalMemberWindow = provisionalMemberWindow
         self.departureRetryDelayNanoseconds = departureRetryDelayNanoseconds
+        self.provisionalMemberWindow = provisionalMemberWindow
         credentialStore = CredentialStore(keychain: secretStore)
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
