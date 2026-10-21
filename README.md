@@ -62,8 +62,17 @@ group ID and the inviter's MLS fingerprint. The 17-word phrase carries only a
 secret, and the joiner learns the rest from an offer sealed under that secret.
 Both devices then show a safety code derived from both fingerprints and the
 group ID. Compare the codes before calling `approveSafetyCode()` on the
-inviting device. Any linked device can invite another device with
+inviting device. Approve within 10 minutes; after that the attempt fails with
+`SyncError.approvalExpired`. Any linked device can invite another device with
 `inviteToGroup()`.
+
+`SyncState.linkedDevices` lists the group's devices. Call
+`removeDevice(_:)` with one of them to remove a lost or stolen device; the
+request is saved and retried until the removal commit is accepted.
+`unlinkAndKeepTasks()` leaves the group: the remaining devices commit the
+removal, and this device erases its MLS state once the relay has the leave
+request. A removed device reports `SyncError.removedFromGroup` and keeps its
+tasks.
 
 Links created by earlier versions must be created again. On first launch the
 engine clears the old link credentials, keeps local tasks, and reports
@@ -118,10 +127,10 @@ If the relay serves a commit that this device cannot verify, sync stops at that
 point and the engine reports `SyncError.syncHistoryBlocked`. Local tasks stay
 editable; unlink and pair again to keep syncing.
 
-The MLS integration has not received an independent review. There is not yet
-an operation to remove another device, and leaving only erases this device's
-MLS state; the remaining members still list it. Read the
-[threat model](docs/THREAT-MODEL.md) and
+Removing a device stops it from reading later changes, but it keeps the tasks
+it already has and cannot be wiped remotely. Any member can remove any other
+member; there is no administrator. The MLS integration has not received an
+independent review. Read the [threat model](docs/THREAT-MODEL.md) and
 [red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
 
 ## Test
@@ -136,6 +145,7 @@ scripts/test-integration.sh
 The integration script starts the actual Python relay with a temporary SQLite
 database, checks readiness, runs Swift tests, and stops the server on exit. Its
 integration test pairs three engines over MLS and verifies live delivery,
-offline catch-up after restart, and multi-device convergence. `scripts/test-swift.sh`
+offline catch-up after restart, multi-device convergence, and that a removed
+device stops receiving while the others keep converging. `scripts/test-swift.sh`
 runs unit tests and explicitly skips that integration test. Swift build files
 also stay in the external checkout cache.

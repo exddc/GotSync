@@ -15,7 +15,7 @@ public struct MLSJoiningIdentity: Sendable {
 }
 
 public struct MLSDelivery: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable { case commit, application }
+    public enum Kind: String, Codable, Sendable { case commit, application, proposal }
     public let group: Data
     public let epoch: UInt64
     public let kind: Kind
@@ -64,6 +64,7 @@ struct ClientRecord: Codable {
     var rejectedApplicationCursors: [UInt64] = []
     var inbox: [MLSInboxMessage] = []
     var removed = false
+    var departures: [Data]?
 }
 
 struct IdentityRecord: Codable {
@@ -117,6 +118,7 @@ public actor MLSClient {
     public func inbox() throws -> [MLSInboxMessage] { try store.read().inbox }
     public func isRemoved() throws -> Bool { try store.read().removed }
     public func rejectedCommit() throws -> MLSDelivery? { try store.read().rejectedCommit }
+    public func departures() throws -> [Data] { try store.read().departures ?? [] }
     public func rejectedApplicationCursors() throws -> [UInt64] { try store.read().rejectedApplicationCursors }
 
     public func createGroup(id: Data) throws {
@@ -149,6 +151,17 @@ public actor MLSClient {
         }
     }
 
+    public func prepareLeave() throws -> MLSDelivery {
+        try mutate { record in
+            guard record.pending == nil else { throw MLSClientError.invalidState }
+            let transition = try GotSyncMLSBindings.prepareLeave(state: record.state)
+            Self.apply(transition, to: &record)
+            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .proposal, payload: Data(transition.output))
+            record.pending = delivery
+            return delivery
+        }
+    }
+
     public func prepareMessage(_ plaintext: Data) throws -> MLSDelivery {
         try mutate { record in
             guard record.pending == nil else { throw MLSClientError.invalidState }
@@ -176,6 +189,7 @@ public actor MLSClient {
                delivery.kind == pending.kind, delivery.epoch == pending.epoch {
                 if pending.kind == .commit {
                     Self.apply(try acceptCommit(state: record.state, acceptedCommit: delivery.payload), to: &record)
+                    try Self.pruneDepartures(in: &record)
                 }
                 record.pending = nil
                 record.pendingPlaintext = nil
@@ -193,7 +207,7 @@ public actor MLSClient {
                 do {
                     transition = try receiveMessage(state: record.state, message: delivery.payload)
                 } catch let error as MlsError {
-                    guard delivery.kind == .application, error != .InvalidState else { throw error }
+                    guard delivery.kind != .commit, error != .InvalidState else { throw error }
                     record.rejectedApplicationCursors.append(cursor)
                     record.rejectedApplicationCursors = Array(record.rejectedApplicationCursors.suffix(64))
                     record.cursor = cursor
@@ -201,9 +215,13 @@ public actor MLSClient {
                 }
                 let expectedEpoch = delivery.epoch + (delivery.kind == .commit ? 1 : 0)
                 guard transition.epoch == expectedEpoch,
-                      (transition.sender == nil) == (delivery.kind == .commit)
+                      (transition.sender != nil) == (delivery.kind == .application),
+                      (transition.departed != nil) == (delivery.kind == .proposal)
                 else { throw MLSClientError.invalidDelivery }
                 Self.apply(transition, to: &record)
+                if let departed = transition.departed, !(record.departures ?? []).contains(departed) {
+                    record.departures = Array(((record.departures ?? []) + [departed]).suffix(8))
+                }
                 if let sender = transition.sender {
                     guard record.inbox.count < 1000 else { throw MLSClientError.capacityReached }
                     record.inbox.append(MLSInboxMessage(cursor: cursor, sender: sender, plaintext: transition.output))
@@ -215,8 +233,14 @@ public actor MLSClient {
                     record.writerToken = Data()
                     record.pending = nil
                     record.pendingPlaintext = nil
-                } else if let retryPlaintext {
-                    _ = try Self.seal(retryPlaintext, in: &record)
+                    record.departures = nil
+                } else {
+                    if delivery.kind == .commit {
+                        try Self.pruneDepartures(in: &record)
+                    }
+                    if let retryPlaintext {
+                        _ = try Self.seal(retryPlaintext, in: &record)
+                    }
                 }
             }
             record.cursor = cursor
@@ -260,6 +284,12 @@ public actor MLSClient {
         record.pending = delivery
         record.pendingPlaintext = plaintext
         return delivery
+    }
+
+    private static func pruneDepartures(in record: inout ClientRecord) throws {
+        guard let departures = record.departures else { return }
+        let current = try GotSyncMLSBindings.members(state: record.state).map(\.fingerprint)
+        record.departures = departures.filter(current.contains)
     }
 
     private static func apply(_ transition: MlsTransition, to record: inout ClientRecord) {

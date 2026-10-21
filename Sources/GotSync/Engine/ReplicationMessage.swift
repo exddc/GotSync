@@ -67,17 +67,33 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     static let joinIntentFilename = "sync-v2-join.json"
     static let version = 2
 
+    struct Member: Codable, Equatable, Sendable {
+        let deviceID: Data
+        let fingerprint: Data
+    }
+
+    /// A member this device added that has not yet sent a message. It is
+    /// removed once `deadline` passes.
+    struct ProvisionalMember: Codable, Equatable, Sendable {
+        let fingerprint: Data
+        let deadline: Date
+    }
+
     var version = Self.version
     let group: Data
     var uploadedThrough: UInt64
-    var memberDeviceIDs: [Data]
+    var members: [Member]
     var joinPending: Bool
     var provider: Data?
+    var pendingRemovals: [Data] = []
+    var provisionalMembers: [ProvisionalMember] = []
 
-    init(group: Data, memberDeviceIDs: [Data], joinPending: Bool, provider: Data?) {
+    var memberDeviceIDs: [Data] { members.map(\.deviceID) }
+
+    init(group: Data, members: [Member], joinPending: Bool, provider: Data?) {
         self.group = group
         uploadedThrough = 0
-        self.memberDeviceIDs = memberDeviceIDs
+        self.members = members
         self.joinPending = joinPending
         self.provider = provider
     }
@@ -92,12 +108,7 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     }
 
     func save(to url: URL) throws {
-        var options: Data.WritingOptions = .atomic
-        #if os(iOS)
-        options.insert(.completeFileProtectionUntilFirstUserAuthentication)
-        #endif
-        try ReplicaCanonicalJSON.encode(self).write(to: url, options: options)
-        try FileManager.default.setAttributes(ProtectedStorage.backgroundFileAttributes, ofItemAtPath: url.path)
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(self), to: url)
     }
 
     static func remove(at url: URL) throws {

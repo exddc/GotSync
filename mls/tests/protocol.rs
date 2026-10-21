@@ -203,3 +203,140 @@ fn any_unexpired_published_package_can_join() {
         .is_ok()
     );
 }
+
+fn leave_and_commit(size: u8) {
+    let alice = identity(1);
+    let bob = identity(2);
+    let (mut a, mut b, _) = add(group(&alice).state, &bob, &alice);
+    let mut others = Vec::new();
+    for id in 3..=size {
+        let joiner = identity(id);
+        let (next, joined, commit) = add(a, &joiner, &alice);
+        b = receive_message(b, commit.clone()).unwrap().state;
+        others = others
+            .into_iter()
+            .map(|state| receive_message(state, commit.clone()).unwrap().state)
+            .collect();
+        others.push(joined);
+        a = next;
+    }
+    let retained = b.clone();
+    let proposal = prepare_leave(b).unwrap();
+    assert!(proposal.departed.is_none());
+    let received = receive_message(a, proposal.output.clone()).unwrap();
+    assert_eq!(received.departed, Some(bob.fingerprint.clone()));
+    others = others
+        .into_iter()
+        .map(|state| {
+            let seen = receive_message(state, proposal.output.clone()).unwrap();
+            assert_eq!(seen.departed, Some(bob.fingerprint.clone()));
+            seen.state
+        })
+        .collect();
+    assert!(seal_message(received.state.clone(), b"blocked".to_vec()).is_err());
+    let pending = prepare_remove(received.state, bob.fingerprint.clone()).unwrap();
+    assert_eq!(pending.removed_writer.as_ref().map(Vec::len), Some(32));
+    others = others
+        .into_iter()
+        .map(|state| {
+            receive_message(state, pending.output.clone())
+                .unwrap()
+                .state
+        })
+        .collect();
+    let a = accept_commit(pending.state, pending.output.clone())
+        .unwrap()
+        .state;
+    assert_eq!(members(a.clone()).unwrap().len(), usize::from(size) - 1);
+    let next = seal_message(a, b"after leave".to_vec()).unwrap();
+    assert!(receive_message(retained.clone(), next.output.clone()).is_err());
+    let replayed = receive_message(retained, pending.output).unwrap();
+    assert!(replayed.removed);
+    assert!(receive_message(replayed.state, next.output.clone()).is_err());
+    for state in others {
+        assert_eq!(
+            receive_message(state, next.output.clone()).unwrap().output,
+            b"after leave"
+        );
+    }
+}
+
+#[test]
+fn leave_proposal_committed_by_another_member_locks_out_retained_state() {
+    leave_and_commit(2);
+    leave_and_commit(3);
+}
+
+#[test]
+fn removed_member_with_retained_state_cannot_read_later_epochs() {
+    for size in [2u8, 3] {
+        let alice = identity(1);
+        let bob = identity(2);
+        let (mut a, mut b, _) = add(group(&alice).state, &bob, &alice);
+        let mut charlie = None;
+        if size == 3 {
+            let joiner = identity(3);
+            let (next, joined, commit) = add(a, &joiner, &alice);
+            b = receive_message(b, commit).unwrap().state;
+            a = next;
+            charlie = Some(joined);
+        }
+        let stolen = b.clone();
+        let pending = prepare_remove(a, bob.fingerprint.clone()).unwrap();
+        let a = accept_commit(pending.state, pending.output.clone())
+            .unwrap()
+            .state;
+        let charlie = charlie.map(|c| receive_message(c, pending.output.clone()).unwrap().state);
+        let next = seal_message(a, b"after removal".to_vec()).unwrap();
+        assert!(receive_message(stolen.clone(), next.output.clone()).is_err());
+        let removed = receive_message(stolen, pending.output).unwrap();
+        assert!(removed.removed);
+        assert!(receive_message(removed.state, next.output.clone()).is_err());
+        if let Some(c) = charlie {
+            assert_eq!(
+                receive_message(c, next.output).unwrap().output,
+                b"after removal"
+            );
+        }
+    }
+}
+
+#[test]
+fn departing_install_can_rejoin_in_the_commit_that_removes_it() {
+    let alice = identity(1);
+    let bob = identity(2);
+    let (a, b, _) = add(group(&alice).state, &bob, &alice);
+    let proposal = prepare_leave(b).unwrap();
+    let rejoining = identity(2);
+    assert!(matches!(
+        prepare_add(
+            a.clone(),
+            rejoining.key_package.clone(),
+            rejoining.fingerprint.clone()
+        ),
+        Err(MlsError::InvalidState)
+    ));
+    let a = receive_message(a, proposal.output).unwrap().state;
+    let pending = prepare_add(a, rejoining.key_package, rejoining.fingerprint.clone()).unwrap();
+    let joined = join_group(
+        rejoining.state,
+        pending.welcome.unwrap(),
+        vec![7; 32],
+        alice.fingerprint.clone(),
+    )
+    .unwrap();
+    let a = accept_commit(pending.state, pending.output).unwrap().state;
+    let roster = members(a.clone()).unwrap();
+    assert_eq!(roster.len(), 2);
+    assert!(
+        roster
+            .iter()
+            .any(|m| m.fingerprint == rejoining.fingerprint)
+    );
+    assert!(!roster.iter().any(|m| m.fingerprint == bob.fingerprint));
+    let sent = seal_message(a, b"welcome back".to_vec()).unwrap();
+    assert_eq!(
+        receive_message(joined.state, sent.output).unwrap().output,
+        b"welcome back"
+    );
+}

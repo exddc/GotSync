@@ -65,6 +65,28 @@ final class RelayIntegrationTests: XCTestCase {
             try await wait("multi-device convergence", engines: [host, joiner, third]) { host.tasks.count == 4 && joiner.tasks.count == 4 && third.tasks.count == 4 }
             XCTAssertEqual(host.tasks.map(\.titleValue), joiner.tasks.map(\.titleValue))
             XCTAssertEqual(host.tasks.map(\.titleValue), third.tasks.map(\.titleValue))
+
+            let thirdSession = try XCTUnwrap(third.mlsSessionForTesting)
+            let group = try await thirdSession.group()
+            let thirdAuthorization = try await thirdSession.client.transportAuthorization()
+            let removedDevice = try XCTUnwrap(host.linkedDevices.first { $0.deviceID == third.localDeviceID })
+            XCTAssertTrue(host.removeDevice(removedDevice))
+            try await wait("third device removed", engines: [host, joiner, third]) {
+                host.linkedMemberCount == 2 && joiner.linkedMemberCount == 2 && !third.isPaired
+            }
+            XCTAssertEqual(third.errorMessage, SyncError.removedFromGroup.errorDescription)
+            XCTAssertTrue(joiner.addTask(title: "After removal"))
+            try await wait("remaining devices converge", engines: [host, joiner]) { host.tasks.count == 5 && joiner.pendingMailboxOperationCount == 0 }
+            try await Task.sleep(for: .seconds(1))
+            XCTAssertEqual(third.tasks.count, 4)
+            let relay = HTTPMLSRelayTransport(
+                baseURL: try SyncEndpointConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, policy: .localDevelopment).mlsURL,
+                policy: .localDevelopment
+            )
+            do {
+                _ = try await relay.fetch(group: try XCTUnwrap(group), after: 0, limit: 8, authorization: thirdAuthorization)
+                XCTFail("The relay served a removed device")
+            } catch MLSRelayError.unauthorized {}
             host.inviteToGroup()
             try await wait("teardown invite", engines: [host, fourth]) { host.invitationURL != nil }
             fourth.joinPrivateSync(url: try XCTUnwrap(host.invitationURL))
