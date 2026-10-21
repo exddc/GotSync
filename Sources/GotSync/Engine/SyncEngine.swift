@@ -314,6 +314,7 @@ public final class SyncEngine {
     private var backgroundFlushTask: Task<Void, Never>?
     private var departureTask: Task<Void, Never>?
     private var syncCycleID: UUID?
+    var inboxReadHookForTesting: (@MainActor () async -> Void)?
     private var syncCycleRequested = false
     private var syncFailureCount = 0
     private var nextSyncAttemptAt = Date.distantPast
@@ -767,6 +768,7 @@ public final class SyncEngine {
                 try stageDeparture()
             }
             try ReplicationCheckpoint.remove(at: checkpointURL)
+            try ReplicationCheckpoint.remove(at: joinIntentURL)
             try eraseCurrentMLSState()
             session = try openSession()
         } catch {
@@ -1166,6 +1168,10 @@ public final class SyncEngine {
                 inviterNonce: inviterNonce,
                 joinerNonce: joinerNonce
             )
+            let joinIntent = ReplicationCheckpoint(
+                group: groupID, members: [], joinPending: true, provider: inviterFingerprint
+            )
+            try joinIntent.save(to: joinIntentURL)
             phase = .verifying
             listenForInviterDecision(on: connection, invitation: invitation, attemptID: attemptID)
 
@@ -1193,15 +1199,14 @@ public final class SyncEngine {
             await connection.cancel()
             try requireCurrentPairingAttempt(attemptID)
             let roster = try await session.members()
-            try saveCheckpoint(ReplicationCheckpoint(
-                group: groupID,
-                members: roster.map(ReplicationCheckpoint.Member.init),
-                joinPending: true,
-                provider: inviterFingerprint
-            ))
+            var joined = joinIntent
+            joined.members = roster.map(ReplicationCheckpoint.Member.init)
+            try saveCheckpoint(joined)
+            try ReplicationCheckpoint.remove(at: joinIntentURL)
             finishPairing(attemptID: attemptID)
         } catch {
-            pairingFailed(error, attemptID: attemptID)
+            let admitted = (try? await self.session?.group()) != nil
+            pairingFailed(error, attemptID: attemptID, admitted: admitted)
         }
     }
 
@@ -1440,7 +1445,7 @@ public final class SyncEngine {
         startSyncLoop()
     }
 
-    private func pairingFailed(_ error: Error, attemptID: UUID) {
+    private func pairingFailed(_ error: Error, attemptID: UUID, admitted: Bool = false) {
         guard pairingAttemptID == attemptID, !(error is CancellationError) else {
             return
         }
@@ -1448,7 +1453,7 @@ public final class SyncEngine {
         let wasJoining = activePairingRole == .joiner
         declinePeer()
         endPairingAttempt()
-        if wasJoining && !isPaired {
+        if wasJoining && !isPaired && !admitted {
             try? resetSession()
         }
         let mapped = SyncError.fromTransport(error)
@@ -1508,12 +1513,14 @@ public final class SyncEngine {
                     current.members = roster.map(ReplicationCheckpoint.Member.init)
                     try saveCheckpoint(current)
                 } else {
+                    let intent = try? ReplicationCheckpoint.load(from: joinIntentURL)
                     try saveCheckpoint(ReplicationCheckpoint(
                         group: group,
                         members: roster.map(ReplicationCheckpoint.Member.init),
                         joinPending: true,
-                        provider: nil
+                        provider: intent?.group == group ? intent?.provider : nil
                     ))
+                    try ReplicationCheckpoint.remove(at: joinIntentURL)
                 }
                 if !isPaired {
                     isPaired = true
@@ -1699,6 +1706,8 @@ public final class SyncEngine {
             return
         }
         let fingerprint = try await session.fingerprint()
+        await inboxReadHookForTesting?()
+        try requireCurrent(session)
         let senders = Set(messages.map(\.sender))
         if var current = checkpoint, current.provisionalMembers.contains(where: { senders.contains($0.fingerprint) }) {
             current.provisionalMembers.removeAll { senders.contains($0.fingerprint) }
@@ -1725,11 +1734,18 @@ public final class SyncEngine {
         }
         for hello in hellos {
             try await answer(hello, fingerprint: fingerprint, session: session)
+            try requireCurrent(session)
         }
         if !pool.isEmpty {
             try await send(.hello(vector: replica.versionVector, provider: nil), session: session)
         }
         try await session.acknowledgeInbox(through: last.cursor)
+    }
+
+    private func requireCurrent(_ session: MLSSession) throws {
+        guard !Task.isCancelled, hasDurableStorage, self.session === session else {
+            throw CancellationError()
+        }
     }
 
     /// Applies every operation whose origin sequence is next, repeating until
@@ -1795,6 +1811,7 @@ public final class SyncEngine {
         let operations = replica.retainedOperations
         try await send(.hello(vector: vector, provider: announced.provider), session: session)
         try await send(operations, session: session)
+        try requireCurrent(session)
         guard var current = checkpoint, current.group == announced.group else {
             throw CancellationError()
         }
@@ -1830,6 +1847,7 @@ public final class SyncEngine {
                 )
             }
             try await send(.operations(batch), session: session)
+            try requireCurrent(session)
             guard var latest = checkpoint, latest.group == current.group else {
                 throw CancellationError()
             }
@@ -1856,6 +1874,7 @@ public final class SyncEngine {
     @discardableResult
     private func refreshMembers(session: MLSSession) async throws -> [MLSMember] {
         let roster = try await session.members()
+        try requireCurrent(session)
         let fingerprints = roster.map(\.fingerprint)
         guard var current = checkpoint else {
             return roster
@@ -2018,6 +2037,10 @@ public final class SyncEngine {
         session = nil
         try eraseCurrentMLSState()
         session = try openSession()
+    }
+
+    private var joinIntentURL: URL {
+        checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
     }
 
     /// Each session generation gets a new directory. A closed-over session
@@ -2217,6 +2240,9 @@ public final class SyncEngine {
         try store.clearPair()
         try removeAllPairingArtifacts(in: persistenceURL.deletingLastPathComponent())
         try ReplicationCheckpoint.remove(at: checkpointURL)
+        try ReplicationCheckpoint.remove(
+            at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
+        )
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
