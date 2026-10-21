@@ -42,6 +42,7 @@ actor MLSSession {
     let client: MLSClient
     private let transport: any MLSRelayTransport
     private let fetchLimit: Int
+    private var acknowledged: UInt64 = 0
     private var tail: Task<Void, Never>?
 
     init(
@@ -173,7 +174,6 @@ actor MLSSession {
                         verifiedInviterFingerprint: verifiedInviterFingerprint,
                         cursor: entry.cursor
                     )
-                    try await session.transport.acknowledge(group: group, through: entry.cursor, authorization: authorization)
                     _ = try await session.catchUp()
                     return true
                 }
@@ -216,25 +216,40 @@ actor MLSSession {
 
     private func catchUp() async throws -> Int {
         guard let group = try await client.group() else { throw MLSSessionError.notInGroup }
-        if try await client.isRemoved() { return 0 }
+        if try await client.isRemoved() {
+            try await acknowledgeRemoval(group: group)
+            return 0
+        }
         let authorization = try await client.transportAuthorization()
         var processed = 0
         while true {
             try Task.checkCancellation()
+            let cursor = try await client.cursor()
+            if acknowledged < cursor {
+                try await transport.acknowledge(group: group, through: cursor, authorization: authorization)
+                acknowledged = cursor
+            }
             let entries = try await transport.fetch(
-                group: group, after: client.cursor(), limit: fetchLimit, authorization: authorization
+                group: group, after: cursor, limit: fetchLimit, authorization: authorization
             )
-            guard let last = entries.last else { return processed }
+            guard !entries.isEmpty else { return processed }
             for entry in entries {
                 try await client.process(entry.delivery, cursor: entry.cursor)
                 processed += 1
                 if try await client.isRemoved() {
-                    try await transport.acknowledge(group: group, through: entry.cursor, authorization: authorization)
+                    try await acknowledgeRemoval(group: group)
                     return processed
                 }
             }
-            try await transport.acknowledge(group: group, through: last.cursor, authorization: authorization)
         }
+    }
+
+    private func acknowledgeRemoval(group: Data) async throws {
+        guard let authorization = try await client.removalAuthorization() else { return }
+        do {
+            try await transport.acknowledge(group: group, through: client.cursor(), authorization: authorization)
+        } catch MLSRelayError.unauthorized {}
+        try await client.confirmRemovalAcknowledged()
     }
 
     private func exclusive<T: Sendable>(

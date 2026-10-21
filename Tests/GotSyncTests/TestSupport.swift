@@ -184,11 +184,17 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
     private var failWelcomeAcknowledgement = false
+    private var failingAcknowledgers: Set<Data> = []
     private(set) var lastPublishedReference: Data?
+    private(set) var acknowledgementCount = 0
 
     func dropNextAppendResponse() { dropAppendResponse = true }
 
     func failNextWelcomeAcknowledgement() { failWelcomeAcknowledgement = true }
+
+    func failAcknowledgements(by authorization: Data, _ fail: Bool) {
+        if fail { failingAcknowledgers.insert(Self.digest(authorization)) } else { failingAcknowledgers.remove(Self.digest(authorization)) }
+    }
 
     func acknowledged(by authorization: Data) -> UInt64? {
         groups.values.compactMap { $0.writers[Self.digest(authorization)]?.ack }.first
@@ -268,6 +274,8 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func acknowledge(group: Data, through cursor: UInt64, authorization: Data) throws {
+        acknowledgementCount += 1
+        if failingAcknowledgers.contains(Self.digest(authorization)) { throw URLError(.networkConnectionLost) }
         _ = try authorize(group: group, authorization: authorization)
         let digest = Self.digest(authorization)
         if failWelcomeAcknowledgement, entries.first(where: { $0.cursor == cursor })?.delivery.addWriter == digest {
