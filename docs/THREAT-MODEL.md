@@ -30,7 +30,9 @@ Excluding the files from backups means a backup restored to another device
 contains no tasks or link; the tasks return only by pairing with a device that
 still has them.
 
-The relay receives MLS ciphertext, commits, Welcome messages, KeyPackages,
+The relay serves only the `/v2/pairing` WebSocket room and the `/v2/mls`
+delivery log; it stores no version 1 mailbox data. It receives MLS ciphertext,
+commits, Welcome messages, KeyPackages,
 writer-token hashes, cursors, and epochs. It also observes IP addresses,
 timing, sizes, group IDs, and co-membership in pairing rooms. It sees the
 pairing token when the inviter fetches a KeyPackage, but not the invitation
