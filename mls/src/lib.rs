@@ -61,6 +61,7 @@ pub struct MlsTransition {
     pub removed: bool,
     pub added_writer: Option<Vec<u8>>,
     pub removed_writer: Option<Vec<u8>>,
+    pub departed: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record)]
@@ -111,6 +112,19 @@ fn roster(group: &MlsGroup) -> Result<Vec<MlsMember>> {
         return Err(MlsError::InvalidInput);
     }
     Ok(members)
+}
+
+fn departing_fingerprints(group: &MlsGroup) -> HashSet<Vec<u8>> {
+    group
+        .pending_proposals()
+        .filter_map(|queued| match queued.proposal() {
+            Proposal::Remove(remove) => group
+                .members()
+                .find(|m| m.index == remove.removed())
+                .map(|m| key_fingerprint(&m.signature_key)),
+            _ => None,
+        })
+        .collect()
 }
 
 #[uniffi::export]
@@ -213,6 +227,7 @@ impl Client {
             removed,
             added_writer: None,
             removed_writer: None,
+            departed: None,
         })
     }
 
@@ -375,7 +390,11 @@ pub fn prepare_add(
         &verified_fingerprint,
     )?;
     let mut group = client.group()?;
-    let current = roster(&group)?;
+    let departing = departing_fingerprints(&group);
+    let current: Vec<_> = roster(&group)?
+        .into_iter()
+        .filter(|m| !departing.contains(&m.fingerprint))
+        .collect();
     if current.len() >= 8
         || current.iter().any(|m| {
             m.fingerprint == verified_fingerprint
@@ -414,6 +433,15 @@ pub fn prepare_remove(state: Vec<u8>, member_fingerprint: Vec<u8>) -> Result<Mls
     let mut transition = client.save(commit, None, Some(&group), None, false)?;
     transition.removed_writer = Some(writer_hash);
     Ok(transition)
+}
+
+#[uniffi::export]
+pub fn prepare_leave(state: Vec<u8>) -> Result<MlsTransition> {
+    let client = Client::load(state)?;
+    client.ready()?;
+    let mut group = client.group()?;
+    let proposal = protocol(group.leave_group(&client.provider, &client.signer))?;
+    client.save(encode(&proposal)?, None, Some(&group), None, false)
 }
 
 #[uniffi::export]
@@ -550,6 +578,27 @@ pub fn receive_message(state: Vec<u8>, message: Vec<u8>) -> Result<MlsTransition
             client.snapshot.pending_commit = None;
             client.save(vec![], None, Some(&group), None, removed)
         }
+        ProcessedMessageContent::ProposalMessage(queued) => {
+            let Sender::Member(index) = sender else {
+                return Err(MlsError::InvalidInput);
+            };
+            if index == group.own_leaf_index()
+                || !matches!(queued.proposal(), Proposal::Remove(remove) if remove.removed() == index)
+            {
+                return Err(MlsError::InvalidInput);
+            }
+            let departed = key_fingerprint(
+                &group
+                    .members()
+                    .find(|m| m.index == index)
+                    .ok_or(MlsError::InvalidInput)?
+                    .signature_key,
+            );
+            protocol(group.store_pending_proposal(client.provider.storage(), *queued))?;
+            let mut transition = client.save(vec![], None, Some(&group), None, false)?;
+            transition.departed = Some(departed);
+            Ok(transition)
+        }
         _ => Err(MlsError::InvalidInput),
     }
 }
@@ -671,6 +720,46 @@ mod policy_tests {
             .save(encode(&commit).unwrap(), None, Some(&group), None, false)
             .unwrap();
         (transition.state, transition.output)
+    }
+
+    #[test]
+    fn proposals_other_than_self_removal_are_rejected() {
+        let alice = create_identity(vec![1; 16]).unwrap();
+        let bob = create_identity(vec![2; 16]).unwrap();
+        let charlie = create_identity(vec![3; 16]).unwrap();
+        let group = create_group(alice.state, vec![7; 32]).unwrap();
+        let bob_package = publish_key_package(bob.state).unwrap();
+        let pending = prepare_add(group.state, bob_package.output, bob.fingerprint).unwrap();
+        let b = join_group(
+            bob_package.state,
+            pending.welcome.unwrap(),
+            vec![7; 32],
+            alice.fingerprint.clone(),
+        )
+        .unwrap()
+        .state;
+        let a = accept_commit(pending.state, pending.output).unwrap().state;
+        let charlie_package = publish_key_package(charlie.state).unwrap();
+        let pending = prepare_add(a, charlie_package.output, charlie.fingerprint).unwrap();
+        let b = receive_message(b, pending.output.clone()).unwrap().state;
+        let a = accept_commit(pending.state, pending.output).unwrap().state;
+        let client = Client::load(a).unwrap();
+        let mut group = client.group().unwrap();
+        let victim = group
+            .members()
+            .find(|m| {
+                m.index != group.own_leaf_index()
+                    && key_fingerprint(&m.signature_key) != alice.fingerprint
+            })
+            .unwrap()
+            .index;
+        let (proposal, _) = group
+            .propose_remove_member(&client.provider, &client.signer, victim)
+            .unwrap();
+        assert!(matches!(
+            receive_message(b, encode(&proposal).unwrap()),
+            Err(MlsError::InvalidInput)
+        ));
     }
 
     #[test]

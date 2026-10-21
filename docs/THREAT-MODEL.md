@@ -16,14 +16,19 @@ supplied service name. In-memory test stores provide no production protection.
 
 The MLS state key uses `AfterFirstUnlockThisDeviceOnly`; every other secret
 uses `WhenUnlockedThisDeviceOnly`. This lets a background sync open the MLS
-state while the device is locked, after the first unlock since boot. The
-trade-off is that someone with code execution on a locked device, after that
-first unlock, can read the state key and decrypt the MLS state. The MLS
-database and the replication checkpoint (group ID, member device IDs, and
-upload position) use `completeUntilFirstUserAuthentication` protection to
-match. The task replica keeps `complete` protection. A background cycle on a
-locked device can upload edits but cannot persist received tasks; it leaves
-them unacknowledged and a later cycle retries.
+state while the device is locked, after the first unlock since boot. The MLS
+database, the replication checkpoint, and the task replica match it: they use
+`completeUntilFirstUserAuthentication` protection and are excluded from
+backups. A background cycle on a locked device can therefore persist received
+tasks and acknowledge them.
+
+The trade-off is that someone with code execution on a locked device, after
+that first unlock, can read the task plaintext, the state key, and the MLS
+state. `complete` protection would keep the tasks unreadable until the next
+unlock, but it would also stop locked receive from persisting anything.
+Excluding the files from backups means a backup restored to another device
+contains no tasks or link; the tasks return only by pairing with a device that
+still has them.
 
 The relay receives MLS ciphertext, commits, Welcome messages, KeyPackages,
 writer-token hashes, cursors, and epochs. It also observes IP addresses,
@@ -53,23 +58,54 @@ learns them from an offer sealed under a key derived from the invitation
 secret. The joiner's KeyPackage reference and fingerprint return under a second
 derived key. The inviter rejects a KeyPackage whose hash or signing key does not
 match, and the joiner rejects a Welcome that the expected inviter did not sign.
-Both devices show a safety code over both fingerprints and the group ID; the
-inviter adds the joiner only after approval. The code cannot defeat an
-attacker who already holds the invitation and wins the race to respond, but it
-shows a different value on the real joiner.
+Both devices show a safety code over the group ID, both fingerprints, and a
+nonce from each device; the inviter adds the joiner only after approval. The
+joiner commits to its KeyPackage, fingerprint, and nonce before it learns the
+inviter's nonce, and the inviter accepts one commitment per invitation. Someone
+holding the invitation therefore cannot search offline for a KeyPackage whose
+code matches the real joiner's code. Each attempt matches with probability
+10⁻⁶ and costs a visible pairing attempt. The code still cannot defeat an
+attacker who holds the invitation and wins the race to respond, but then the
+real joiner shows a different value. The inviter's approval wait ends after 10
+minutes, before the relay discards the KeyPackage.
+
+## Removal and leave
+
+Any member can remove another device with an MLS Remove commit. The commit
+starts a new epoch whose secrets the removed leaf cannot derive, so a removed
+or stolen device fails to decrypt later application messages even with a full
+copy of its MLS state. The relay revokes the removed device's writer token in
+the same step: it refuses its appends at once and serves its reads only up to
+the removal commit, for at most 24 hours or until the device acknowledges that
+commit. Removal requests are saved before they are sent and are retried until
+they succeed.
+
+Leaving publishes an MLS proposal that removes this device, and the next member
+to sync commits it. The relay revokes the leaving device when the proposal
+arrives. Until then the departure journal keeps the old MLS state and key on
+the device, so an offline leave is completed later rather than lost. A device
+that learns it was removed erases its MLS state. An added member that never
+sends a message is removed after 15 minutes, so a joiner that cancels does not
+leave a hidden member behind.
+
+These mechanisms have limits:
+
+- A compromised member defeats confidentiality for the whole group, since
+  every member reads every message.
+- There is no administrator. Any member, including a thief using an unlocked
+  stolen device, can remove any other member. Whoever commits first wins.
+- Removal and leave do not delete tasks the device already received, and
+  cannot wipe a device remotely.
+- A device that never comes online again stays a member until someone
+  removes it.
 
 ## Unresolved limits
 
-A compromised member defeats confidentiality for the whole group, since every
-member reads every message. No operation removes another device yet. Leaving
-erases this device's MLS state, but the remaining members still list it in the
-group and its leaf stays until a removal commit. Leaving does not delete a
-former member's local data or wipe it remotely.
-
 Pairing frames on the relay WebSocket use ChaCha20-Poly1305 with keys derived
 from the invitation secret through HKDF-SHA256. They carry only the group ID,
-fingerprints, and a KeyPackage reference. MLS secures everything after the
-Welcome. The MLS integration has not received an independent review.
+fingerprints, nonces, a commitment, and a KeyPackage reference. MLS secures
+everything after the Welcome. The MLS integration has not received an
+independent review.
 
 The relay can deny service. The relay enforces per-source connection and
 request rate limits, per-source concurrency limits, and optional deployment

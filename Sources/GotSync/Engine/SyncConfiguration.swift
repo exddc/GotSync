@@ -18,6 +18,8 @@ public struct SyncConfiguration: Sendable {
 enum SyncTiming {
     static let invitationTimeToLive: TimeInterval = 15 * 60
     static let invitationTimeToLiveNanoseconds: UInt64 = 900_000_000_000
+    static let approvalTimeoutNanoseconds: UInt64 = 600_000_000_000
+    static let provisionalMemberWindow: TimeInterval = invitationTimeToLive
     static let savingNoticeDelay: TimeInterval = 2
     static let linkCompleteCelebrationDuration: TimeInterval = 2.4
 }

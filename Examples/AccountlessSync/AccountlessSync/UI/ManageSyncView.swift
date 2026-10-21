@@ -5,6 +5,7 @@ struct ManageSyncView: View {
     @ObservedObject var model: SyncAppModel
     @Binding var isUnlinkConfirmationPresented: Bool
     @Environment(\.dismiss) private var dismiss
+    @State private var deviceToRemove: LinkedDevice?
 
     var body: some View {
         NavigationStack {
@@ -29,18 +30,21 @@ struct ManageSyncView: View {
                         .accessibilityIdentifier("data-recovery-disclosure")
                 }
 
-                Section("Linked phones") {
-                    ForEach(
-                        Array(model.linkedMemberLabels.enumerated()),
-                        id: \.offset
-                    ) { _, label in
-                        Label(label, systemImage: "iphone")
+                Section {
+                    ForEach(model.snapshot.linkedDevices) { device in
+                        linkedDeviceRow(device)
                     }
                     Text(
                         "\(model.linkedMemberCount) of \(ProductSyncPolicy.maxDevices)"
                     )
                     .font(.footnote)
                     .foregroundStyle(RelayTheme.inkMuted)
+                } header: {
+                    Text("Linked phones")
+                } footer: {
+                    if model.linkedMemberCount > 1 {
+                        Text(ProductSyncPolicy.removePhoneDetail)
+                    }
                 }
 
                 Section {
@@ -91,6 +95,22 @@ struct ManageSyncView: View {
                 }
                 #endif
             }
+            .confirmationDialog(
+                ProductSyncPolicy.removePhoneTitle,
+                isPresented: Binding(
+                    get: { deviceToRemove != nil },
+                    set: { if !$0 { deviceToRemove = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: deviceToRemove
+            ) { device in
+                Button(ProductSyncPolicy.removePhoneTitle, role: .destructive) {
+                    model.removeDevice(device)
+                }
+                .accessibilityIdentifier("confirm-remove-phone")
+            } message: { device in
+                Text(SyncAppModel.label(for: device))
+            }
             .navigationTitle(ProductSyncPolicy.manageSyncTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -100,6 +120,26 @@ struct ManageSyncView: View {
             }
         }
         .presentationDetents([.medium, .large])
+    }
+
+    @ViewBuilder
+    private func linkedDeviceRow(_ device: LinkedDevice) -> some View {
+        HStack {
+            Label(SyncAppModel.label(for: device), systemImage: "iphone")
+            Spacer()
+            if device.isRemovalPending {
+                Text(ProductSyncPolicy.removingPhoneLabel)
+                    .font(.footnote)
+                    .foregroundStyle(RelayTheme.inkMuted)
+            } else if !device.isCurrentDevice {
+                Button(ProductSyncPolicy.removePhoneTitle, role: .destructive) {
+                    deviceToRemove = device
+                }
+                .buttonStyle(.borderless)
+                .font(.subheadline)
+                .accessibilityIdentifier("remove-phone-\(device.shortFingerprint)")
+            }
+        }
     }
 }
 

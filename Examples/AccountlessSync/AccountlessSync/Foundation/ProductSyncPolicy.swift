@@ -72,9 +72,17 @@ enum ProductSyncPolicy {
 
     static let leaveSyncTitle = "Leave sync and keep tasks"
 
-    /// C3: no remote wipe; remaining members rekey so a left phone cannot decrypt new traffic.
+    /// C3: the remaining phones remove this one, so it cannot read later changes. No remote wipe.
     static let leaveSyncDetail =
-        "Tasks stay on this phone. Other phones may update their membership and rotate keys. A phone that retained the shared secret may still read future traffic. Past data is not remotely wiped."
+        "Tasks stay on this phone. The other phones remove it from the sync, and it cannot read changes made after that. Past data is not remotely wiped."
+
+    static let removePhoneTitle = "Remove phone"
+
+    static let removingPhoneLabel = "Removing…"
+
+    /// H4: removal stops future access but cannot wipe the removed phone.
+    static let removePhoneDetail =
+        "Remove a lost phone or one you no longer use. It cannot read changes made after removal, but it keeps the tasks it already has. Any linked phone can remove any other."
 
     /// M3: safety code is accidental cross-pair protection, not invite-theft defense.
     static let safetyCodeDetail =

@@ -225,6 +225,38 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(members.count, 1)
     }
 
+    func testLeaveRevokesRelayAccessAndNextSendCommitsRemoval() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        try await admit(charlie, by: alice, group: group)
+        try await bob.synchronize()
+        let bobFingerprint = try await bob.fingerprint()
+        let bobAuthorization = try await bob.client.transportAuthorization()
+        try await bob.leave()
+        do {
+            _ = try await relay.fetch(group: group, after: 0, limit: 8, authorization: bobAuthorization)
+            XCTFail("Leaver can still read")
+        } catch MLSRelayError.unauthorized {}
+        try await alice.synchronize()
+        let departures = try await alice.departures()
+        XCTAssertEqual(departures, [bobFingerprint])
+        let sent = try await alice.send(Data("after leave".utf8))
+        guard case .accepted = sent else { return XCTFail("Send after leave not accepted") }
+        let members = try await alice.members()
+        XCTAssertEqual(members.count, 2)
+        XCTAssertFalse(members.contains { $0.fingerprint == bobFingerprint })
+        let remaining = try await alice.departures()
+        XCTAssertTrue(remaining.isEmpty)
+        try await charlie.synchronize()
+        let inbox = try await charlie.inbox()
+        XCTAssertEqual(inbox.last?.plaintext, Data("after leave".utf8))
+        let charlieMembers = try await charlie.members()
+        XCTAssertEqual(charlieMembers.count, 2)
+        let repeated = try await alice.remove(fingerprint: bobFingerprint)
+        XCTAssertEqual(repeated, .superseded)
+    }
+
     func testFailedAcknowledgementIsRetriedAfterRestart() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, _) = try await pair(relay)

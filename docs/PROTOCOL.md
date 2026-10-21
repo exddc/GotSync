@@ -44,25 +44,59 @@ ciphertext, tag). The associated data is
 | Kind | Direction | Plaintext |
 | --- | --- | --- |
 | 1 offer | inviter to joiner | group ID ‖ inviter fingerprint |
-| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint |
+| 4 commitment | joiner to inviter | 32-byte commitment `C` |
+| 5 nonce | inviter to joiner | 32-byte inviter nonce `Ni` |
+| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` |
 | 3 decision | either | one byte: 1 added, 0 declined or cancelled |
 
-The inviter sends the offer on each `peerReady`. A joiner holding a URL
-rejects an offer whose group ID or fingerprint differs from the URL. The
-joiner publishes a KeyPackage under the pairing token, sends the response, and
-shows the safety code. The inviter fetches the KeyPackage, checks that its
-SHA-256 equals the reference, and shows the safety code.
+The exchange runs in this order:
+
+1. The inviter sends the offer on each `peerReady`. A joiner holding a URL
+   rejects an offer whose group ID or fingerprint differs from the URL.
+2. The joiner publishes a KeyPackage under the pairing token, draws a random
+   `Nj`, and sends the commitment
+   `C = SHA-256("com.gotdone.sync/mls-pairing-commitment/v2" ‖ group ID ‖ inviter fingerprint ‖ KeyPackage reference ‖ joiner fingerprint ‖ Nj)`.
+3. The inviter binds the first commitment it receives for the invitation and
+   answers with a random `Ni`. It repeats the same `Ni` if the same commitment
+   arrives again after a reconnect. A different commitment aborts the attempt.
+4. The joiner accepts one `Ni` per attempt, then sends the response. The
+   inviter recomputes `C` from the response and aborts on a mismatch.
+5. The inviter fetches the KeyPackage, checks that its SHA-256 equals the
+   reference, and both devices show the safety code.
 
 The safety code is the first four bytes of SHA-256 over
 `com.gotdone.sync/mls-safety-code/v2` ‖ group ID ‖ inviter fingerprint ‖ joiner
-fingerprint, read big-endian, modulo 1,000,000, printed as six digits.
+fingerprint ‖ `Ni` ‖ `Nj`, read big-endian, modulo 1,000,000, printed as six
+digits.
 
-After approval, a founding inviter creates the group, then commits an Add with
-the joiner fingerprint behind the code as the verified fingerprint. OpenMLS
+The commitment is the hash-commitment construction used for short
+authentication strings (as in ZRTP and Bluetooth numeric comparison). Without
+it, a party holding the invitation could learn the real joiner's code and
+generate KeyPackages offline until one produced the same six digits. With it,
+the joiner fixes its KeyPackage, fingerprint, and `Nj` before `Ni` exists, and
+the inviter fixes `Ni` before `Nj` is revealed. Each attempt to match another
+device's code therefore succeeds with probability 10⁻⁶ and costs one online
+pairing attempt, which the inviter's user sees.
+
+The inviter waits at most 10 minutes for approval. The relay discards an
+unused KeyPackage 15 minutes after publication, so an approved KeyPackage can
+always be added. When the wait ends, the inviter sends a declined decision and
+reports `SyncError.approvalExpired`.
+
+After approval, a founding inviter creates the group. A linked inviter first
+catches up and commits pending removals. It then commits an Add with the
+joiner fingerprint behind the code as the verified fingerprint. OpenMLS
 rejects a KeyPackage whose signature key does not match. The inviter retries a
 superseded Add up to three times. The joiner polls the log until a commit
 carries a Welcome for its KeyPackage reference and joins only if the Welcome
 signer's fingerprint equals the inviter fingerprint.
+
+The inviter records the added fingerprint as provisional. Any application
+message from that member clears the record. If none arrives within 15 minutes,
+the inviter removes the member. If the joiner declines while the Add is in
+flight, a linked inviter removes the new member immediately, and a founding
+inviter discards the group. A joiner that cancels or fails erases its MLS
+state, so the private key of an added but unused KeyPackage is gone.
 
 ### Replication
 
@@ -84,11 +118,12 @@ sequence. The engine applies received operations and persists the replica
 before it answers hellos and acknowledges the MLS inbox. A replay after a
 crash is idempotent.
 
-`sync-v2.json` in the storage directory records the group ID, member device
-IDs, the highest own sequence uploaded, and whether the join announcement is
-pending. The MLS state remains the source of truth: on launch, a group with at
-least two members is linked even if the file is missing. Before a joiner
-waits for admission it writes the group ID and inviter fingerprint to
+`sync-v2.json` in the storage directory records the group ID, each member's
+device ID and fingerprint, the highest own sequence uploaded, whether the join
+announcement is pending, requested removals, and provisional members. The MLS
+state remains the source of truth: on launch, a group with at least two
+members is linked even if the file is missing. Before a joiner waits for
+admission it writes the group ID and inviter fingerprint to
 `sync-v2-join.json`, so a joiner that stops after admission but before
 `sync-v2.json` exists still names its inviter as provider when it relaunches.
 
@@ -96,6 +131,46 @@ An application message that fails MLS validation is skipped. A commit that
 fails validation stops the cursor, and the engine reports
 `SyncError.syncHistoryBlocked` rather than skipping it. The engine polls the
 log every two seconds while active. No WebSocket carries task changes.
+
+### Membership changes
+
+Any member can remove another member with a Remove commit. The delivery entry
+for that commit carries `removeWriter`, the hash of the removed member's
+writer token. `SyncEngine.removeDevice` first saves the fingerprint in
+`sync-v2.json`. Each sync cycle commits one saved removal at a time until the
+fingerprint has left the roster. A removal superseded by another commit is
+retried in the next epoch, and a target that another member already removed
+is dropped. Removals therefore survive restarts and concurrent removals.
+
+A leaving device sends an MLS Remove proposal for its own leaf. The proposal
+travels as a delivery entry of kind `proposal` at the current epoch, with no
+Welcome, KeyPackage reference, or writer fields. The relay revokes the
+appending writer at that cursor: it refuses further appends and serves reads
+only up to the proposal. After the leaver acknowledges the proposal, the relay
+refuses its reads too.
+
+A receiver accepts a proposal only if it is a Remove from a member for that
+member's own leaf. It stores the proposal and records the sender's fingerprint
+as departing. OpenMLS refuses to send application messages while a proposal
+is pending, so a member commits departing members before it sends. The next
+commit of any kind includes the stored proposal by reference. If an epoch ends
+before that, the member removes the departing fingerprint by value. An Add
+for a KeyPackage whose device ID belongs to a departing member is allowed, and
+its commit also removes the old leaf. The same install can therefore be
+invited again right after it leaves.
+
+`unlinkAndKeepTasks()` and `eraseLocalData()` move the MLS directory and its
+state key to a departure slot under `mls-v2-departing/` before anything else
+changes. The engine opens a fresh MLS identity at once and publishes the leave
+proposal from the slot in the background. It retries with backoff, at launch,
+and when the application becomes active. A slot is erased after the relay
+accepts the proposal, or when the relay or MLS state shows that the device is
+already outside the group. Each MLS identity uses its own directory, so a
+superseded session never shares a path with the session that replaced it.
+
+A device that processes a commit removing it erases its MLS state, keeps its
+tasks, and reports `SyncError.removedFromGroup`. A group can shrink to one
+member, which stays linked and can invite again.
 
 # Version 1 reference
 

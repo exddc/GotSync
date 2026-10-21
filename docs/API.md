@@ -9,6 +9,7 @@ journals are implementation details rather than a supported consumer API.
 | `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, and consumer invitation URL scheme. The MLS endpoint `/v2/mls` is derived from the mailbox origin |
 | `SyncEngine` | MLS pairing, replication, local task mutations, and transport lifecycle |
 | `SyncState`, `SyncPhase`, `MailboxSyncState` | Immutable snapshots and connection state |
+| `LinkedDevice` | A group member as listed in `SyncState.linkedDevices` and passed to `removeDevice(_:)` |
 | `SecretStore`, `KeychainStore`, `SecretAccessibility` | Consumer-owned secret persistence and Apple's Keychain implementation |
 | `BackgroundMailboxScheduling` | Optional OS scheduling supplied by the consuming application |
 | `ReplicatedTask`, `KeepBothPreview` | Visible tasks and merge outcome counts |
@@ -38,25 +39,51 @@ New `SyncError` cases:
   verify. `mailboxError` and `errorMessage` carry it, `mailboxRequiresRepair`
   is `true`, and `phase` is `.failed` until the application becomes active
   again and retries.
-- `removedFromGroup`: another member removed this device. The engine unlinks
-  and keeps local tasks.
+- `removedFromGroup`: another member removed this device. The engine erases
+  its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
+- `approvalExpired`: the inviter did not approve the safety code within 10
+  minutes. Nothing was linked.
 
 These members remain for source compatibility and have no effect:
 `resolvePairingReplicaConflictKeepingBoth()` does nothing,
 `isPairingFinalizationLocked` and `hasPairingReplicaConflict` are always
 `false`, and `pairingFinalizationState` and `keepBothPreview` are always `nil`.
 Pairing merges the joiner's existing tasks with the group's tasks instead of
-asking first. `leaveGroupAndKeepTasks()` currently behaves like
-`unlinkAndKeepTasks()`.
+asking first. `leaveGroupAndKeepTasks()` behaves like `unlinkAndKeepTasks()`.
 
-`unlinkAndKeepTasks()` and `eraseLocalData()` erase this device's MLS state and
-its state key. The next pairing uses a new MLS identity and fingerprint.
+### Devices and removal
+
+`SyncState.linkedDevices` (also `SyncEngine.linkedDevices`) lists the members
+of the current group, including this device, and is empty while unpaired.
+Each `LinkedDevice` has:
+
+- `deviceID`: the member's install identifier.
+- `fingerprint`: the SHA-256 of its MLS signature key, also its `id`.
+- `shortFingerprint`: the first four fingerprint bytes as hex, for display.
+- `isCurrentDevice`: whether the entry is this device.
+- `isRemovalPending`: whether `removeDevice` was called and the removal commit
+  has not been accepted yet.
+
+`removeDevice(_:)` and `removeDevice(fingerprint:)` save a removal request and
+start a sync cycle. They return `false` while unpaired, for this device, and
+for a fingerprint outside the group. Sync cycles commit saved removals until
+the device is gone, after restarts and conflicting commits as well. The entry
+disappears from `linkedDevices` once the commit is accepted. A group may
+shrink to this device alone; it stays paired and can invite again.
+
+`unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
+the MLS state into a departure journal and publishes a proposal removing this
+device in the background; another member commits it. The journal is erased
+once the relay accepts the proposal. Both calls switch to a new MLS identity
+and fingerprint at once, so the same install can be invited again.
 
 `SecretStore` gains `write(_:account:accessibility:)`. Its default
 implementation calls `write(_:account:)`. `KeychainStore` stores the MLS state
 key with `.afterFirstUnlockThisDeviceOnly` so background sync can open the MLS
 state while the device is locked. Every other secret keeps
-`.whenUnlockedThisDeviceOnly`.
+`.whenUnlockedThisDeviceOnly`. The task replica and the checkpoint use
+`completeUntilFirstUserAuthentication` file protection and are excluded from
+backups, so a locked device can persist received tasks.
 
 ## Isolation and lifecycle
 
