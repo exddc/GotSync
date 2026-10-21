@@ -38,19 +38,20 @@ provided the disclosures in "Product claims" ship.
 
 ### Re-run evidence
 
-All suites passed on 2026-10-20 at `abb60f3`:
+All suites passed on 2026-10-21 at `c764717`:
 
 - `scripts/uv.sh pytest server/tests -q`: 77 passed.
-- `scripts/test-swift.sh`: 74 tests, 0 failures, 2 skipped (the real-relay
+- `scripts/test-swift.sh`: 82 tests, 0 failures, 2 skipped (the real-relay
   tests that `scripts/test-integration.sh` runs).
-- `scripts/test-mls.sh`: Rust 17 passed (11 unit, 6 protocol), relay MLS 26
+- `scripts/test-mls.sh`: Rust 17 passed (6 unit, 11 protocol), relay MLS 26
   passed, Swift `MLSClientTests` 22 passed.
-- `scripts/test-integration.sh`: 74 tests, 0 failures, against the real relay.
-- Example app: 20 unit tests passed on the iOS 26.5 simulator. Pairing,
-  removal, and the removed-device notice were checked by hand on two
-  simulators.
+- `scripts/test-integration.sh`: 82 tests, 0 failures, against the real relay.
 
-The Swift suite is smaller than before (121 tests at #16) because the version
+On 2026-10-20 at `abb60f3`, 20 example app unit tests passed on the iOS 26.5
+simulator. Pairing, removal, and the removed-device notice were checked by
+hand on two simulators.
+
+The Swift suite is smaller than before (129 tests at #16) because the version
 1 code and the tests that only covered it were deleted.
 
 H2 has two new tests. A mutation check confirmed that both detect retained
