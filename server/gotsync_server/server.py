@@ -915,13 +915,15 @@ class RelayServer:
         rejection: Rejection,
         *,
         maximum_body_bytes: int,
+        held_source: str | None,
     ) -> None:
-        try:
-            await read_http_body(
-                reader, headers, maximum_body_bytes=maximum_body_bytes
-            )
-        except MailboxError:
-            pass
+        if held_source is not None:
+            try:
+                await read_http_body(
+                    reader, headers, maximum_body_bytes=maximum_body_bytes
+                )
+            except MailboxError:
+                pass
         await write_http_response(
             writer,
             rejection.status,
@@ -970,6 +972,7 @@ class RelayServer:
                         headers,
                         rejection,
                         maximum_body_bytes=maximum_body_bytes,
+                        held_source=held_source,
                     )
                     return
                 body = await read_http_body(

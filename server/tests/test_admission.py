@@ -406,6 +406,41 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         held_writer.close()
 
+    async def test_proxied_rejections_do_not_wait_for_request_bodies(self) -> None:
+        relay = await self.start(
+            AdmissionConfig(
+                trusted_proxies=(network("127.0.0.1/32"),),
+                max_http_requests_per_source=1,
+            ),
+            mailbox_max_connections=4,
+        )
+        incomplete = (
+            b"POST /v1/mailbox/put HTTP/1.1\r\nX-Forwarded-For: 198.51.100.4\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+        )
+        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
+        held_writer.write(incomplete)
+        await held_writer.drain()
+        await asyncio.sleep(0.05)
+        rejected = [
+            await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
+            for _ in range(3)
+        ]
+        for _, writer in rejected:
+            writer.write(incomplete)
+            await writer.drain()
+        for reader, writer in rejected:
+            response = await asyncio.wait_for(reader.read(), 0.5)
+            self.assertTrue(response.startswith(b"HTTP/1.1 429 "))
+            writer.close()
+        await asyncio.sleep(0.05)
+        status, _, _ = await self.post(
+            "/v1/mailbox/put", self.put_document(11, 1), {"X-Forwarded-For": "198.51.100.5"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.counters()["source_concurrency_rejections"], 3)
+        held_writer.close()
+
     async def test_websocket_connect_rate_limit_rejects_handshake(self) -> None:
         relay = await self.start(AdmissionConfig(websocket_connects=RateLimit(1, 1)))
         url = f"ws://127.0.0.1:{relay.websocket_port}/v1"
