@@ -64,6 +64,7 @@ struct ReplicationMessage: Codable, Equatable, Sendable {
 /// Engine state for the current MLS group that MLS itself does not hold.
 struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     static let filename = "sync-v2.json"
+    static let joinIntentFilename = "sync-v2-join.json"
     static let version = 2
 
     struct Member: Codable, Equatable, Sendable {

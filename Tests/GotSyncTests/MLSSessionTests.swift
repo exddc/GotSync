@@ -257,6 +257,92 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(repeated, .superseded)
     }
 
+    func testFailedAcknowledgementIsRetriedAfterRestart() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, _) = try await pair(relay)
+        let bobAuthorization = try await bob.transportAuthorizationForTesting()
+        guard case .accepted(let cursor) = try await alice.send(Data("hello".utf8)) else { return XCTFail("Message not accepted") }
+        await relay.failAcknowledgements(by: bobAuthorization, true)
+        do {
+            try await bob.synchronize()
+            XCTFail("Failed acknowledgement succeeded")
+        } catch {}
+        let processedCursor = try await bob.cursor()
+        XCTAssertEqual(processedCursor, cursor)
+        await relay.failAcknowledgements(by: bobAuthorization, false)
+        let reopened = try session("bob", transport: relay)
+        let processed = try await reopened.synchronize()
+        XCTAssertEqual(processed, 0)
+        let acknowledged = await relay.acknowledged(by: bobAuthorization)
+        XCTAssertEqual(acknowledged, cursor)
+    }
+
+    func testFailedAcknowledgementIsRetriedWithoutNewEntries() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, _) = try await pair(relay)
+        let bobAuthorization = try await bob.transportAuthorizationForTesting()
+        guard case .accepted(let cursor) = try await alice.send(Data("hello".utf8)) else { return XCTFail("Message not accepted") }
+        await relay.failAcknowledgements(by: bobAuthorization, true)
+        do {
+            try await bob.synchronize()
+            XCTFail("Failed acknowledgement succeeded")
+        } catch {}
+        await relay.failAcknowledgements(by: bobAuthorization, false)
+        try await bob.synchronize()
+        let acknowledged = await relay.acknowledged(by: bobAuthorization)
+        XCTAssertEqual(acknowledged, cursor)
+    }
+
+    func testJoinAcknowledgementIsRetriedAfterRestart() async throws {
+        let relay = FakeMLSRelay()
+        let alice = try session("alice", transport: relay)
+        let bob = try session("bob", transport: relay)
+        let bobAuthorization = try await bob.transportAuthorizationForTesting()
+        let group = try Data.secureRandom(count: 32)
+        try await alice.createGroup(group)
+        await relay.failAcknowledgements(by: bobAuthorization, true)
+        do {
+            try await admit(bob, by: alice, group: group)
+            XCTFail("Failed acknowledgement succeeded")
+        } catch {}
+        await relay.failAcknowledgements(by: bobAuthorization, false)
+        let reopened = try session("bob", transport: relay)
+        try await reopened.synchronize()
+        let cursor = try await reopened.cursor()
+        XCTAssertGreaterThan(cursor, 0)
+        let acknowledged = await relay.acknowledged(by: bobAuthorization)
+        XCTAssertEqual(acknowledged, cursor)
+    }
+
+    func testRemovalAcknowledgementIsRetriedAfterRestart() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, _) = try await pair(relay)
+        let bobAuthorization = try await bob.transportAuthorizationForTesting()
+        guard case .accepted(let removal) = try await alice.remove(fingerprint: bob.fingerprint()) else {
+            return XCTFail("Removal not accepted")
+        }
+        await relay.failAcknowledgements(by: bobAuthorization, true)
+        do {
+            try await bob.synchronize()
+            XCTFail("Failed acknowledgement succeeded")
+        } catch {}
+        let removed = try await bob.isRemoved()
+        XCTAssertTrue(removed)
+        await relay.failAcknowledgements(by: bobAuthorization, false)
+        let reopened = try session("bob", transport: relay)
+        try await reopened.synchronize()
+        let acknowledged = await relay.acknowledged(by: bobAuthorization)
+        XCTAssertEqual(acknowledged, removal)
+        let attempts = await relay.acknowledgementCount
+        try await reopened.synchronize()
+        let repeated = await relay.acknowledgementCount
+        XCTAssertEqual(repeated, attempts)
+        do {
+            _ = try await reopened.send(Data("after removal".utf8))
+            XCTFail("Removed member sent")
+        } catch {}
+    }
+
     func testInvalidCommitFailsClosedWithoutAdvancingCursor() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)

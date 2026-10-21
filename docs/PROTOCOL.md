@@ -126,7 +126,10 @@ crash is idempotent.
 device ID and fingerprint, the highest own sequence uploaded, whether the join
 announcement is pending, requested removals, and provisional members. The MLS
 state remains the source of truth: on launch, a group with at least two
-members is linked even if the file is missing.
+members is linked even if the file is missing. Before a joiner waits for
+admission it writes the group ID and inviter fingerprint to
+`sync-v2-join.json`, so a joiner that stops after admission but before
+`sync-v2.json` exists still names its inviter as provider when it relaunches.
 
 An application message that fails MLS validation is skipped. A commit that
 fails validation stops the cursor, and the engine reports

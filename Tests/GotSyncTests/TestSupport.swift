@@ -184,13 +184,23 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
     private var appendsUnavailable = false
+    private(set) var rejectedAppends = 0
+    private var failWelcomeAcknowledgement = false
+    private var failingAcknowledgers: Set<Data> = []
     private(set) var lastPublishedReference: Data?
+    private(set) var acknowledgementCount = 0
 
     func dropNextAppendResponse() { dropAppendResponse = true }
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
 
     func removalCursor(of authorization: Data, group: Data) -> UInt64? {
         groups[group]?.writers[Self.digest(authorization)]?.removal ?? nil
+    }
+
+    func failNextWelcomeAcknowledgement() { failWelcomeAcknowledgement = true }
+
+    func failAcknowledgements(by authorization: Data, _ fail: Bool) {
+        if fail { failingAcknowledgers.insert(Self.digest(authorization)) } else { failingAcknowledgers.remove(Self.digest(authorization)) }
     }
 
     func acknowledged(by authorization: Data) -> UInt64? {
@@ -242,7 +252,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func append(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
-        if appendsUnavailable { throw URLError(.notConnectedToInternet) }
+        if appendsUnavailable {
+            rejectedAppends += 1
+            throw URLError(.notConnectedToInternet)
+        }
         guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
             throw MLSRelayError.unauthorized
         }
@@ -276,8 +289,14 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func acknowledge(group: Data, through cursor: UInt64, authorization: Data) throws {
+        acknowledgementCount += 1
+        if failingAcknowledgers.contains(Self.digest(authorization)) { throw URLError(.networkConnectionLost) }
         _ = try authorize(group: group, authorization: authorization)
         let digest = Self.digest(authorization)
+        if failWelcomeAcknowledgement, entries.first(where: { $0.cursor == cursor })?.delivery.addWriter == digest {
+            failWelcomeAcknowledgement = false
+            throw URLError(.networkConnectionLost)
+        }
         let previous = groups[group]?.writers[digest]?.ack ?? 0
         groups[group]?.writers[digest]?.ack = max(previous, cursor)
     }

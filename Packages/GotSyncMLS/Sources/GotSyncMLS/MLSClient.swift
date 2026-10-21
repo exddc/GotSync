@@ -54,6 +54,7 @@ struct ClientRecord: Codable {
     var deviceID: Data
     var identity: IdentityRecord
     var writerToken: Data
+    var removalAuthorization: Data?
     var group: Data?
     var epoch: UInt64 = 0
     var cursor: UInt64 = 0
@@ -104,6 +105,7 @@ public actor MLSClient {
         guard !record.removed, record.writerToken.count == 32 else { throw MLSClientError.invalidState }
         return record.writerToken
     }
+    public func removalAuthorization() throws -> Data? { try store.read().removalAuthorization }
     public func members() throws -> [MLSMember] {
         try GotSyncMLSBindings.members(state: store.read().state).map {
             MLSMember(deviceID: $0.deviceId, fingerprint: $0.fingerprint, writerHash: $0.writerHash)
@@ -226,6 +228,7 @@ public actor MLSClient {
                 }
                 if transition.removed {
                     record.removed = true
+                    record.removalAuthorization = record.writerToken
                     record.state = Data()
                     record.writerToken = Data()
                     record.pending = nil
@@ -258,6 +261,10 @@ public actor MLSClient {
 
     public func acknowledgeInbox(through cursor: UInt64) throws {
         try mutate(allowRemoved: true) { record in record.inbox.removeAll { $0.cursor <= cursor } }
+    }
+
+    public func confirmRemovalAcknowledged() throws {
+        try mutate(allowRemoved: true) { record in record.removalAuthorization = nil }
     }
 
     private func mutate<T>(allowRemoved: Bool = false, _ body: (inout ClientRecord) throws -> T) throws -> T {
