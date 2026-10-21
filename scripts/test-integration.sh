@@ -2,6 +2,7 @@
 set -euo pipefail
 source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
+scripts/ensure-mls.sh
 uv sync --project server --locked --no-editable
 GOTSYNC_TEST_DIR="$(mktemp -d)"
 GOTSYNC_TEST_SERVER_PID=""

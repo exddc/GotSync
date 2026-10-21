@@ -73,28 +73,49 @@ public struct SyncEndpointConfiguration: Equatable, Sendable {
         _ url: URL,
         policy: EndpointSecurityPolicy
     ) throws {
+        guard isValidHTTPEndpoint(url, path: "/v1/mailbox", policy: policy) else {
+            throw SyncEndpointConfigurationError.invalidMailbox
+        }
+    }
+
+    var mlsURL: URL {
+        var components = URLComponents(url: mailboxURL, resolvingAgainstBaseURL: false)!
+        components.path = "/v2/mls"
+        return components.url!
+    }
+
+    static func validateMLSURL(
+        _ url: URL,
+        policy: EndpointSecurityPolicy
+    ) throws {
+        guard isValidHTTPEndpoint(url, path: "/v2/mls", policy: policy) else {
+            throw SyncEndpointConfigurationError.invalidMailbox
+        }
+    }
+
+    private static func isValidHTTPEndpoint(
+        _ url: URL,
+        path: String,
+        policy: EndpointSecurityPolicy
+    ) -> Bool {
         guard
             let scheme = url.scheme?.lowercased(),
             scheme == "http" || scheme == "https",
             let host = url.host?.lowercased(),
             !host.isEmpty,
-            url.path == "/v1/mailbox",
+            url.path == path,
             url.user == nil,
             url.password == nil,
             url.query == nil,
             url.fragment == nil
         else {
-            throw SyncEndpointConfigurationError.invalidMailbox
+            return false
         }
         switch policy {
         case .localDevelopment:
-            guard scheme == "https" || isLoopback(host) || isPrivateLANHost(host) else {
-                throw SyncEndpointConfigurationError.invalidMailbox
-            }
+            return scheme == "https" || isLoopback(host) || isPrivateLANHost(host)
         case .production:
-            guard scheme == "https", !isLocalOnly(host) else {
-                throw SyncEndpointConfigurationError.invalidMailbox
-            }
+            return scheme == "https" && !isLocalOnly(host)
         }
     }
 
