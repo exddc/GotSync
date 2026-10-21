@@ -4,54 +4,23 @@ import Security
 
 enum SyncProtocol {
     static let version: UInt8 = 1
-    static let pairingVersion: UInt8 = 2
-    static let appID = ProtocolDomains.appID
 }
 
 enum ProtocolLimits {
     static let registrationBytes = 512
     static let webSocketMessageBytes = 512 * 1_024
     static let plaintextBytes = 384 * 1_024
-    static let provisioningArchiveBytes = 280 * 1_024
-    static let operationBatchCount = 256
-    static let operationBatchBytes = 256 * 1_024
-    static let titleScalars = 200
-    static let titleBytes = 512
-    static let taskCount = 1_000
-    static let operationCount = 10_000
-    static let vectorOrigins = 8
-    static let mailboxEnvelopeBytes = 64 * 1_024
-    static let mailboxBatchCount = 128
-    static let mailboxRequestBytes = 512 * 1_024
-    static let mailboxFetchCount = 64
 }
 
 public enum DeviceRole: String, Codable, Sendable {
     case host
     case joiner
-
-    public var wireByte: UInt8 {
-        switch self {
-        case .host: 0x41
-        case .joiner: 0x42
-        }
-    }
-
-    public var opposite: DeviceRole {
-        switch self {
-        case .host: .joiner
-        case .joiner: .host
-        }
-    }
 }
 
 enum ProtocolSupportError: Error, Equatable {
     case invalidRandomLength
     case randomGenerationFailed(Int32)
     case invalidBase64URL
-    case invalidInteger
-    case invalidRelayURL
-    case invalidTranscript
 }
 
 extension Data {
@@ -94,41 +63,6 @@ extension Data {
         self = decoded
     }
 
-    var hexString: String {
-        map { String(format: "%02x", $0) }.joined()
-    }
-
-    mutating func appendUInt32(_ value: UInt32) {
-        append(contentsOf: [
-            UInt8((value >> 24) & 0xff),
-            UInt8((value >> 16) & 0xff),
-            UInt8((value >> 8) & 0xff),
-            UInt8(value & 0xff),
-        ])
-    }
-
-    mutating func appendUInt64(_ value: UInt64) {
-        append(contentsOf: [
-            UInt8((value >> 56) & 0xff),
-            UInt8((value >> 48) & 0xff),
-            UInt8((value >> 40) & 0xff),
-            UInt8((value >> 32) & 0xff),
-            UInt8((value >> 24) & 0xff),
-            UInt8((value >> 16) & 0xff),
-            UInt8((value >> 8) & 0xff),
-            UInt8(value & 0xff),
-        ])
-    }
-
-    func uint64(at offset: Int) throws -> UInt64 {
-        guard offset >= 0, count >= offset + 8 else {
-            throw ProtocolSupportError.invalidInteger
-        }
-        return self[offset..<(offset + 8)].reduce(UInt64.zero) {
-            ($0 << 8) | UInt64($1)
-        }
-    }
-
     var sha256: Data {
         Data(SHA256.hash(data: self))
     }
@@ -148,36 +82,4 @@ struct CanonicalJSON {
     }()
 
     static let decoder = JSONDecoder()
-}
-
-struct TranscriptBuilder {
-    private(set) var data = Data()
-    private var lastTag: UInt8 = 0
-
-    mutating func append(tag: UInt8, value: Data) throws {
-        guard tag > lastTag, value.count <= Int(UInt32.max) else {
-            throw ProtocolSupportError.invalidTranscript
-        }
-        lastTag = tag
-        data.append(tag)
-        data.appendUInt32(UInt32(value.count))
-        data.append(value)
-    }
-}
-
-extension URL {
-    var canonicalRelayOrigin: String? {
-        guard
-            let scheme = scheme?.lowercased(),
-            scheme == "ws" || scheme == "wss",
-            let host = host?.lowercased(),
-            user == nil,
-            password == nil
-        else {
-            return nil
-        }
-
-        let resolvedPort = port ?? (scheme == "wss" ? 443 : 80)
-        return "\(scheme)://\(host):\(resolvedPort)"
-    }
 }

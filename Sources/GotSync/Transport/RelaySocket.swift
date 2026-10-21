@@ -58,7 +58,6 @@ public actor RelaySocket {
     private var socket: URLSessionWebSocketTask?
     private var openObserver: RelayOpenObserver?
     private var sendTail: Task<Void, Error>?
-    private var secureSession: SecureSession?
 
     public init(url: URL, policy: EndpointSecurityPolicy = .production) {
         self.policy = policy
@@ -135,35 +134,6 @@ public actor RelaySocket {
         try await enqueue(data, on: socket)
     }
 
-    func installSecureSession(
-        material: HandshakeMaterial,
-        role: DeviceRole
-    ) throws {
-        secureSession = try material.makeSecureSession(role: role)
-    }
-
-    public func sendEncrypted(_ plaintext: Data) async throws {
-        guard let socket, var secureSession else {
-            throw RelaySocketError.notConnected
-        }
-        let frame = try secureSession.seal(plaintext)
-        self.secureSession = secureSession
-        try await enqueue(frame, on: socket)
-    }
-
-    public func openEncrypted(_ frame: Data) throws -> Data {
-        guard var secureSession else {
-            throw RelaySocketError.notConnected
-        }
-        let plaintext = try secureSession.open(frame)
-        self.secureSession = secureSession
-        return plaintext
-    }
-
-    public func clearSecureSession() {
-        secureSession = nil
-    }
-
     private func enqueue(
         _ data: Data,
         on socket: URLSessionWebSocketTask
@@ -188,7 +158,6 @@ public actor RelaySocket {
         session = nil
         openObserver = nil
         sendTail = nil
-        secureSession = nil
     }
 
     /// Opens a short-lived socket to verify the relay accepts WebSocket connections.

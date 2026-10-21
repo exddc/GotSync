@@ -373,12 +373,11 @@ final class ReplicaTests: XCTestCase {
         }
     }
 
-    func testPersistenceReloadAndProvisioning() throws {
+    func testPersistenceReload() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let hostURL = directory.appendingPathComponent("host.json")
-        let joinerURL = directory.appendingPathComponent("joiner.json")
         let taskID = task(7)
 
         var host = try TaskReplica(deviceID: device(1), persistenceURL: hostURL)
@@ -391,92 +390,6 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(reloaded.task(id: taskID)?.isCompleted, true)
         let third = try reloaded.setTitle(taskID: taskID, title: "Reloaded")
         XCTAssertEqual(third.originSequence, 3)
-
-        let provisioningA = try reloaded.exportProvisioningArchive()
-        let provisioningB = try reloaded.exportProvisioningArchive()
-        XCTAssertEqual(provisioningA, provisioningB)
-
-        var joiner = try TaskReplica.provision(
-            deviceID: device(2),
-            from: provisioningA,
-            persistenceURL: joinerURL
-        )
-        XCTAssertEqual(joiner.deviceID, device(2))
-        XCTAssertEqual(joiner.task(id: taskID)?.titleValue, "Reloaded")
-        XCTAssertEqual(joiner.versionVector[device(1)], 3)
-        let joinerEdit = try joiner.setCompleted(taskID: taskID, completed: false)
-        XCTAssertEqual(joinerEdit.originDeviceID, device(2))
-        XCTAssertEqual(joinerEdit.originSequence, 1)
-
-        let joinerReloaded = try TaskReplica(
-            deviceID: device(2),
-            persistenceURL: joinerURL
-        )
-        XCTAssertEqual(
-            try joinerReloaded.atomicArchiveData(),
-            try joiner.atomicArchiveData()
-        )
-    }
-
-    func testProvisioningRejectsNonCanonicalAndNonemptyDestination() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let destination = directory.appendingPathComponent("replica.json")
-
-        var host = try TaskReplica(deviceID: device(1))
-        try host.createTask(id: task(8), title: "Host")
-        let canonical = try host.exportProvisioningArchive()
-        var nonCanonical = canonical
-        nonCanonical.append(0x0A)
-
-        XCTAssertThrowsError(
-            try TaskReplica.provision(deviceID: device(2), from: nonCanonical)
-        ) {
-            XCTAssertEqual($0 as? ReplicaError, .nonCanonicalArchive)
-        }
-
-        var existing = try TaskReplica(deviceID: device(2), persistenceURL: destination)
-        try existing.createTask(id: task(9), title: "Existing")
-        XCTAssertThrowsError(
-            try TaskReplica.provision(
-                deviceID: device(2),
-                from: canonical,
-                persistenceURL: destination
-            )
-        ) {
-            XCTAssertEqual($0 as? ReplicaError, .provisioningRequiresEmptyReplica)
-        }
-    }
-
-    func testProvisioningResumesPreviouslyLinkedDeviceSequence() throws {
-        let hostID = device(1)
-        let joinerID = device(2)
-        var host = try TaskReplica(deviceID: hostID)
-        try host.createTask(id: task(10), title: "Host")
-        var firstJoin = try TaskReplica.provision(
-            deviceID: joinerID,
-            from: host.exportProvisioningArchive()
-        )
-        let firstJoinerEdit = try firstJoin.createTask(
-            id: task(11),
-            title: "First join"
-        )
-        _ = try host.applyRemote([firstJoinerEdit])
-
-        var rejoined = try TaskReplica.provision(
-            deviceID: joinerID,
-            from: host.exportProvisioningArchive()
-        )
-        let nextJoinerEdit = try rejoined.createTask(
-            id: task(12),
-            title: "After rejoin"
-        )
-
-        XCTAssertEqual(rejoined.versionVector[joinerID], 2)
-        XCTAssertEqual(nextJoinerEdit.originDeviceID, joinerID)
-        XCTAssertEqual(nextJoinerEdit.originSequence, 2)
-        XCTAssertEqual(try host.applyRemote([nextJoinerEdit]), 1)
     }
 
     func testMissingOperationsAndVectorEntriesAreDeterministicallySorted() throws {

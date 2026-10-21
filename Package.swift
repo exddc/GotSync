@@ -8,6 +8,6 @@ let package = Package(
     dependencies: [.package(path: "Packages/GotSyncMLS")],
     targets: [
         .target(name: "GotSync", dependencies: [.product(name: "GotSyncMLS", package: "GotSyncMLS")]),
-        .testTarget(name: "GotSyncTests", dependencies: ["GotSync"], resources: [.copy("Fixtures")]),
+        .testTarget(name: "GotSyncTests", dependencies: ["GotSync"]),
     ]
 )

@@ -36,8 +36,6 @@ enum ReplicaError: Error, Equatable, Sendable {
     case nonCanonicalArchive
     case archiveDeviceMismatch(expected: ReplicaDeviceID, actual: ReplicaDeviceID)
     case corruptArchive(String)
-    case provisioningRequiresEmptyReplica
-    case provisioningDeviceCollision(ReplicaDeviceID)
 }
 
 extension ReplicaError: LocalizedError {
@@ -91,10 +89,6 @@ extension ReplicaError: LocalizedError {
             "Archive device \(actual) does not match \(expected)."
         case .corruptArchive(let reason):
             "The replica archive is corrupt: \(reason)"
-        case .provisioningRequiresEmptyReplica:
-            "Provisioning requires an empty replica."
-        case .provisioningDeviceCollision(let deviceID):
-            "Provisioning already contains device \(deviceID)."
         }
     }
 }
@@ -420,34 +414,6 @@ struct ReplicaArchive: Codable, Equatable, Sendable {
 
     static func decodeCanonical(from data: Data) throws -> ReplicaArchive {
         let archive = try ReplicaCanonicalJSON.decode(ReplicaArchive.self, from: data)
-        guard try archive.canonicalData() == data else {
-            throw ReplicaError.nonCanonicalArchive
-        }
-        return archive.normalized()
-    }
-}
-
-struct ReplicaProvisioningArchive: Codable, Equatable, Sendable {
-    let formatVersion: Int
-    let sourceDeviceID: ReplicaDeviceID
-    let lamport: UInt64
-    let versionVector: ReplicaVersionVector
-    var taskRecords: [ReplicatedTask]
-    var operations: [TaskOperation]
-
-    func canonicalData() throws -> Data {
-        try ReplicaCanonicalJSON.encode(normalized())
-    }
-
-    func normalized() -> ReplicaProvisioningArchive {
-        var result = self
-        result.taskRecords.sort(by: ReplicaOrdering.tasks)
-        result.operations.sort(by: ReplicaOrdering.operations)
-        return result
-    }
-
-    static func decodeCanonical(from data: Data) throws -> ReplicaProvisioningArchive {
-        let archive = try ReplicaCanonicalJSON.decode(ReplicaProvisioningArchive.self, from: data)
         guard try archive.canonicalData() == data else {
             throw ReplicaError.nonCanonicalArchive
         }

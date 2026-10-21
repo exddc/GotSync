@@ -1,8 +1,8 @@
 # Public Swift API
 
 This API is for applications embedding GotSync. The package's current model is
-task-scoped. Cryptographic codecs, key derivation, replica archives, and pairing
-journals are implementation details rather than a supported consumer API.
+task-scoped. The MLS session, pairing frames, replication messages, and replica
+archives are implementation details rather than a supported consumer API.
 
 | Surface | Purpose |
 | --- | --- |
@@ -12,14 +12,16 @@ journals are implementation details rather than a supported consumer API.
 | `LinkedDevice` | A group member as listed in `SyncState.linkedDevices` and passed to `removeDevice(_:)` |
 | `SecretStore`, `KeychainStore`, `SecretAccessibility` | Consumer-owned secret persistence and Apple's Keychain implementation |
 | `BackgroundMailboxScheduling` | Optional OS scheduling supplied by the consuming application |
-| `ReplicatedTask`, `KeepBothPreview` | Visible tasks and merge outcome counts |
-| `Invitation`, `DeviceRole`, `PairingFinalizationState` | Pairing material and state |
-| `MailboxTransport` and its receipt/envelope types | Version 1 mailbox client; `SyncEngine` no longer uses it |
+| `ReplicatedTask` | Visible tasks |
+| `Invitation`, `DeviceRole`, `MnemonicError` | Pairing material, the role of this device in a pairing attempt, and invitation parsing errors |
 | `SyncError` and transport/configuration errors | Typed failures; UI maps them to its own presentation |
 | `SyncEndpointConfiguration`, `EndpointSecurityPolicy` | Endpoint validation with secure defaults |
-| `RelaySocket.probeReachability` | Optional connection check for a developer settings surface |
+| `RelaySocket.probeReachability` | Optional check that the pairing relay accepts WebSocket connections, for a developer settings surface |
 
 ## Version 2 changes
+
+Version 2 is a breaking API and protocol release. See
+[COMPATIBILITY.md](COMPATIBILITY.md) for the cutover.
 
 `SyncEngine.init(configuration:secretStore:backgroundMailboxScheduler:pairingRetryDelayNanoseconds:)`
 replaces the initializer that accepted a `mailboxTransport`. Task changes now
@@ -44,11 +46,32 @@ New `SyncError` cases:
 - `approvalExpired`: the inviter did not approve the safety code within 10
   minutes. Nothing was linked.
 
-These members remain for source compatibility and have no effect:
-`resolvePairingReplicaConflictKeepingBoth()` does nothing,
-`isPairingFinalizationLocked` and `hasPairingReplicaConflict` are always
-`false`, and `pairingFinalizationState` and `keepBothPreview` are always `nil`.
-Pairing merges the joiner's existing tasks with the group's tasks instead of
+`SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
+device stopped being linked without the user unlinking it: `.removedFromGroup`
+or `.relinkRequired`. The value is `nil` otherwise and is cleared when a new
+pairing attempt starts or the device unlinks. It is not persisted, so show it
+while the engine that detected it is running.
+
+Removed in version 2:
+
+- The version 1 mailbox client (`MailboxTransport`, `HTTPMailboxTransport`,
+  `StoredMailboxEnvelope` and the receipt and page types) and
+  `MailboxTransportError`.
+- The keep-both and finalization members, which had no effect after the MLS
+  migration: `resolvePairingReplicaConflictKeepingBoth()`,
+  `isPairingFinalizationLocked`, `hasPairingReplicaConflict`,
+  `pairingFinalizationState`, `keepBothPreview`, `pairingRecoveryResetRequired`,
+  `PairingFinalizationState`, and `KeepBothPreview`.
+- `SyncPhase.finalizing` and `lastRoundTripMilliseconds`, which the engine no
+  longer produces.
+- `SyncError` cases that only the version 1 protocol produced:
+  `invalidSyncMessage`, `archiveTooLarge`, `safetyCodeMismatch`,
+  `pairingReplicaConflict`, `pairingMergeTooLarge`, `legacyPairingNeedsRelink`,
+  `pairingRecoveryHistoryFull`, and `pairingRecoveryJournalDamaged`.
+- `RelaySocket.sendEncrypted(_:)`, `openEncrypted(_:)`, and
+  `clearSecureSession()`. `RelaySocket` now only carries pairing frames.
+
+Pairing merges the joiner's existing tasks with the group's tasks without
 asking first. `leaveGroupAndKeepTasks()` behaves like `unlinkAndKeepTasks()`.
 
 ### Devices and removal
@@ -120,10 +143,15 @@ Keychain-backed identity and storage on the iOS Simulator.
 
 ## Deferred API refinements
 
-Main-actor isolation preserves the existing serial recovery behavior. Crypto,
-JSON, local file I/O, and secret-store calls still run on that actor and can
+Main-actor isolation preserves the existing serial recovery behavior. MLS
+calls run on the `MLSSession` actor, but JSON, local file I/O, and secret-store calls still run on that actor and can
 block UI responsiveness for large inputs. Moving those operations to a
 dedicated actor needs separate concurrency and performance validation.
+
+The `mailbox*` state members and `BackgroundMailboxScheduling` keep their
+version 1 names. They now describe delivery through the `/v2/mls` log. The
+`mailboxURL` configuration value selects the relay origin; the engine sends no
+requests to its `/v1/mailbox` path.
 
 The initial extracted API retains diagnostic error strings and the
 `showsSavingNotice`/`showsLinkCompleteCelebration` progress timing from the

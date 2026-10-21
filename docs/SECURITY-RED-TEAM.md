@@ -6,148 +6,320 @@ independent audit has been completed.
 
 ## Verdict
 
-Re-run on 2026-10-20 against `main` at `88be0f6`.
+Re-run on 2026-10-20 against `feature/tw-530-l4-remove-custom-crypto` at
+`abb60f3`. That branch stacks on PRs #16, #15, #13, and #12. `SyncEngine` runs
+protocol version 2 on OpenMLS (RFC 9420). The custom version 1 cryptography is
+no longer in the client.
 
-**Production claim: not ready.** `SyncEngine` still uses the custom protocol.
-The blocking crypto findings C2, C3, C5, and H2 remain open. They are resolved
-by moving `SyncEngine` to the OpenMLS package and the `/v2/mls` relay, not by
-patching the custom protocol. Public operation also requires the hardened relay
-host (H1). The owner accepted C1, C4, H3, and M1 on 2026-10-20 with the
-rationale below.
+**Production claim: not ready.** No crypto finding is open in code. Two items
+still block a production claim:
+
+1. **C5:** the integration-only external review of the MLS integration and the
+   pairing-frame composition has not happened.
+2. **H1:** the admission and rate-limit controls are in sibling PR #14. They
+   close only when the hardened relay host is deployed with the perimeter
+   controls in `server/README.md`.
+
+C2, C3, H2, and H4 are fixed. The owner accepted C1, C4, H3, and M1 on
+2026-10-20; their rationale still holds under MLS. The new findings N1 to N8
+need an owner decision. None of them blocks the claims in the table below,
+provided the disclosures in "Product claims" ship.
 
 | Claim | Status |
 | --- | --- |
-| Relay cannot read or forge task changes | Holds for an honest-but-curious or active relay without device secrets |
+| Relay cannot read or forge task changes | Holds against an honest-but-curious or active relay without device secrets (MLS) |
+| Keys are bound to verified fingerprints | Holds; a substituted KeyPackage, inviter fingerprint, or Welcome signer is rejected (C2) |
+| Removed or departed devices lose future access | Holds once the removal commit or leave proposal reaches the relay (C3, H4); see N3 |
+| Forward secrecy for relay-retained ciphertext | Holds across epochs (H2); no post-compromise recovery without a membership change (N6) |
 | Privacy between group members | Not provided; accepted by design (C1) |
-| Forged membership updates are rejected | Only when the issuer's signing key is pinned (C2 open) |
-| Removed or stolen devices lose future access | Not provided (C3, H4 open) |
-| Forward secrecy for retained data | Not provided (H2 open) |
-| Public relay service | Not ready (H1 open) |
-| "Private" or "audited" marketing | Blocked until every blocking finding closes and the MLS integration review completes |
+| Sync availability against a malicious relay or member | Not provided (N1, N2, N7) |
+| Public relay service | Not ready (H1) |
+| "Private" or "audited" marketing | Blocked until the external review (C5) completes and H1 closes |
 
 ### Re-run evidence
 
-All suites passed on 2026-10-20:
+All suites passed on 2026-10-21 at `c764717`:
 
-- `scripts/uv.sh pytest server/tests -q`: 75 passed.
-- `scripts/test-swift.sh`: 114 tests, 0 failures, 1 skipped (the real-relay
-  integration test, which `scripts/test-integration.sh` runs).
-- `scripts/test-mls.sh`: Rust 12 passed, relay MLS 24 passed, Swift
-  `MLSClientTests` 21 passed.
+- `scripts/uv.sh pytest server/tests -q`: 77 passed.
+- `scripts/test-swift.sh`: 82 tests, 0 failures, 2 skipped (the real-relay
+  tests that `scripts/test-integration.sh` runs).
+- `scripts/test-mls.sh`: Rust 17 passed (6 unit, 11 protocol), relay MLS 26
+  passed, Swift `MLSClientTests` 22 passed.
+- `scripts/test-integration.sh`: 82 tests, 0 failures, against the real relay.
 
-Code inspection of `GroupMailbox.swift` and `GroupCredentials.swift` confirms
-that C1, C2, C3, and H2 remain present. For an issuer without a pinned key,
-`acceptedUpdate(against:)` verifies the signature against the key the snapshot
-itself claims, so an attacker holding the group root can substitute a key.
-`SyncEngine` exposes `leaveGroupAndKeepTasks()` but no operation to remove
-another device.
+On 2026-10-20 at `abb60f3`, 20 example app unit tests passed on the iOS 26.5
+simulator. Pairing, removal, and the removed-device notice were checked by
+hand on two simulators.
 
-## Experimental MLS status
+The Swift suite is smaller than before (129 tests at #16) because the version
+1 code and the tests that only covered it were deleted.
 
-The experimental OpenMLS package in `Packages/GotSyncMLS` tests rejection of
-unknown-member application messages (R2a), QR fingerprint substitution, Welcome-signer
-substitution, and removed-device decryption of later epochs. It also tests
-replays, tampering, commit conflicts, and durable state/inbox recovery.
-These results apply only to the experimental package. `SyncEngine` still
-uses the custom protocol, so no existing finding is marked resolved.
+H2 has two new tests. A mutation check confirmed that both detect retained
+epoch secrets: with `max_past_epochs(2)` instead of `0`, the Rust test fails,
+and the Swift test fails with `invalidDelivery`.
 
-The Rust tests covering these attacks are
-`three_members_offline_catchup_and_removal`,
-`fingerprints_and_group_id_are_verified_in_both_directions`,
-`replay_tampering_and_unknown_member_are_rejected`, and
-`welcome_must_be_signed_by_pinned_inviter_not_just_contain_them`. The relay test
-`test_unauthorized_and_removed_writers_cannot_advance_epoch` covers delivery
-authorization. Once `SyncEngine` uses this package, re-run these checks against
-the engine and the real relay before closing any finding.
+Code inspection covered `SyncEngine`, `MLSSession`, `PairingChannel`,
+`Invitation`, `MLSClient`, `mls/src/lib.rs`, and `server/gotsync_server/mls.py`.
+It found the new findings N1 to N8 below.
 
 ## Findings and disposition
 
 "Blocking" means the finding prevents a production claim. "Accepted" means
 the finding stays true and is disclosed instead of fixed, with owner sign-off
-and the rationale given.
+and the rationale given. "Proposed" means the finding awaits that sign-off.
 
-| ID | Finding | Disposition | Closes when |
+| ID | Severity | Finding | Disposition |
 | --- | --- | --- | --- |
-| C1 | Every member derives every pair's mailbox keys | Accepted 2026-10-20 | Accepted; shared access is the product model |
-| C2 | Unpinned signing keys permit substitution | Blocking, open | `SyncEngine` uses MLS credentials bound to verified fingerprints |
-| C3 | Old root holders can follow rekey | Blocking, open | `SyncEngine` removes members with MLS commits |
-| C4 | A live invitation is an admission capability | Accepted 2026-10-20 | Accepted; disclosure replaces proximity |
-| C5 | Custom, unaudited cryptographic composition | Blocking, open | MLS replaces the custom protocol and the integration review completes |
-| H1 | Anonymous capacity exhaustion | Blocking for public service | Hardened relay host deploys admission and rate limits |
-| H2 | No forward secrecy for retained mailbox data | Blocking, open | `SyncEngine` uses MLS epochs |
-| H3 | No account recovery | Accepted 2026-10-20 | Accepted; loss is disclosed |
-| H4 | No operation to remove another device | Blocking, open | `SyncEngine` exposes MLS removal |
-| M1 | Observable relay metadata | Accepted 2026-10-20 | Accepted; no metadata privacy claim |
+| C1 | Critical | Every member can read every member's traffic | Accepted 2026-10-20 |
+| C2 | Critical | Unpinned signing keys permit substitution | Fixed |
+| C3 | Critical | Old root holders can follow rekey | Fixed |
+| C4 | Critical | A live invitation is an admission capability | Accepted 2026-10-20 |
+| C5 | Critical | Custom, unaudited cryptographic composition | Fixed in code, pending the integration-only external MLS review; blocking |
+| H1 | High | Anonymous capacity exhaustion | Fixed in code by PR #14 (sibling branch); closes when the hardened relay host is deployed with the perimeter controls in `server/README.md`; blocking for public service |
+| H2 | High | No forward secrecy for retained data | Fixed |
+| H3 | High | No account recovery | Accepted 2026-10-20 |
+| H4 | High | No operation to remove another device | Fixed |
+| M1 | Medium | Observable relay metadata | Accepted 2026-10-20 |
+| N1 | Medium | An invalid commit blocks a group's sync until it pairs again | Not blocking; acceptance proposed |
+| N2 | Medium | No administrator: any member, or a thief with an unlocked phone, can remove others | Not blocking; acceptance proposed |
+| N3 | Medium | A departing device keeps its keys until its leave proposal is accepted | Not blocking; acceptance proposed |
+| N4 | Medium | Task data and the MLS state key use after-first-unlock protection | Not blocking; acceptance proposed |
+| N5 | Low | A removed device can read pre-removal history from the relay for up to 24 hours | Not blocking; acceptance proposed |
+| N6 | Medium | No periodic key update, so no post-compromise security without a membership change | Not blocking; fix recommended |
+| N7 | Low | An offline member stops log pruning until the group log is full | Not blocking; acceptance proposed |
+| N8 | Low | Pairing frames have no replay protection or transcript binding | Not blocking; in scope for the C5 review |
 
-### Finding details
+### Fixed findings
 
-| ID | Current behavior and impact | Required mitigation |
-| --- | --- | --- |
-| C1 | `GroupMailboxKeyMaterial` derives keys from one shared root. A third member can decrypt another pair's traffic. This is consistent with shared task access, but provides no privacy between members. | Use independently distributed sender or pairwise keys if member privacy becomes a goal. |
-| C2 | Signed membership v2 rejects unsigned and wrong-known-key updates. A roster entry with an empty key accepts any key claimed by the snapshot itself, including on updates that carry a rekey seed. Join provision does not bind every member's real signing key. | Bind all roster keys during authenticated provision and reject updates for unpinned issuers. |
-| C3 | Membership messages carry the rekey seed under the previous root. A removed or compromised device retaining that root can derive the next root and read subsequent traffic. Leave is best effort, without a durable delivery journal, and a two-member leave does not publish a rekey. | Deliver fresh secrets through keys unavailable to removed members and journal leave/removal delivery. |
-| C4 | Someone holding a live invitation's phrase or QR can attempt admission during the 15-minute window. Safety-code comparison does not establish physical proximity or defeat invite theft. | Add a verified local channel if proximity is required; otherwise retain explicit admission disclosure. |
-| C5 | Key derivation, envelopes, membership signing, and rekey are a custom composition. Protocol vectors freeze behavior but do not show the design is sound. | Replace with MLS (RFC 9420) and complete the integration-only external review. |
-| H1 | Room, socket, queue, request, and SQLite quotas bound work but do not provide caller admission or robust per-source abuse controls. | Add deployment admission controls and perimeter rate limiting before operating a public service. |
-| H2 | Compromise of a retained root permits derivation of keys for stored envelopes. Epoch separation alone does not solve C3. | Introduce an appropriate ratchet and authenticated secret distribution with a migration plan. |
-| H3 | Losing every device loses the group's keys and data. There is no recovery account or server-side plaintext backup. | Define an explicit recovery mechanism before promising recovery. |
-| H4 | A member can leave, but no member can exclude a lost or stolen device. Combined with C3, a stolen device keeps access. | Expose removal of another device, and make it cryptographically effective. |
-| M1 | Stable routes, global cursors, sizes, IP addresses, timing, and acknowledgements expose activity metadata. Aggregate metrics suppress identifiers but transport metadata remains visible. | Evaluate route rotation and privacy-preserving storage metadata for a stronger privacy goal. |
+**C2, fixed.** Every MLS credential is bound to a fingerprint that a user
+verified. The inviter adds a KeyPackage only if its signature key matches the
+joiner fingerprint behind the safety code (`prepare_add` returns
+`FingerprintMismatch` otherwise). The joiner accepts only a Welcome signed by
+the inviter fingerprint from the URL or the authenticated offer. Other members
+accept a new member because a verified member committed the Add; this is
+transitive trust in group members, as C1 already assumes. Evidence:
+`SyncEngineMLSTests.testSubstitutedKeyPackageIsRejected`,
+`testSubstitutedInviterFingerprintIsRejected`,
+`testWelcomeSignedByNonInviterIsRejected`,
+`testStolenInvitationSubstitutingResponseShowsDifferentSafetyCode`,
+`testOfferForgedWithoutInvitationSecretIsRejected`,
+`testApplicationMessageFromNonMemberIsRejected`; Rust
+`fingerprints_and_group_id_are_verified_in_both_directions`,
+`welcome_must_be_signed_by_pinned_inviter_not_just_contain_them`, and
+`replay_tampering_and_unknown_member_are_rejected`.
 
-The protocol lets any valid group member remove another member through a
-signed membership update, but `SyncEngine` does not expose this (H4). This is
-the current no-administrator model, not protection from a malicious co-member. A departing device's already stored plaintext cannot be
-remotely wiped.
+**C3, fixed.** Removal and leave are MLS Remove commits. They start an epoch
+whose secrets the removed leaf cannot derive. The relay revokes the removed
+writer in the same entry. The leave path is durable: the departure journal
+retries the proposal across restarts. Evidence:
+`SyncEngineMLSTests.testRemovedDeviceWithRetainedStateCannotReadLaterEpochs`
+and `testLeaveIsCommittedByRemainingMembersAndLocksOutRetainedState` (groups of
+2 and 3; a full copy of the removed device's MLS state and key fails to decrypt
+later epochs, and the relay refuses its writes and reads past the removal);
+Rust `removed_member_with_retained_state_cannot_read_later_epochs` and
+`leave_proposal_committed_by_another_member_locks_out_retained_state`; relay
+`test_removed_writer_cannot_read_or_write_later_epochs` and
+`test_leave_proposal_revokes_its_sender_and_a_later_commit_removes_it`. The
+residual window before a leave proposal reaches the relay is N3.
 
-### Acceptance rationale
+**H2, fixed.** OpenMLS runs with `max_past_epochs(0)`, so a state snapshot
+holds no secrets of earlier epochs. The per-sender ratchet deletes each message
+key after use. Evidence: Rust
+`state_after_epoch_change_cannot_decrypt_earlier_epoch_messages`, which shows
+that a pre-change state could decrypt a message and the post-change snapshot
+cannot. Also `SyncEngineMLSTests.testStateAfterEpochChangeCannotDecryptEarlierEpochs`,
+which uses the persisted, encrypted state of a real engine: a copy that skips
+the old messages and processes only the commit fails to open them, as does the
+device's own post-change state. Both tests fail under the mutation described
+in the evidence section. The fix covers ciphertext the relay retains. It does
+not protect plaintext on a compromised device, and it does not give
+post-compromise security (N6).
 
-The owner accepted each item below on 2026-10-20. Revisit an acceptance if a
-product claim starts to depend on it.
+**H4, fixed.** `SyncEngine.linkedDevices` lists members and
+`removeDevice(_:)` removes one with an MLS commit. The request is saved first
+and retried until the device leaves the roster. Evidence:
+`testRemovedDeviceWithRetainedStateCannotReadLaterEpochs` (in the group of 3
+the stolen device is offline and a member other than its inviter removes it),
+`testDeviceRemovalSurvivesRestartAndConcurrentRemoval`,
+`testAddedMemberThatNeverJoinsIsRemoved`, and the real-relay
+`RelayIntegrationTests.testPairAndSyncThroughRealRelayOverMLS`, where the
+removed device stops receiving and gets HTTP 403.
 
-- **C1:** Every member can read and edit all tasks by design. Pairwise
-  privacy would not protect task contents from co-members. MLS also gives
-  every member every application message, so the migration does not change this.
-- **C4:** Invitations expire after 15 minutes and need host approval after
-  safety-code comparison. The README and threat model disclose that a stolen
-  invitation admits its holder.
-- **H3:** Accountless operation rules out server-held recovery. Permanent loss
-  when every device is lost is already disclosed to users.
-- **M1:** The relay must route and store ciphertext, so it sees timing, size,
-  and network metadata. No product claim covers metadata privacy.
+### Open blocking findings
 
-## Existing mitigations and evidence
+**C5, fixed in code, pending review.** The custom protocol is gone from the
+client: `SyncCrypto`, `MailboxCrypto`, `GroupMailbox`, `GroupCredentials`,
+the version 1 mailbox and live clients, `LegacyInvitation`, the no-op
+keep-both API, and the version 1 vectors and their tests. Two compositions
+remain outside MLS itself and need the integration-only external review before
+any "audited" or "private" claim:
 
-`GroupSyncTests.testMembershipSnapshotRejectsUnsignedOrForeignIssuer` verifies
-signature and issuer checks when an issuer key is known.
-`testSharedGroupRootCanDeriveForeignPairMailbox` records the C1 boundary by
-showing that a third member derives a foreign pair's keys.
-`testEpochRekeyInvalidatesOldMailboxMaterial` verifies epoch isolation without
-assuming the old root holder cannot learn the rekey seed.
-`testLeavePublishesRemoveAndDropsRoutes` checks the local membership operation;
-it does not prove reliable remote exclusion.
+- **The pairing-frame composition (`PairingChannel.swift`, `Invitation.swift`).**
+  HKDF-SHA256 derives route, pairing token, and two ChaCha20-Poly1305 keys from
+  the invitation secret. The frames carry the offer, the hash commitment, the
+  inviter nonce, the response, and the decision. A 6-digit SAS covers both
+  fingerprints, the group ID, and both nonces. The reviewer should cover the
+  commitment ordering, the SAS reduction, frame replay (N8), and the
+  phrase-only path, where the joiner learns the inviter fingerprint from a
+  frame that any invitation holder can forge.
+- **The OpenMLS integration (`mls/src/lib.rs`, `MLSClient`, `MLSSession`).**
+  This covers proposal filtering (only self-removal), commit validation and
+  merge, credential identity (device ID and writer hash), Welcome signer
+  pinning, pending-commit handling, state encryption at rest, and the relay
+  authorization model.
 
-Pairing recovery, mailbox, and terminal-journal suites check durable completion
-and persist-before-ack behavior. Protocol vectors freeze version 1 key
-derivation, canonical records, encrypted envelopes, and membership snapshots
-against the pre-extraction baseline. The real-server integration test covers
-pairing, live convergence, restart catch-up, and three-member mailbox delivery.
-These tests establish implementation behavior, not the absence of other
-cryptographic attacks.
+**H1, fixed in code by PR #14.** Sibling PR #14 adds per-source token-bucket
+rate limits, per-source concurrency limits, trusted-proxy handling, and
+optional admission tokens on the WebSocket, `/v1/mailbox`, and `/v2/mls`. This
+branch does not contain PR #14. H1 closes when the hardened relay host runs
+with those controls and the perimeter checklist in `server/README.md`.
+
+### Accepted findings
+
+The owner accepted each item below on 2026-10-20. The rationale was rechecked
+under MLS. Revisit an acceptance if a product claim starts to depend on it.
+
+- **C1:** Every member can read and edit all tasks by design. MLS gives every
+  member every application message, so pairwise privacy would not protect task
+  contents from co-members. Holds unchanged.
+- **C4:** A live invitation still admits its holder if the inviter approves. It
+  expires after 15 minutes, approval waits at most 10 minutes, and the README
+  and threat model disclose the risk. The L3 commitment strengthens the
+  rationale. A holder can no longer search offline for a KeyPackage whose code
+  matches the real joiner's code: each attempt matches with probability 10⁻⁶
+  and is visible to the inviter. Because the inviter binds the first
+  commitment, a holder who answers first also blocks the real joiner, which
+  users notice. The phrase path gives the holder the same power to impersonate
+  the inviter to a joiner; comparing codes on both devices detects it.
+  Proximity is still not proven. Holds.
+- **H3:** Accountless operation rules out server-held recovery. Since L3 the
+  task replica and MLS state are also excluded from device backups, so a
+  restored backup has no tasks or link. Losing every device still loses the
+  group. This is disclosed. Holds.
+- **M1:** The relay must route and store ciphertext. It sees timing, sizes, IP
+  addresses, group IDs, cursors, epochs, writer hashes, and add and remove
+  events, which reveal membership churn. No product claim covers metadata
+  privacy. Holds.
+
+### New findings
+
+**N1. An invalid commit blocks a group's sync until it pairs again (Medium).**
+The relay does not parse MLS. It accepts any payload of kind `commit` from a
+current writer at the current epoch and advances its epoch. The relay
+operator can do the same directly in its database. Every client stops at the
+unverifiable commit and reports `syncHistoryBlocked`. Its own appends then
+fail with `epochConflict`, so the group cannot sync in either direction until
+its devices pair into a new group. Tasks stay on each device. Evidence:
+`testInvalidCommitBlocksSyncAndIsSurfaced` and the Swift MLS
+`testInvalidApplicationIsSkippedAndInvalidCommitFailsClosed`. **Proposed
+acceptance:** the relay can already deny service by withholding the log, and
+members are fully trusted (C1). Failing closed is the safe choice; skipping an
+unverifiable commit would fork the group. A later relay could reject commits
+whose MLS framing does not parse, but cannot verify them without group
+secrets.
+
+**N2. No administrator role (Medium).** Any member can remove any other
+member. A thief with an unlocked stolen phone can remove the owner's other
+devices before they remove it; whoever commits first wins. The relay also
+trusts the `removeWriter` field of a commit entry. A member can append a valid
+commit that names another member's writer hash. The victim then loses relay
+access while it is still an MLS member, and its sync retries without success.
+**Proposed acceptance:** consistent with C1, every member is fully trusted; a
+thief with an unlocked device can read all tasks anyway. The README discloses
+the lack of an administrator. A device that is removed this way can pair
+again. An admin role or a removal quorum would change the product model and is
+not planned.
+
+**N3. A departing device keeps its keys until its leave proposal is accepted
+(Medium).** `unlinkAndKeepTasks()` and `eraseLocalData()` move the MLS state
+and key into `mls-v2-departing/` and publish the proposal in the background. If
+the device is offline, the old state stays on it. If the device is stolen
+before the proposal reaches the relay, the other members do not know it left,
+and the thief can keep reading until a member removes the device. **Proposed
+acceptance:** the journal is what makes leave durable instead of best effort
+(C3). The mitigation is H4, removing the device from another phone. The
+example's leave copy should say so for a lost phone.
+
+**N4. After-first-unlock protection for task data and the MLS key (Medium).**
+The MLS state key uses `AfterFirstUnlockThisDeviceOnly`. The replica,
+checkpoint, and MLS database use `completeUntilFirstUserAuthentication`.
+Someone with code execution on, or a forensic image of, a locked device that
+was unlocked once since boot can read tasks and the MLS state. **Proposed
+acceptance:** this is what allows background receive on a locked device to
+persist. Under `complete` protection, received tasks could not be stored until
+the next unlock. The trade-off is documented in THREAT-MODEL.md. The secrets
+stay `ThisDeviceOnly` and out of backups.
+
+**N5. A removed device can read pre-removal history for up to 24 hours (Low).**
+A revoked writer may fetch entries up to its removal cursor until it
+acknowledges that cursor or 24 hours pass. A thief holding a removed, offline
+device can therefore fetch and decrypt the backlog from before the removal
+that the device had not yet processed. Evidence:
+`test_removed_writer_final_read_ack_and_pruning` and
+`test_removed_writer_floor_expires_after_day`. **Proposed acceptance:** these
+are messages from epochs the device belonged to. The device would have
+received them if it had been online, and they are bounded by the removal
+cursor. The window lets a legitimately removed device catch up before it
+erases itself. A shorter window or an opt-out for theft removals would reduce
+it.
+
+**N6. No periodic key update (Medium).** Epochs change only on Add and Remove
+commits. If the MLS state and key of a device are copied without the device
+being removed, for example through a forensic image (N4), the copy keeps
+decrypting new messages until the next membership change. **Not blocking**
+because no product claim covers post-compromise security. Recommended fix:
+periodic self-Update commits (for example daily or every N messages), so that
+H2-style forward secrecy also limits a silent state clone.
+
+**N7. An offline member stops log pruning (Low).** The relay deletes entries
+only after every current writer acknowledges them. A member that never syncs
+holds the whole log, which grows until it reaches 10,000 entries or 16 MiB.
+Every append then fails with `deliveryCapacity`. **Proposed acceptance:**
+removing the inactive device (H4) releases the log, and an added member that
+never joins is already removed after 15 minutes. A relay-side inactivity
+policy could follow with H1.
+
+**N8. Pairing frames have no replay protection or transcript binding (Low).**
+Frames are bound only to the invitation key, direction, and kind byte. Within
+an invitation's lifetime the relay can replay an earlier frame into a later
+attempt. Its effect is limited to aborting pairing: a replayed decision cannot
+cause a join, because the joiner needs a Welcome signed by the inviter for its
+own KeyPackage reference, and a replayed response fails the commitment check.
+**Not blocking.** It is in scope for the C5 review.
 
 ## Product claims
 
-Consumers must disclose full shared access, live-invitation admission, lack of
-recovery and push receive, and the limits of removal and rekey. The example's
-leave text does not claim that a former root holder loses future access.
-Avoid claims of forward secrecy, private traffic between group members,
-reliable remote deletion, or theft-resistant removal until their underlying
-mechanisms change and receive review.
+Consumers may state that task contents are end-to-end encrypted with MLS,
+that the relay cannot read or forge them, and that a removed device cannot read
+later changes. They must disclose:
+
+- full shared access between linked devices (C1);
+- live-invitation admission and the need to compare safety codes (C4);
+- the lack of recovery when every device is lost (H3);
+- that any linked device can remove any other (N2);
+- that removal does not wipe a device, and that a phone lost after leaving
+  should be removed from another phone (N3);
+- that a malicious relay can stop sync until devices pair again (N1);
+- the lack of push receive.
+
+Avoid claims of an independent audit, "private" or audited marketing, metadata
+privacy, privacy between members, post-compromise security, or theft-resistant
+removal until C5 and H1 close and the relevant findings change. The example's
+copy no longer refers to live sockets or mailboxes, and it shows
+`removedFromGroup` on the unpaired screen.
 
 ## Follow-up verification
 
-After `SyncEngine` moves to MLS, re-run this record against the engine. For
-C2, a key substituted for an unverified fingerprint must be rejected. For C3
-and H4, a device removed by another member must fail to decrypt a
-later-epoch operation. For H2, a state snapshot taken after an epoch change
-must not decrypt earlier application messages. Update the protocol version,
-compatibility policy, and threat model with that change.
+- **C5:** run the integration-only external review with the scope listed
+  above, including the pairing-frame composition and N8, and record its
+  findings here.
+- **H1:** after PR #14 merges and the hardened host is deployed, re-run the
+  admission and rate-limit tests against that host and record the perimeter
+  configuration.
+- **N1 to N8:** record the owner's acceptance or a fix for each. If N6 is
+  fixed, add a test showing that a state clone stops decrypting after an
+  Update commit.
+- **H2:** re-run the mutation check, temporarily setting a non-zero
+  `max_past_epochs`, after any OpenMLS upgrade or `config()` change.
+- **Server:** remove `/v1/mailbox` once no supported client release uses
+  version 1, as described in COMPATIBILITY.md.
