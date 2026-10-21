@@ -533,3 +533,21 @@ def test_store_creates_private_database_directory(tmp_path):
     assert not store.is_ready()
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_readiness_bounds_sqlite_write_contention(tmp_path):
+    import time
+    path = tmp_path / "mls.sqlite3"
+    store = MLSDeliveryStore(path)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        assert not store.is_ready(max_wait_seconds=0.05)
+        assert time.monotonic() - started < 1
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert store.is_ready()
+    assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    store.close()

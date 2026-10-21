@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import sqlite3
 import stat
@@ -99,15 +100,27 @@ class MLSDeliveryStore:
         self._db.close()
 
     def is_ready(self, *, max_wait_seconds: float = 0.25) -> bool:
+        deadline = time.monotonic() + max_wait_seconds
         if not self._lock.acquire(timeout=max_wait_seconds):
             return False
+        original_busy_timeout: int | None = None
         try:
+            original_busy_timeout = int(self._db.execute("PRAGMA busy_timeout").fetchone()[0])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._db.execute(f"PRAGMA busy_timeout = {max(1, math.ceil(remaining * 1000))}")
             self._db.execute("BEGIN IMMEDIATE")
             self._db.execute("ROLLBACK")
             return True
         except sqlite3.Error:
             return False
         finally:
+            if original_busy_timeout is not None:
+                try:
+                    self._db.execute(f"PRAGMA busy_timeout = {original_busy_timeout}")
+                except sqlite3.Error:
+                    pass
             self._lock.release()
 
     def request(self, operation: str, document: dict[str, Any]) -> dict[str, Any]:
