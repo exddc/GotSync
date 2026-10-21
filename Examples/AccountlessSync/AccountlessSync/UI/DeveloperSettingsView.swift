@@ -85,7 +85,7 @@ struct DeveloperSettingsView: View {
         Form {
             Section {
                 TextField(
-                    "ws://host:port/v1",
+                    "ws://host:port/v2/pairing",
                     text: $relayURLText,
                     axis: .vertical
                 )
@@ -110,7 +110,7 @@ struct DeveloperSettingsView: View {
                 Text("Relay URL")
             } footer: {
                 Text(
-                    "Must be ws:// or wss:// ending in /v1. Applies on save and restarts the local sync session."
+                    "Must be ws:// or wss:// ending in /v2/pairing. Applies on save and restarts the local sync session."
                 )
             }
 
