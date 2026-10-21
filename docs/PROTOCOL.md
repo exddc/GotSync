@@ -17,6 +17,11 @@ A member's fingerprint is the SHA-256 of its MLS signature public key. The
 relay's `/v2/mls` delivery service holds KeyPackages and an ordered,
 per-group log of commits and application messages.
 
+Any member can invite another device. Pairing always runs between two
+devices: the inviting member and the joining device. After the joiner is
+added, every member reads the same group log, so groups of any size up to
+eight deliver operations the same way.
+
 ### Invitation
 
 An invitation holds a 16-byte random `secret`. The URL form is
