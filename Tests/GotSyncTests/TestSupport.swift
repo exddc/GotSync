@@ -184,6 +184,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
     private var appendsUnavailable = false
+    private(set) var rejectedAppends = 0
     private(set) var lastPublishedReference: Data?
 
     func dropNextAppendResponse() { dropAppendResponse = true }
@@ -242,7 +243,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func append(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
-        if appendsUnavailable { throw URLError(.notConnectedToInternet) }
+        if appendsUnavailable {
+            rejectedAppends += 1
+            throw URLError(.notConnectedToInternet)
+        }
         guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
             throw MLSRelayError.unauthorized
         }

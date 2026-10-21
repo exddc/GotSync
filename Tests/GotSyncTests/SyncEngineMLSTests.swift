@@ -28,7 +28,8 @@ final class SyncEngineMLSTests: XCTestCase {
     private func engine(
         _ name: String,
         approvalTimeoutNanoseconds: UInt64 = SyncTiming.approvalTimeoutNanoseconds,
-        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow
+        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
+        departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000
     ) -> SyncEngine {
         let store = stores[name] ?? MemorySecretStore()
         stores[name] = store
@@ -47,7 +48,8 @@ final class SyncEngineMLSTests: XCTestCase {
             rendezvous: rendezvous,
             syncIntervalNanoseconds: 50_000_000,
             approvalTimeoutNanoseconds: approvalTimeoutNanoseconds,
-            provisionalMemberWindow: provisionalMemberWindow
+            provisionalMemberWindow: provisionalMemberWindow,
+            departureRetryDelayNanoseconds: departureRetryDelayNanoseconds
         )
         engines.append(engine)
         return engine
@@ -658,6 +660,21 @@ final class SyncEngineMLSTests: XCTestCase {
             }
             XCTAssertFalse(leaver.tasks.contains { $0.titleValue == title })
             try await assertLockedOut(retained, replay: replay, group: group)
+        }
+    }
+
+    func testLeaveKeepsRetryingUntilRelayIsReachable() async throws {
+        let host = engine("retry-host")
+        let leaver = engine("retry-leaver", departureRetryDelayNanoseconds: 1_000_000...20_000_000)
+        try await pair(host, leaver)
+        await relay.setAppendsUnavailable(true)
+        leaver.unlinkAndKeepTasks()
+        try await wait("initial attempts exhausted") { await self.relay.rejectedAppends > 12 }
+        await relay.setAppendsUnavailable(false)
+        try await wait("removal committed") { host.linkedMemberCount == 1 && host.isPaired }
+        let departures = root.appendingPathComponent("retry-leaver").appendingPathComponent(SyncEngine.departuresDirectoryName)
+        try await wait("departure erased") {
+            ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
         }
     }
 

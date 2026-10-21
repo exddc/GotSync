@@ -297,6 +297,7 @@ public final class SyncEngine {
     private let syncIntervalNanoseconds: UInt64
     private let approvalTimeoutNanoseconds: UInt64
     private let provisionalMemberWindow: TimeInterval
+    private let departureRetryDelayNanoseconds: ClosedRange<UInt64>
 
     private var pairingAttemptID: UUID?
     private var pairingDeadline: Date?
@@ -348,7 +349,8 @@ public final class SyncEngine {
         rendezvous: (any PairingRendezvous)?,
         syncIntervalNanoseconds: UInt64 = 2_000_000_000,
         approvalTimeoutNanoseconds: UInt64 = SyncTiming.approvalTimeoutNanoseconds,
-        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow
+        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
+        departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000
     ) {
         let baseDirectory = configuration.storageDirectory
         relayURL = configuration.endpoints.relayURL
@@ -364,6 +366,7 @@ public final class SyncEngine {
         self.syncIntervalNanoseconds = syncIntervalNanoseconds
         self.approvalTimeoutNanoseconds = approvalTimeoutNanoseconds
         self.provisionalMemberWindow = provisionalMemberWindow
+        self.departureRetryDelayNanoseconds = departureRetryDelayNanoseconds
         credentialStore = CredentialStore(keychain: secretStore)
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
@@ -1941,13 +1944,14 @@ public final class SyncEngine {
 
     private func startDepartures() {
         guard hasDurableIdentity, departureTask == nil, !departureSlots().isEmpty else { return }
+        let delays = departureRetryDelayNanoseconds
         departureTask = Task { [weak self] in
-            var delayNanoseconds: UInt64 = 1_000_000_000
-            for _ in 0..<6 {
+            var delayNanoseconds = delays.lowerBound
+            while true {
                 guard let self, !Task.isCancelled else { return }
                 if await self.publishDepartures() { break }
                 guard (try? await Task.sleep(nanoseconds: delayNanoseconds)) != nil else { return }
-                delayNanoseconds = min(delayNanoseconds * 2, 30_000_000_000)
+                delayNanoseconds = min(delayNanoseconds * 2, delays.upperBound)
             }
             self?.departureTask = nil
         }
