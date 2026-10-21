@@ -36,9 +36,9 @@ All suites passed on 2026-10-20:
   `MLSClientTests` 21 passed.
 
 Code inspection of `GroupMailbox.swift` and `GroupCredentials.swift` confirms
-that C1, C2, C3, and H2 remain present. It also found a C2 detail missing from
-the previous record: an update carrying a rekey seed from an issuer without a
-pinned key is accepted without any signature check, not only on first use.
+that C1, C2, C3, and H2 remain present. For an issuer without a pinned key,
+`acceptedUpdate(against:)` verifies the signature against the key the snapshot
+itself claims, so an attacker holding the group root can substitute a key.
 `SyncEngine` exposes `leaveGroupAndKeepTasks()` but no operation to remove
 another device.
 
@@ -84,7 +84,7 @@ and the rationale given.
 | ID | Current behavior and impact | Required mitigation |
 | --- | --- | --- |
 | C1 | `GroupMailboxKeyMaterial` derives keys from one shared root. A third member can decrypt another pair's traffic. This is consistent with shared task access, but provides no privacy between members. | Use independently distributed sender or pairwise keys if member privacy becomes a goal. |
-| C2 | Signed membership v2 rejects unsigned and wrong-known-key updates. A roster entry with an empty key can accept a key claimed by the snapshot itself, and an update carrying a rekey seed from such an issuer is accepted unsigned. Join provision does not bind every member's real signing key. | Bind all roster keys during authenticated provision and reject updates for unpinned issuers. |
+| C2 | Signed membership v2 rejects unsigned and wrong-known-key updates. A roster entry with an empty key accepts any key claimed by the snapshot itself, including on updates that carry a rekey seed. Join provision does not bind every member's real signing key. | Bind all roster keys during authenticated provision and reject updates for unpinned issuers. |
 | C3 | Membership messages carry the rekey seed under the previous root. A removed or compromised device retaining that root can derive the next root and read subsequent traffic. Leave is best effort, without a durable delivery journal, and a two-member leave does not publish a rekey. | Deliver fresh secrets through keys unavailable to removed members and journal leave/removal delivery. |
 | C4 | Someone holding a live invitation's phrase or QR can attempt admission during the 15-minute window. Safety-code comparison does not establish physical proximity or defeat invite theft. | Add a verified local channel if proximity is required; otherwise retain explicit admission disclosure. |
 | C5 | Key derivation, envelopes, membership signing, and rekey are a custom composition. Protocol vectors freeze behavior but do not show the design is sound. | Replace with MLS (RFC 9420) and complete the integration-only external review. |
