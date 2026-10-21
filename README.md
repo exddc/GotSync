@@ -40,8 +40,8 @@ import GotSync
 @MainActor
 func makeEngine(storageDirectory: URL) throws -> SyncEngine {
     let configuration = try SyncConfiguration(
-        relayURL: URL(string: "wss://sync.example.com/v1")!,
-        mailboxURL: URL(string: "https://sync.example.com/v1/mailbox")!,
+        relayURL: URL(string: "wss://sync.example.com/v2/pairing")!,
+        mailboxURL: URL(string: "https://sync.example.com/v2/mls")!,
         storageDirectory: storageDirectory,
         invitationURLScheme: "example-app-sync"
     )
@@ -52,8 +52,9 @@ func makeEngine(storageDirectory: URL) throws -> SyncEngine {
 }
 ```
 
-The engine derives its MLS delivery endpoint, `/v2/mls`, from the origin of
-`mailboxURL`. The relay WebSocket is used only while pairing.
+`mailboxURL` is the MLS delivery endpoint and must end in `/v2/mls`.
+`relayURL` must end in `/v2/pairing`; the engine opens that WebSocket only
+while pairing.
 
 Observe `engine.states()` as an `AsyncStream<SyncState>`. Call
 `createPrivateSync()` on the first device, then `joinPrivateSync(url:)` or
@@ -74,7 +75,7 @@ removal, and this device erases its MLS state once the relay has the leave
 request. A removed device reports `SyncError.removedFromGroup` and keeps its
 tasks.
 
-This release speaks protocol version 2 (MLS over `/v2/mls`) and is a breaking
+This release speaks only protocol version 2 (MLS over `/v2/mls`) and is a breaking
 cutover: it contains no version 1 code, so every link created by an earlier
 version must be created again. On first launch the engine clears the old link
 credentials, keeps local tasks, and reports `SyncError.relinkRequired`. Deploy

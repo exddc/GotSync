@@ -5,7 +5,7 @@ import hashlib
 import pytest
 
 from gotsync_server.mls import MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized
-from gotsync_server.mailbox import MailboxError, encode_base64url
+from gotsync_server.http import RequestError, encode_base64url
 
 
 def request(store, operation, **values):
@@ -84,11 +84,11 @@ def test_no_crypto_secrets_in_delivery_schema(tmp_path):
 
 def test_bounds_and_version(tmp_path, monkeypatch):
     store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
-    with pytest.raises(MailboxError):
+    with pytest.raises(RequestError):
         store.request("append", {"version": 1})
-    with pytest.raises(MailboxError):
+    with pytest.raises(RequestError):
         append(store, epoch=True)
-    with pytest.raises(MailboxError):
+    with pytest.raises(RequestError):
         append(store, payload=b"x" * (448 * 1024 + 1))
     monkeypatch.setattr("gotsync_server.mls.MAX_ENTRIES", 0)
     with pytest.raises(DeliveryCapacity):
@@ -119,7 +119,7 @@ def test_writer_metadata_retries_and_group_capacity(tmp_path, monkeypatch):
     package = request(store, "key-package/publish", payload=payload)["reference"]
     with pytest.raises(DeliveryConflict):
         request(store, "key-package/publish", payload=payload, authorization=encode_base64url(b"c" * 32))
-    with pytest.raises(MailboxError):
+    with pytest.raises(RequestError):
         append(store, reference=package, welcome=encode_base64url(b"welcome"), removeWriter=encode_base64url(b"unknown".ljust(32, b"!")))
     assert request(store, "key-package/fetch", reference=package)["payload"] == payload
     append(store, reference=package, welcome=encode_base64url(b"welcome"))
@@ -286,7 +286,7 @@ def test_removed_writer_final_read_ack_and_pruning(tmp_path):
     assert len(request(store, "fetch", group=group, after=0)["entries"]) == 3
     entries = request(store, "fetch", group=group, after=0, authorization=bob)["entries"]
     assert entries[-1]["cursor"] == cursor
-    with pytest.raises(MailboxError):
+    with pytest.raises(RequestError):
         request(store, "ack", route=group, cursor=cursor + 1, authorization=bob)
     request(store, "ack", route=group, cursor=cursor, authorization=bob)
     assert len(request(store, "fetch", group=group, after=0)["entries"]) == 1
@@ -320,7 +320,7 @@ def test_ack_floor_is_monotonic_and_route_local(tmp_path):
     request(store, "create", group=other, authorization=token)
     request(store, "append", group=other, authorization=token, epoch=0, kind="application", payload=encode_base64url(b"other"))
     group = encode_base64url(b"g" * 32)
-    with pytest.raises(MailboxError):
+    with pytest.raises(RequestError):
         request(store, "ack", route=group, cursor=last + 1)
     request(store, "ack", route=group, cursor=last)
     request(store, "ack", route=group, cursor=first)
@@ -338,7 +338,7 @@ def test_paging_defaults_bounds_and_order(tmp_path):
     assert request(store, "fetch", group=group, after=0, limit=32)["entries"] == expected[:32]
     assert request(store, "fetch", group=group, after=expected[31]["cursor"], limit=32)["entries"] == expected[32:]
     for limit in (0, 33, True, -1, "16"):
-        with pytest.raises(MailboxError):
+        with pytest.raises(RequestError):
             request(store, "fetch", group=group, after=0, limit=limit)
     store.close()
 
@@ -373,9 +373,9 @@ def test_http_mount_auth_paging_ack_and_threaded_store(tmp_path, monkeypatch, pr
 
     async def run():
         if production:
-            server = RelayServer(port=0, metrics_port=0, mailbox_port=0, mailbox_database_path=tmp_path / "mailbox.sqlite3")
+            server = RelayServer(port=0, metrics_port=0, delivery_port=0, delivery_database_path=tmp_path / "mls.sqlite3")
             await server.start()
-            port = server.bound_mailbox_port
+            port = server.bound_delivery_port
             store = server.mls.store
         else:
             store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
@@ -487,7 +487,7 @@ def test_leave_proposal_revokes_its_sender_and_a_later_commit_removes_it(tmp_pat
     package = request(store, "key-package/publish", payload=encode_base64url(b"carol package"), authorization=carol)["reference"]
     append(store, payload=b"add carol", epoch=2, reference=package, welcome=encode_base64url(b"welcome"), addWriter=carol_hash)
     for fields in ({"removeWriter": carol_hash}, {"addWriter": carol_hash}):
-        with pytest.raises(MailboxError):
+        with pytest.raises(RequestError):
             append(store, payload=b"bad proposal", epoch=3, kind="proposal", authorization=carol, **fields)
     with pytest.raises(DeliveryConflict):
         append(store, payload=b"stale leave", epoch=2, kind="proposal", authorization=carol)
@@ -521,4 +521,33 @@ def test_removed_writer_cannot_read_or_write_later_epochs(tmp_path):
     for kind in ("application", "proposal", "commit"):
         with pytest.raises(DeliveryUnauthorized):
             append(store, payload=b"removed " + kind.encode(), epoch=2, kind=kind, authorization=bob)
+    store.close()
+
+
+def test_store_creates_private_database_directory(tmp_path):
+    import stat
+    path = tmp_path / "relay-data" / "mls.sqlite3"
+    store = MLSDeliveryStore(path)
+    assert store.is_ready()
+    store.close()
+    assert not store.is_ready()
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_readiness_bounds_sqlite_write_contention(tmp_path):
+    import time
+    path = tmp_path / "mls.sqlite3"
+    store = MLSDeliveryStore(path)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        assert not store.is_ready(max_wait_seconds=0.05)
+        assert time.monotonic() - started < 1
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert store.is_ready()
+    assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     store.close()

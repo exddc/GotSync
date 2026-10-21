@@ -6,7 +6,7 @@ archives are implementation details rather than a supported consumer API.
 
 | Surface | Purpose |
 | --- | --- |
-| `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, and consumer invitation URL scheme. The MLS endpoint `/v2/mls` is derived from the mailbox origin |
+| `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, and consumer invitation URL scheme. `relayURL` ends in `/v2/pairing` and `mailboxURL` in `/v2/mls` |
 | `SyncEngine` | MLS pairing, replication, local task mutations, and transport lifecycle |
 | `SyncState`, `SyncPhase`, `MailboxSyncState` | Immutable snapshots and connection state |
 | `LinkedDevice` | A group member as listed in `SyncState.linkedDevices` and passed to `removeDevice(_:)` |
@@ -149,9 +149,10 @@ block UI responsiveness for large inputs. Moving those operations to a
 dedicated actor needs separate concurrency and performance validation.
 
 The `mailbox*` state members and `BackgroundMailboxScheduling` keep their
-version 1 names. They now describe delivery through the `/v2/mls` log. The
-`mailboxURL` configuration value selects the relay origin; the engine sends no
-requests to its `/v1/mailbox` path.
+version 1 names. They now describe delivery through the `/v2/mls` log.
+`mailboxURL` is the `/v2/mls` delivery endpoint itself, and `relayURL` is the
+`/v2/pairing` WebSocket. Endpoint validation rejects the old `/v1` and
+`/v1/mailbox` paths.
 
 The initial extracted API retains diagnostic error strings and the
 `showsSavingNotice`/`showsLinkCompleteCelebration` progress timing from the
