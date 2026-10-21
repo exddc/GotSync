@@ -31,7 +31,7 @@ def route_text(seed: int) -> str:
 
 def registration(route: str) -> str:
     return json.dumps(
-        {"route": route, "type": "register", "version": 1},
+        {"route": route, "type": "register", "version": 2},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -68,7 +68,7 @@ class RegistrationTests(unittest.TestCase):
         invalid_messages: tuple[str | bytes, ...] = (
             registration(route).encode("utf-8"),
             (
-                '{"type":"register","type":"register","version":1,"route":"'
+                '{"type":"register","type":"register","version":2,"route":"'
                 + route
                 + '"}'
             ),
@@ -77,7 +77,7 @@ class RegistrationTests(unittest.TestCase):
                     "extra": False,
                     "route": route,
                     "type": "register",
-                    "version": 1,
+                    "version": 2,
                 }
             ),
             json.dumps(
@@ -133,15 +133,15 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.mailbox_database_path = os.path.join(
+        self.database_path = os.path.join(
             self.temporary_directory.name,
-            "mailbox.sqlite3",
+            "mls.sqlite3",
         )
         self.relay = RelayServer(
             port=0,
             metrics_port=0,
-            mailbox_port=0,
-            mailbox_database_path=self.mailbox_database_path,
+            delivery_port=0,
+            delivery_database_path=self.database_path,
         )
         await self.relay.start()
         self.clients: list[ClientConnection] = []
@@ -154,7 +154,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.relay.close()
         self.temporary_directory.cleanup()
 
-    async def open_client(self, path: str = "/v1") -> ClientConnection:
+    async def open_client(self, path: str = "/v2/pairing") -> ClientConnection:
         client = await connect(
             f"ws://127.0.0.1:{self.relay.websocket_port}{path}",
             compression=None,
@@ -170,8 +170,8 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.relay = RelayServer(
             port=0,
             metrics_port=0,
-            mailbox_port=0,
-            mailbox_database_path=self.mailbox_database_path,
+            delivery_port=0,
+            delivery_database_path=self.database_path,
             **limits,
         )
         await self.relay.start()
@@ -248,7 +248,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await third.send(registration(route))
 
         error = json.loads(await asyncio.wait_for(third.recv(), 1))
-        self.assertEqual(error, {"code": "routeFull", "type": "error", "version": 1})
+        self.assertEqual(error, {"code": "routeFull", "type": "error", "version": 2})
         with self.assertRaises(ConnectionClosed) as closed:
             await third.recv()
         self.assertEqual(closed.exception.rcvd.code, 1008)
@@ -271,7 +271,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         rejected = await self.open_client()
         self.assertEqual(
             json.loads(await asyncio.wait_for(rejected.recv(), 1)),
-            {"code": "relayBusy", "type": "error", "version": 1},
+            {"code": "relayBusy", "type": "error", "version": 2},
         )
         with self.assertRaises(ConnectionClosed) as closed:
             await rejected.recv()
@@ -305,7 +305,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await rejected.send(registration(route_text(52)))
         self.assertEqual(
             json.loads(await asyncio.wait_for(rejected.recv(), 1)),
-            {"code": "relayBusy", "type": "error", "version": 1},
+            {"code": "relayBusy", "type": "error", "version": 2},
         )
         with self.assertRaises(ConnectionClosed) as closed:
             await rejected.recv()
@@ -313,7 +313,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             json.loads(await asyncio.wait_for(waiting.recv(), 1)),
-            {"code": "waitingExpired", "type": "error", "version": 1},
+            {"code": "waitingExpired", "type": "error", "version": 2},
         )
         with self.assertRaises(ConnectionClosed) as expired:
             await waiting.recv()
@@ -347,11 +347,11 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await second.close()
         self.assertEqual(
             json.loads(await asyncio.wait_for(first.recv(), 1)),
-            {"type": "peerLeft", "version": 1},
+            {"type": "peerLeft", "version": 2},
         )
         self.assertEqual(
             json.loads(await asyncio.wait_for(first.recv(), 1)),
-            {"code": "waitingExpired", "type": "error", "version": 1},
+            {"code": "waitingExpired", "type": "error", "version": 2},
         )
         with self.assertRaises(ConnectionClosed) as expired:
             await first.recv()
@@ -367,7 +367,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await second.close()
 
         peer_left = json.loads(await asyncio.wait_for(first.recv(), 1))
-        self.assertEqual(peer_left, {"type": "peerLeft", "version": 1})
+        self.assertEqual(peer_left, {"type": "peerLeft", "version": 2})
         await first.close()
         await wait_until(lambda: self.relay.service.room_count == 0)
         self.assertEqual(self.relay.service.connection_count, 0)
@@ -382,10 +382,12 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.relay.service.room_count, 1)
 
     async def test_only_generic_path_and_binary_frames_are_accepted(self) -> None:
-        wrong_path = await self.open_client("/v1?route=leak")
-        with self.assertRaises(ConnectionClosed) as path_close:
-            await wrong_path.recv()
-        self.assertEqual(path_close.exception.rcvd.code, 1008)
+        for path in ("/v2/pairing?route=leak", "/v1"):
+            with self.subTest(path=path):
+                wrong_path = await self.open_client(path)
+                with self.assertRaises(ConnectionClosed) as path_close:
+                    await wrong_path.recv()
+                self.assertEqual(path_close.exception.rcvd.code, 1008)
 
         route = route_text(90)
         first, _ = await self.registered_pair(route)
@@ -396,7 +398,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_websocket_compression_is_not_negotiated(self) -> None:
         client = await connect(
-            f"ws://127.0.0.1:{self.relay.websocket_port}/v1",
+            f"ws://127.0.0.1:{self.relay.websocket_port}/v2/pairing",
             compression="deflate",
         )
         self.clients.append(client)
@@ -427,11 +429,11 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         health_status, health, _ = await self.http_request("GET", "/healthz")
         self.assertEqual(health_status, 200)
-        self.assertEqual(health, {"status": "ok", "version": 1, "supportedVersions": [1]})
+        self.assertEqual(health, {"status": "ok", "version": 2, "supportedVersions": [2]})
 
         ready_status, ready, _ = await self.http_request("GET", "/readyz")
         self.assertEqual(ready_status, 200)
-        self.assertEqual(ready, {"status": "ready", "version": 1})
+        self.assertEqual(ready, {"status": "ready", "version": 2})
 
         status, metrics, raw_metrics = await self.http_request("GET", "/metrics")
         self.assertEqual(status, 200)
@@ -499,7 +501,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         for options in (
             {"host": "0.0.0.0"},
-            {"mailbox_host": "0.0.0.0"},
+            {"delivery_host": "0.0.0.0"},
         ):
             with self.subTest(options=options):
                 with self.assertRaisesRegex(ValueError, "loopback"):
@@ -511,20 +513,46 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             relay = RelayServer(
                 host="0.0.0.0",
-                mailbox_host="0.0.0.0",
-                mailbox_database_path=os.path.join(
+                delivery_host="0.0.0.0",
+                delivery_database_path=os.path.join(
                     temporary_directory,
-                    "mailbox.sqlite3",
+                    "mls.sqlite3",
                 ),
                 allow_insecure_non_loopback=True,
             )
             await relay.close()
 
-    async def test_readiness_reports_closed_mailbox_store(self) -> None:
-        self.relay.mailbox.close()
+    async def test_readiness_reports_closed_delivery_store(self) -> None:
+        self.relay.mls.store.close()
         status, document, _ = await self.http_request("GET", "/readyz")
         self.assertEqual(status, 503)
         self.assertEqual(
             document,
-            {"status": "unavailable", "version": 1},
+            {"status": "unavailable", "version": 2},
         )
+
+    async def test_delivery_listener_serves_only_mls_paths(self) -> None:
+        for target in ("/v1/mailbox/fetch", "/v2/mailbox/fetch", "/v2/mls"):
+            with self.subTest(target=target):
+                reader, writer = await asyncio.open_connection(
+                    "127.0.0.1", self.relay.bound_delivery_port
+                )
+                writer.write(
+                    (
+                        f"POST {target} HTTP/1.1\r\n"
+                        "Host: localhost\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 13\r\n"
+                        "\r\n"
+                        '{"version":2}'
+                    ).encode("ascii")
+                )
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), 1)
+                writer.close()
+                await writer.wait_closed()
+                head, body = response.split(b"\r\n\r\n", 1)
+                self.assertTrue(head.startswith(b"HTTP/1.1 404 "))
+                self.assertEqual(
+                    json.loads(body), {"error": "notFound", "version": 2}
+                )

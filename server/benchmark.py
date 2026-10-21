@@ -15,7 +15,7 @@ from websockets.asyncio.client import connect
 def registration(route: bytes) -> str:
     encoded = base64.urlsafe_b64encode(route).rstrip(b"=").decode("ascii")
     return json.dumps(
-        {"route": encoded, "type": "register", "version": 1},
+        {"route": encoded, "type": "register", "version": 2},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -61,7 +61,7 @@ async def run(url: str, iterations: int, payload_bytes: int) -> dict[str, float 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark the volatile relay")
-    parser.add_argument("--url", default="ws://127.0.0.1:8765/v1")
+    parser.add_argument("--url", default="ws://127.0.0.1:8765/v2/pairing")
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--payload-bytes", type=int, default=256)
     arguments = parser.parse_args()

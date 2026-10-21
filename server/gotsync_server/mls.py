@@ -3,16 +3,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import sqlite3
+import stat
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from .mailbox import MailboxError, decode_canonical_base64url, encode_base64url
-from .http import read_http_json_request, parse_mailbox_json, write_http_response
+from .http import (
+    RequestError,
+    decode_canonical_base64url,
+    encode_base64url,
+    parse_json_object,
+    read_http_json_request,
+    write_http_response,
+)
+from .protocol import PROTOCOL_VERSION as VERSION
 
-VERSION = 2
 MAX_PAYLOAD = 448 * 1024
 MAX_ENTRIES = 10_000
 MAX_BYTES = 16 * 1024 * 1024
@@ -20,17 +28,17 @@ DEFAULT_MAX_PACKAGES = 4096
 DEFAULT_MAX_GROUPS = 4096
 
 
-class DeliveryConflict(MailboxError):
+class DeliveryConflict(RequestError):
     status = 409
     code = "epochConflict"
 
 
-class DeliveryCapacity(MailboxError):
+class DeliveryCapacity(RequestError):
     status = 429
     code = "deliveryCapacity"
 
 
-class DeliveryUnauthorized(MailboxError):
+class DeliveryUnauthorized(RequestError):
     status = 403
     code = "unauthorized"
 
@@ -38,24 +46,30 @@ class DeliveryUnauthorized(MailboxError):
 def blob(doc: dict, name: str, size: int | None = None, maximum: int = MAX_PAYLOAD) -> bytes:
     result = decode_canonical_base64url(doc.get(name), field=name, exact_bytes=size, maximum_bytes=maximum)
     if not result:
-        raise MailboxError(f"{name} must not be empty")
+        raise RequestError(f"{name} must not be empty")
     return result
 
 
 def number(doc: dict, name: str, default: int | None = None) -> int:
     result = doc.get(name, default)
     if type(result) is not int or not 0 <= result < 2**53:
-        raise MailboxError(f"invalid {name}")
+        raise RequestError(f"invalid {name}")
     return result
 
 
 class MLSDeliveryStore:
-    def __init__(self, path: Path, *, max_groups: int = DEFAULT_MAX_GROUPS, max_packages: int = DEFAULT_MAX_PACKAGES) -> None:
+    def __init__(self, path: str | os.PathLike[str], *, max_groups: int = DEFAULT_MAX_GROUPS, max_packages: int = DEFAULT_MAX_PACKAGES) -> None:
         if type(max_groups) is not int or type(max_packages) is not int or min(max_groups, max_packages) <= 0:
             raise ValueError("directory limits must be positive integers")
         self.max_groups = max_groups
         self.max_packages = max_packages
         self._lock = threading.Lock()
+        path = Path(path)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.close(os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600))
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ValueError("delivery database path must be a regular file")
+        path.chmod(0o600)
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.executescript("""
@@ -84,9 +98,21 @@ class MLSDeliveryStore:
     def close(self) -> None:
         self._db.close()
 
+    def is_ready(self, *, max_wait_seconds: float = 0.25) -> bool:
+        if not self._lock.acquire(timeout=max_wait_seconds):
+            return False
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute("ROLLBACK")
+            return True
+        except sqlite3.Error:
+            return False
+        finally:
+            self._lock.release()
+
     def request(self, operation: str, document: dict[str, Any]) -> dict[str, Any]:
         if type(document.get("version")) is not int or document["version"] != VERSION:
-            raise MailboxError("unsupported version")
+            raise RequestError("unsupported version")
         with self._lock, self._db:
             self._db.execute("DELETE FROM mls_packages WHERE expires <= ?", (time.time(),))
             self._expire_empty_groups()
@@ -101,7 +127,7 @@ class MLSDeliveryStore:
         }
         handler = operations.get(operation)
         if handler is None:
-            raise MailboxError("unknown MLS operation")
+            raise RequestError("unknown MLS operation")
         return handler(doc)
 
     def _publish(self, doc: dict) -> dict:
@@ -122,7 +148,7 @@ class MLSDeliveryStore:
         reference = blob(doc, "reference", 32)
         try:
             pairing = hashlib.sha256(blob(doc, "pairingToken", 32)).digest()
-        except MailboxError as error:
+        except RequestError as error:
             raise DeliveryUnauthorized("pairing token required") from error
         row = self._db.execute("SELECT payload,pairing FROM mls_packages WHERE reference=?", (reference,)).fetchone()
         if row and row[1] != pairing:
@@ -146,7 +172,7 @@ class MLSDeliveryStore:
     def _authorize(self, doc: dict, route: bytes, *, writing: bool = False) -> tuple:
         try:
             writer = hashlib.sha256(blob(doc, "authorization", 32)).digest()
-        except MailboxError as error:
+        except RequestError as error:
             raise DeliveryUnauthorized("writer token required") from error
         row = self._db.execute("SELECT ack,removal,removed_at FROM mls_writers WHERE route=? AND digest=?", (route, writer)).fetchone()
         if row is None or (row[1] is not None and (writing or row[0] >= row[1] or time.time() >= row[2] + 86400)):
@@ -159,7 +185,7 @@ class MLSDeliveryStore:
         after = number(doc, "after")
         limit = number(doc, "limit", default=16)
         if not 1 <= limit <= 32:
-            raise MailboxError("invalid limit")
+            raise RequestError("invalid limit")
         rows = self._db.execute(
             "SELECT cursor,epoch,kind,payload,welcome,package,removed_writer,added_writer FROM mls_entries WHERE route=? AND cursor>? AND cursor<=? ORDER BY cursor LIMIT ?",
             (route, after, removal if removal is not None else 2**53, limit),
@@ -172,7 +198,7 @@ class MLSDeliveryStore:
         cursor = number(doc, "cursor")
         head = self._db.execute("SELECT head FROM mls_groups WHERE route=?", (route,)).fetchone()[0]
         if cursor > head or (removal is not None and cursor > removal):
-            raise MailboxError("cursor exceeds readable log")
+            raise RequestError("cursor exceeds readable log")
         self._db.execute("UPDATE mls_writers SET ack=MAX(ack,?) WHERE route=? AND digest=?", (cursor, route, writer))
         self._prune()
         return {}
@@ -221,24 +247,24 @@ class MLSDeliveryStore:
         epoch = number(doc, "epoch")
         kind = doc.get("kind")
         if kind not in ("commit", "application", "proposal"):
-            raise MailboxError("invalid kind")
+            raise RequestError("invalid kind")
         payload = blob(doc, "payload")
         welcome = blob(doc, "welcome") if doc.get("welcome") is not None else None
         package = blob(doc, "reference", 32) if doc.get("reference") is not None else None
         removed_writer = blob(doc, "removeWriter", 32) if doc.get("removeWriter") is not None else None
         added_writer = blob(doc, "addWriter", 32) if doc.get("addWriter") is not None else None
         if removed_writer is not None and (kind != "commit" or removed_writer == writer):
-            raise MailboxError("invalid writer removal")
+            raise RequestError("invalid writer removal")
         if (welcome is None) != (package is None) or (welcome is None) != (added_writer is None) or (welcome is not None and kind != "commit"):
-            raise MailboxError("Welcome requires commit and KeyPackage reference")
+            raise RequestError("Welcome requires commit and KeyPackage reference")
         if kind == "proposal" and removed_writer is not None:
-            raise MailboxError("a proposal can only remove its sender")
+            raise RequestError("a proposal can only remove its sender")
         return epoch, kind, payload, welcome, package, removed_writer, added_writer
 
     def _check_membership(self, route: bytes, entry: tuple) -> bool:
         _, _, _, _, package, removed_writer, added_writer = entry
         if removed_writer and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=?", (route, removed_writer)).fetchone():
-            raise MailboxError("writer removal target is unknown")
+            raise RequestError("writer removal target is unknown")
         joining = self._db.execute("SELECT writer FROM mls_packages WHERE reference=?", (package,)).fetchone() if package else None
         if package and (not joining or joining[0] != added_writer):
             return False
@@ -310,7 +336,7 @@ class MLSDeliveryServer:
                 await write_http_response(writer, 404, {"error": "notFound", "version": VERSION})
                 return
             await self.handle_request(target, headers, body, writer)
-        except MailboxError as error:
+        except RequestError as error:
             await write_http_response(writer, error.status, {"error": error.code, "version": VERSION})
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
@@ -329,8 +355,8 @@ class MLSDeliveryServer:
     async def handle_request(self, target: str, headers: dict, body: bytes, writer: asyncio.StreamWriter) -> None:
         try:
             if headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
-                raise MailboxError("content type must be application/json")
-            document = parse_mailbox_json(body)
+                raise RequestError("content type must be application/json")
+            document = parse_json_object(body)
             document.pop("authorization", None)
             authorization = headers.get("authorization", "")
             scheme, _, token = authorization.partition(" ")
@@ -338,7 +364,7 @@ class MLSDeliveryServer:
                 document["authorization"] = token
             result = await asyncio.to_thread(self.store.request, target.removeprefix("/v2/mls/"), document)
             await write_http_response(writer, 409 if "error" in result else 200, result)
-        except MailboxError as error:
+        except RequestError as error:
             await write_http_response(writer, error.status, {"error": error.code, "version": VERSION})
         except ConnectionError:
             raise

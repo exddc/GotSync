@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "gotsync-server"
 version = "0.1.0"
-description = "An opaque WebSocket relay and durable encrypted mailbox for GotSync"
+description = "An opaque pairing relay and MLS delivery service for GotSync"
 requires-python = ">=3.11"
 dependencies = ["websockets==15.0.1"]
 license = "MIT"
