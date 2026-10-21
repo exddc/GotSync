@@ -4,9 +4,10 @@ This relay forwards opaque live frames and stores encrypted mailbox envelopes fo
 It provides two transports:
 
 - A volatile WebSocket path routes opaque binary messages between two live
-  peers with low latency.
+  peers with low latency. Pairing and two-member groups use it.
 - A persistent HTTP mailbox stores opaque, end-to-end-encrypted envelopes so a
-  device can publish changes while its peer is offline.
+  device can publish changes while other members are offline. Groups with
+  three to eight members deliver through per-recipient mailboxes only.
 
 The relay does not encrypt, decrypt, or inspect application envelopes. Live
 frames are never persisted or buffered before a peer arrives. The mailbox

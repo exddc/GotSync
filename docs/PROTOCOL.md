@@ -8,6 +8,12 @@ must stay consistent with it. The construction uses standard CryptoKit
 primitives, but the composition has not received an independent security audit
 and must not be treated as production cryptography.
 
+A sync group links up to eight devices. Pairing always runs between two
+devices: an existing member that issues the invitation and the joining device.
+The pairing and live-connection sections below describe that two-device
+exchange. [Multi-device groups](#multi-device-groups) describes how members
+beyond the second device receive operations.
+
 ## Goals and invariants
 
 - The relay never receives a task title, completion value, long-term pair root,
@@ -880,4 +886,5 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the version matrix and deployment o
 
 ## Multi-device groups
 
-Groups contain up to eight members. Founding two-member groups use the live two-socket room and durable mailbox. Groups with three or more members deliver operations through per-recipient mailboxes. A relay room accepts at most two sockets by default, independently of the group-size limit. Membership snapshots use signed version 2 records; the shared-root and signing-key limitations are documented in THREAT-MODEL.md and SECURITY-RED-TEAM.md.
+Groups contain up to eight members. Any member can invite another device; the
+inviter acts as host (role A) for that pairing. Founding two-member groups use the live two-socket room and durable mailbox. Groups with three or more members deliver operations through per-recipient mailboxes. A relay room accepts at most two sockets by default, independently of the group-size limit. Membership snapshots use signed version 2 records; the shared-root and signing-key limitations are documented in THREAT-MODEL.md and SECURITY-RED-TEAM.md.
