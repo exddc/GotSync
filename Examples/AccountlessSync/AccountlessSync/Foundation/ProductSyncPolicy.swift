@@ -7,7 +7,7 @@ import Foundation
 /// or the next time they open. There is no push path yet.
 ///
 /// **Send (background-capable):** this iPhone uploads pending edits to the
-/// private mailbox while Accountless Sync is open and while iOS grants background time.
+/// relay as MLS messages while Accountless Sync is open and while iOS grants background time.
 /// Incomplete uploads are durable and retry on the next launch.
 enum ProductSyncPolicy {
     /// Single product number for invitation QR/phrase, host expiry, UI countdown,
@@ -88,6 +88,26 @@ enum ProductSyncPolicy {
     static let safetyCodeDetail =
         "Compare this code with the other phone. Matching digits confirm both phones are in the same setup. This does not stop someone who already has your live invite code."
 
+    static func linkEndedTitle(for reason: SyncError) -> String {
+        switch reason {
+        case .removedFromGroup:
+            "Removed from sync"
+        case .relinkRequired:
+            "Link again to sync"
+        default:
+            "Link ended"
+        }
+    }
+
+    static func linkEndedDetail(for reason: SyncError) -> String {
+        switch reason {
+        case .removedFromGroup:
+            "Another linked phone removed this iPhone. It no longer receives changes, and your tasks stay on this iPhone."
+        default:
+            reason.errorDescription ?? "Your tasks stay on this iPhone."
+        }
+    }
+
     static func linkedStatusSummary(memberCount: Int) -> String {
         let phones = memberCount == 1 ? "1 phone" : "\(memberCount) phones"
         return "Linked with \(phones)."
@@ -109,6 +129,8 @@ enum ProductSyncPolicy {
 enum ConsumerCopyBanlist {
     static let bannedTokens = [
         "ciphertext",
+        "mailbox",
+        "live relay",
         "version vector",
         "version vectors",
         "durably applies",

@@ -3,12 +3,15 @@ import XCTest
 @testable import GotSync
 
 final class ProtocolCompatibilityTests: XCTestCase {
-    func testWireVersionIsRejectedBeforeUnknownKind() throws {
-        for body in [#"{"version":2,"kind":"future"}"#, #"{"version":0,"kind":"hello"}"#, #"{"kind":"hello"}"#, #"{"version":true,"kind":"hello"}"#] {
-            XCTAssertThrowsError(try WireCodec.decode(SyncWireMessage.self, from: Data(body.utf8))) { error in
-                XCTAssertEqual(error as? WireMessageError, .invalidVersion)
-            }
-        }
+    func testInvitationSecretsAreFreshAndRoundTripThroughPhrase() throws {
+        let group = Data(repeating: 0x01, count: 32)
+        let fingerprint = Data(repeating: 0x02, count: 32)
+        let first = try Invitation.generate(groupID: group, inviterFingerprint: fingerprint)
+        let second = try Invitation.generate(groupID: group, inviterFingerprint: fingerprint)
+        XCTAssertEqual(first.secret.count, 16)
+        XCTAssertNotEqual(first.secret, second.secret)
+        XCTAssertEqual(try Invitation.from(phrase: first.phrase).secret, first.secret)
+        XCTAssertEqual(SyncTiming.invitationTimeToLive, 15 * 60)
     }
 
     func testConfigurationDefaultsToProductionInEveryBuild() {

@@ -1,8 +1,8 @@
 # Threat model
 
 This document is for consumers assessing GotSync and operators deploying its
-relay. It describes the implemented task-sync model, rather than a security
-certification. See PROTOCOL.md for formats and SECURITY-RED-TEAM.md for findings.
+relay. It describes the implemented task-sync model of protocol version 2, which
+runs on MLS (RFC 9420) through OpenMLS, rather than a security certification. See PROTOCOL.md for formats and SECURITY-RED-TEAM.md for findings.
 
 ## Assets and trust boundaries
 
@@ -97,25 +97,54 @@ These mechanisms have limits:
 - Removal and leave do not delete tasks the device already received, and
   cannot wipe a device remotely.
 - A device that never comes online again stays a member until someone
-  removes it.
+  removes it. Its missing acknowledgements also stop the relay from pruning
+  the log, which fills up after 10,000 entries or 16 MiB.
+- A leaving device keeps its old MLS state and key in the departure journal
+  until the relay accepts its proposal. If the device is stolen before the
+  proposal reaches the relay, the other members do not know it left, and the
+  thief can read new messages until a member removes the device.
+- For up to 24 hours after removal, a removed device can still fetch log
+  entries from before its removal that it had not acknowledged, and decrypt
+  them with its retained state. These are messages it was entitled to read
+  while it was a member.
+- The relay trusts the `removeWriter` field of a commit entry and does not
+  parse MLS. A member can revoke another member's relay access with an entry
+  whose MLS content does not remove it.
+
+## Forward secrecy and key updates
+
+The group uses OpenMLS with `max_past_epochs(0)`. A device's state, taken after
+an epoch change, cannot decrypt application messages from earlier epochs, and
+the per-sender ratchet deletes each message key once it is used. Ciphertext
+the relay retains from earlier epochs is therefore safe from a later state
+compromise. This does not cover plaintext: the task replica on each device
+holds every task it has received.
+
+Epochs change only on membership commits. Members do not send periodic Update
+commits, so state copied from a device without its removal keeps decrypting
+new messages until the next Add or Remove. Removing the device ends this.
 
 ## Unresolved limits
 
 Pairing frames on the relay WebSocket use ChaCha20-Poly1305 with keys derived
 from the invitation secret through HKDF-SHA256. They carry only the group ID,
 fingerprints, nonces, a commitment, and a KeyPackage reference. MLS secures
-everything after the Welcome. The MLS integration has not received an
-independent review.
+everything after the Welcome. This pairing composition and the MLS integration
+have not received an independent review.
 
-The relay can deny service. The relay enforces per-source connection and
-request rate limits, per-source concurrency limits, and optional deployment
-admission by network allowlist or proxy-injected token. These bound what one
-address or IPv6 `/64` can consume, but anonymous clients spread across many
-addresses can still exhaust capacity despite bounded rooms, request bodies,
-mailbox quotas, and delivery logs. Operators remain responsible for the TLS
-proxy, trusted-proxy configuration, perimeter rate limits and DDoS protection,
-firewalling the relay ports, backup policy, and deployment monitoring. See the
-relay README for the perimeter checklist.
+The relay can deny service. The delivery service accepts any opaque payload
+from a current writer as a commit, so the relay itself, or a member, can
+append a commit that no client can verify. Every client then stops at that
+entry and reports `SyncError.syncHistoryBlocked` until its device pairs again.
+The relay enforces per-source connection and request rate limits, per-source
+concurrency limits, and optional deployment admission by network allowlist or
+proxy-injected token. These bound what one address or IPv6 `/64` can consume,
+but anonymous clients spread across many addresses can still exhaust capacity
+despite bounded rooms, request bodies, mailbox quotas, and delivery logs.
+Operators remain responsible for the TLS proxy, trusted-proxy configuration,
+perimeter rate limits and DDoS protection, firewalling the relay ports, backup
+policy, and deployment monitoring. See the relay README for the perimeter
+checklist.
 
 ## Delivery and loss
 

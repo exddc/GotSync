@@ -46,6 +46,11 @@ struct WelcomeView: View {
 
                     Spacer()
 
+                    if model.phase != .failed, let reason = model.linkEndedReason {
+                        LinkEndedNotice(reason: reason)
+                            .relayCard(padding: 14)
+                    }
+
                     Label(
                         ProductSyncPolicy.dataRecoveryDisclosure,
                         systemImage: "exclamationmark.circle"

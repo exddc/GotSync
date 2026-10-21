@@ -74,9 +74,11 @@ removal, and this device erases its MLS state once the relay has the leave
 request. A removed device reports `SyncError.removedFromGroup` and keeps its
 tasks.
 
-Links created by earlier versions must be created again. On first launch the
-engine clears the old link credentials, keeps local tasks, and reports
-`SyncError.relinkRequired`.
+This release speaks protocol version 2 (MLS over `/v2/mls`) and is a breaking
+cutover: it contains no version 1 code, so every link created by an earlier
+version must be created again. On first launch the engine clears the old link
+credentials, keeps local tasks, and reports `SyncError.relinkRequired`. Deploy
+the relay before the clients; see [compatibility](docs/COMPATIBILITY.md).
 
 Local mutations use `addTask(title:)`, `toggleTask(_:)`, and `deleteTasks(ids:)`.
 Forward application lifecycle events to `applicationDidBecomeActive()` and
@@ -129,8 +131,9 @@ editable; unlink and pair again to keep syncing.
 
 Removing a device stops it from reading later changes, but it keeps the tasks
 it already has and cannot be wiped remotely. Any member can remove any other
-member; there is no administrator. The MLS integration has not received an
-independent review. Read the [threat model](docs/THREAT-MODEL.md) and
+member; there is no administrator. The MLS integration and the pairing-frame
+construction have not received an independent review, so do not describe this
+library as audited. Read the [threat model](docs/THREAT-MODEL.md) and
 [red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
 
 ## Test
@@ -144,7 +147,7 @@ scripts/test-integration.sh
 
 The integration script starts the actual Python relay with a temporary SQLite
 database, checks readiness, runs Swift tests, and stops the server on exit. Its
-integration test pairs three engines over MLS and verifies live delivery,
+integration test pairs three engines over MLS and verifies delivery while active,
 offline catch-up after restart, multi-device convergence, and that a removed
 device stops receiving while the others keep converging. `scripts/test-swift.sh`
 runs unit tests and explicitly skips that integration test. Swift build files

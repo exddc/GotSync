@@ -34,7 +34,7 @@ struct JoinSyncSheet: View {
 
                     if model.hasLocalReplicaHistory {
                         Label(
-                            "Local tasks stay on this phone during setup. If the lists differ, you’ll choose how to combine them before the link finishes.",
+                            "Local tasks stay on this phone. After linking, they are added to the shared list.",
                             systemImage: "iphone.and.arrow.forward"
                         )
                         .font(.footnote)

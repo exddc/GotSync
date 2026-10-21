@@ -10,37 +10,6 @@ public enum MnemonicError: Error, Equatable {
     case unsupportedVersion
 }
 
-struct LegacyInvitation: Equatable, Sendable {
-    let secret: Data
-
-    init(secret: Data) throws {
-        guard secret.count == 16 else {
-            throw MnemonicError.invalidSecretLength
-        }
-        self.secret = secret
-    }
-
-    var phrase: String {
-        MnemonicCodec.encode(secret)
-    }
-
-    var pairRoute: Data {
-        SyncKeyDerivation.derive(
-            input: secret,
-            label: "\(ProtocolDomains.namespace)/pair-route/v1",
-            count: 32
-        )
-    }
-
-    var pairPSK: Data {
-        SyncKeyDerivation.derive(
-            input: secret,
-            label: "\(ProtocolDomains.namespace)/pair-psk/v1",
-            count: 32
-        )
-    }
-}
-
 enum MnemonicCodec {
     /// 256 single words (one per byte). No hyphens or compound tokens.
     static let words: [String] = [
