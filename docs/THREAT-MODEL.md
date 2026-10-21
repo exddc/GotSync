@@ -136,9 +136,15 @@ The relay can deny service. The delivery service accepts any opaque payload
 from a current writer as a commit, so the relay itself, or a member, can
 append a commit that no client can verify. Every client then stops at that
 entry and reports `SyncError.syncHistoryBlocked` until its device pairs again.
-Anonymous clients can exhaust capacity despite bounded rooms, request bodies,
-and delivery logs. Admission controls, perimeter rate limits, backup policy,
-and deployment monitoring are operator responsibilities.
+The relay enforces per-source connection and request rate limits, per-source
+concurrency limits, and optional deployment admission by network allowlist or
+proxy-injected token. These bound what one address or IPv6 `/64` can consume,
+but anonymous clients spread across many addresses can still exhaust capacity
+despite bounded rooms, request bodies, mailbox quotas, and delivery logs.
+Operators remain responsible for the TLS proxy, trusted-proxy configuration,
+perimeter rate limits and DDoS protection, firewalling the relay ports, backup
+policy, and deployment monitoring. See the relay README for the perimeter
+checklist.
 
 ## Delivery and loss
 

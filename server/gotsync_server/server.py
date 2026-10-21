@@ -9,14 +9,35 @@ import logging
 import math
 import os
 import signal
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Request, Response
 
+from .admission import (
+    DEFAULT_CLIENT_IP_HEADER,
+    DEFAULT_HTTP_REQUEST_BURST,
+    DEFAULT_HTTP_REQUEST_RATE,
+    DEFAULT_IPV6_SOURCE_PREFIX,
+    DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE,
+    DEFAULT_MAX_TRACKED_SOURCES,
+    DEFAULT_MAX_WEBSOCKETS_PER_SOURCE,
+    DEFAULT_WEBSOCKET_CONNECT_BURST,
+    DEFAULT_WEBSOCKET_CONNECT_RATE,
+    AdmissionConfig,
+    AdmissionController,
+    ClientSource,
+    RateLimit,
+    Rejection,
+    parse_network,
+    read_admission_tokens,
+)
 from .http import (
     MAX_HTTP_HEADER_BYTES,
     encode_json_document,
@@ -89,6 +110,12 @@ WAITING_EXPIRED = json.dumps(
     separators=(",", ":"),
     sort_keys=True,
 )
+RATE_LIMITED = json.dumps(
+    {"code": "rateLimited", "type": "error", "version": PROTOCOL_VERSION},
+    separators=(",", ":"),
+    sort_keys=True,
+)
+ADMISSION_TOKEN_FILE_ENVIRONMENT = "GOTSYNC_ADMISSION_TOKEN_FILE"
 
 COUNTER_NAMES = (
     "websocket_connections_opened",
@@ -117,6 +144,9 @@ COUNTER_NAMES = (
     "mailbox_messages_fetched",
     "mailbox_messages_acked",
     "mailbox_routes_forgotten",
+    "admission_rejections",
+    "rate_limit_rejections",
+    "source_concurrency_rejections",
     "internal_errors",
 )
 
@@ -285,6 +315,7 @@ class RelayService:
         max_rooms: int = DEFAULT_MAX_ROOMS,
         max_sockets_per_route: int = DEFAULT_MAX_SOCKETS_PER_ROUTE,
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
+        admission: AdmissionController | None = None,
     ) -> None:
         if max_connections <= 0:
             raise ValueError("max_connections must be positive")
@@ -299,6 +330,7 @@ class RelayService:
         self.max_rooms = max_rooms
         self.max_sockets_per_route = max_sockets_per_route
         self.waiting_room_ttl = waiting_room_ttl
+        self.admission = admission or AdmissionController()
         self._rooms: dict[bytes, Room] = {}
         self._connection_count = 0
         self._live_connection_count = 0
@@ -321,7 +353,13 @@ class RelayService:
         self.metrics.increment("websocket_connections_opened")
         member: Member | None = None
         admitted = False
+        source = websocket_source(self.admission, socket)
+        source_admitted = self.admission.websockets.acquire(source.key)
         try:
+            if not source_admitted:
+                self.metrics.increment("source_concurrency_rejections")
+                await self._send_and_close(socket, RATE_LIMITED, 1013, "rate limited")
+                return
             admitted = await self._admit_connection()
             if not admitted:
                 self.metrics.increment("connection_capacity_rejections")
@@ -372,6 +410,8 @@ class RelayService:
                 await self._leave(member)
             if admitted:
                 await self._release_connection()
+            if source_admitted:
+                self.admission.websockets.release(source.key)
             self.metrics.increment("websocket_connections_closed")
 
     async def _admit_connection(self) -> bool:
@@ -614,6 +654,8 @@ class RelayServer:
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
         mailbox_clock: Callable[[], float] | None = None,
         allow_insecure_non_loopback: bool = False,
+        admission: AdmissionConfig | None = None,
+        admission_clock: Callable[[], float] | None = None,
     ) -> None:
         _require_loopback(metrics_host, label="metrics host")
         if not allow_insecure_non_loopback:
@@ -641,11 +683,15 @@ class RelayServer:
         self.mailbox_port = mailbox_port
         self.mailbox_purge_interval_seconds = mailbox_purge_interval_seconds
         self.mailbox_max_connections = mailbox_max_connections
+        self.admission = AdmissionController(
+            admission, clock=admission_clock or time.monotonic
+        )
         self.service = RelayService(
             metrics,
             max_connections=max_connections,
             max_rooms=max_rooms,
             waiting_room_ttl=waiting_room_ttl,
+            admission=self.admission,
         )
         mailbox_options: dict[str, Any] = {
             "retention_seconds": mailbox_retention_seconds,
@@ -711,6 +757,7 @@ class RelayServer:
                 open_timeout=5,
                 server_header=None,
                 logger=self._websocket_logger,
+                process_request=self._screen_websocket_request,
             )
             self._metrics_server = await asyncio.start_server(
                 self._handle_metrics_http,
@@ -786,6 +833,30 @@ class RelayServer:
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
+    def _screen_websocket_request(
+        self, connection: ServerConnection, request: Request
+    ) -> Response | None:
+        headers = _websocket_headers(request.headers)
+        source = self.admission.resolve_source(connection.remote_address, headers)
+        rejection = self.admission.admit(source, headers)
+        if rejection is None:
+            retry_after = self.admission.websocket_connects.acquire(source.key)
+            if retry_after is None:
+                return None
+            rejection = AdmissionController.rate_limited(retry_after)
+        self._count_rejection(rejection)
+        response = connection.respond(rejection.status, f"{rejection.code}\n")
+        if rejection.retry_after is not None:
+            response.headers["Retry-After"] = str(rejection.retry_after)
+        return response
+
+    def _count_rejection(self, rejection: Rejection) -> None:
+        self.service.metrics.increment(
+            "rate_limit_rejections"
+            if rejection.code == "rateLimited"
+            else "admission_rejections"
+        )
+
     def _accept_mailbox_http(
         self,
         reader: asyncio.StreamReader,
@@ -797,9 +868,70 @@ class RelayServer:
             )
             writer.close()
             return
-        task = asyncio.create_task(self._handle_mailbox_http(reader, writer))
+        peer = self.admission.resolve_source(writer.get_extra_info("peername"), None)
+        held_source: str | None = None
+        if not self.admission.is_trusted_proxy(peer.address):
+            if not self.admission.http_in_flight.acquire(peer.key):
+                self.service.metrics.increment("source_concurrency_rejections")
+                writer.close()
+                return
+            held_source = peer.key
+        task = asyncio.create_task(
+            self._handle_mailbox_http(reader, writer, held_source=held_source)
+        )
         self._mailbox_tasks.add(task)
         task.add_done_callback(self._mailbox_tasks.discard)
+
+    def _screen_http_request(
+        self,
+        writer: asyncio.StreamWriter,
+        headers: dict[str, str],
+        held_source: str | None,
+    ) -> tuple[Rejection | None, str | None]:
+        source = self.admission.resolve_source(
+            writer.get_extra_info("peername"), headers
+        )
+        rejection = self.admission.admit(source, headers)
+        if rejection is not None:
+            self._count_rejection(rejection)
+            return rejection, held_source
+        if held_source is None:
+            if not self.admission.http_in_flight.acquire(source.key):
+                self.service.metrics.increment("source_concurrency_rejections")
+                return Rejection("rateLimited", 429, 1), None
+            held_source = source.key
+        retry_after = self.admission.http_requests.acquire(source.key)
+        if retry_after is not None:
+            rejection = AdmissionController.rate_limited(retry_after)
+            self._count_rejection(rejection)
+            return rejection, held_source
+        return None, held_source
+
+    async def _reject_http(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        headers: dict[str, str],
+        rejection: Rejection,
+        *,
+        maximum_body_bytes: int,
+        held_source: str | None,
+    ) -> None:
+        if held_source is not None:
+            try:
+                await read_http_body(
+                    reader, headers, maximum_body_bytes=maximum_body_bytes
+                )
+            except MailboxError:
+                pass
+        await write_http_response(
+            writer,
+            rejection.status,
+            {"error": rejection.code, "version": PROTOCOL_VERSION},
+            {"Retry-After": str(rejection.retry_after)}
+            if rejection.retry_after is not None
+            else None,
+        )
 
     async def _purge_mailbox_periodically(self) -> None:
         while not self._mailbox_purge_stop.is_set():
@@ -817,15 +949,34 @@ class RelayServer:
                 self.service.metrics.increment("internal_errors")
 
     async def _handle_mailbox_http(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        held_source: str | None = None,
     ) -> None:
         self.service.metrics.increment("mailbox_requests")
         try:
             try:
                 method, target, headers = await read_http_head(reader)
+                maximum_body_bytes = (
+                    1024 * 1024 if target.startswith("/v2/mls/") else MAX_MAILBOX_REQUEST_BYTES
+                )
+                rejection, held_source = self._screen_http_request(
+                    writer, headers, held_source
+                )
+                if rejection is not None:
+                    await self._reject_http(
+                        reader,
+                        writer,
+                        headers,
+                        rejection,
+                        maximum_body_bytes=maximum_body_bytes,
+                        held_source=held_source,
+                    )
+                    return
                 body = await read_http_body(
-                    reader, headers,
-                    maximum_body_bytes=1024 * 1024 if target.startswith("/v2/mls/") else MAX_MAILBOX_REQUEST_BYTES,
+                    reader, headers, maximum_body_bytes=maximum_body_bytes,
                 )
                 if method == "POST" and target.startswith("/v2/mls/"):
                     await self.mls.handle_request(target, headers, body, writer)
@@ -893,6 +1044,8 @@ class RelayServer:
             except ConnectionError:
                 pass
         finally:
+            if held_source is not None:
+                self.admission.http_in_flight.release(held_source)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -1137,6 +1290,45 @@ def _require_cursor(value: object, *, field: str) -> int:
     return value
 
 
+def _websocket_headers(headers: Headers) -> dict[str, str]:
+    return {
+        name.lower(): ",".join(headers.get_all(name))
+        for name in {name.lower() for name in headers.keys()}
+    }
+
+
+def websocket_source(
+    admission: AdmissionController, socket: ServerConnection
+) -> ClientSource:
+    request = socket.request
+    headers = _websocket_headers(request.headers) if request is not None else None
+    return admission.resolve_source(socket.remote_address, headers)
+
+
+def admission_config_from_arguments(
+    args: argparse.Namespace,
+    environment: dict[str, str] | None = None,
+) -> AdmissionConfig:
+    environment = dict(os.environ) if environment is None else environment
+    token_file = args.admission_token_file or environment.get(
+        ADMISSION_TOKEN_FILE_ENVIRONMENT
+    )
+    return AdmissionConfig.with_tokens(
+        read_admission_tokens(token_file) if token_file else (),
+        trusted_proxies=tuple(parse_network(value) for value in args.trusted_proxy),
+        client_ip_header=args.client_ip_header,
+        ipv6_source_prefix=args.ipv6_source_prefix,
+        max_tracked_sources=args.rate_limit_max_sources,
+        websocket_connects=RateLimit(
+            args.websocket_connect_rate, args.websocket_connect_burst
+        ),
+        max_websockets_per_source=args.max_websockets_per_source,
+        http_requests=RateLimit(args.http_request_rate, args.http_request_burst),
+        max_http_requests_per_source=args.max_http_requests_per_source,
+        allowed_networks=tuple(parse_network(value) for value in args.admission_allow),
+    )
+
+
 def _require_loopback(host: str, *, label: str) -> None:
     if host == "localhost":
         return
@@ -1204,6 +1396,78 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow plaintext relay listeners on non-loopback interfaces",
     )
+    parser.add_argument(
+        "--trusted-proxy",
+        action="append",
+        default=[],
+        metavar="CIDR",
+        help="peer network whose client address header is trusted; repeatable",
+    )
+    parser.add_argument(
+        "--client-ip-header",
+        default=DEFAULT_CLIENT_IP_HEADER,
+        help="header a trusted proxy uses to pass the client address",
+    )
+    parser.add_argument(
+        "--ipv6-source-prefix",
+        default=DEFAULT_IPV6_SOURCE_PREFIX,
+        type=int,
+        help="IPv6 prefix length that rate limits treat as one source",
+    )
+    parser.add_argument(
+        "--rate-limit-max-sources",
+        default=DEFAULT_MAX_TRACKED_SOURCES,
+        type=int,
+        help="maximum sources tracked by each rate limiter",
+    )
+    parser.add_argument(
+        "--websocket-connect-rate",
+        default=DEFAULT_WEBSOCKET_CONNECT_RATE,
+        type=float,
+        help="sustained WebSocket connections per second per source; 0 disables",
+    )
+    parser.add_argument(
+        "--websocket-connect-burst",
+        default=DEFAULT_WEBSOCKET_CONNECT_BURST,
+        type=int,
+    )
+    parser.add_argument(
+        "--max-websockets-per-source",
+        default=DEFAULT_MAX_WEBSOCKETS_PER_SOURCE,
+        type=int,
+        help="concurrent WebSocket connections per source; 0 disables",
+    )
+    parser.add_argument(
+        "--http-request-rate",
+        default=DEFAULT_HTTP_REQUEST_RATE,
+        type=float,
+        help="sustained mailbox and MLS requests per second per source; 0 disables",
+    )
+    parser.add_argument(
+        "--http-request-burst",
+        default=DEFAULT_HTTP_REQUEST_BURST,
+        type=int,
+    )
+    parser.add_argument(
+        "--max-http-requests-per-source",
+        default=DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE,
+        type=int,
+        help="concurrent mailbox and MLS requests per source; 0 disables",
+    )
+    parser.add_argument(
+        "--admission-allow",
+        action="append",
+        default=[],
+        metavar="CIDR",
+        help="admit only clients from this network; repeatable",
+    )
+    parser.add_argument(
+        "--admission-token-file",
+        help=(
+            "file of admission tokens, one per line, required in the "
+            f"X-GotSync-Admission header; defaults to ${ADMISSION_TOKEN_FILE_ENVIRONMENT}"
+        ),
+    )
     parser.add_argument("--max-connections", default=DEFAULT_MAX_CONNECTIONS, type=int)
     parser.add_argument("--max-rooms", default=DEFAULT_MAX_ROOMS, type=int)
     parser.add_argument(
@@ -1214,7 +1478,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_until_stopped(args: argparse.Namespace) -> None:
+async def _run_until_stopped(
+    args: argparse.Namespace, admission: AdmissionConfig
+) -> None:
     relay = RelayServer(
         host=args.host,
         port=args.port,
@@ -1234,6 +1500,7 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
         max_rooms=args.max_rooms,
         waiting_room_ttl=args.waiting_room_ttl,
         allow_insecure_non_loopback=args.allow_insecure_non_loopback,
+        admission=admission,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1252,6 +1519,12 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
                 "plaintext relay listeners may be reachable beyond this machine"
             )
         await relay.start()
+        print(
+            "admission: "
+            f"{len(admission.allowed_networks)} allowed networks, "
+            f"{'token required' if admission.admission_token_digests else 'no token'}, "
+            f"{len(admission.trusted_proxies)} trusted proxy networks"
+        )
         print(f"relay ready on {relay.host}:{relay.websocket_port}/v1")
         print(
             "health and aggregate metrics ready on "
@@ -1269,9 +1542,14 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _argument_parser().parse_args(argv)
+    parser = _argument_parser()
+    args = parser.parse_args(argv)
     try:
-        asyncio.run(_run_until_stopped(args))
+        admission = admission_config_from_arguments(args)
+    except (OSError, ValueError) as error:
+        parser.error(f"invalid admission configuration: {error}")
+    try:
+        asyncio.run(_run_until_stopped(args, admission))
     except KeyboardInterrupt:
         pass
     return 0

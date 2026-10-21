@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from .mailbox import MailboxError, MailboxHeadersTooLargeError, MailboxRequestTooLargeError
@@ -121,7 +122,10 @@ def parse_mailbox_json(body: bytes) -> dict[str, Any]:
 
 
 async def write_http_response(
-    writer: asyncio.StreamWriter, status: int, document: dict[str, Any]
+    writer: asyncio.StreamWriter,
+    status: int,
+    document: dict[str, Any],
+    headers: Mapping[str, str] | None = None,
 ) -> None:
     reasons = {
         200: "OK",
@@ -137,15 +141,17 @@ async def write_http_response(
         503: "Service Unavailable",
     }
     body = encode_json_document(document)
-    headers = (
+    extra = "".join(f"{name}: {value}\r\n" for name, value in (headers or {}).items())
+    head = (
         f"HTTP/1.1 {status} {reasons[status]}\r\n"
         "Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n"
         "Cache-Control: no-store\r\n"
+        f"{extra}"
         "Connection: close\r\n"
         "\r\n"
     ).encode("ascii")
-    writer.write(headers + body)
+    writer.write(head + body)
     try:
         await writer.drain()
     except ConnectionError:
