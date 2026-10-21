@@ -13,11 +13,21 @@ final class SecurityTests: XCTestCase {
 
     func testMnemonicRoundTripAndChecksum() throws {
         let secret = Data(0..<16)
-        let invitation = try Invitation(secret: secret)
+        let invitation = try Invitation(
+            secret: secret,
+            groupID: Data(repeating: 0x01, count: 32),
+            inviterFingerprint: Data(repeating: 0x02, count: 32)
+        )
 
         XCTAssertEqual(invitation.phrase.split(separator: " ").count, 17)
-        XCTAssertEqual(try Invitation.from(phrase: invitation.phrase), invitation)
+        XCTAssertEqual(try Invitation.from(phrase: invitation.phrase), try Invitation(secret: secret))
         XCTAssertEqual(try Invitation.from(url: invitation.url(scheme: "gotsync-tests"), scheme: "gotsync-tests"), invitation)
+        XCTAssertThrowsError(try Invitation(secret: secret).url(scheme: "gotsync-tests"))
+        XCTAssertThrowsError(
+            try Invitation.from(url: URL(string: "gotsync-tests://pair?v=1&secret=\(secret.base64URLString)")!, scheme: "gotsync-tests")
+        ) {
+            XCTAssertEqual($0 as? MnemonicError, .unsupportedVersion)
+        }
 
         var words = invitation.phrase.split(separator: " ").map(String.init)
         words[16] = MnemonicCodec.words[(MnemonicCodec.words.firstIndex(of: words[16])! + 1) % 256]
@@ -27,7 +37,7 @@ final class SecurityTests: XCTestCase {
 
         XCTAssertThrowsError(
             try Invitation.from(
-                url: URL(string: "gotsync-tests://pair?v=1&v=1&secret=\(secret.base64URLString)")!, scheme: "gotsync-tests"
+                url: URL(string: "gotsync-tests://pair?v=2&v=2&secret=\(secret.base64URLString)")!, scheme: "gotsync-tests"
             )
         ) {
             XCTAssertEqual($0 as? MnemonicError, .invalidInviteURL)
@@ -35,7 +45,7 @@ final class SecurityTests: XCTestCase {
     }
 
     func testPairingHandshakeAndDirectionalFrames() throws {
-        let invitation = try Invitation(secret: Data(0..<16))
+        let invitation = try LegacyInvitation(secret: Data(0..<16))
         let context = HandshakeContext.pairing(
             relayOrigin: "ws://127.0.0.1:8765",
             route: invitation.pairRoute
@@ -83,7 +93,7 @@ final class SecurityTests: XCTestCase {
     }
 
     func testHandshakeRejectsTamperedConfirmation() throws {
-        let invitation = try Invitation(secret: Data(repeating: 0x44, count: 16))
+        let invitation = try LegacyInvitation(secret: Data(repeating: 0x44, count: 16))
         let context = HandshakeContext.pairing(
             relayOrigin: "ws://127.0.0.1:8765",
             route: invitation.pairRoute
@@ -102,7 +112,7 @@ final class SecurityTests: XCTestCase {
     }
 
     func testPairingHandshakeRejectsPeersWithoutDurableCompletion() throws {
-        let invitation = try Invitation(
+        let invitation = try LegacyInvitation(
             secret: Data(repeating: 0x45, count: 16)
         )
         let modern = HandshakeContext.pairing(
@@ -589,63 +599,6 @@ final class SecurityTests: XCTestCase {
         XCTAssertFalse(model.addTask(title: "Still disabled"))
         XCTAssertTrue(model.tasks.isEmpty)
         model.applicationDidEnterBackground()
-    }
-
-    @MainActor
-    func testCancelPairingRollsBackStagedJoinerReplica() throws {
-        let service = "com.gotdone.relay.tests.\(UUID().uuidString)"
-        let keychain = MemorySecretStore(service: service)
-        let credentialStore = CredentialStore(keychain: keychain)
-        let identity = try InstallIdentity.loadOrCreate(store: keychain)
-        defer {
-            try? credentialStore.clearPair()
-            try? keychain.delete(account: InstallIdentity.account)
-        }
-
-        let baseDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: baseDirectory) }
-        let model = SyncEngine(
-            keychain: keychain,
-            baseDirectory: baseDirectory
-        )
-        let localDeviceID = try ReplicaDeviceID(bytes: identity.deviceID)
-        var host = try TaskReplica(deviceID: ReplicaDeviceID(uuid: UUID()))
-        try host.createTask(title: "Staged")
-        let archive = try host.exportProvisioningArchive()
-        let persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
-        let stagingURL = baseDirectory.appendingPathComponent(
-            SyncEngine.pairingStagingFilename
-        )
-        _ = try TaskReplica.provision(
-            deviceID: localDeviceID,
-            from: archive,
-            persistenceURL: stagingURL
-        )
-        try credentialStore.savePending(
-            PendingPair(
-                version: SyncProtocol.version,
-                pairRoot: Data(repeating: 0x44, count: 32),
-                pairID: Data(repeating: 0x55, count: 16),
-                role: .joiner,
-                localDeviceID: identity.deviceID,
-                remoteDeviceID: host.deviceID.bytes,
-                archiveHash: archive.sha256,
-                expiresAt: Date().addingTimeInterval(120)
-            )
-        )
-
-        model.cancelPairing()
-
-        XCTAssertNil(try credentialStore.pending())
-        XCTAssertTrue(
-            try TaskReplica(
-                deviceID: localDeviceID,
-                persistenceURL: persistenceURL
-            ).isEmpty
-        )
-        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingURL.path))
-        XCTAssertTrue(model.tasks.isEmpty)
     }
 
     @MainActor

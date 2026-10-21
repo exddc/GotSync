@@ -4,7 +4,7 @@ import XCTest
 
 final class RelayIntegrationTests: XCTestCase {
     @MainActor
-    func testPairAndSyncThroughRealRelayAndOfflineMailbox() async throws {
+    func testPairAndSyncThroughRealRelayOverMLS() async throws {
         guard ProcessInfo.processInfo.environment["GOTSYNC_INTEGRATION"] == "1" else {
             if ProcessInfo.processInfo.environment["GOTSYNC_REQUIRE_INTEGRATION"] == "1" {
                 XCTFail("The required relay integration environment is missing.")
@@ -22,7 +22,7 @@ final class RelayIntegrationTests: XCTestCase {
         let fourthStore = MemorySecretStore()
         func engine(_ name: String, store: MemorySecretStore) throws -> SyncEngine {
             let configuration = try SyncConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, storageDirectory: directory.appendingPathComponent(name), invitationURLScheme: "gotsync-tests", endpointPolicy: .localDevelopment)
-            return SyncEngine(configuration: configuration, secretStore: store)
+            return SyncEngine(configuration: configuration, secretStore: store, pairingRetryDelayNanoseconds: 100_000_000)
         }
         let host = try engine("host", store: hostStore)
         var joiner = try engine("joiner", store: joinerStore)
@@ -37,16 +37,18 @@ final class RelayIntegrationTests: XCTestCase {
             XCTAssertEqual(host.safetyCode, joiner.safetyCode)
             host.approveSafetyCode()
             try await wait("founding pair", engines: [host, joiner]) { host.isPaired && joiner.isPaired }
+            XCTAssertEqual(host.linkedMemberCount, 2)
             try await wait("provisioned task", engines: [host, joiner]) { joiner.tasks.count == 1 }
             XCTAssertTrue(joiner.addTask(title: "Live peer edit"))
             try await wait("live convergence", engines: [host, joiner]) { host.tasks.count == 2 && host.phase == .synced && joiner.phase == .synced }
 
             await joiner.stop()
             XCTAssertTrue(host.addTask(title: "Offline recipient edit"))
-            try await wait("durable mailbox upload", engines: [host]) { host.pendingMailboxOperationCount == 0 }
+            try await wait("durable upload", engines: [host]) { host.pendingMailboxOperationCount == 0 }
             host.applicationDidEnterBackground()
             await host.waitForBackgroundWork()
             joiner = try engine("joiner", store: joinerStore)
+            XCTAssertTrue(joiner.isPaired)
             try await wait("catch up after restart", engines: [host, joiner]) { joiner.tasks.count == 3 }
 
             XCTAssertNotNil(joiner.lastMailboxReceivedAt)
@@ -57,7 +59,8 @@ final class RelayIntegrationTests: XCTestCase {
             try await wait("third-device safety check", engines: [host, third]) { host.isHostApprovalPending && third.safetyCode != nil }
             XCTAssertEqual(host.safetyCode, third.safetyCode)
             host.approveSafetyCode()
-            try await wait("multi-device membership", engines: [host, joiner, third]) { host.linkedMemberCount == 3 && joiner.linkedMemberCount == 3 && third.linkedMemberCount == 3 && third.isPaired && !third.isPairingFinalizationLocked }
+            try await wait("multi-device membership", engines: [host, joiner, third]) { host.linkedMemberCount == 3 && joiner.linkedMemberCount == 3 && third.linkedMemberCount == 3 && third.isPaired }
+            try await wait("third-device history", engines: [host, third]) { third.tasks.count == 3 }
             XCTAssertTrue(third.addTask(title: "Third device edit"))
             try await wait("multi-device convergence", engines: [host, joiner, third]) { host.tasks.count == 4 && joiner.tasks.count == 4 && third.tasks.count == 4 }
             XCTAssertEqual(host.tasks.map(\.titleValue), joiner.tasks.map(\.titleValue))
