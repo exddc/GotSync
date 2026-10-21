@@ -183,9 +183,12 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var groups: [Data: Group] = [:]
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
+    private var failWelcomeAcknowledgement = false
     private(set) var lastPublishedReference: Data?
 
     func dropNextAppendResponse() { dropAppendResponse = true }
+
+    func failNextWelcomeAcknowledgement() { failWelcomeAcknowledgement = true }
 
     func acknowledged(by authorization: Data) -> UInt64? {
         groups.values.compactMap { $0.writers[Self.digest(authorization)]?.ack }.first
@@ -267,6 +270,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     func acknowledge(group: Data, through cursor: UInt64, authorization: Data) throws {
         _ = try authorize(group: group, authorization: authorization)
         let digest = Self.digest(authorization)
+        if failWelcomeAcknowledgement, entries.first(where: { $0.cursor == cursor })?.delivery.addWriter == digest {
+            failWelcomeAcknowledgement = false
+            throw URLError(.networkConnectionLost)
+        }
         let previous = groups[group]?.writers[digest]?.ack ?? 0
         groups[group]?.writers[digest]?.ack = max(previous, cursor)
     }

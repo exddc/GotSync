@@ -137,6 +137,68 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertEqual(Set(second.tasks.map(\.titleValue)), Set(third.tasks.map(\.titleValue)))
     }
 
+    func testJoinerInterruptedAfterAdmissionStillReceivesProviderHistory() async throws {
+        let host = engine("host")
+        let second = engine("second")
+        try await pair(host, second)
+        XCTAssertTrue(second.addTask(title: "From second"))
+        try await wait("host receives") { host.tasks.count == 1 && second.pendingMailboxOperationCount == 0 }
+        await second.stop()
+
+        await relay.failNextWelcomeAcknowledgement()
+        var third = engine("third")
+        third.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && third.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("interrupted after admission") { third.phase == .failed }
+        let admittedGroup = try await third.mlsSessionForTesting?.group()
+        XCTAssertNotNil(admittedGroup)
+        XCTAssertFalse(third.isPaired)
+        await third.stop()
+
+        third = engine("third")
+        try await wait("recovered membership") { third.isPaired && third.linkedMemberCount == 3 }
+        try await wait("provider history") { third.tasks.map(\.titleValue) == ["From second"] }
+    }
+
+    func testStaleSyncCycleCannotRestoreTasksAfterErase() async throws {
+        try await assertStaleSyncCycleIsDiscarded(expectedTitles: []) { $0.eraseLocalData() }
+    }
+
+    func testStaleSyncCycleCannotCarryOperationsAcrossUnlink() async throws {
+        try await assertStaleSyncCycleIsDiscarded(expectedTitles: ["Before"]) { $0.unlinkAndKeepTasks() }
+    }
+
+    private func assertStaleSyncCycleIsDiscarded(
+        expectedTitles: [String],
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        teardown: (SyncEngine) -> Void
+    ) async throws {
+        let host = engine("host")
+        let joiner = engine("joiner")
+        XCTAssertTrue(host.addTask(title: "Before"))
+        try await pair(host, joiner)
+        try await wait("converged") {
+            joiner.tasks.count == 1 && host.phase == .synced && joiner.phase == .synced
+                && host.pendingMailboxOperationCount == 0 && joiner.pendingMailboxOperationCount == 0
+        }
+
+        let gate = SyncTestGate()
+        host.inboxReadHookForTesting = { await gate.pause() }
+        XCTAssertTrue(joiner.addTask(title: "Stale"))
+        try await wait("cycle paused") { gate.isPaused }
+        host.inboxReadHookForTesting = nil
+        teardown(host)
+        gate.release()
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(host.tasks.map(\.titleValue), expectedTitles, file: file, line: line)
+        await host.stop()
+        let reopened = engine("host")
+        XCTAssertEqual(reopened.tasks.map(\.titleValue), expectedTitles, file: file, line: line)
+    }
+
     func testBackgroundFlushUploadsPendingEdits() async throws {
         let host = engine("host")
         let joiner = engine("joiner")
@@ -403,6 +465,22 @@ final class SyncEngineMLSTests: XCTestCase {
 
 private enum SyncTestError: Error {
     case timeout
+}
+
+@MainActor
+private final class SyncTestGate {
+    private(set) var isPaused = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        isPaused = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {

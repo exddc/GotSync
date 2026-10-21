@@ -301,6 +301,7 @@ public final class SyncEngine {
     private var syncCycleTask: Task<Void, Never>?
     private var backgroundFlushTask: Task<Void, Never>?
     private var syncCycleID: UUID?
+    var inboxReadHookForTesting: (@MainActor () async -> Void)?
     private var syncCycleRequested = false
     private var syncFailureCount = 0
     private var nextSyncAttemptAt = Date.distantPast
@@ -686,6 +687,7 @@ public final class SyncEngine {
         do {
             try credentialStore.clearAllPairingData()
             try ReplicationCheckpoint.remove(at: checkpointURL)
+            try ReplicationCheckpoint.remove(at: joinIntentURL)
             try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
             session = try openSession()
         } catch {
@@ -1002,6 +1004,10 @@ public final class SyncEngine {
             safetyCode = PairingSafetyCode.code(
                 groupID: groupID, inviterFingerprint: inviterFingerprint, joinerFingerprint: published.fingerprint
             )
+            let joinIntent = ReplicationCheckpoint(
+                group: groupID, memberDeviceIDs: [], joinPending: true, provider: inviterFingerprint
+            )
+            try joinIntent.save(to: joinIntentURL)
             phase = .verifying
             listenForInviterDecision(on: connection, invitation: invitation, attemptID: attemptID)
 
@@ -1029,9 +1035,10 @@ public final class SyncEngine {
             await connection.cancel()
             try requireCurrentPairingAttempt(attemptID)
             let roster = try await session.members()
-            try saveCheckpoint(ReplicationCheckpoint(
-                group: groupID, memberDeviceIDs: roster.map(\.deviceID), joinPending: true, provider: inviterFingerprint
-            ))
+            var joined = joinIntent
+            joined.memberDeviceIDs = roster.map(\.deviceID)
+            try saveCheckpoint(joined)
+            try ReplicationCheckpoint.remove(at: joinIntentURL)
             finishPairing(attemptID: attemptID)
         } catch {
             pairingFailed(error, attemptID: attemptID)
@@ -1282,9 +1289,14 @@ public final class SyncEngine {
                     current.memberDeviceIDs = roster.map(\.deviceID)
                     try saveCheckpoint(current)
                 } else {
+                    let intent = try? ReplicationCheckpoint.load(from: joinIntentURL)
                     try saveCheckpoint(ReplicationCheckpoint(
-                        group: group, memberDeviceIDs: roster.map(\.deviceID), joinPending: true, provider: nil
+                        group: group,
+                        memberDeviceIDs: roster.map(\.deviceID),
+                        joinPending: true,
+                        provider: intent?.group == group ? intent?.provider : nil
                     ))
+                    try ReplicationCheckpoint.remove(at: joinIntentURL)
                 }
                 if !isPaired {
                     isPaired = true
@@ -1470,6 +1482,8 @@ public final class SyncEngine {
             return
         }
         let fingerprint = try await session.fingerprint()
+        await inboxReadHookForTesting?()
+        try requireCurrent(session)
         var pool: [TaskOperation] = []
         var hellos: [ReplicationMessage] = []
         for message in messages where message.sender != fingerprint {
@@ -1491,11 +1505,18 @@ public final class SyncEngine {
         }
         for hello in hellos {
             try await answer(hello, fingerprint: fingerprint, session: session)
+            try requireCurrent(session)
         }
         if !pool.isEmpty {
             try await send(.hello(vector: replica.versionVector, provider: nil), session: session)
         }
         try await session.acknowledgeInbox(through: last.cursor)
+    }
+
+    private func requireCurrent(_ session: MLSSession) throws {
+        guard !Task.isCancelled, hasDurableStorage, self.session === session else {
+            throw CancellationError()
+        }
     }
 
     /// Applies every operation whose origin sequence is next, repeating until
@@ -1561,6 +1582,7 @@ public final class SyncEngine {
         let operations = replica.retainedOperations
         try await send(.hello(vector: vector, provider: announced.provider), session: session)
         try await send(operations, session: session)
+        try requireCurrent(session)
         guard var current = checkpoint, current.group == announced.group else {
             throw CancellationError()
         }
@@ -1596,6 +1618,7 @@ public final class SyncEngine {
                 )
             }
             try await send(.operations(batch), session: session)
+            try requireCurrent(session)
             guard var latest = checkpoint, latest.group == current.group else {
                 throw CancellationError()
             }
@@ -1621,6 +1644,7 @@ public final class SyncEngine {
 
     private func refreshMembers(session: MLSSession) async throws {
         let roster = try await session.members()
+        try requireCurrent(session)
         let deviceIDs = roster.map(\.deviceID)
         guard var current = checkpoint, current.memberDeviceIDs != deviceIDs else {
             return
@@ -1670,6 +1694,10 @@ public final class SyncEngine {
         session = nil
         try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
         session = try openSession()
+    }
+
+    private var joinIntentURL: URL {
+        checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
     }
 
     private func saveCheckpoint(_ value: ReplicationCheckpoint) throws {
@@ -1842,6 +1870,9 @@ public final class SyncEngine {
         try store.clearPair()
         try removeAllPairingArtifacts(in: persistenceURL.deletingLastPathComponent())
         try ReplicationCheckpoint.remove(at: checkpointURL)
+        try ReplicationCheckpoint.remove(
+            at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
+        )
         try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
