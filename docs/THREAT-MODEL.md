@@ -32,8 +32,8 @@ still has them.
 
 The relay serves only the `/v2/pairing` WebSocket room and the `/v2/mls`
 delivery log; it stores no version 1 mailbox data. It receives MLS ciphertext,
-commits, Welcome messages, KeyPackages,
-writer-token hashes, cursors, and epochs. It also observes IP addresses,
+commits, Welcome messages, KeyPackages, writer-token hashes, cursors, and
+epochs. It also observes IP addresses,
 timing, sizes, group IDs, and co-membership in pairing rooms. It sees the
 pairing token when the inviter fetches a KeyPackage, but not the invitation
 secret it is derived from. The server has no application decryption keys. Its
