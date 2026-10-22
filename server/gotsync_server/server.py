@@ -6,6 +6,7 @@ import base64
 import ipaddress
 import json
 import logging
+import math
 import os
 import signal
 from collections.abc import Sequence
@@ -22,7 +23,7 @@ from .http import (
     read_http_body,
     write_http_response,
 )
-from .mls import MLSDeliveryServer, MLSDeliveryStore
+from .mls import DEFAULT_RETENTION_SECONDS, MLSDeliveryServer, MLSDeliveryStore
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
 
 WEBSOCKET_PATH = "/v2/pairing"
@@ -571,6 +572,7 @@ class RelayServer:
         delivery_port: int = 8767,
         delivery_database_path: str | os.PathLike[str] = DEFAULT_DELIVERY_DATABASE_PATH,
         delivery_max_connections: int = DEFAULT_MAX_DELIVERY_CONNECTIONS,
+        delivery_retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         metrics: Metrics | None = None,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_rooms: int = DEFAULT_MAX_ROOMS,
@@ -601,7 +603,9 @@ class RelayServer:
             max_rooms=max_rooms,
             waiting_room_ttl=waiting_room_ttl,
         )
-        self.mls = MLSDeliveryServer(MLSDeliveryStore(delivery_database_path))
+        self.mls = MLSDeliveryServer(
+            MLSDeliveryStore(delivery_database_path, retention_seconds=delivery_retention_seconds)
+        )
         self._websocket_server: Any | None = None
         self._metrics_server: asyncio.Server | None = None
         self._delivery_server: asyncio.Server | None = None
@@ -664,6 +668,7 @@ class RelayServer:
                 self.delivery_port,
                 limit=MAX_HTTP_HEADER_BYTES,
             )
+            self.mls.start_expiry()
         except BaseException:
             if self._delivery_server is not None:
                 self._delivery_server.close()
@@ -703,6 +708,7 @@ class RelayServer:
         if websocket_server is not None:
             websocket_server.close(close_connections=True)
             await websocket_server.wait_closed()
+        await self.mls.stop_expiry()
         self.mls.store.close()
 
     async def __aenter__(self) -> RelayServer:
@@ -843,6 +849,13 @@ def _require_loopback(host: str, *, label: str) -> None:
         raise ValueError(f"{label} must be a loopback address")
 
 
+def _retention_days(value: str) -> float:
+    days = float(value)
+    if not 1 <= days < math.inf:
+        raise argparse.ArgumentTypeError("retention must be at least 1 day")
+    return days
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="GotSync pairing relay and MLS delivery service"
@@ -858,6 +871,12 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--delivery-max-connections",
         default=DEFAULT_MAX_DELIVERY_CONNECTIONS,
         type=int,
+    )
+    parser.add_argument(
+        "--retention-days",
+        default=DEFAULT_RETENTION_SECONDS / 86400,
+        type=_retention_days,
+        help="days the delivery store keeps unread entries and idle groups",
     )
     parser.add_argument(
         "--allow-insecure-non-loopback",
@@ -884,6 +903,7 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
         delivery_port=args.delivery_port,
         delivery_database_path=args.database,
         delivery_max_connections=args.delivery_max_connections,
+        delivery_retention_seconds=args.retention_days * 86400,
         max_connections=args.max_connections,
         max_rooms=args.max_rooms,
         waiting_room_ttl=args.waiting_room_ttl,

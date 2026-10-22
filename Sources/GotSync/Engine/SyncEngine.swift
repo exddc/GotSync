@@ -37,6 +37,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case unsupportedProtocolVersion
     case relinkRequired
     case syncHistoryBlocked
+    case syncHistoryExpired
     case removedFromGroup
     case approvalExpired
 
@@ -65,6 +66,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "This version uses a new sync protocol. Your tasks are safe on this iPhone. Create a new link to sync again."
         case .syncHistoryBlocked:
             "Sync stopped at an update this iPhone could not verify. Your tasks are safe. Unlink and create a new link to keep syncing."
+        case .syncHistoryExpired:
+            "This iPhone was offline longer than the sync service keeps updates. Your tasks are safe. Unlink and create a new link to keep syncing."
         case .removedFromGroup:
             "This iPhone was removed from the sync group. Your tasks are safe on this iPhone."
         case .approvalExpired:
@@ -107,6 +110,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             switch mls {
             case .unsupportedVersion:
                 return SyncError.unsupportedProtocolVersion
+            case .historyExpired:
+                return SyncError.syncHistoryExpired
             default:
                 return SyncError.privateSyncUnreachable
             }
@@ -128,7 +133,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         case .invitationExpired, .pairingDeclined, .groupAtCapacity,
              .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
              .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
-             .removedFromGroup, .approvalExpired:
+             .syncHistoryExpired, .removedFromGroup, .approvalExpired:
             return false
         }
     }
@@ -1594,12 +1599,12 @@ public final class SyncEngine {
             return
         case .removed:
             handleRemoval()
-        case .blocked:
+        case .blocked(let reason):
             isHistoryBlocked = true
             syncLoopTask?.cancel()
             syncLoopTask = nil
-            mailboxError = .syncHistoryBlocked
-            mailboxErrorMessage = Self.displayMessage(for: SyncError.syncHistoryBlocked)
+            mailboxError = reason
+            mailboxErrorMessage = Self.displayMessage(for: reason)
             mailboxRequiresRepair = true
             mailboxState = .unavailable
             errorMessage = mailboxErrorMessage
@@ -1949,7 +1954,8 @@ public final class SyncEngine {
 
     private static func isRetriableDeparture(_ error: Error) -> Bool {
         switch error {
-        case MLSRelayError.unauthorized, MLSRelayError.invalidRequest, MLSRelayError.unsupportedVersion:
+        case MLSRelayError.unauthorized, MLSRelayError.invalidRequest, MLSRelayError.unsupportedVersion,
+             MLSRelayError.historyExpired:
             return false
         case MLSSessionError.unresolvedConflict, MLSClientError.storageUnavailable:
             return true
@@ -2130,7 +2136,7 @@ public final class SyncEngine {
     private enum SyncFailure {
         case cancelled
         case removed
-        case blocked
+        case blocked(SyncError)
         case storage
         case transient
     }
@@ -2141,6 +2147,8 @@ public final class SyncEngine {
             return .cancelled
         case MLSSessionError.removed:
             return .removed
+        case MLSRelayError.historyExpired:
+            return .blocked(.syncHistoryExpired)
         case MLSSessionError.unresolvedConflict, is SyncCycleError:
             return .transient
         case MLSClientError.storageUnavailable, MLSClientError.capacityReached, is MLSStoreError:
@@ -2150,7 +2158,7 @@ public final class SyncEngine {
         case _ where isTransientTransportFailure(error):
             return .transient
         default:
-            return .blocked
+            return .blocked(.syncHistoryBlocked)
         }
     }
 

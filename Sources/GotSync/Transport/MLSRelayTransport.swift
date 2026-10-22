@@ -22,6 +22,7 @@ enum MLSRelayError: Error, Equatable {
     case unauthorized
     case epochConflict
     case capacityReached
+    case historyExpired
     case rejected(status: Int, code: String)
 }
 
@@ -329,6 +330,7 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
                 return .keyPackageUnavailable(epoch: epoch)
             case (409, "epochConflict"): throw MLSRelayError.epochConflict
             case (403, _): throw MLSRelayError.unauthorized
+            case (410, "historyExpired"): throw MLSRelayError.historyExpired
             case (429, _): throw MLSRelayError.capacityReached
             case (_, "unsupportedVersion"): throw MLSRelayError.unsupportedVersion
             case (let status, let code): throw MLSRelayError.rejected(status: status, code: code ?? "http\(status)")
