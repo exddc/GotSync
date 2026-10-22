@@ -19,10 +19,10 @@ Two effects follow:
 
 ## Decision for 2.0
 
-- **Phase 1, background app refresh, ships in 2.0.** It needs no wire change and
-  adds no third party; the relay gains only an aggregate metric. It uses the locked-storage model that 2.0
-  already has. It shortens how long a quiet device stays stale and helps the
-  relay prune the log.
+- **Phase 1, background app refresh, ships in 2.0.** It needs no wire
+  change and adds no third party; the relay gains only an aggregate metric.
+  It uses the locked-storage model that 2.0 already has. It shortens how long
+  a quiet device stays stale and helps the relay prune the log.
 - **Phase 2, APNs background push, does not ship in 2.0.** It makes Apple a
   third party and stores a durable device identifier on the relay. The 2.0
   positioning says the relay stores only ciphertext. Push works only on the
