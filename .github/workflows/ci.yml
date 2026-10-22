@@ -11,7 +11,7 @@ concurrency:
 jobs:
   apple:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       GOTSYNC_CACHE_DIR: ${{ github.workspace }}/../gotsync-cache
     steps:
@@ -32,6 +32,8 @@ jobs:
         run: scripts/test-mls.sh
       - name: Verify existing sync behavior
         run: scripts/test-integration.sh
+      - name: Check release builds use TLS only
+        run: scripts/check-release-transport.sh
       - name: Package Swift dependency without Rust requirement
         run: python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
       - name: Test packaged dependency without Cargo

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import signal
+import ssl
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +35,7 @@ MAX_BINARY_MESSAGE_BYTES = 512 * 1024
 MAX_FORWARD_QUEUE_FRAMES = 16
 MAX_FORWARD_QUEUE_BYTES = 1024 * 1024
 REGISTRATION_TIMEOUT_SECONDS = 5.0
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_CONNECTIONS = 256
 DEFAULT_MAX_ROOMS = 128
 DEFAULT_MAX_DELIVERY_CONNECTIONS = 64
@@ -575,12 +577,12 @@ class RelayServer:
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_rooms: int = DEFAULT_MAX_ROOMS,
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
-        allow_insecure_non_loopback: bool = False,
+        tls: ssl.SSLContext | None = None,
     ) -> None:
         _require_loopback(metrics_host, label="metrics host")
-        if not allow_insecure_non_loopback:
-            _require_loopback(host, label="relay host")
-            _require_loopback(delivery_host, label="delivery host")
+        if tls is None:
+            _require_loopback(host, label="relay host without TLS")
+            _require_loopback(delivery_host, label="delivery host without TLS")
         if not all(
             0 <= candidate <= 65535
             for candidate in (port, metrics_port, delivery_port)
@@ -595,6 +597,7 @@ class RelayServer:
         self.delivery_host = delivery_host
         self.delivery_port = delivery_port
         self.delivery_max_connections = delivery_max_connections
+        self.tls = tls
         self.service = RelayService(
             metrics,
             max_connections=max_connections,
@@ -636,6 +639,7 @@ class RelayServer:
             or self._delivery_server is not None
         ):
             raise RuntimeError("relay is already running")
+        handshake_timeout = TLS_HANDSHAKE_TIMEOUT_SECONDS if self.tls else None
         try:
             self._websocket_server = await serve(
                 self.service.handle,
@@ -651,6 +655,8 @@ class RelayServer:
                 open_timeout=5,
                 server_header=None,
                 logger=self._websocket_logger,
+                ssl=self.tls,
+                ssl_handshake_timeout=handshake_timeout,
             )
             self._metrics_server = await asyncio.start_server(
                 self._handle_metrics_http,
@@ -663,6 +669,8 @@ class RelayServer:
                 self.delivery_host,
                 self.delivery_port,
                 limit=MAX_HTTP_HEADER_BYTES,
+                ssl=self.tls,
+                ssl_handshake_timeout=handshake_timeout,
             )
         except BaseException:
             if self._delivery_server is not None:
@@ -843,6 +851,12 @@ def _require_loopback(host: str, *, label: str) -> None:
         raise ValueError(f"{label} must be a loopback address")
 
 
+def server_tls_context(certificate_path: str, key_path: str) -> ssl.SSLContext:
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certificate_path, key_path)
+    return context
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="GotSync pairing relay and MLS delivery service"
@@ -860,10 +874,10 @@ def _argument_parser() -> argparse.ArgumentParser:
         type=int,
     )
     parser.add_argument(
-        "--allow-insecure-non-loopback",
-        action="store_true",
-        help="allow plaintext relay listeners on non-loopback interfaces",
+        "--tls-cert",
+        help="PEM certificate chain; required with --tls-key to bind beyond loopback",
     )
+    parser.add_argument("--tls-key", help="PEM private key for --tls-cert")
     parser.add_argument("--max-connections", default=DEFAULT_MAX_CONNECTIONS, type=int)
     parser.add_argument("--max-rooms", default=DEFAULT_MAX_ROOMS, type=int)
     parser.add_argument(
@@ -874,7 +888,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_until_stopped(args: argparse.Namespace) -> None:
+async def _run_until_stopped(
+    args: argparse.Namespace, tls: ssl.SSLContext | None
+) -> None:
     relay = RelayServer(
         host=args.host,
         port=args.port,
@@ -887,7 +903,7 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
         max_connections=args.max_connections,
         max_rooms=args.max_rooms,
         waiting_room_ttl=args.waiting_room_ttl,
-        allow_insecure_non_loopback=args.allow_insecure_non_loopback,
+        tls=tls,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -901,10 +917,6 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
             pass
 
     try:
-        if args.allow_insecure_non_loopback:
-            logging.warning(
-                "plaintext relay listeners may be reachable beyond this machine"
-            )
         await relay.start()
         print(f"pairing relay ready on {relay.host}:{relay.websocket_port}{WEBSOCKET_PATH}")
         print(
@@ -923,9 +935,18 @@ async def _run_until_stopped(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _argument_parser().parse_args(argv)
+    parser = _argument_parser()
+    args = parser.parse_args(argv)
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("--tls-cert and --tls-key must be given together")
+    tls = None
+    if args.tls_cert:
+        try:
+            tls = server_tls_context(args.tls_cert, args.tls_key)
+        except (OSError, ssl.SSLError) as error:
+            parser.error(f"cannot load TLS certificate {args.tls_cert}: {error}")
     try:
-        asyncio.run(_run_until_stopped(args))
+        asyncio.run(_run_until_stopped(args, tls))
     except KeyboardInterrupt:
         pass
     return 0

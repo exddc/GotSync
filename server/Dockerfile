@@ -14,4 +14,4 @@ EXPOSE 8765 8767
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/readyz', timeout=3)" || exit 1
 ENTRYPOINT ["gotsync-server"]
-CMD ["--host", "0.0.0.0", "--delivery-host", "0.0.0.0", "--allow-insecure-non-loopback", "--database", "/data/mls.sqlite3"]
+CMD ["--host", "0.0.0.0", "--delivery-host", "0.0.0.0", "--tls-cert", "/certs/tls.crt", "--tls-key", "/certs/tls.key", "--database", "/data/mls.sqlite3"]

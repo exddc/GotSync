@@ -33,9 +33,11 @@ test dependencies. Use `uv lock --project server` after changing dependencies.
 The pairing endpoint is `ws://127.0.0.1:8765/v2/pairing`. The delivery
 endpoint is `http://127.0.0.1:8767/v2/mls`. For a simulator to reach a relay
 running on the same Mac, `127.0.0.1` works with the iOS Simulator. A real
-device needs a deployed TLS endpoint. The relay rejects non-loopback pairing
-and delivery binds by default. `--allow-insecure-non-loopback` exists only for
-an explicit local demo and emits a plaintext-exposure warning.
+device needs a deployed TLS endpoint. The relay serves plaintext only on
+loopback. To bind pairing or delivery to any other interface, pass a PEM
+certificate chain and key with `--tls-cert` and `--tls-key`; both listeners
+then serve only `wss://` and `https://`, and drop clients that do not finish
+the TLS handshake within 5 seconds.
 
 The delivery SQLite database defaults to `relay-data/mls.sqlite3`, uses full
 synchronous durability, and is created with mode `0600` in a `0700` directory.
@@ -102,6 +104,8 @@ monotonic, so their gaps can also reveal rough aggregate delivery write volume.
 
 ## Test
 
+The TLS tests create a throwaway certificate with the `openssl` command.
+
 ```sh
 scripts/uv.sh pytest server/tests -q
 uv lock --project server --check
@@ -113,7 +117,7 @@ Run the loopback forwarding benchmark with:
 scripts/uv.sh python server/benchmark.py --iterations 1000 --payload-bytes 256
 ```
 
-Local development uses plain HTTP and `ws://` for loopback development. A deployed
+Local development uses plain HTTP and `ws://` on loopback only. A deployed
 version needs HTTPS and `wss://`, an admission design resistant to anonymous
 capacity exhaustion, rate limits, encrypted backups, operational storage
 monitoring, and carefully scrubbed proxy access logs.
@@ -126,21 +130,28 @@ Build using the server directory as the context:
 docker build -t gotsync-server server
 ```
 
-The command above runs from the repository root. For local use, publish backend
-ports on loopback and persist the delivery store:
+The command above runs from the repository root. The container listens on its
+own interfaces, so it requires TLS. Mount a directory holding `tls.crt` and
+`tls.key` (readable by UID 10001) at `/certs`, publish the backend ports on
+loopback, and persist the delivery store. For local use, a self-signed pair
+works:
 
 ```sh
+mkdir -p certs && openssl req -x509 -newkey ec \
+  -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj /CN=localhost \
+  -keyout certs/tls.key -out certs/tls.crt && chmod a+r certs/tls.key
 docker run --rm --name gotsync-server \
   -p 127.0.0.1:8765:8765 -p 127.0.0.1:8767:8767 \
-  -v gotsync-data:/data gotsync-server
+  -v "$PWD/certs:/certs:ro" -v gotsync-data:/data gotsync-server
 ```
 
 The image runs as UID 10001. Its health check probes SQLite readiness on the
 loopback metrics listener inside the container. Port 8766 is deliberately not
-published. The backend listens on container interfaces with the explicit
-plaintext override required for container networking. A public deployment
-must terminate HTTPS/WSS at a trusted reverse proxy and keep these ports off
-the public network. Restrict the volume and encrypt its backups.
+published. A public deployment must use a certificate from a trusted CA, or
+terminate HTTPS/WSS at a trusted reverse proxy. A proxy reaches the container
+over TLS; a proxy on the same host as a relay bound to loopback may use plain
+HTTP. Keep the backend ports off the public network. Restrict the volume and
+encrypt its backups.
 
 ## Protocol versions
 
