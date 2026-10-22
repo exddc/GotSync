@@ -16,7 +16,7 @@ record schema.
 | `mls/`, `Packages/GotSyncMLS` | OpenMLS bindings and the Swift wrapper the engine uses |
 | `scripts/` | Development, build, and test scripts |
 | `Examples/AccountlessSync` | SwiftUI iPhone demo with a local package dependency |
-| `docs/` | Protocol, compatibility, threat model, and security findings |
+| `docs/` | Protocol, compatibility, threat model, security findings, and design notes |
 
 The root `Package.swift` exports one product, `GotSync`. Adding this repository
 in Swift Package Manager builds the library without the example or Python
@@ -119,7 +119,9 @@ members, sends task changes as MLS application messages through the relay's
 ordered delivery log. While the application is active, the engine polls that
 log every two seconds. There are no inbound push notifications and no live
 socket for task changes. Background upload depends on the execution time the
-operating system grants and retries on the next launch.
+operating system grants and retries on the next launch. See
+[push and background receive](docs/PUSH-AND-BACKGROUND-RECEIVE.md) for the
+planned design.
 
 All linked devices share access to the group's tasks. A live invitation is an
 admission capability. The safety code protects against accidental pairing and
