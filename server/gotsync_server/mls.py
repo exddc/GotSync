@@ -10,7 +10,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .http import (
     RequestError,
@@ -27,6 +27,17 @@ MAX_ENTRIES = 10_000
 MAX_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_PACKAGES = 4096
 DEFAULT_MAX_GROUPS = 4096
+DEFAULT_RETENTION_SECONDS = 90 * 86400
+GRACE_SECONDS = 86400
+PACKAGE_LIFETIME_SECONDS = 900
+ACTIVITY_RESOLUTION_SECONDS = 3600
+EXPIRY_INTERVAL_SECONDS = 3600
+ADDED_COLUMNS = (
+    ("mls_groups", "expired", "INTEGER", 0),
+    ("mls_groups", "active_at", "REAL", None),
+    ("mls_entries", "created_at", "REAL", None),
+    ("mls_rejections", "created_at", "REAL", None),
+)
 
 
 class DeliveryConflict(RequestError):
@@ -44,6 +55,11 @@ class DeliveryUnauthorized(RequestError):
     code = "unauthorized"
 
 
+class HistoryExpired(RequestError):
+    status = 410
+    code = "historyExpired"
+
+
 def blob(doc: dict, name: str, size: int | None = None, maximum: int = MAX_PAYLOAD) -> bytes:
     result = decode_canonical_base64url(doc.get(name), field=name, exact_bytes=size, maximum_bytes=maximum)
     if not result:
@@ -58,12 +74,25 @@ def number(doc: dict, name: str, default: int | None = None) -> int:
     return result
 
 
+class Writer(NamedTuple):
+    digest: bytes
+    ack: int
+    removal: int | None
+    expired: int
+
+
 class MLSDeliveryStore:
-    def __init__(self, path: str | os.PathLike[str], *, max_groups: int = DEFAULT_MAX_GROUPS, max_packages: int = DEFAULT_MAX_PACKAGES) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], *, max_groups: int = DEFAULT_MAX_GROUPS,
+        max_packages: int = DEFAULT_MAX_PACKAGES, retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+    ) -> None:
         if type(max_groups) is not int or type(max_packages) is not int or min(max_groups, max_packages) <= 0:
             raise ValueError("directory limits must be positive integers")
+        if not GRACE_SECONDS <= retention_seconds < math.inf:
+            raise ValueError("retention must be at least one day")
         self.max_groups = max_groups
         self.max_packages = max_packages
+        self.retention_seconds = retention_seconds
         self._lock = threading.Lock()
         path = Path(path)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -73,8 +102,13 @@ class MLSDeliveryStore:
         path.chmod(0o600)
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA synchronous=FULL")
+        self._db.execute("PRAGMA secure_delete=ON")
+        self._db.execute("PRAGMA journal_mode=DELETE")
         self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS mls_groups (route BLOB PRIMARY KEY, epoch INTEGER NOT NULL, head INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS mls_groups (
+                route BLOB PRIMARY KEY, epoch INTEGER NOT NULL, head INTEGER NOT NULL DEFAULT 0,
+                expired INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, active_at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS mls_writers (
                 route BLOB NOT NULL, digest BLOB NOT NULL, ack INTEGER NOT NULL DEFAULT 0,
                 removal INTEGER, removed_at REAL, PRIMARY KEY(route, digest)
@@ -83,17 +117,21 @@ class MLSDeliveryStore:
                 cursor INTEGER PRIMARY KEY AUTOINCREMENT, route BLOB NOT NULL,
                 epoch INTEGER NOT NULL, kind TEXT NOT NULL, payload BLOB NOT NULL,
                 welcome BLOB, package BLOB, removed_writer BLOB, added_writer BLOB,
-                UNIQUE(route, payload)
+                created_at REAL NOT NULL, UNIQUE(route, payload)
             );
             CREATE INDEX IF NOT EXISTS mls_route_cursor ON mls_entries(route, cursor);
             CREATE TABLE IF NOT EXISTS mls_rejections (
-                route BLOB NOT NULL, digest BLOB NOT NULL, epoch INTEGER NOT NULL,
+                route BLOB NOT NULL, digest BLOB NOT NULL, epoch INTEGER NOT NULL, created_at REAL NOT NULL,
                 PRIMARY KEY(route, digest)
             );
             CREATE TABLE IF NOT EXISTS mls_packages (
                 reference BLOB PRIMARY KEY, payload BLOB, expires REAL NOT NULL, writer BLOB NOT NULL, pairing BLOB NOT NULL
             );
         """)
+        for table, column, kind, default in ADDED_COLUMNS:
+            if column not in {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind} NOT NULL DEFAULT {default if default is not None else time.time()}")
+        self._db.execute("CREATE INDEX IF NOT EXISTS mls_entry_age ON mls_entries(created_at)")
         self._db.commit()
 
     def close(self) -> None:
@@ -126,12 +164,18 @@ class MLSDeliveryStore:
     def request(self, operation: str, document: dict[str, Any]) -> dict[str, Any]:
         if type(document.get("version")) is not int or document["version"] != VERSION:
             raise RequestError("unsupported version")
-        with self._lock, self._db:
-            self._db.execute("DELETE FROM mls_packages WHERE expires <= ?", (time.time(),))
-            self._expire_empty_groups()
-            self._prune()
-            result = self._request(operation, document)
-            return {"version": VERSION, **result}
+        with self._lock:
+            self._expire_committed()
+            with self._db:
+                return {"version": VERSION, **self._request(operation, document)}
+
+    def expire(self) -> None:
+        with self._lock:
+            self._expire_committed()
+
+    def _expire_committed(self) -> None:
+        with self._db:
+            self._expire(time.time())
 
     def _request(self, operation: str, doc: dict[str, Any]) -> dict[str, Any]:
         operations = {
@@ -154,7 +198,7 @@ class MLSDeliveryStore:
         if not existing:
             if self._db.execute("SELECT COUNT(*) FROM mls_packages").fetchone()[0] >= self.max_packages:
                 raise DeliveryCapacity("package directory full")
-            self._db.execute("INSERT INTO mls_packages VALUES (?,?,?,?,?)", (reference, package, time.time() + 900, writer, pairing))
+            self._db.execute("INSERT INTO mls_packages VALUES (?,?,?,?,?)", (reference, package, time.time() + PACKAGE_LIFETIME_SECONDS, writer, pairing))
         return {"reference": encode_base64url(reference)}
 
     def _package_fetch(self, doc: dict) -> dict:
@@ -178,62 +222,80 @@ class MLSDeliveryStore:
         else:
             if self._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0] >= self.max_groups:
                 raise DeliveryCapacity("group directory full")
-            self._db.execute("INSERT INTO mls_groups(route,epoch,created_at) VALUES (?,0,?)", (route, time.time()))
+            now = time.time()
+            self._db.execute("INSERT INTO mls_groups(route,epoch,created_at,active_at) VALUES (?,0,?,?)", (route, now, now))
             self._db.execute("INSERT INTO mls_writers(route,digest) VALUES (?,?)", (route, writer))
         return {}
 
-    def _authorize(self, doc: dict, route: bytes, *, writing: bool = False) -> tuple:
+    def _authorize(self, doc: dict, route: bytes, *, writing: bool = False) -> Writer:
         try:
-            writer = hashlib.sha256(blob(doc, "authorization", 32)).digest()
+            digest = hashlib.sha256(blob(doc, "authorization", 32)).digest()
         except RequestError as error:
             raise DeliveryUnauthorized("writer token required") from error
-        row = self._db.execute("SELECT ack,removal,removed_at FROM mls_writers WHERE route=? AND digest=?", (route, writer)).fetchone()
-        if row is None or (row[1] is not None and (writing or row[0] >= row[1] or time.time() >= row[2] + 86400)):
+        group = self._db.execute("SELECT expired FROM mls_groups WHERE route=?", (route,)).fetchone()
+        if group is None:
+            raise HistoryExpired("group expired")
+        row = self._db.execute("SELECT ack,removal,removed_at FROM mls_writers WHERE route=? AND digest=?", (route, digest)).fetchone()
+        now = time.time()
+        if row is None or (row[1] is not None and (writing or row[0] >= row[1] or now >= row[2] + GRACE_SECONDS)):
             raise DeliveryUnauthorized("writer not authorized")
-        return writer, row[1]
+        self._db.execute("UPDATE mls_groups SET active_at=? WHERE route=? AND active_at<?", (now, route, now - ACTIVITY_RESOLUTION_SECONDS))
+        return Writer(digest, row[0], row[1], group[0])
 
     def _fetch(self, doc: dict) -> dict:
         route = blob(doc, "group", 32)
-        _, removal = self._authorize(doc, route)
+        writer = self._authorize(doc, route)
         after = number(doc, "after")
         limit = number(doc, "limit", default=16)
         if not 1 <= limit <= 32:
             raise RequestError("invalid limit")
+        if max(writer.ack, after) < writer.expired:
+            raise HistoryExpired("unread entries expired")
         rows = self._db.execute(
             "SELECT cursor,epoch,kind,payload,welcome,package,removed_writer,added_writer FROM mls_entries WHERE route=? AND cursor>? AND cursor<=? ORDER BY cursor LIMIT ?",
-            (route, after, removal if removal is not None else 2**53, limit),
+            (route, after, writer.removal if writer.removal is not None else 2**53, limit),
         ).fetchall()
         return {"entries": [self._entry(row) for row in rows]}
 
     def _ack(self, doc: dict) -> dict:
         route = blob(doc, "route", 32)
-        writer, removal = self._authorize(doc, route)
+        writer = self._authorize(doc, route)
         cursor = number(doc, "cursor")
         head = self._db.execute("SELECT head FROM mls_groups WHERE route=?", (route,)).fetchone()[0]
-        if cursor > head or (removal is not None and cursor > removal):
+        if cursor > head or (writer.removal is not None and cursor > writer.removal):
             raise RequestError("cursor exceeds readable log")
-        self._db.execute("UPDATE mls_writers SET ack=MAX(ack,?) WHERE route=? AND digest=?", (cursor, route, writer))
-        self._prune()
+        self._db.execute("UPDATE mls_writers SET ack=MAX(ack,?) WHERE route=? AND digest=?", (cursor, route, writer.digest))
+        self._prune(time.time())
         return {}
 
-    def _expire_empty_groups(self) -> None:
-        expired = self._db.execute(
-            "SELECT route FROM mls_groups WHERE head=0 AND created_at<=?", (time.time() - 86400,)
+    def _expire(self, now: float) -> None:
+        cutoff = now - self.retention_seconds
+        self._db.execute("DELETE FROM mls_packages WHERE expires <= ?", (now,))
+        self._db.execute(
+            "UPDATE mls_groups SET expired=(SELECT MAX(cursor) FROM mls_entries WHERE route=mls_groups.route AND created_at<=?) "
+            "WHERE route IN (SELECT route FROM mls_entries WHERE created_at<=?)",
+            (cutoff, cutoff),
+        )
+        self._db.execute("DELETE FROM mls_entries WHERE created_at<=?", (cutoff,))
+        self._db.execute("DELETE FROM mls_rejections WHERE created_at<=?", (now - GRACE_SECONDS,))
+        self._db.execute("DELETE FROM mls_writers WHERE removed_at<=?", (now - GRACE_SECONDS,))
+        stale = self._db.execute(
+            "SELECT route FROM mls_groups WHERE active_at<=? OR (head=0 AND created_at<=?)",
+            (cutoff - ACTIVITY_RESOLUTION_SECONDS, now - GRACE_SECONDS),
         ).fetchall()
-        for route in expired:
-            self._db.execute("DELETE FROM mls_writers WHERE route=?", route)
-            self._db.execute("DELETE FROM mls_rejections WHERE route=?", route)
-            self._db.execute("DELETE FROM mls_groups WHERE route=?", route)
+        for table in ("mls_entries", "mls_writers", "mls_rejections", "mls_groups"):
+            self._db.executemany(f"DELETE FROM {table} WHERE route=?", stale)
+        self._prune(now)
 
-    def _prune(self) -> None:
+    def _prune(self, now: float) -> None:
         self._db.execute(
             "DELETE FROM mls_entries WHERE cursor <= (SELECT MIN(ack) FROM mls_writers WHERE mls_writers.route=mls_entries.route AND (removal IS NULL OR (ack<removal AND removed_at>?)))",
-            (time.time() - 86400,),
+            (now - GRACE_SECONDS,),
         )
 
     def _append(self, doc: dict) -> dict:
         route = blob(doc, "group", 32)
-        writer, _ = self._authorize(doc, route, writing=True)
+        writer = self._authorize(doc, route, writing=True).digest
         entry = self._parse_entry(doc, writer)
         duplicate = self._db.execute(
             "SELECT cursor,epoch,kind,payload,welcome,package,removed_writer,added_writer FROM mls_entries WHERE route=? AND payload=?", (route, entry[2])
@@ -252,7 +314,7 @@ class MLSDeliveryStore:
         if not self._check_membership(route, entry):
             if self._db.execute("SELECT COUNT(*) FROM mls_rejections WHERE route=?", (route,)).fetchone()[0] >= MAX_ENTRIES:
                 raise DeliveryCapacity("rejection journal full")
-            self._db.execute("INSERT INTO mls_rejections VALUES (?,?,?)", (route, digest, entry[0]))
+            self._db.execute("INSERT INTO mls_rejections VALUES (?,?,?,?)", (route, digest, entry[0], time.time()))
             return {"error": "keyPackageUnavailable", "epoch": entry[0]}
         return self._accept_entry(route, entry, writer)
 
@@ -275,9 +337,7 @@ class MLSDeliveryStore:
         return epoch, kind, payload, welcome, package, removed_writer, added_writer
 
     def _check_membership(self, route: bytes, entry: tuple) -> bool:
-        _, _, _, _, package, removed_writer, added_writer = entry
-        if removed_writer and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=?", (route, removed_writer)).fetchone():
-            raise RequestError("writer removal target is unknown")
+        _, _, _, _, package, _, added_writer = entry
         joining = self._db.execute("SELECT writer FROM mls_packages WHERE reference=?", (package,)).fetchone() if package else None
         if package and (not joining or joining[0] != added_writer):
             return False
@@ -294,8 +354,8 @@ class MLSDeliveryStore:
         if count >= MAX_ENTRIES or size + len(payload) + len(welcome or b"") + len(package or b"") > MAX_BYTES:
             raise DeliveryCapacity("delivery log full")
         cursor = self._db.execute(
-            "INSERT INTO mls_entries(route,epoch,kind,payload,welcome,package,removed_writer,added_writer) VALUES (?,?,?,?,?,?,?,?)",
-            (route, *entry),
+            "INSERT INTO mls_entries(route,epoch,kind,payload,welcome,package,removed_writer,added_writer,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (route, *entry, time.time()),
         ).lastrowid
         self._db.execute("UPDATE mls_groups SET head=?,epoch=epoch+? WHERE route=?", (cursor, int(kind == "commit"), route))
         if package:
@@ -321,12 +381,32 @@ class MLSDeliveryServer:
         self.store = store
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._expiry: asyncio.Task | None = None
+
+    def start_expiry(self, interval: float = EXPIRY_INTERVAL_SECONDS) -> None:
+        self._expiry = asyncio.create_task(self._expire_periodically(interval))
+
+    async def stop_expiry(self) -> None:
+        if self._expiry:
+            self._expiry.cancel()
+            await asyncio.gather(self._expiry, return_exceptions=True)
+            self._expiry = None
+
+    async def _expire_periodically(self, interval: float) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await asyncio.to_thread(self.store.expire)
+            except sqlite3.Error:
+                pass
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0, limit=8192)
+        self.start_expiry()
         return self._server.sockets[0].getsockname()[1]
 
     async def close(self) -> None:
+        await self.stop_expiry()
         if self._server:
             self._server.close()
             await self._server.wait_closed()

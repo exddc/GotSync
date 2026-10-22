@@ -505,6 +505,21 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertTrue(joiner.isPaired)
     }
 
+    func testExpiredRelayHistoryStopsSyncAndIsSurfaced() async throws {
+        let host = engine("host")
+        let joiner = engine("joiner")
+        try await pair(host, joiner)
+        try await wait("synced") { joiner.phase == .synced }
+        await relay.expireHistory(group: try await groupID(host))
+        XCTAssertTrue(host.addTask(title: "After expiry"))
+        try await wait("expired") { joiner.phase == .failed }
+        XCTAssertEqual(joiner.mailboxError, .syncHistoryExpired)
+        XCTAssertTrue(joiner.mailboxRequiresRepair)
+        XCTAssertEqual(joiner.errorMessage, SyncError.syncHistoryExpired.errorDescription)
+        XCTAssertTrue(joiner.isPaired)
+        XCTAssertEqual(SyncError.fromTransport(MLSRelayError.historyExpired) as? SyncError, .syncHistoryExpired)
+    }
+
     func testUnlinkAndEraseResetTheMLSSession() async throws {
         let host = engine("host")
         let joiner = engine("joiner")
@@ -736,6 +751,19 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("departure erased") {
             ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
         }
+    }
+
+    func testLeaveFromExpiredGroupIsNotRetried() async throws {
+        let host = engine("expired-host")
+        let leaver = engine("expired-leaver", departureRetryDelayNanoseconds: 1_000_000...20_000_000)
+        try await pair(host, leaver)
+        await relay.expireHistory(group: try await groupID(host))
+        leaver.unlinkAndKeepTasks()
+        let departures = root.appendingPathComponent("expired-leaver").appendingPathComponent(SyncEngine.departuresDirectoryName)
+        try await wait("departure erased") {
+            ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
+        }
+        XCTAssertFalse(leaver.isPaired)
     }
 
     func testLeftInstallCanBeInvitedAgain() async throws {

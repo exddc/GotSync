@@ -38,6 +38,10 @@ timing, sizes, group IDs, and co-membership in pairing rooms. It sees the
 pairing token when the inviter fetches a KeyPackage, but not the invitation
 secret it is derived from. The server has no application decryption keys. Its
 SQLite database and backups still need access controls and encrypted storage.
+The relay deletes stored records on the schedule in the
+[server README](../server/README.md#retention). Anyone who knows a group ID can
+learn whether the relay still holds that group, because requests for a deleted
+group return `historyExpired` instead of `unauthorized`.
 
 A group has up to eight devices. Every member can read and edit all tasks and
 invite additional members. There is no administrator role or privacy boundary
@@ -99,8 +103,9 @@ These mechanisms have limits:
 - Removal and leave do not delete tasks the device already received, and
   cannot wipe a device remotely.
 - A device that never comes online again stays a member until someone
-  removes it. Its missing acknowledgements also stop the relay from pruning
-  the log, which fills up after 10,000 entries or 16 MiB.
+  removes it. Its missing acknowledgements keep the relay from pruning the
+  log until entries reach the 90-day retention limit, and the log can fill
+  up after 10,000 entries or 16 MiB before then.
 - A leaving device keeps its old MLS state and key in the departure journal
   until the relay accepts its proposal. If the device is stolen before the
   proposal reaches the relay, the other members do not know it left, and the
@@ -148,5 +153,7 @@ The engine receives while its application is active. Background send is best
 effort; iOS suspension and force-quit can prevent delivery until the next launch.
 An edit that never reaches another replica or the delivery log can be lost with
 its source device. The relay prunes log entries once every current member has
-acknowledged them. There is no recovery if every copy of a group's secrets and
-data is lost.
+acknowledged them, and deletes them after 90 days in any case. A device offline
+for longer misses those entries and must pair again; it reports
+`SyncError.syncHistoryExpired`. There is no recovery if every copy of a group's
+secrets and data is lost.
