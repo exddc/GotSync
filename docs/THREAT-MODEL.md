@@ -30,8 +30,10 @@ Excluding the files from backups means a backup restored to another device
 contains no tasks or link; the tasks return only by pairing with a device that
 still has them.
 
-The relay receives MLS ciphertext, commits, Welcome messages, KeyPackages,
-writer-token hashes, cursors, and epochs. It also observes IP addresses,
+The relay serves only the `/v2/pairing` WebSocket room and the `/v2/mls`
+delivery log; it stores no version 1 mailbox data. It receives MLS ciphertext,
+commits, Welcome messages, KeyPackages, writer-token hashes, cursors, and
+epochs. It also observes IP addresses,
 timing, sizes, group IDs, and co-membership in pairing rooms. It sees the
 pairing token when the inviter fetches a KeyPackage, but not the invitation
 secret it is derived from. The server has no application decryption keys. Its
@@ -140,7 +142,7 @@ The relay enforces per-source connection and request rate limits, per-source
 concurrency limits, and optional deployment admission by network allowlist or
 proxy-injected token. These bound what one address or IPv6 `/64` can consume,
 but anonymous clients spread across many addresses can still exhaust capacity
-despite bounded rooms, request bodies, mailbox quotas, and delivery logs.
+despite bounded rooms, request bodies, group and package quotas, and delivery logs.
 Operators remain responsible for the TLS proxy, trusted-proxy configuration,
 perimeter rate limits and DDoS protection, firewalling the relay ports, backup
 policy, and deployment monitoring. See the relay README for the perimeter

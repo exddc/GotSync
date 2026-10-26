@@ -11,7 +11,7 @@ from gotsync_server.server import RelayServer
 
 async def main() -> None:
     directory = Path(sys.argv[1])
-    server = RelayServer(port=0, mailbox_port=0, metrics_port=0, mailbox_database_path=directory / "mailbox.sqlite3")
+    server = RelayServer(port=0, delivery_port=0, metrics_port=0, delivery_database_path=directory / "mls.sqlite3")
     await server.start()
     try:
         def check_readiness() -> None:
@@ -20,8 +20,8 @@ async def main() -> None:
                     raise RuntimeError("relay is not ready")
         await asyncio.to_thread(check_readiness)
         (directory / "endpoints.env").write_text(
-            f"GOTSYNC_RELAY_URL=ws://127.0.0.1:{server.websocket_port}/v1\n"
-            f"GOTSYNC_MAILBOX_URL=http://127.0.0.1:{server.bound_mailbox_port}/v1/mailbox\n"
+            f"GOTSYNC_RELAY_URL=ws://127.0.0.1:{server.websocket_port}/v2/pairing\n"
+            f"GOTSYNC_MAILBOX_URL=http://127.0.0.1:{server.bound_delivery_port}/v2/mls\n"
         )
         stopped = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):

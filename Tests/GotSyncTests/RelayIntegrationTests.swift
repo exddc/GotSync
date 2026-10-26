@@ -80,7 +80,7 @@ final class RelayIntegrationTests: XCTestCase {
             try await Task.sleep(for: .seconds(1))
             XCTAssertEqual(third.tasks.count, 4)
             let relay = HTTPMLSRelayTransport(
-                baseURL: try SyncEndpointConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, policy: .localDevelopment).mlsURL,
+                baseURL: mailboxURL,
                 policy: .localDevelopment
             )
             do {

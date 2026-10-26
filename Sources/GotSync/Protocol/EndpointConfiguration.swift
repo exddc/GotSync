@@ -47,7 +47,7 @@ public struct SyncEndpointConfiguration: Equatable, Sendable {
             scheme == "ws" || scheme == "wss",
             let host = url.host?.lowercased(),
             !host.isEmpty,
-            url.path == "/v1",
+            url.path == "/v2/pairing",
             url.user == nil,
             url.password == nil,
             url.query == nil,
@@ -70,21 +70,6 @@ public struct SyncEndpointConfiguration: Equatable, Sendable {
     }
 
     public static func validateMailboxURL(
-        _ url: URL,
-        policy: EndpointSecurityPolicy
-    ) throws {
-        guard isValidHTTPEndpoint(url, path: "/v1/mailbox", policy: policy) else {
-            throw SyncEndpointConfigurationError.invalidMailbox
-        }
-    }
-
-    var mlsURL: URL {
-        var components = URLComponents(url: mailboxURL, resolvingAgainstBaseURL: false)!
-        components.path = "/v2/mls"
-        return components.url!
-    }
-
-    static func validateMLSURL(
         _ url: URL,
         policy: EndpointSecurityPolicy
     ) throws {

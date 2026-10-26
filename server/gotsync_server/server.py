@@ -6,13 +6,11 @@ import base64
 import ipaddress
 import json
 import logging
-import math
 import os
 import signal
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -40,38 +38,18 @@ from .admission import (
 )
 from .http import (
     MAX_HTTP_HEADER_BYTES,
-    encode_json_document,
-    parse_mailbox_json,
+    RequestError,
     read_http_head,
     read_http_body,
     write_http_response,
 )
 from .mls import MLSDeliveryServer, MLSDeliveryStore
-from .mailbox import (
-    DEFAULT_MAILBOX_RETENTION_SECONDS,
-    DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS,
-    DEFAULT_MAX_GLOBAL_LIVE_BYTES,
-    DEFAULT_MAX_GLOBAL_RECEIPTS,
-    DEFAULT_MAX_ROUTE_LIVE_BYTES,
-    DEFAULT_MAX_ROUTE_RECEIPTS,
-    MAX_MAILBOX_BATCH_MESSAGES,
-    MAX_MAILBOX_PAYLOAD_BYTES,
-    MAX_MAILBOX_REQUEST_BYTES,
-    MAX_MAILBOX_RESPONSE_BYTES,
-    MailboxAuthorizationError,
-    MailboxCapacityError,
-    MailboxConflictError,
-    MailboxError,
-    MailboxPutMessage,
-    MailboxStore,
-    authorize_mailbox,
-    decode_canonical_base64url,
-    encode_base64url,
-)
-
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
-WEBSOCKET_PATH = "/v1"
-DEFAULT_MAILBOX_DATABASE_PATH = "relay-data/mailbox.sqlite3"
+
+WEBSOCKET_PATH = "/v2/pairing"
+DELIVERY_PATH_PREFIX = "/v2/mls/"
+DEFAULT_DELIVERY_DATABASE_PATH = "relay-data/mls.sqlite3"
+MAX_DELIVERY_REQUEST_BYTES = 1024 * 1024
 MAX_REGISTRATION_BYTES = 512
 MAX_BINARY_MESSAGE_BYTES = 512 * 1024
 MAX_FORWARD_QUEUE_FRAMES = 16
@@ -79,7 +57,7 @@ MAX_FORWARD_QUEUE_BYTES = 1024 * 1024
 REGISTRATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_CONNECTIONS = 256
 DEFAULT_MAX_ROOMS = 128
-DEFAULT_MAX_MAILBOX_CONNECTIONS = 64
+DEFAULT_MAX_DELIVERY_CONNECTIONS = 64
 DEFAULT_MAX_SOCKETS_PER_ROUTE = 2
 # Must stay aligned with ProductSyncPolicy.pairingWindowTimeToLive (15 minutes)
 # so physical QR + phrase pairing is not cut short by the relay waiting room.
@@ -134,16 +112,9 @@ COUNTER_NAMES = (
     "binary_bytes_dropped_no_peer",
     "forward_queue_overflows",
     "control_frames_sent",
-    "mailbox_requests",
-    "mailbox_connection_capacity_rejections",
-    "mailbox_bad_requests",
-    "mailbox_authorization_rejections",
-    "mailbox_capacity_rejections",
-    "mailbox_conflicts",
-    "mailbox_messages_put",
-    "mailbox_messages_fetched",
-    "mailbox_messages_acked",
-    "mailbox_routes_forgotten",
+    "delivery_requests",
+    "delivery_connection_capacity_rejections",
+    "delivery_bad_requests",
     "admission_rejections",
     "rate_limit_rejections",
     "source_concurrency_rejections",
@@ -636,23 +607,14 @@ class RelayServer:
         port: int = 8765,
         metrics_host: str = "127.0.0.1",
         metrics_port: int = 8766,
-        mailbox_host: str = "127.0.0.1",
-        mailbox_port: int = 8767,
-        mailbox_database_path: str | os.PathLike[str] = DEFAULT_MAILBOX_DATABASE_PATH,
-        mailbox_retention_seconds: float = DEFAULT_MAILBOX_RETENTION_SECONDS,
-        mailbox_purge_interval_seconds: float = (
-            DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS
-        ),
-        mailbox_max_route_receipts: int = DEFAULT_MAX_ROUTE_RECEIPTS,
-        mailbox_max_route_live_bytes: int = DEFAULT_MAX_ROUTE_LIVE_BYTES,
-        mailbox_max_global_receipts: int = DEFAULT_MAX_GLOBAL_RECEIPTS,
-        mailbox_max_global_live_bytes: int = DEFAULT_MAX_GLOBAL_LIVE_BYTES,
-        mailbox_max_connections: int = DEFAULT_MAX_MAILBOX_CONNECTIONS,
+        delivery_host: str = "127.0.0.1",
+        delivery_port: int = 8767,
+        delivery_database_path: str | os.PathLike[str] = DEFAULT_DELIVERY_DATABASE_PATH,
+        delivery_max_connections: int = DEFAULT_MAX_DELIVERY_CONNECTIONS,
         metrics: Metrics | None = None,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_rooms: int = DEFAULT_MAX_ROOMS,
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
-        mailbox_clock: Callable[[], float] | None = None,
         allow_insecure_non_loopback: bool = False,
         admission: AdmissionConfig | None = None,
         admission_clock: Callable[[], float] | None = None,
@@ -660,29 +622,21 @@ class RelayServer:
         _require_loopback(metrics_host, label="metrics host")
         if not allow_insecure_non_loopback:
             _require_loopback(host, label="relay host")
-            _require_loopback(mailbox_host, label="mailbox host")
-        if (
-            not math.isfinite(mailbox_purge_interval_seconds)
-            or mailbox_purge_interval_seconds <= 0
-        ):
-            raise ValueError(
-                "mailbox_purge_interval_seconds must be finite and positive"
-            )
+            _require_loopback(delivery_host, label="delivery host")
         if not all(
             0 <= candidate <= 65535
-            for candidate in (port, metrics_port, mailbox_port)
+            for candidate in (port, metrics_port, delivery_port)
         ):
             raise ValueError("ports must be between 0 and 65535")
-        if mailbox_max_connections <= 0:
-            raise ValueError("mailbox max connections must be positive")
+        if delivery_max_connections <= 0:
+            raise ValueError("delivery max connections must be positive")
         self.host = host
         self.port = port
         self.metrics_host = metrics_host
         self.metrics_port = metrics_port
-        self.mailbox_host = mailbox_host
-        self.mailbox_port = mailbox_port
-        self.mailbox_purge_interval_seconds = mailbox_purge_interval_seconds
-        self.mailbox_max_connections = mailbox_max_connections
+        self.delivery_host = delivery_host
+        self.delivery_port = delivery_port
+        self.delivery_max_connections = delivery_max_connections
         self.admission = AdmissionController(
             admission, clock=admission_clock or time.monotonic
         )
@@ -693,23 +647,11 @@ class RelayServer:
             waiting_room_ttl=waiting_room_ttl,
             admission=self.admission,
         )
-        mailbox_options: dict[str, Any] = {
-            "retention_seconds": mailbox_retention_seconds,
-            "max_route_receipts": mailbox_max_route_receipts,
-            "max_route_live_bytes": mailbox_max_route_live_bytes,
-            "max_global_receipts": mailbox_max_global_receipts,
-            "max_global_live_bytes": mailbox_max_global_live_bytes,
-        }
-        if mailbox_clock is not None:
-            mailbox_options["clock"] = mailbox_clock
-        self.mailbox = MailboxStore(mailbox_database_path, **mailbox_options)
-        self.mls = MLSDeliveryServer(MLSDeliveryStore(Path(mailbox_database_path).with_name("mls.sqlite3")))
+        self.mls = MLSDeliveryServer(MLSDeliveryStore(delivery_database_path))
         self._websocket_server: Any | None = None
         self._metrics_server: asyncio.Server | None = None
-        self._mailbox_server: asyncio.Server | None = None
-        self._mailbox_tasks: set[asyncio.Task[Any]] = set()
-        self._mailbox_purge_task: asyncio.Task[None] | None = None
-        self._mailbox_purge_stop = asyncio.Event()
+        self._delivery_server: asyncio.Server | None = None
+        self._delivery_tasks: set[asyncio.Task[Any]] = set()
         self._websocket_logger = logging.Logger("gotsync-server-websocket")
         self._websocket_logger.addHandler(logging.NullHandler())
         self._websocket_logger.propagate = False
@@ -728,21 +670,19 @@ class RelayServer:
         return int(self._metrics_server.sockets[0].getsockname()[1])
 
     @property
-    def bound_mailbox_port(self) -> int:
-        if self._mailbox_server is None or not self._mailbox_server.sockets:
-            raise RuntimeError("mailbox server is not running")
-        return int(self._mailbox_server.sockets[0].getsockname()[1])
+    def bound_delivery_port(self) -> int:
+        if self._delivery_server is None or not self._delivery_server.sockets:
+            raise RuntimeError("delivery server is not running")
+        return int(self._delivery_server.sockets[0].getsockname()[1])
 
     async def start(self) -> None:
         if (
             self._websocket_server is not None
             or self._metrics_server is not None
-            or self._mailbox_server is not None
-            or self._mailbox_purge_task is not None
+            or self._delivery_server is not None
         ):
             raise RuntimeError("relay is already running")
         try:
-            await asyncio.to_thread(self.mailbox.purge_expired)
             self._websocket_server = await serve(
                 self.service.handle,
                 self.host,
@@ -765,24 +705,17 @@ class RelayServer:
                 self.metrics_port,
                 limit=8192,
             )
-            self._mailbox_server = await asyncio.start_server(
-                self._accept_mailbox_http,
-                self.mailbox_host,
-                self.mailbox_port,
+            self._delivery_server = await asyncio.start_server(
+                self._accept_delivery_http,
+                self.delivery_host,
+                self.delivery_port,
                 limit=MAX_HTTP_HEADER_BYTES,
             )
-            self._mailbox_purge_task = asyncio.create_task(
-                self._purge_mailbox_periodically()
-            )
         except BaseException:
-            if self._mailbox_purge_task is not None:
-                self._mailbox_purge_stop.set()
-                await self._mailbox_purge_task
-                self._mailbox_purge_task = None
-            if self._mailbox_server is not None:
-                self._mailbox_server.close()
-                await self._mailbox_server.wait_closed()
-                self._mailbox_server = None
+            if self._delivery_server is not None:
+                self._delivery_server.close()
+                await self._delivery_server.wait_closed()
+                self._delivery_server = None
             if self._metrics_server is not None:
                 self._metrics_server.close()
                 await self._metrics_server.wait_closed()
@@ -791,39 +724,32 @@ class RelayServer:
                 self._websocket_server.close()
                 await self._websocket_server.wait_closed()
                 self._websocket_server = None
-            self.mailbox.close()
             self.mls.store.close()
             raise
 
     async def close(self) -> None:
-        mailbox_purge_task = self._mailbox_purge_task
-        mailbox_server = self._mailbox_server
+        delivery_server = self._delivery_server
         metrics_server = self._metrics_server
         websocket_server = self._websocket_server
-        self._mailbox_purge_task = None
-        self._mailbox_server = None
+        self._delivery_server = None
         self._metrics_server = None
         self._websocket_server = None
 
-        if mailbox_purge_task is not None:
-            self._mailbox_purge_stop.set()
-            await mailbox_purge_task
-        if mailbox_server is not None:
-            mailbox_server.close()
-            await mailbox_server.wait_closed()
+        if delivery_server is not None:
+            delivery_server.close()
+            await delivery_server.wait_closed()
         current_task = asyncio.current_task()
-        mailbox_tasks = [
-            task for task in self._mailbox_tasks if task is not current_task
+        delivery_tasks = [
+            task for task in self._delivery_tasks if task is not current_task
         ]
-        if mailbox_tasks:
-            await asyncio.gather(*mailbox_tasks, return_exceptions=True)
+        if delivery_tasks:
+            await asyncio.gather(*delivery_tasks, return_exceptions=True)
         if metrics_server is not None:
             metrics_server.close()
             await metrics_server.wait_closed()
         if websocket_server is not None:
             websocket_server.close(close_connections=True)
             await websocket_server.wait_closed()
-        self.mailbox.close()
         self.mls.store.close()
 
     async def __aenter__(self) -> RelayServer:
@@ -857,14 +783,14 @@ class RelayServer:
             else "admission_rejections"
         )
 
-    def _accept_mailbox_http(
+    def _accept_delivery_http(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        if len(self._mailbox_tasks) >= self.mailbox_max_connections:
+        if len(self._delivery_tasks) >= self.delivery_max_connections:
             self.service.metrics.increment(
-                "mailbox_connection_capacity_rejections"
+                "delivery_connection_capacity_rejections"
             )
             writer.close()
             return
@@ -877,10 +803,10 @@ class RelayServer:
                 return
             held_source = peer.key
         task = asyncio.create_task(
-            self._handle_mailbox_http(reader, writer, held_source=held_source)
+            self._handle_delivery_http(reader, writer, held_source=held_source)
         )
-        self._mailbox_tasks.add(task)
-        task.add_done_callback(self._mailbox_tasks.discard)
+        self._delivery_tasks.add(task)
+        task.add_done_callback(self._delivery_tasks.discard)
 
     def _screen_http_request(
         self,
@@ -922,7 +848,7 @@ class RelayServer:
                 await read_http_body(
                     reader, headers, maximum_body_bytes=maximum_body_bytes
                 )
-            except MailboxError:
+            except RequestError:
                 pass
         await write_http_response(
             writer,
@@ -933,35 +859,17 @@ class RelayServer:
             else None,
         )
 
-    async def _purge_mailbox_periodically(self) -> None:
-        while not self._mailbox_purge_stop.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._mailbox_purge_stop.wait(),
-                    timeout=self.mailbox_purge_interval_seconds,
-                )
-                return
-            except TimeoutError:
-                pass
-            try:
-                await asyncio.to_thread(self.mailbox.purge_expired)
-            except Exception:
-                self.service.metrics.increment("internal_errors")
-
-    async def _handle_mailbox_http(
+    async def _handle_delivery_http(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
         held_source: str | None = None,
     ) -> None:
-        self.service.metrics.increment("mailbox_requests")
+        self.service.metrics.increment("delivery_requests")
         try:
             try:
                 method, target, headers = await read_http_head(reader)
-                maximum_body_bytes = (
-                    1024 * 1024 if target.startswith("/v2/mls/") else MAX_MAILBOX_REQUEST_BYTES
-                )
                 rejection, held_source = self._screen_http_request(
                     writer, headers, held_source
                 )
@@ -971,61 +879,19 @@ class RelayServer:
                         writer,
                         headers,
                         rejection,
-                        maximum_body_bytes=maximum_body_bytes,
+                        maximum_body_bytes=MAX_DELIVERY_REQUEST_BYTES,
                         held_source=held_source,
                     )
                     return
+                if method != "POST" or not target.startswith(DELIVERY_PATH_PREFIX):
+                    await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
+                    return
                 body = await read_http_body(
-                    reader, headers, maximum_body_bytes=maximum_body_bytes,
+                    reader, headers, maximum_body_bytes=MAX_DELIVERY_REQUEST_BYTES,
                 )
-                if method == "POST" and target.startswith("/v2/mls/"):
-                    await self.mls.handle_request(target, headers, body, writer)
-                    return
-                if method != "POST":
-                    await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
-                    return
-                if headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
-                    "application/json"
-                ):
-                    raise MailboxError("content type must be application/json")
-                document = parse_mailbox_json(body)
-                _require_mailbox_version(document)
-
-                if target == "/v1/mailbox/put":
-                    response = await self._mailbox_put(document)
-                elif target == "/v1/mailbox/fetch":
-                    response = await self._mailbox_fetch(document)
-                elif target == "/v1/mailbox/ack":
-                    response = await self._mailbox_ack(document)
-                elif target == "/v1/mailbox/forget":
-                    response = await self._mailbox_forget(document)
-                else:
-                    await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
-                    return
-                await write_http_response(writer, 200, response)
-            except MailboxAuthorizationError as error:
-                self.service.metrics.increment("mailbox_authorization_rejections")
-                await write_http_response(
-                    writer,
-                    error.status,
-                    {"error": error.code, "version": PROTOCOL_VERSION},
-                )
-            except MailboxConflictError as error:
-                self.service.metrics.increment("mailbox_conflicts")
-                await write_http_response(
-                    writer,
-                    error.status,
-                    {"error": error.code, "version": PROTOCOL_VERSION},
-                )
-            except MailboxCapacityError as error:
-                self.service.metrics.increment("mailbox_capacity_rejections")
-                await write_http_response(
-                    writer,
-                    error.status,
-                    {"error": error.code, "version": PROTOCOL_VERSION},
-                )
-            except MailboxError as error:
-                self.service.metrics.increment("mailbox_bad_requests")
+                await self.mls.handle_request(target, headers, body, writer)
+            except RequestError as error:
+                self.service.metrics.increment("delivery_bad_requests")
                 await write_http_response(
                     writer,
                     error.status,
@@ -1051,137 +917,6 @@ class RelayServer:
                 await writer.wait_closed()
             except ConnectionError:
                 pass
-
-    async def _mailbox_put(self, document: dict[str, Any]) -> dict[str, Any]:
-        _require_fields(document, required={"route", "auth", "messages"}, optional={"version"})
-        route, _ = _mailbox_credentials(document)
-        raw_messages = document["messages"]
-        if not isinstance(raw_messages, list):
-            raise MailboxError("messages must be an array")
-        if not 1 <= len(raw_messages) <= MAX_MAILBOX_BATCH_MESSAGES:
-            raise MailboxError("messages batch has the wrong size")
-
-        messages: list[MailboxPutMessage] = []
-        seen_ids: set[bytes] = set()
-        for raw_message in raw_messages:
-            if not isinstance(raw_message, dict):
-                raise MailboxError("message must be an object")
-            _require_fields(raw_message, required={"id", "payload"})
-            message_id = decode_canonical_base64url(
-                raw_message["id"],
-                field="id",
-                exact_bytes=32,
-            )
-            if message_id in seen_ids:
-                raise MailboxError("messages contains duplicate ids")
-            seen_ids.add(message_id)
-            payload = decode_canonical_base64url(
-                raw_message["payload"],
-                field="payload",
-                maximum_bytes=MAX_MAILBOX_PAYLOAD_BYTES,
-            )
-            messages.append(MailboxPutMessage(message_id, payload))
-
-        stored = await asyncio.to_thread(self.mailbox.put, route, messages)
-        self.service.metrics.increment("mailbox_messages_put", len(messages))
-        return {
-            "messages": [
-                {
-                    "acknowledged": message.acknowledged,
-                    "cursor": message.cursor,
-                    "id": encode_base64url(message.message_id),
-                }
-                for message in stored
-            ],
-            "version": PROTOCOL_VERSION,
-        }
-
-    async def _mailbox_fetch(self, document: dict[str, Any]) -> dict[str, Any]:
-        _require_fields(
-            document,
-            required={"route", "auth", "after"},
-            optional={"limit", "version"},
-        )
-        route, _ = _mailbox_credentials(document)
-        after = _require_cursor(document["after"], field="after")
-        limit = document.get("limit", MAX_MAILBOX_BATCH_MESSAGES)
-        if type(limit) is not int or not 1 <= limit <= MAX_MAILBOX_BATCH_MESSAGES:
-            raise MailboxError("limit is out of range")
-
-        page = await asyncio.to_thread(
-            self.mailbox.fetch,
-            route,
-            after_cursor=after,
-            limit=limit,
-        )
-        message_documents = [
-            {
-                "cursor": message.cursor,
-                "id": encode_base64url(message.message_id),
-                "payload": encode_base64url(message.payload),
-            }
-            for message in page.messages
-        ]
-
-        def response_for(message_count: int) -> dict[str, Any]:
-            selected = message_documents[:message_count]
-            next_cursor = selected[-1]["cursor"] if selected else after
-            return {
-                "hasMore": page.has_more or message_count < len(message_documents),
-                "messages": selected,
-                "nextCursor": next_cursor,
-                "version": PROTOCOL_VERSION,
-            }
-
-        response = response_for(len(message_documents))
-        if len(encode_json_document(response)) > MAX_MAILBOX_RESPONSE_BYTES:
-            lower_bound = 1
-            upper_bound = len(message_documents) - 1
-            selected_count = 0
-            while lower_bound <= upper_bound:
-                candidate_count = (lower_bound + upper_bound) // 2
-                candidate = response_for(candidate_count)
-                if (
-                    len(encode_json_document(candidate))
-                    <= MAX_MAILBOX_RESPONSE_BYTES
-                ):
-                    selected_count = candidate_count
-                    lower_bound = candidate_count + 1
-                else:
-                    upper_bound = candidate_count - 1
-            if selected_count == 0:
-                raise RuntimeError("one mailbox envelope exceeds response limit")
-            response = response_for(selected_count)
-
-        self.service.metrics.increment(
-            "mailbox_messages_fetched",
-            len(response["messages"]),
-        )
-        return response
-
-    async def _mailbox_ack(self, document: dict[str, Any]) -> dict[str, Any]:
-        _require_fields(document, required={"route", "auth", "cursor"}, optional={"version"})
-        route, _ = _mailbox_credentials(document)
-        cursor = _require_cursor(document["cursor"], field="cursor")
-        acknowledged = await asyncio.to_thread(
-            self.mailbox.acknowledge,
-            route,
-            through_cursor=cursor,
-        )
-        self.service.metrics.increment("mailbox_messages_acked", acknowledged)
-        return {
-            "acked": acknowledged,
-            "cursor": cursor,
-            "version": PROTOCOL_VERSION,
-        }
-
-    async def _mailbox_forget(self, document: dict[str, Any]) -> dict[str, Any]:
-        _require_fields(document, required={"route", "auth"}, optional={"version"})
-        route, _ = _mailbox_credentials(document)
-        deleted = await asyncio.to_thread(self.mailbox.forget, route)
-        if deleted:
-            self.service.metrics.increment("mailbox_routes_forgotten")
-        return {"forgotten": True, "version": PROTOCOL_VERSION}
 
     async def _handle_metrics_http(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -1216,7 +951,7 @@ class RelayServer:
             elif method == "GET" and target == "/readyz":
                 try:
                     ready = await asyncio.wait_for(
-                        asyncio.to_thread(self.mailbox.is_ready),
+                        asyncio.to_thread(self.mls.store.is_ready),
                         timeout=1,
                     )
                 except TimeoutError:
@@ -1246,48 +981,6 @@ class RelayServer:
                 await writer.wait_closed()
             except ConnectionError:
                 pass
-
-
-class MailboxVersionError(MailboxError):
-    code = "unsupportedVersion"
-
-
-def _require_mailbox_version(document: dict[str, Any]) -> None:
-    version = document.get("version", PROTOCOL_VERSION)
-    if type(version) is not int or version != PROTOCOL_VERSION:
-        raise MailboxVersionError("unsupported mailbox protocol version")
-
-
-def _require_fields(
-    document: dict[str, Any],
-    *,
-    required: set[str],
-    optional: set[str] | None = None,
-) -> None:
-    allowed = required | (optional or set())
-    if not required.issubset(document) or not set(document).issubset(allowed):
-        raise MailboxError("request has the wrong shape")
-
-
-def _mailbox_credentials(document: dict[str, Any]) -> tuple[bytes, bytes]:
-    route = decode_canonical_base64url(
-        document["route"],
-        field="route",
-        exact_bytes=32,
-    )
-    auth = decode_canonical_base64url(
-        document["auth"],
-        field="auth",
-        exact_bytes=32,
-    )
-    authorize_mailbox(route, auth)
-    return route, auth
-
-
-def _require_cursor(value: object, *, field: str) -> int:
-    if type(value) is not int or not 0 <= value <= 2**63 - 1:
-        raise MailboxError(f"{field} cursor is out of range")
-    return value
 
 
 def _websocket_headers(headers: Headers) -> dict[str, str]:
@@ -1342,53 +1035,18 @@ def _require_loopback(host: str, *, label: str) -> None:
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="GotSync live relay and encrypted mailbox"
+        description="GotSync pairing relay and MLS delivery service"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     parser.add_argument("--metrics-host", default="127.0.0.1")
     parser.add_argument("--metrics-port", default=8766, type=int)
-    parser.add_argument("--mailbox-host", default="127.0.0.1")
-    parser.add_argument("--mailbox-port", default=8767, type=int)
+    parser.add_argument("--delivery-host", default="127.0.0.1")
+    parser.add_argument("--delivery-port", default=8767, type=int)
+    parser.add_argument("--database", default=DEFAULT_DELIVERY_DATABASE_PATH)
     parser.add_argument(
-        "--mailbox-database",
-        default=DEFAULT_MAILBOX_DATABASE_PATH,
-    )
-    parser.add_argument(
-        "--mailbox-retention",
-        default=DEFAULT_MAILBOX_RETENTION_SECONDS,
-        type=float,
-        help="encrypted mailbox retention in seconds",
-    )
-    parser.add_argument(
-        "--mailbox-purge-interval",
-        default=DEFAULT_MAILBOX_PURGE_INTERVAL_SECONDS,
-        type=float,
-        help="expired mailbox purge interval in seconds",
-    )
-    parser.add_argument(
-        "--mailbox-max-route-receipts",
-        default=DEFAULT_MAX_ROUTE_RECEIPTS,
-        type=int,
-    )
-    parser.add_argument(
-        "--mailbox-max-route-live-bytes",
-        default=DEFAULT_MAX_ROUTE_LIVE_BYTES,
-        type=int,
-    )
-    parser.add_argument(
-        "--mailbox-max-global-receipts",
-        default=DEFAULT_MAX_GLOBAL_RECEIPTS,
-        type=int,
-    )
-    parser.add_argument(
-        "--mailbox-max-global-live-bytes",
-        default=DEFAULT_MAX_GLOBAL_LIVE_BYTES,
-        type=int,
-    )
-    parser.add_argument(
-        "--mailbox-max-connections",
-        default=DEFAULT_MAX_MAILBOX_CONNECTIONS,
+        "--delivery-max-connections",
+        default=DEFAULT_MAX_DELIVERY_CONNECTIONS,
         type=int,
     )
     parser.add_argument(
@@ -1441,7 +1099,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--http-request-rate",
         default=DEFAULT_HTTP_REQUEST_RATE,
         type=float,
-        help="sustained mailbox and MLS requests per second per source; 0 disables",
+        help="sustained MLS delivery requests per second per source; 0 disables",
     )
     parser.add_argument(
         "--http-request-burst",
@@ -1452,7 +1110,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--max-http-requests-per-source",
         default=DEFAULT_MAX_HTTP_REQUESTS_PER_SOURCE,
         type=int,
-        help="concurrent mailbox and MLS requests per source; 0 disables",
+        help="concurrent MLS delivery requests per source; 0 disables",
     )
     parser.add_argument(
         "--admission-allow",
@@ -1486,16 +1144,10 @@ async def _run_until_stopped(
         port=args.port,
         metrics_host=args.metrics_host,
         metrics_port=args.metrics_port,
-        mailbox_host=args.mailbox_host,
-        mailbox_port=args.mailbox_port,
-        mailbox_database_path=args.mailbox_database,
-        mailbox_retention_seconds=args.mailbox_retention,
-        mailbox_purge_interval_seconds=args.mailbox_purge_interval,
-        mailbox_max_route_receipts=args.mailbox_max_route_receipts,
-        mailbox_max_route_live_bytes=args.mailbox_max_route_live_bytes,
-        mailbox_max_global_receipts=args.mailbox_max_global_receipts,
-        mailbox_max_global_live_bytes=args.mailbox_max_global_live_bytes,
-        mailbox_max_connections=args.mailbox_max_connections,
+        delivery_host=args.delivery_host,
+        delivery_port=args.delivery_port,
+        delivery_database_path=args.database,
+        delivery_max_connections=args.delivery_max_connections,
         max_connections=args.max_connections,
         max_rooms=args.max_rooms,
         waiting_room_ttl=args.waiting_room_ttl,
@@ -1525,14 +1177,14 @@ async def _run_until_stopped(
             f"{'token required' if admission.admission_token_digests else 'no token'}, "
             f"{len(admission.trusted_proxies)} trusted proxy networks"
         )
-        print(f"relay ready on {relay.host}:{relay.websocket_port}/v1")
+        print(f"pairing relay ready on {relay.host}:{relay.websocket_port}{WEBSOCKET_PATH}")
         print(
             "health and aggregate metrics ready on "
             f"{relay.metrics_host}:{relay.bound_metrics_port}"
         )
         print(
-            "encrypted mailbox ready on "
-            f"{relay.mailbox_host}:{relay.bound_mailbox_port}"
+            "MLS delivery ready on "
+            f"{relay.delivery_host}:{relay.bound_delivery_port}/v2/mls"
         )
         await stop.wait()
     finally:

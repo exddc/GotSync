@@ -311,7 +311,7 @@ public final class SyncEngine {
         invitationURLScheme = configuration.invitationURLScheme
         self.secretStore = secretStore
         self.mlsTransport = mlsTransport
-            ?? HTTPMLSRelayTransport(baseURL: configuration.endpoints.mlsURL, policy: configuration.endpointPolicy)
+            ?? HTTPMLSRelayTransport(baseURL: configuration.endpoints.mailboxURL, policy: configuration.endpointPolicy)
         self.rendezvous = rendezvous
             ?? RelayPairingRendezvous(url: configuration.endpoints.relayURL, policy: configuration.endpointPolicy)
         self.backgroundMailboxScheduler = backgroundMailboxScheduler ?? NoopBackgroundMailboxScheduler()

@@ -21,7 +21,7 @@ from gotsync_server.admission import (
     TokenBucketLimiter,
     read_admission_tokens,
 )
-from gotsync_server.mailbox import encode_base64url, mailbox_route_for_auth
+from gotsync_server.http import encode_base64url
 from gotsync_server.server import (
     ADMISSION_TOKEN_FILE_ENVIRONMENT,
     RelayServer,
@@ -52,7 +52,7 @@ def route_text(seed: int) -> str:
 
 def registration(route: str) -> str:
     return json.dumps(
-        {"route": route, "type": "register", "version": 1},
+        {"route": route, "type": "register", "version": 2},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -209,7 +209,7 @@ class AdmissionTests(unittest.TestCase):
 class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.database_path = os.path.join(self.temporary_directory.name, "mailbox.sqlite3")
+        self.database_path = os.path.join(self.temporary_directory.name, "mls.sqlite3")
         self.clock = FakeClock()
         self.relay: RelayServer | None = None
 
@@ -222,8 +222,8 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.relay = RelayServer(
             port=0,
             metrics_port=0,
-            mailbox_port=0,
-            mailbox_database_path=self.database_path,
+            delivery_port=0,
+            delivery_database_path=self.database_path,
             admission=config,
             admission_clock=self.clock,
             **options,
@@ -243,7 +243,7 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
     ) -> tuple[int, dict[str, str], dict[str, Any]]:
         assert self.relay is not None
         reader, writer = await asyncio.open_connection(
-            "127.0.0.1", self.relay.bound_mailbox_port
+            "127.0.0.1", self.relay.bound_delivery_port
         )
         body = json.dumps(document).encode()
         extra = "".join(f"{name}: {value}\r\n" for name, value in (headers or {}).items())
@@ -267,63 +267,35 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
         }
         return int(lines[0].split()[1]), response_headers, json.loads(response_body)
 
-    @staticmethod
-    def put_document(seed: int, message_seed: int) -> dict[str, Any]:
-        auth = bytes((seed + offset) % 256 for offset in range(32))
-        return {
-            "auth": encode_base64url(auth),
-            "messages": [
-                {
-                    "id": encode_base64url(bytes([message_seed]) * 32),
-                    "payload": encode_base64url(b"ciphertext-" + bytes([message_seed])),
-                }
-            ],
-            "route": encode_base64url(mailbox_route_for_auth(auth)),
-            "version": 1,
-        }
+    async def create(
+        self, seed: int, headers: dict[str, str] | None = None
+    ) -> tuple[int, dict[str, str], dict[str, Any]]:
+        return await self.post(
+            "/v2/mls/create",
+            {"group": encode_base64url(bytes([seed]) * 32), "version": 2},
+            {"Authorization": f"Bearer {encode_base64url(b'a' * 32)}", **(headers or {})},
+        )
 
-    async def test_mailbox_rate_limit_returns_retry_after_without_storing(self) -> None:
-        relay = await self.start(AdmissionConfig(http_requests=RateLimit(1, 2)))
-        for message_seed in (1, 2):
-            status, _, _ = await self.post("/v1/mailbox/put", self.put_document(5, message_seed))
+    def group_count(self) -> int:
+        assert self.relay is not None
+        return self.relay.mls.store._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0]
+
+    async def test_rate_limit_returns_retry_after_without_storing(self) -> None:
+        await self.start(AdmissionConfig(http_requests=RateLimit(1, 2)))
+        for seed in (1, 2):
+            status, _, _ = await self.create(seed)
             self.assertEqual(status, 200)
 
-        status, headers, body = await self.post(
-            "/v1/mailbox/put", self.put_document(5, 3)
-        )
+        status, headers, body = await self.create(3)
         self.assertEqual(status, 429)
         self.assertEqual(headers["retry-after"], "1")
-        self.assertEqual(body, {"error": "rateLimited", "version": 1})
-        route = mailbox_route_for_auth(bytes((5 + offset) % 256 for offset in range(32)))
-        page = relay.mailbox.fetch(route, after_cursor=0, limit=10)
-        self.assertEqual(len(page.messages), 2)
+        self.assertEqual(body, {"error": "rateLimited", "version": 2})
+        self.assertEqual(self.group_count(), 2)
         self.assertEqual(self.counters()["rate_limit_rejections"], 1)
-        self.assertEqual(self.counters()["mailbox_messages_put"], 2)
 
         self.clock.value += 1
-        status, _, _ = await self.post("/v1/mailbox/put", self.put_document(5, 3))
+        status, _, _ = await self.create(3)
         self.assertEqual(status, 200)
-
-    async def test_mls_requests_share_the_request_limit(self) -> None:
-        await self.start(AdmissionConfig(http_requests=RateLimit(1, 1)))
-        group = encode_base64url(b"g" * 32)
-        token = encode_base64url(b"a" * 32)
-        status, _, _ = await self.post(
-            "/v2/mls/create",
-            {"group": group, "version": 2},
-            {"Authorization": f"Bearer {token}"},
-        )
-        self.assertEqual(status, 200)
-        status, headers, body = await self.post(
-            "/v2/mls/create",
-            {"group": encode_base64url(b"h" * 32), "version": 2},
-            {"Authorization": f"Bearer {token}"},
-        )
-        self.assertEqual((status, body["error"]), (429, "rateLimited"))
-        self.assertIn("retry-after", headers)
-        assert self.relay is not None
-        groups = self.relay.mls.store._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0]
-        self.assertEqual(groups, 1)
 
     async def test_trusted_proxy_separates_forwarded_clients(self) -> None:
         await self.start(
@@ -334,51 +306,47 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
         )
         first = {"X-Forwarded-For": "198.51.100.1"}
         second = {"X-Forwarded-For": "198.51.100.2"}
-        self.assertEqual((await self.post("/v1/mailbox/put", self.put_document(6, 1), first))[0], 200)
-        self.assertEqual((await self.post("/v1/mailbox/put", self.put_document(6, 2), first))[0], 429)
-        self.assertEqual((await self.post("/v1/mailbox/put", self.put_document(6, 2), second))[0], 200)
+        self.assertEqual((await self.create(1, first))[0], 200)
+        self.assertEqual((await self.create(2, first))[0], 429)
+        self.assertEqual((await self.create(2, second))[0], 200)
 
     async def test_untrusted_forwarded_header_cannot_evade_limit(self) -> None:
         await self.start(AdmissionConfig(http_requests=RateLimit(1, 1)))
         self.assertEqual(
-            (await self.post("/v1/mailbox/put", self.put_document(7, 1), {"X-Forwarded-For": "198.51.100.1"}))[0],
+            (await self.create(1, {"X-Forwarded-For": "198.51.100.1"}))[0],
             200,
         )
         self.assertEqual(
-            (await self.post("/v1/mailbox/put", self.put_document(7, 2), {"X-Forwarded-For": "198.51.100.2"}))[0],
+            (await self.create(2, {"X-Forwarded-For": "198.51.100.2"}))[0],
             429,
         )
 
-    async def test_mailbox_admission_token_is_required_and_not_exposed(self) -> None:
+    async def test_delivery_admission_token_is_required_and_not_exposed(self) -> None:
         relay = await self.start(AdmissionConfig.with_tokens([TOKEN]))
-        status, _, body = await self.post("/v1/mailbox/put", self.put_document(8, 1))
+        status, _, body = await self.create(1)
         self.assertEqual((status, body["error"]), (403, "admissionDenied"))
-        status, _, _ = await self.post(
-            "/v1/mailbox/put", self.put_document(8, 1), {"X-GotSync-Admission": "x" * 40}
-        )
+        status, _, _ = await self.create(1, {"X-GotSync-Admission": "x" * 40})
         self.assertEqual(status, 403)
         self.assertEqual(self.counters()["admission_rejections"], 2)
-        self.assertEqual(self.counters()["mailbox_messages_put"], 0)
-        status, _, _ = await self.post(
-            "/v1/mailbox/put", self.put_document(8, 1), {"X-GotSync-Admission": TOKEN}
-        )
+        self.assertEqual(self.group_count(), 0)
+        status, _, _ = await self.create(1, {"X-GotSync-Admission": TOKEN})
         self.assertEqual(status, 200)
         snapshot = json.dumps(relay.service.metrics.snapshot())
         self.assertNotIn(TOKEN, snapshot)
 
     async def test_direct_peer_in_flight_limit_closes_extra_connections(self) -> None:
         relay = await self.start(AdmissionConfig(max_http_requests_per_source=1))
-        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
-        held_writer.write(b"POST /v1/mailbox/put HTTP/1.1\r\n")
+        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_delivery_port)
+        held_writer.write(b"POST /v2/mls/create HTTP/1.1\r\n")
         await held_writer.drain()
         await asyncio.sleep(0.05)
-        reader, writer = await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
+        reader, writer = await asyncio.open_connection("127.0.0.1", relay.bound_delivery_port)
         self.assertEqual(await asyncio.wait_for(reader.read(), 2), b"")
         writer.close()
         self.assertEqual(self.counters()["source_concurrency_rejections"], 1)
         held_writer.close()
         await asyncio.sleep(0.05)
-        status, _, _ = await self.post("/v1/mailbox/put", self.put_document(9, 1))
+        status, _, _ = await self.create(1)
         self.assertEqual(status, 200)
         self.assertEqual(relay.admission.http_in_flight.tracked_sources, 0)
 
@@ -389,20 +357,16 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 max_http_requests_per_source=1,
             )
         )
-        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
+        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_delivery_port)
         held_writer.write(
-            b"POST /v1/mailbox/put HTTP/1.1\r\nX-Forwarded-For: 198.51.100.4\r\n"
+            b"POST /v2/mls/create HTTP/1.1\r\nX-Forwarded-For: 198.51.100.4\r\n"
             b"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n"
         )
         await held_writer.drain()
         await asyncio.sleep(0.05)
-        status, headers, body = await self.post(
-            "/v1/mailbox/put", self.put_document(10, 1), {"X-Forwarded-For": "198.51.100.4"}
-        )
+        status, headers, body = await self.create(1, {"X-Forwarded-For": "198.51.100.4"})
         self.assertEqual((status, body["error"], headers["retry-after"]), (429, "rateLimited", "1"))
-        status, _, _ = await self.post(
-            "/v1/mailbox/put", self.put_document(10, 1), {"X-Forwarded-For": "198.51.100.5"}
-        )
+        status, _, _ = await self.create(1, {"X-Forwarded-For": "198.51.100.5"})
         self.assertEqual(status, 200)
         held_writer.close()
 
@@ -412,18 +376,18 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 trusted_proxies=(network("127.0.0.1/32"),),
                 max_http_requests_per_source=1,
             ),
-            mailbox_max_connections=4,
+            delivery_max_connections=4,
         )
         incomplete = (
-            b"POST /v1/mailbox/put HTTP/1.1\r\nX-Forwarded-For: 198.51.100.4\r\n"
+            b"POST /v2/mls/create HTTP/1.1\r\nX-Forwarded-For: 198.51.100.4\r\n"
             b"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n"
         )
-        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
+        _, held_writer = await asyncio.open_connection("127.0.0.1", relay.bound_delivery_port)
         held_writer.write(incomplete)
         await held_writer.drain()
         await asyncio.sleep(0.05)
         rejected = [
-            await asyncio.open_connection("127.0.0.1", relay.bound_mailbox_port)
+            await asyncio.open_connection("127.0.0.1", relay.bound_delivery_port)
             for _ in range(3)
         ]
         for _, writer in rejected:
@@ -434,16 +398,14 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response.startswith(b"HTTP/1.1 429 "))
             writer.close()
         await asyncio.sleep(0.05)
-        status, _, _ = await self.post(
-            "/v1/mailbox/put", self.put_document(11, 1), {"X-Forwarded-For": "198.51.100.5"}
-        )
+        status, _, _ = await self.create(1, {"X-Forwarded-For": "198.51.100.5"})
         self.assertEqual(status, 200)
         self.assertEqual(self.counters()["source_concurrency_rejections"], 3)
         held_writer.close()
 
     async def test_websocket_connect_rate_limit_rejects_handshake(self) -> None:
         relay = await self.start(AdmissionConfig(websocket_connects=RateLimit(1, 1)))
-        url = f"ws://127.0.0.1:{relay.websocket_port}/v1"
+        url = f"ws://127.0.0.1:{relay.websocket_port}/v2/pairing"
         async with connect(url, open_timeout=2) as first:
             await first.send(registration(route_text(1)))
             with self.assertRaises(InvalidStatus) as rejected:
@@ -460,12 +422,12 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_websocket_per_source_limit_closes_with_try_again_later(self) -> None:
         relay = await self.start(AdmissionConfig(max_websockets_per_source=1))
-        url = f"ws://127.0.0.1:{relay.websocket_port}/v1"
+        url = f"ws://127.0.0.1:{relay.websocket_port}/v2/pairing"
         async with connect(url, open_timeout=2) as first:
             await first.send(registration(route_text(2)))
             async with connect(url, open_timeout=2) as second:
                 error = json.loads(await asyncio.wait_for(second.recv(), 1))
-                self.assertEqual(error, {"code": "rateLimited", "type": "error", "version": 1})
+                self.assertEqual(error, {"code": "rateLimited", "type": "error", "version": 2})
                 with self.assertRaises(ConnectionClosed) as closed:
                     await second.recv()
                 self.assertEqual(closed.exception.rcvd.code, 1013)
@@ -474,7 +436,7 @@ class RelayAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_websocket_admission_token(self) -> None:
         relay = await self.start(AdmissionConfig.with_tokens([TOKEN]))
-        url = f"ws://127.0.0.1:{relay.websocket_port}/v1"
+        url = f"ws://127.0.0.1:{relay.websocket_port}/v2/pairing"
         with self.assertRaises(InvalidStatus) as rejected:
             await connect(url, open_timeout=2)
         self.assertEqual(rejected.exception.response.status_code, 403)

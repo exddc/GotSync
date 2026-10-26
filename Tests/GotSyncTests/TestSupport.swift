@@ -28,8 +28,8 @@ final class MemorySecretStore: SecretStore, @unchecked Sendable {
 }
 
 enum TestEndpoints {
-    static let relayURL = URL(string: "ws://127.0.0.1:8765/v1")!
-    static let mailboxURL = URL(string: "http://127.0.0.1:8767/v1/mailbox")!
+    static let relayURL = URL(string: "ws://127.0.0.1:8765/v2/pairing")!
+    static let mailboxURL = URL(string: "http://127.0.0.1:8767/v2/mls")!
 }
 
 @MainActor

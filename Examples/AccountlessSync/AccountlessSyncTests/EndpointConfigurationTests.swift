@@ -5,7 +5,7 @@ import XCTest
 final class EndpointConfigurationTests: XCTestCase {
     func testDeveloperRelayReplacementUsesDemoPolicy() throws {
         let original = try SyncEndpointConfiguration.load(values: [:], policy: .localDevelopment)
-        let replacement = try original.replacingRelayURL(URL(string: "ws://192.168.1.10:8765/v1")!)
+        let replacement = try original.replacingRelayURL(URL(string: "ws://192.168.1.10:8765/v2/pairing")!)
         XCTAssertEqual(replacement.relayURL.host, "192.168.1.10")
         XCTAssertEqual(replacement.mailboxURL, original.mailboxURL)
     }
@@ -38,56 +38,64 @@ final class EndpointConfigurationTests: XCTestCase {
         let configuration = try SyncEndpointConfiguration.load(
             values: [
                 SyncEndpointConfiguration.relayInfoKey:
-                    "wss://sync.example.com/v1",
+                    "wss://sync.example.com/v2/pairing",
                 SyncEndpointConfiguration.mailboxInfoKey:
-                    "https://sync.example.com/v1/mailbox",
+                    "https://sync.example.com/v2/mls",
             ],
             policy: .production
         )
 
         XCTAssertEqual(
             configuration.relayURL.absoluteString,
-            "wss://sync.example.com/v1"
+            "wss://sync.example.com/v2/pairing"
         )
         XCTAssertEqual(
             configuration.mailboxURL.absoluteString,
-            "https://sync.example.com/v1/mailbox"
+            "https://sync.example.com/v2/mls"
         )
     }
 
     func testProductionRejectsInsecureLoopbackAndMalformedEndpoints() {
         let invalidPairs = [
             (
-                "ws://sync.example.com/v1",
-                "https://sync.example.com/v1/mailbox"
+                "ws://sync.example.com/v2/pairing",
+                "https://sync.example.com/v2/mls"
             ),
             (
-                "wss://127.0.0.1/v1",
-                "https://sync.example.com/v1/mailbox"
+                "wss://127.0.0.1/v2/pairing",
+                "https://sync.example.com/v2/mls"
             ),
             (
-                "wss://0.0.0.0/v1",
-                "https://sync.example.com/v1/mailbox"
+                "wss://0.0.0.0/v2/pairing",
+                "https://sync.example.com/v2/mls"
             ),
             (
                 "wss://sync.example.com/wrong",
-                "https://sync.example.com/v1/mailbox"
+                "https://sync.example.com/v2/mls"
             ),
             (
-                "wss://sync.example.com/v1?token=secret",
-                "https://sync.example.com/v1/mailbox"
+                "wss://sync.example.com/v2/pairing?token=secret",
+                "https://sync.example.com/v2/mls"
             ),
             (
-                "wss://sync.example.com/v1",
-                "http://sync.example.com/v1/mailbox"
+                "wss://sync.example.com/v2/pairing",
+                "http://sync.example.com/v2/mls"
             ),
             (
-                "wss://sync.example.com/v1",
-                "https://localhost/v1/mailbox"
+                "wss://sync.example.com/v2/pairing",
+                "https://localhost/v2/mls"
             ),
             (
-                "wss://sync.example.com/v1",
+                "wss://sync.example.com/v2/pairing",
                 "https://sync.example.com/wrong"
+            ),
+            (
+                "wss://sync.example.com/v1",
+                "https://sync.example.com/v2/mls"
+            ),
+            (
+                "wss://sync.example.com/v2/pairing",
+                "https://sync.example.com/v1/mailbox"
             ),
         ]
 
@@ -112,7 +120,7 @@ final class EndpointConfigurationTests: XCTestCase {
                     SyncEndpointConfiguration.relayInfoKey:
                         "$(GOTSYNC_RELAY_URL)",
                     SyncEndpointConfiguration.mailboxInfoKey:
-                        "https://sync.example.com/v1/mailbox",
+                        "https://sync.example.com/v2/mls",
                 ],
                 policy: .production
             )
@@ -130,7 +138,7 @@ final class EndpointConfigurationTests: XCTestCase {
                 values: [
                     SyncEndpointConfiguration.relayInfoKey: "://",
                     SyncEndpointConfiguration.mailboxInfoKey:
-                        "http://127.0.0.1:8767/v1/mailbox",
+                        "http://127.0.0.1:8767/v2/mls",
                 ],
                 policy: .localDevelopment
             )
@@ -146,20 +154,20 @@ final class EndpointConfigurationTests: XCTestCase {
         let configuration = try SyncEndpointConfiguration.load(
             values: [
                 SyncEndpointConfiguration.relayInfoKey:
-                    "ws://192.168.1.10:8765/v1",
+                    "ws://192.168.1.10:8765/v2/pairing",
                 SyncEndpointConfiguration.mailboxInfoKey:
-                    "http://192.168.1.10:8767/v1/mailbox",
+                    "http://192.168.1.10:8767/v2/mls",
             ],
             policy: .localDevelopment
         )
 
         XCTAssertEqual(
             configuration.relayURL.absoluteString,
-            "ws://192.168.1.10:8765/v1"
+            "ws://192.168.1.10:8765/v2/pairing"
         )
         XCTAssertEqual(
             configuration.mailboxURL.absoluteString,
-            "http://192.168.1.10:8767/v1/mailbox"
+            "http://192.168.1.10:8767/v2/mls"
         )
     }
 
@@ -168,9 +176,9 @@ final class EndpointConfigurationTests: XCTestCase {
             try SyncEndpointConfiguration.load(
                 values: [
                     SyncEndpointConfiguration.relayInfoKey:
-                        "ws://sync.example.com/v1",
+                        "ws://sync.example.com/v2/pairing",
                     SyncEndpointConfiguration.mailboxInfoKey:
-                        "http://sync.example.com/v1/mailbox",
+                        "http://sync.example.com/v2/mls",
                 ],
                 policy: .localDevelopment
             )

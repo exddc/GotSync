@@ -45,7 +45,7 @@ and the info string `com.gotdone.sync/<label>`:
 
 ### Pairing frames
 
-Both devices join the `/v1` WebSocket room for the route. Each binary frame is
+Both devices join the `/v2/pairing` WebSocket room for the route. Each binary frame is
 one kind byte followed by the ChaCha20-Poly1305 combined box (nonce,
 ciphertext, tag). The associated data is
 `com.gotdone.sync/mls-pairing-frame/v2` followed by the kind byte.
@@ -183,18 +183,20 @@ member, which stays linked and can invite again.
 
 ## Pairing room
 
-Clients connect to the generic `/v1` WebSocket endpoint and register a room in
+Clients connect to the generic `/v2/pairing` WebSocket endpoint and register a room in
 the first text frame, so the route never appears in a URL, header, or access
 log:
 
 ```json
-{"type":"register","version":1,"route":"base64url-32-bytes"}
+{"type":"register","version":2,"route":"base64url-32-bytes"}
 ```
 
 The relay validates the size and shape, admits at most two sockets per route,
 and forwards later binary frames unchanged to the other socket. It never
 buffers a frame before the second peer exists and destroys an empty room at
-once. Control frames report `peerReady` and `peerLeft`. Capacity and route
+once. Control frames report `peerReady` and `peerLeft` and carry `version: 2`.
+The relay closes a socket that connects to any other path or registers with
+another version. Capacity and route
 failures use these codes:
 
 | Code | Meaning | WebSocket close |
@@ -206,10 +208,10 @@ failures use these codes:
 
 Per-source admission and rate limits run before registration. A handshake over
 the connection-rate limit receives HTTP 429 with `Retry-After`; a handshake that
-fails deployment admission receives HTTP 403. Mailbox and MLS requests receive
-the same statuses with JSON bodies `{"error":"rateLimited"}` or
-`{"error":"admissionDenied"}`. Rejected requests change no room, mailbox, or
-delivery state, so a client may retry them unchanged after `Retry-After`.
+fails deployment admission receives HTTP 403. MLS delivery requests receive the
+same statuses with JSON bodies `{"error":"rateLimited"}` or
+`{"error":"admissionDenied"}`. Rejected requests change no room or delivery
+state, so a client may retry them unchanged after `Retry-After`.
 
 A lone peer expires after 15 minutes by default, the same as the invitation
 lifetime. The default process limits are 256 WebSocket connections and 128
@@ -348,5 +350,5 @@ Version 1 was a custom protocol: an X25519 pairing handshake, ChaCha20-Poly1305
 live frames between two sockets, HKDF-derived per-pair and group mailbox
 envelopes, signed membership snapshots, and rekey records under a shared group
 root. The red-team review found it unsound (see SECURITY-RED-TEAM.md), and it
-has been removed from the client. The relay still serves `/v1/mailbox` for
-version 1 clients during the rollout described in COMPATIBILITY.md.
+has been removed from the client and the relay. The relay serves no `/v1`
+path.

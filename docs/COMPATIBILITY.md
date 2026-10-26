@@ -9,6 +9,8 @@ The current protocol is version 2. Groups are MLS groups (RFC 9420, ciphersuite
 `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) run through OpenMLS. Version 2
 identifiers are:
 
+- the `/v2/pairing` WebSocket room, whose registration and control messages
+  carry `version: 2`;
 - the `/v2/mls` HTTP delivery service, where every request and response
   carries `version: 2`;
 - invitation URLs with `v=2`;
@@ -17,27 +19,24 @@ identifiers are:
 - the `sync-v2.json` checkpoint and the `mls-v2` and `mls-v2-departing`
   storage directories.
 
-Pairing frames still travel through the version 1 WebSocket room at `/v1`. The
-room only forwards opaque binary frames between two sockets, so its
-registration and control messages keep `version: 1`.
+The relay serves no `/v1` path.
 
 ## Supported contracts
 
 | Artifact | Version | Validation and mismatch behavior |
 | --- | --- | --- |
-| WebSocket path and registration | `/v1`, `version: 1` | Relay rejects unsupported registration and closes the socket |
-| Relay control JSON | `version: 1` | Client rejects unsupported control before acting on it |
+| WebSocket path and registration | `/v2/pairing`, `version: 2` | Relay closes any other path and rejects unsupported registration |
+| Relay control JSON | `version: 2` | Client rejects unsupported control before acting on it |
 | Invitation URL | Consumer-specific scheme and `pair` host with `v=2` | Parser requires `secret`, `group`, and `fingerprint`; `v=1` fails with `unsupportedVersion` |
 | Invitation phrase | 17 words: 16-byte secret and a checksum word | Unknown words and a wrong checksum are rejected; the phrase carries no version |
-| MLS pairing frames | Version 2 domains over the `/v1` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment aborts pairing |
+| MLS pairing frames | Version 2 domains over the `/v2/pairing` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment aborts pairing |
 | MLS delivery service | `/v2/mls`, `version: 2` | Client rejects any other response version; server rejects other request versions |
 | MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
 | Replication checkpoint | `sync-v2.json`, version 2 | Engine discards an unreadable checkpoint and rebuilds it from MLS state |
 | Replica archive | `replica-v1.json`, format 1 | Unchanged by the cutover; replica validation rejects unsupported archives |
 
-The relay's `/healthz` reports `supportedVersions: [1]`, which describes the
-WebSocket room and `/v1/mailbox`. `/v2/mls` checks its own version field.
+The relay's `/healthz` reports `supportedVersions: [2]`.
 
 ## Breaking cutover from version 1
 
@@ -63,26 +62,22 @@ group, then create a new link on one of them and invite the others.
 
 ## Server rollout
 
-Deploy the relay before the clients. The current relay serves all of:
+The relay serves only version 2: the `/v2/pairing` WebSocket room and
+`/v2/mls`. The version 1 mailbox and its storage are gone, so version 1
+clients that are still installed stop syncing as soon as the relay is
+upgraded. Their users must update and pair again. Version 2 clients need no
+change.
 
-- the `/v1` WebSocket room, which version 2 clients use for pairing;
-- `/v2/mls`, which version 2 clients use for delivery;
-- `/v1/mailbox`, which no version 2 client calls.
-
-`/v1/mailbox` stays in the server, with its tests, for this rollout. Version 1
-clients that are still installed keep syncing through it with each other until
-they update, so removing it before every client has updated would break those
-groups before their users can pair again. Remove `/v1/mailbox` and its storage
-once no supported client release uses version 1. That removal needs no client
-change. The mailbox keeps its existing rules: requests that omit `version` are
-treated as version 1, and any other explicit value is rejected before
-authorization or mutation.
+A relay that previously ran version 1 can delete its `mailbox.sqlite3`. The
+delivery store now defaults to `relay-data/mls.sqlite3` and is selected with
+`--database`; `--mailbox-*` options were replaced by `--delivery-host`,
+`--delivery-port`, and `--delivery-max-connections`.
 
 Production consumers must use the same relay origin for pairing and delivery.
-`SyncConfiguration.mailboxURL` still selects that origin, and the engine
-derives `/v2/mls` from it. The demo's application identifier and Keychain
-service create an independent install; it does not migrate another
-application's sandbox or credentials.
+`SyncConfiguration.relayURL` must end in `/v2/pairing` and
+`SyncConfiguration.mailboxURL` in `/v2/mls`. The demo's application
+identifier and Keychain service create an independent install; it does not
+migrate another application's sandbox or credentials.
 
 ## Future changes
 
@@ -101,7 +96,7 @@ previous release first.
 
 The namespace `com.gotdone.sync` is protocol bytes, not a package name or
 application configuration. Swift centralizes it in `ProtocolDomains.swift`;
-Python keeps the version 1 route domains in `gotsync_server/protocol.py`.
+the relay treats every MLS message as opaque and uses no protocol labels.
 Preserve it through the final brand rename; changing it requires a protocol
 version. Invitation URL schemes are outside the cryptographic wire contract.
 Each consumer supplies its own scheme through `SyncConfiguration` and registers

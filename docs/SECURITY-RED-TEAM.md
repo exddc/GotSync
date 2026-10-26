@@ -9,7 +9,8 @@ independent audit has been completed.
 Re-run on 2026-10-20 against `feature/tw-530-l4-remove-custom-crypto` at
 `abb60f3`. That branch stacks on PRs #16, #15, #13, and #12. `SyncEngine` runs
 protocol version 2 on OpenMLS (RFC 9420). The custom version 1 cryptography is
-no longer in the client.
+no longer in the client. The follow-up branch `feature/tw-530-l5-remove-v1`
+removes every `/v1` path from the relay as well; see "Re-run evidence".
 
 **Production claim: not ready.** No crypto finding is open in code. Two items
 still block a production claim:
@@ -38,14 +39,18 @@ provided the disclosures in "Product claims" ship.
 
 ### Re-run evidence
 
-All suites passed on 2026-10-21 at `c764717`:
+All suites passed on 2026-10-21 at `a6c1def` on
+`feature/tw-530-l5-remove-v1`, after the relay's `/v1` paths were removed:
 
-- `scripts/uv.sh pytest server/tests -q`: 77 passed.
+- `scripts/uv.sh pytest server/tests -q`: 49 passed. The drop from 77 is the
+  deleted version 1 mailbox and route-vector tests.
 - `scripts/test-swift.sh`: 82 tests, 0 failures, 2 skipped (the real-relay
   tests that `scripts/test-integration.sh` runs).
-- `scripts/test-mls.sh`: Rust 17 passed (6 unit, 11 protocol), relay MLS 26
+- `scripts/test-mls.sh`: Rust 17 passed (6 unit, 11 protocol), relay MLS 27
   passed, Swift `MLSClientTests` 22 passed.
-- `scripts/test-integration.sh`: 82 tests, 0 failures, against the real relay.
+- `scripts/test-integration.sh`: 82 tests, 0 failures, against the real relay
+  on `/v2/pairing` and `/v2/mls`.
+- Example app: 20 unit tests passed on the iOS 26.5 simulator.
 
 On 2026-10-20 at `abb60f3`, 20 example app unit tests passed on the iOS 26.5
 simulator. Pairing, removal, and the removed-device notice were checked by
@@ -171,7 +176,8 @@ any "audited" or "private" claim:
 **H1, fixed in code by PR #14.** Sibling PR #14 adds per-source token-bucket
 rate limits, per-source concurrency limits, trusted-proxy handling, and
 optional admission tokens on the WebSocket, `/v1/mailbox`, and `/v2/mls`. This
-branch does not contain PR #14. H1 closes when the hardened relay host runs
+branch does not contain PR #14, and the relay no longer serves `/v1/mailbox`,
+so PR #14's controls apply to the `/v2/pairing` WebSocket and `/v2/mls` only. H1 closes when the hardened relay host runs
 with those controls and the perimeter checklist in `server/README.md`.
 
 ### Accepted findings
@@ -199,7 +205,9 @@ under MLS. Revisit an acceptance if a product claim starts to depend on it.
 - **M1:** The relay must route and store ciphertext. It sees timing, sizes, IP
   addresses, group IDs, cursors, epochs, writer hashes, and add and remove
   events, which reveal membership churn. No product claim covers metadata
-  privacy. Holds.
+  privacy. Holds. The relay no longer keeps version 1 mailbox routes,
+  envelopes, or receipts, so the MLS delivery log and the volatile pairing
+  rooms are the only metadata it holds.
 
 ### New findings
 
@@ -277,7 +285,9 @@ holds the whole log, which grows until it reaches 10,000 entries or 16 MiB.
 Every append then fails with `deliveryCapacity`. **Proposed acceptance:**
 removing the inactive device (H4) releases the log, and an added member that
 never joins is already removed after 15 minutes. A relay-side inactivity
-policy could follow with H1.
+policy could follow with H1. The MLS log has no time-based expiry; the version
+1 mailbox's 365-day retention no longer applies, because that store has been
+removed.
 
 **N8. Pairing frames have no replay protection or transcript binding (Low).**
 Frames are bound only to the invitation key, direction, and kind byte. Within
@@ -321,5 +331,5 @@ copy no longer refers to live sockets or mailboxes, and it shows
   Update commit.
 - **H2:** re-run the mutation check, temporarily setting a non-zero
   `max_past_epochs`, after any OpenMLS upgrade or `config()` change.
-- **Server:** remove `/v1/mailbox` once no supported client release uses
-  version 1, as described in COMPATIBILITY.md.
+- **Server:** done. The relay serves only `/v2/pairing` and `/v2/mls`, and
+  `/healthz` advertises `supportedVersions: [2]`.
