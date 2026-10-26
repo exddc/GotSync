@@ -1,3 +1,4 @@
+from .admission import AdmissionConfig, RateLimit
 from .http import (
     RequestError,
     decode_canonical_base64url,
@@ -20,6 +21,8 @@ from .server import (
 )
 
 __all__ = [
+    "AdmissionConfig",
+    "RateLimit",
     "DEFAULT_DELIVERY_DATABASE_PATH",
     "DEFAULT_MAX_DELIVERY_CONNECTIONS",
     "MAX_BINARY_MESSAGE_BYTES",

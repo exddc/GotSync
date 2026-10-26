@@ -130,7 +130,9 @@ There is no account recovery when every device is lost.
 
 If the relay serves a commit that this device cannot verify, sync stops at that
 point and the engine reports `SyncError.syncHistoryBlocked`. Local tasks stay
-editable; unlink and pair again to keep syncing.
+editable; unlink and pair again to keep syncing. A device that stays offline
+longer than the relay keeps its unread updates reports
+`SyncError.syncHistoryExpired` and recovers the same way.
 
 Removing a device stops it from reading later changes, but it keeps the tasks
 it already has and cannot be wiped remotely. Any member can remove any other
@@ -138,6 +140,22 @@ member; there is no administrator. The MLS integration and the pairing-frame
 construction have not received an independent review, so do not describe this
 library as audited. Read the [threat model](docs/THREAT-MODEL.md) and
 [red-team findings](docs/SECURITY-RED-TEAM.md) before using it with sensitive data.
+
+## Privacy
+
+The relay stores only encrypted data and deletes it on a fixed schedule. The
+[server README](server/README.md#retention) gives the full policy. Apps that
+use this library can show this text in their privacy policy:
+
+> Your tasks are end-to-end encrypted on your devices. The sync service cannot
+> read them. It keeps an encrypted update only until every linked device has
+> received it, and for at most 90 days. If none of your devices connects for
+> 90 days, the service deletes your sync group. Invitation data is deleted
+> after 15 minutes at most, and records of removed devices after 24 hours.
+
+Change the numbers if the relay runs with a different `--retention-days`. The
+relay cannot delete backups. Add "Server backups are deleted within 90 days."
+only if the operator enforces that.
 
 ## Test
 

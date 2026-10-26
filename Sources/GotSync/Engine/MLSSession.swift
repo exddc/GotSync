@@ -207,7 +207,7 @@ actor MLSSession {
                     entries = try await session.transport.fetch(
                         group: group, after: after, limit: session.fetchLimit, authorization: authorization
                     )
-                } catch MLSRelayError.unauthorized {
+                } catch MLSRelayError.unauthorized, MLSRelayError.historyExpired {
                     return false
                 }
                 guard let last = entries.last else { return false }
@@ -305,7 +305,7 @@ actor MLSSession {
         guard let authorization = try await client.removalAuthorization() else { return }
         do {
             try await transport.acknowledge(group: group, through: client.cursor(), authorization: authorization)
-        } catch MLSRelayError.unauthorized {}
+        } catch MLSRelayError.unauthorized, MLSRelayError.historyExpired {}
         try await client.confirmRemovalAcknowledged()
     }
 

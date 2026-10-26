@@ -187,11 +187,13 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var rejectedAppends = 0
     private var failWelcomeAcknowledgement = false
     private var failingAcknowledgers: Set<Data> = []
+    private var expiredGroups: Set<Data> = []
     private(set) var lastPublishedReference: Data?
     private(set) var acknowledgementCount = 0
 
     func dropNextAppendResponse() { dropAppendResponse = true }
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
+    func expireHistory(group: Data) { expiredGroups.insert(group) }
 
     func removalCursor(of authorization: Data, group: Data) -> UInt64? {
         groups[group]?.writers[Self.digest(authorization)]?.removal ?? nil
@@ -256,6 +258,7 @@ actor FakeMLSRelay: MLSRelayTransport {
             rejectedAppends += 1
             throw URLError(.notConnectedToInternet)
         }
+        if expiredGroups.contains(delivery.group) { throw MLSRelayError.historyExpired }
         guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
             throw MLSRelayError.unauthorized
         }
@@ -302,6 +305,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     private func authorize(group: Data, authorization: Data) throws -> (ack: UInt64, removal: UInt64?) {
+        if expiredGroups.contains(group) { throw MLSRelayError.historyExpired }
         guard let writer = groups[group]?.writers[Self.digest(authorization)] else { throw MLSRelayError.unauthorized }
         if let removal = writer.removal, writer.ack >= removal { throw MLSRelayError.unauthorized }
         return writer
