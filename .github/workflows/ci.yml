@@ -33,6 +33,8 @@ jobs:
       - name: Verify existing sync behavior
         run: scripts/test-integration.sh
       - name: Check release builds use TLS only
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: scripts/check-release-transport.sh
       - name: Package Swift dependency without Rust requirement
         run: python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
