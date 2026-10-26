@@ -126,16 +126,20 @@ Phase 1 therefore needs these changes before background receive can work:
    credential check reads only items that are erased on the first upgraded
    launch.
 3. Before the first unlock after boot, every protected item is unavailable.
-   Distinguish that case (`errSecInteractionNotAllowed`, or
-   `UIApplication.isProtectedDataAvailable` being false) from real storage
-   failure: the engine reports a temporary `locked` condition instead of the
+   The engine always attempts to open storage and classifies only the actual
+   failure: `errSecInteractionNotAllowed` from the Keychain, or a
+   data-protection permission error from a file, is temporary. It does not
+   use `UIApplication.isProtectedDataAvailable`, which is false whenever the
+   device is locked, even while after-first-unlock storage is readable. On a
+   temporary failure the engine reports a `locked` condition instead of the
    fatal state, retries opening storage on
    `protectedDataDidBecomeAvailableNotification` and on
    `applicationDidBecomeActive()`, and still calls `scheduleRefresh()` so that
    the next refresh is not lost.
 4. Test on a device after normal process termination, locked, and unlocked
-   once since boot: a refresh restores the same identity and session,
-   persists and acknowledges remote changes, and submits the next refresh.
+   once since boot, where `isProtectedDataAvailable` is false: a refresh
+   restores the same identity and session, persists and acknowledges remote
+   changes, and submits the next refresh.
 
 The install device ID is a 128-bit replica identifier, not key material. With
 item 1, code running on a locked device after first unlock can read it, as it
