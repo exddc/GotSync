@@ -21,8 +21,9 @@ Two effects follow:
 
 - **Phase 1, background app refresh, ships in 2.0.** It needs no wire
   change and adds no third party; the relay gains only an aggregate metric.
-  It uses the locked-storage model that 2.0 already has. It shortens how long
-  a quiet device stays stale and helps the relay prune the log.
+  It extends the locked-storage model that 2.0 already has to the install
+  identity. It shortens how long a quiet device stays stale and helps the
+  relay prune the log.
 - **Phase 2, APNs background push, does not ship in 2.0.** It makes Apple a
   third party and stores a durable device identifier on the relay. The 2.0
   positioning says the relay stores only ciphertext. Push works only on the
@@ -63,10 +64,17 @@ Non-goals:
 - The demo's `SystemBackgroundMailboxScheduler` submits a `BGProcessingTask`
   only while uploads are pending. The demo `Info.plist` declares the `fetch`
   background mode, but no `BGAppRefreshTask` is registered.
-- Locked-device processing already works for storage: the MLS state key uses
-  `AfterFirstUnlockThisDeviceOnly`, and the MLS database, checkpoint, and
-  replica use `completeUntilFirstUserAuthentication`
-  ([THREAT-MODEL.md](THREAT-MODEL.md#assets-and-trust-boundaries)).
+- Locked processing works only in a process that started while the device
+  was unlocked. The MLS state key uses `AfterFirstUnlockThisDeviceOnly`, and
+  the MLS database, checkpoint, and replica use
+  `completeUntilFirstUserAuthentication`
+  ([THREAT-MODEL.md](THREAT-MODEL.md#assets-and-trust-boundaries)). The
+  install device ID, however, is written by `InstallIdentity.loadOrCreate()`
+  with the default `WhenUnlockedThisDeviceOnly`, and `SyncEngine.init` reads
+  it first. When iOS launches the process into the background on a locked
+  device, that read fails and the engine enters the fatal local error state.
+  `hasDurableIdentity` is a constant, so the state lasts until the process
+  ends, even if the user unlocks and opens the application.
 
 ## Options
 
@@ -100,6 +108,38 @@ Reasons for rejection:
   iOS. They add a second third party and an SDK without removing Apple.
 
 ## Phase 1: background app refresh
+
+### Locked cold launch
+
+A refresh usually starts a new process, often while the device is locked.
+Phase 1 therefore needs these changes before background receive can work:
+
+1. Write the install identity with `AfterFirstUnlockThisDeviceOnly`.
+   `InstallIdentity.loadOrCreate()` passes that class on create, and on every
+   read made while unlocked it rewrites an item still stored under
+   `WhenUnlockedThisDeviceOnly`. `KeychainStore.write` already updates the
+   accessibility of an existing item. An install that has not launched
+   unlocked since upgrading keeps the old class, and its refreshes fail until
+   it does.
+2. Audit every other Keychain read on the `SyncEngine.init` path. The MLS
+   state key already uses the after-first-unlock class. The legacy version 1
+   credential check reads only items that are erased on the first upgraded
+   launch.
+3. Before the first unlock after boot, every protected item is unavailable.
+   Distinguish that case (`errSecInteractionNotAllowed`, or
+   `UIApplication.isProtectedDataAvailable` being false) from real storage
+   failure: the engine reports a temporary `locked` condition instead of the
+   fatal state, retries opening storage on
+   `protectedDataDidBecomeAvailableNotification` and on
+   `applicationDidBecomeActive()`, and still calls `scheduleRefresh()` so that
+   the next refresh is not lost.
+4. Test on a device after normal process termination, locked, and unlocked
+   once since boot: a refresh restores the same identity and session,
+   persists and acknowledges remote changes, and submits the next refresh.
+
+The install device ID is a 128-bit replica identifier, not key material. With
+item 1, code running on a locked device after first unlock can read it, as it
+can already read the MLS state key and the replica.
 
 ### Engine
 
@@ -189,6 +229,8 @@ timing. These documents must change when phase 1 ships:
   while active."
 - THREAT-MODEL.md, "Delivery and loss": "The engine receives while its
   application is active."
+- THREAT-MODEL.md, "Assets and trust boundaries", and docs/API.md: the
+  install identity moves to `AfterFirstUnlockThisDeviceOnly`.
 - server/README.md, metrics paragraph: list the lag counters.
 - `ProductSyncPolicy.deliverySummary` in the demo. It may say that other phones
   can update in the background. It must not promise when.
