@@ -78,6 +78,87 @@ before it reads the request body. Requests are limited to 1 MiB.
 [PROTOCOL.md](../docs/PROTOCOL.md) lists the operations, authorization rules,
 and limits.
 
+## Admission and rate limits
+
+The relay limits work per client source before it parses a request body or
+accepts a registration. A source is one IPv4 address or one IPv6 `/64`
+(`--ipv6-source-prefix`). The limits apply to the WebSocket listener and to
+every request on the delivery listener (`/v2/mls/*`).
+
+| Limit | Default | Argument | Rejection |
+| --- | --- | --- | --- |
+| WebSocket connections | 2/s, burst 30 | `--websocket-connect-rate`, `--websocket-connect-burst` | Handshake `429` with `Retry-After` |
+| Concurrent WebSockets | 32 | `--max-websockets-per-source` | `rateLimited` frame, close `1013` |
+| Delivery requests | 40/s, burst 400 | `--http-request-rate`, `--http-request-burst` | `429` `rateLimited` with `Retry-After` |
+| Concurrent delivery requests | 16 | `--max-http-requests-per-source` | Connection closed, or `429` behind a trusted proxy |
+
+Set a rate and its burst to `0`, or a concurrency limit to `0`, to disable that
+limit. A rejected request touches no room or MLS state and does not consume a
+token. The engine treats a `429` as transient and retries on its next cycle.
+
+Each rate limiter tracks at most 65,536 sources (`--rate-limit-max-sources`)
+and evicts the least recently used source when full. An attacker controlling
+more sources than that can reset other sources' buckets, so size this above
+the expected number of active clients and rely on the perimeter for
+distributed floods. Concurrency state exists only while a request or socket is
+open.
+
+### Client addresses behind a proxy
+
+By default the relay uses the TCP peer address and ignores forwarding headers.
+Behind a TLS proxy, every client would then share the proxy's address. Pass
+`--trusted-proxy CIDR` (repeatable) for each proxy network. For a request from a
+trusted peer, the relay reads `X-Forwarded-For` (or `--client-ip-header`) from
+right to left and uses the first address that is not itself a trusted proxy. A
+missing or malformed header falls back to the proxy address. The proxy must
+overwrite or append to this header; it must never pass a client-supplied value
+through unmodified. Only trust addresses that clients cannot reach the relay
+from directly.
+
+### Private deployments
+
+Deployment admission is off by default. Two mechanisms restrict a private
+relay, and every configured mechanism must pass:
+
+- `--admission-allow CIDR` (repeatable) admits only clients whose resolved
+  address is in one of the networks, for example a VPN or tailnet range.
+  Rejected clients receive `403` `admissionDenied`.
+- `--admission-token-file PATH`, or the `GOTSYNC_ADMISSION_TOKEN_FILE`
+  environment variable, names a file of tokens, one per line. Blank lines and
+  lines starting with `#` are ignored. Each token must be at least 32 printable
+  ASCII characters. Requests and WebSocket handshakes must carry a token in
+  the `X-GotSync-Admission` header, or they receive `403`.
+
+The GotSync Swift client does not send an admission token. Use the token to
+prove that traffic passed through an authenticating front proxy: the proxy
+authenticates users (for example with mTLS or an identity-aware proxy), then
+sets the header. The proxy must strip any client-supplied
+`X-GotSync-Admission` header. Generate a token with `openssl rand -base64 48`,
+store the file with mode `0600`, and keep it out of the image and the command
+line. The relay stores only SHA-256 digests, compares them in constant time,
+and never logs or exports tokens. Metrics count `admission_rejections`,
+`rate_limit_rejections`, and `source_concurrency_rejections` without client
+identifiers.
+
+### Perimeter for a public relay
+
+These limits bound damage from one source; they do not stop a distributed
+flood or a slow-read attack that stays under the per-source limits. A hardened
+public relay host also needs:
+
+- A TLS proxy or load balancer that terminates HTTPS/WSS and is the only
+  network path to the relay ports, with `--trusted-proxy` set to its address.
+- Connection-rate, request-rate, and concurrent-connection limits at that proxy
+  or at a DDoS-protection provider, set at or below the relay's limits.
+- Header, idle, and request timeouts at the proxy, plus a cap on WebSocket
+  lifetime if long-lived sockets are not required.
+- A firewall that drops direct traffic to ports 8765 to 8767 from anywhere other
+  than the proxy, and keeps the metrics port on loopback.
+- Proxy access logs that omit request bodies, the `Authorization` and
+  `X-GotSync-Admission` headers, and, where possible, client addresses.
+- Alerts on the rejection counters, `relayBusy`, delivery capacity, and disk
+  usage.
+
 ## Health and metrics
 
 The metrics listener is restricted to a loopback address and defaults to
@@ -114,9 +195,9 @@ scripts/uv.sh python server/benchmark.py --iterations 1000 --payload-bytes 256
 ```
 
 Local development uses plain HTTP and `ws://` for loopback development. A deployed
-version needs HTTPS and `wss://`, an admission design resistant to anonymous
-capacity exhaustion, rate limits, encrypted backups, operational storage
-monitoring, and carefully scrubbed proxy access logs.
+version needs HTTPS and `wss://`, the perimeter controls in
+[Admission and rate limits](#admission-and-rate-limits), encrypted backups,
+operational storage monitoring, and carefully scrubbed proxy access logs.
 
 ## Docker
 
@@ -140,7 +221,11 @@ loopback metrics listener inside the container. Port 8766 is deliberately not
 published. The backend listens on container interfaces with the explicit
 plaintext override required for container networking. A public deployment
 must terminate HTTPS/WSS at a trusted reverse proxy and keep these ports off
-the public network. Restrict the volume and encrypt its backups.
+the public network. Inside a container, every proxied request arrives from the
+proxy's address, so append `--trusted-proxy` with the proxy's network to the
+command. Mount an admission token file read-only and set
+`GOTSYNC_ADMISSION_TOKEN_FILE` to its path. Restrict the volume and encrypt its
+backups.
 
 ## Protocol versions
 
