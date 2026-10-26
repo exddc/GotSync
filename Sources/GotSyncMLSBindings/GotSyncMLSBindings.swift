@@ -693,10 +693,11 @@ public struct MlsTransition: Equatable, Hashable {
     public var removed: Bool
     public var addedWriter: Data?
     public var removedWriter: Data?
+    public var departed: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(state: Data, output: Data, welcome: Data?, groupId: Data, epoch: UInt64, sender: Data?, removed: Bool, addedWriter: Data?, removedWriter: Data?) {
+    public init(state: Data, output: Data, welcome: Data?, groupId: Data, epoch: UInt64, sender: Data?, removed: Bool, addedWriter: Data?, removedWriter: Data?, departed: Data?) {
         self.state = state
         self.output = output
         self.welcome = welcome
@@ -706,6 +707,7 @@ public struct MlsTransition: Equatable, Hashable {
         self.removed = removed
         self.addedWriter = addedWriter
         self.removedWriter = removedWriter
+        self.departed = departed
     }
 
     
@@ -732,7 +734,8 @@ public struct FfiConverterTypeMlsTransition: FfiConverterRustBuffer {
                 sender: FfiConverterOptionData.read(from: &buf), 
                 removed: FfiConverterBool.read(from: &buf), 
                 addedWriter: FfiConverterOptionData.read(from: &buf), 
-                removedWriter: FfiConverterOptionData.read(from: &buf)
+                removedWriter: FfiConverterOptionData.read(from: &buf), 
+                departed: FfiConverterOptionData.read(from: &buf)
         )
     }
 
@@ -746,6 +749,7 @@ public struct FfiConverterTypeMlsTransition: FfiConverterRustBuffer {
         FfiConverterBool.write(value.removed, into: &buf)
         FfiConverterOptionData.write(value.addedWriter, into: &buf)
         FfiConverterOptionData.write(value.removedWriter, into: &buf)
+        FfiConverterOptionData.write(value.departed, into: &buf)
     }
 }
 
@@ -968,6 +972,14 @@ public func prepareAdd(state: Data, keyPackage: Data, verifiedFingerprint: Data)
     )
 })
 }
+public func prepareLeave(state: Data)throws  -> MlsTransition  {
+    return try  FfiConverterTypeMlsTransition_lift(try rustCallWithError(FfiConverterTypeMlsError_lift) {
+        uniffiCallStatus in
+    uniffi_gotsync_mls_fn_func_prepare_leave(
+        FfiConverterData.lower(state),uniffiCallStatus
+    )
+})
+}
 public func prepareRemove(state: Data, memberFingerprint: Data)throws  -> MlsTransition  {
     return try  FfiConverterTypeMlsTransition_lift(try rustCallWithError(FfiConverterTypeMlsError_lift) {
         uniffiCallStatus in
@@ -1038,6 +1050,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_gotsync_mls_checksum_func_prepare_add() != 55511) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_gotsync_mls_checksum_func_prepare_leave() != 10977) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_gotsync_mls_checksum_func_prepare_remove() != 36450) {
