@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import signal
+import ssl
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -56,6 +57,7 @@ MAX_BINARY_MESSAGE_BYTES = 512 * 1024
 MAX_FORWARD_QUEUE_FRAMES = 16
 MAX_FORWARD_QUEUE_BYTES = 1024 * 1024
 REGISTRATION_TIMEOUT_SECONDS = 5.0
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_CONNECTIONS = 256
 DEFAULT_MAX_ROOMS = 128
 DEFAULT_MAX_DELIVERY_CONNECTIONS = 64
@@ -617,14 +619,14 @@ class RelayServer:
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_rooms: int = DEFAULT_MAX_ROOMS,
         waiting_room_ttl: float = DEFAULT_WAITING_ROOM_TTL_SECONDS,
-        allow_insecure_non_loopback: bool = False,
+        tls: ssl.SSLContext | None = None,
         admission: AdmissionConfig | None = None,
         admission_clock: Callable[[], float] | None = None,
     ) -> None:
         _require_loopback(metrics_host, label="metrics host")
-        if not allow_insecure_non_loopback:
-            _require_loopback(host, label="relay host")
-            _require_loopback(delivery_host, label="delivery host")
+        if tls is None:
+            _require_loopback(host, label="relay host without TLS")
+            _require_loopback(delivery_host, label="delivery host without TLS")
         if not all(
             0 <= candidate <= 65535
             for candidate in (port, metrics_port, delivery_port)
@@ -639,6 +641,7 @@ class RelayServer:
         self.delivery_host = delivery_host
         self.delivery_port = delivery_port
         self.delivery_max_connections = delivery_max_connections
+        self.tls = tls
         self.admission = AdmissionController(
             admission, clock=admission_clock or time.monotonic
         )
@@ -686,6 +689,7 @@ class RelayServer:
             or self._delivery_server is not None
         ):
             raise RuntimeError("relay is already running")
+        handshake_timeout = TLS_HANDSHAKE_TIMEOUT_SECONDS if self.tls else None
         try:
             self._websocket_server = await serve(
                 self.service.handle,
@@ -701,6 +705,8 @@ class RelayServer:
                 open_timeout=5,
                 server_header=None,
                 logger=self._websocket_logger,
+                ssl=self.tls,
+                ssl_handshake_timeout=handshake_timeout,
                 process_request=self._screen_websocket_request,
             )
             self._metrics_server = await asyncio.start_server(
@@ -714,6 +720,8 @@ class RelayServer:
                 self.delivery_host,
                 self.delivery_port,
                 limit=MAX_HTTP_HEADER_BYTES,
+                ssl=self.tls,
+                ssl_handshake_timeout=handshake_timeout,
             )
             self.mls.start_expiry()
         except BaseException:
@@ -1039,6 +1047,12 @@ def _require_loopback(host: str, *, label: str) -> None:
         raise ValueError(f"{label} must be a loopback address")
 
 
+def server_tls_context(certificate_path: str, key_path: str) -> ssl.SSLContext:
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certificate_path, key_path)
+    return context
+
+
 def _retention_days(value: str) -> float:
     days = float(value)
     if not 1 <= days < math.inf:
@@ -1069,10 +1083,10 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="days the delivery store keeps unread entries and idle groups",
     )
     parser.add_argument(
-        "--allow-insecure-non-loopback",
-        action="store_true",
-        help="allow plaintext relay listeners on non-loopback interfaces",
+        "--tls-cert",
+        help="PEM certificate chain; required with --tls-key to bind beyond loopback",
     )
+    parser.add_argument("--tls-key", help="PEM private key for --tls-cert")
     parser.add_argument(
         "--trusted-proxy",
         action="append",
@@ -1156,7 +1170,9 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 
 async def _run_until_stopped(
-    args: argparse.Namespace, admission: AdmissionConfig
+    args: argparse.Namespace,
+    tls: ssl.SSLContext | None,
+    admission: AdmissionConfig,
 ) -> None:
     relay = RelayServer(
         host=args.host,
@@ -1171,7 +1187,7 @@ async def _run_until_stopped(
         max_connections=args.max_connections,
         max_rooms=args.max_rooms,
         waiting_room_ttl=args.waiting_room_ttl,
-        allow_insecure_non_loopback=args.allow_insecure_non_loopback,
+        tls=tls,
         admission=admission,
     )
     stop = asyncio.Event()
@@ -1186,10 +1202,6 @@ async def _run_until_stopped(
             pass
 
     try:
-        if args.allow_insecure_non_loopback:
-            logging.warning(
-                "plaintext relay listeners may be reachable beyond this machine"
-            )
         await relay.start()
         print(
             "admission: "
@@ -1216,12 +1228,20 @@ async def _run_until_stopped(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _argument_parser()
     args = parser.parse_args(argv)
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("--tls-cert and --tls-key must be given together")
+    tls = None
+    if args.tls_cert:
+        try:
+            tls = server_tls_context(args.tls_cert, args.tls_key)
+        except (OSError, ssl.SSLError) as error:
+            parser.error(f"cannot load TLS certificate {args.tls_cert}: {error}")
     try:
         admission = admission_config_from_arguments(args)
     except (OSError, ValueError) as error:
         parser.error(f"invalid admission configuration: {error}")
     try:
-        asyncio.run(_run_until_stopped(args, admission))
+        asyncio.run(_run_until_stopped(args, tls, admission))
     except KeyboardInterrupt:
         pass
     return 0

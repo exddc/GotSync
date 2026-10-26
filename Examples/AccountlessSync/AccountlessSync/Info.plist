@@ -41,11 +41,13 @@
 	<string>public.app-category.productivity</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+#if GOTSYNC_ALLOW_LOCAL_NETWORKING
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+#endif
 	<key>NSCameraUsageDescription</key>
 	<string>Scan a one-time pairing code to link phones.</string>
 	<key>UIApplicationSceneManifest</key>

@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import io
 import json
 import os
+import ssl
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidMessage
 
 from gotsync_server.server import (
     MAX_FORWARD_QUEUE_BYTES,
@@ -20,8 +24,26 @@ from gotsync_server.server import (
     Metrics,
     RegistrationError,
     RelayServer,
+    main,
     parse_registration,
+    server_tls_context,
 )
+
+
+def self_signed_certificate(directory: str) -> tuple[str, str]:
+    certificate = os.path.join(directory, "tls.crt")
+    key = os.path.join(directory, "tls.key")
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "ec",
+            "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+            "-days", "1", "-subj", "/CN=127.0.0.1",
+            "-keyout", key, "-out", certificate,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return certificate, key
 
 
 def route_text(seed: int) -> str:
@@ -131,6 +153,17 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.certificate_directory = tempfile.TemporaryDirectory()
+        cls.certificate, cls.key = self_signed_certificate(
+            cls.certificate_directory.name
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.certificate_directory.cleanup()
+
     async def asyncSetUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.database_path = os.path.join(
@@ -496,7 +529,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "loopback"):
             RelayServer(metrics_host="0.0.0.0")
 
-    async def test_plaintext_listeners_reject_non_loopback_binds_by_default(
+    async def test_plaintext_listeners_reject_non_loopback_binds(
         self,
     ) -> None:
         for options in (
@@ -504,12 +537,10 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {"delivery_host": "0.0.0.0"},
         ):
             with self.subTest(options=options):
-                with self.assertRaisesRegex(ValueError, "loopback"):
+                with self.assertRaisesRegex(ValueError, "without TLS"):
                     RelayServer(**options)
 
-    async def test_insecure_non_loopback_bind_requires_explicit_override(
-        self,
-    ) -> None:
+    async def test_tls_listeners_accept_non_loopback_binds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             relay = RelayServer(
                 host="0.0.0.0",
@@ -518,9 +549,59 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     temporary_directory,
                     "mls.sqlite3",
                 ),
-                allow_insecure_non_loopback=True,
+                tls=server_tls_context(self.certificate, self.key),
             )
             await relay.close()
+
+    async def test_tls_listeners_serve_only_tls(self) -> None:
+        await self.restart_relay(tls=server_tls_context(self.certificate, self.key))
+        client_tls = ssl.create_default_context(cafile=self.certificate)
+        client_tls.check_hostname = False
+
+        client = await connect(
+            f"wss://127.0.0.1:{self.relay.websocket_port}/v2/pairing",
+            ssl=client_tls,
+            open_timeout=2,
+        )
+        await client.close()
+        with self.assertRaises(InvalidMessage):
+            await connect(
+                f"ws://127.0.0.1:{self.relay.websocket_port}/v2/pairing",
+                open_timeout=2,
+            )
+
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", self.relay.bound_delivery_port, ssl=client_tls
+        )
+        writer.write(b"GET /healthz HTTP/1.1\r\nHost: relay\r\n\r\n")
+        await writer.drain()
+        status_line = await asyncio.wait_for(reader.readline(), 2)
+        writer.close()
+        await writer.wait_closed()
+        self.assertEqual(status_line.split()[1], b"404")
+
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", self.relay.bound_delivery_port
+        )
+        writer.write(b"GET /healthz HTTP/1.1\r\nHost: relay\r\n\r\n")
+        await writer.drain()
+        self.assertEqual(await asyncio.wait_for(reader.read(), 2), b"")
+        writer.close()
+        await writer.wait_closed()
+
+    def test_cli_requires_certificate_and_key_together(self) -> None:
+        for arguments in (["--tls-cert", "cert.pem"], ["--tls-key", "key.pem"]):
+            with self.subTest(arguments=arguments):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        main(arguments)
+
+    def test_cli_rejects_unreadable_certificate(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                main(["--tls-cert", "/missing/tls.crt", "--tls-key", self.key])
+        self.assertIn("cannot load TLS certificate /missing/tls.crt", stderr.getvalue())
 
     async def test_readiness_reports_closed_delivery_store(self) -> None:
         self.relay.mls.store.close()
