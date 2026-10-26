@@ -236,6 +236,10 @@ final class MLSClientTests: XCTestCase {
 
     func testThreeSwiftClientsAgainstRealRelay() async throws {
         guard let endpoint = ProcessInfo.processInfo.environment["GOTSYNC_MLS_URL"], let url = URL(string: endpoint) else {
+            if ProcessInfo.processInfo.environment["GOTSYNC_REQUIRE_INTEGRATION"] == "1" {
+                XCTFail("The required MLS relay environment is missing.")
+                return
+            }
             throw XCTSkip("Run scripts/test-mls.sh for the real relay test")
         }
         let alice = try client(1)

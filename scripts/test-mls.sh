@@ -25,4 +25,4 @@ for ((attempt=0; attempt<100; attempt++)); do
 done
 if [ ! -f "$GOTSYNC_MLS_TEST_DIR/endpoint" ]; then cat "$GOTSYNC_MLS_TEST_DIR/server.log"; exit 1; fi
 export GOTSYNC_MLS_URL="$(cat "$GOTSYNC_MLS_TEST_DIR/endpoint")"
-swift test --package-path Packages/GotSyncMLS --scratch-path "$GOTSYNC_CACHE_DIR/swift-mls" "$@"
+swift test --scratch-path "$GOTSYNC_SWIFT_SCRATCH_PATH" --filter GotSyncMLSTests "$@"

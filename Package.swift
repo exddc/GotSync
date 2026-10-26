@@ -1,13 +1,26 @@
 // swift-tools-version: 6.0
+import Foundation
 import PackageDescription
+
+let mlsBinary = (
+    path: "Artifacts/gotsync_mlsFFI.xcframework",
+    url: "https://github.com/exddc/GotSync/releases/download/mls-ffi-0.1.0/gotsync_mlsFFI.xcframework.zip",
+    checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+)
+let mlsBinaryTarget: Target = FileManager.default.fileExists(atPath: "\(Context.packageDirectory)/\(mlsBinary.path)")
+    ? .binaryTarget(name: "gotsync_mlsFFI", path: mlsBinary.path)
+    : .binaryTarget(name: "gotsync_mlsFFI", url: mlsBinary.url, checksum: mlsBinary.checksum)
 
 let package = Package(
     name: "GotSync",
     platforms: [.iOS(.v18), .macOS(.v14)],
     products: [.library(name: "GotSync", targets: ["GotSync"])],
-    dependencies: [.package(path: "Packages/GotSyncMLS")],
     targets: [
-        .target(name: "GotSync", dependencies: [.product(name: "GotSyncMLS", package: "GotSyncMLS")]),
+        .target(name: "GotSync", dependencies: ["GotSyncMLS"]),
+        mlsBinaryTarget,
+        .target(name: "GotSyncMLSBindings", dependencies: ["gotsync_mlsFFI"]),
+        .target(name: "GotSyncMLS", dependencies: ["GotSyncMLSBindings"]),
         .testTarget(name: "GotSyncTests", dependencies: ["GotSync"]),
+        .testTarget(name: "GotSyncMLSTests", dependencies: ["GotSyncMLS", "GotSyncMLSBindings"]),
     ]
 )

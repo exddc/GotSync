@@ -19,7 +19,9 @@ identifiers are:
 - the `sync-v2.json` checkpoint and the `mls-v2` and `mls-v2-departing`
   storage directories.
 
-The relay serves no `/v1` path.
+The relay serves no `/v1` path. The delivery listener answers any `/v1` request
+with HTTP 400 `unsupportedVersion`, `supportedVersions: [2]`, and a message
+that tells the user to pair every device again.
 
 ## Supported contracts
 
@@ -30,7 +32,7 @@ The relay serves no `/v1` path.
 | Invitation URL | Consumer-specific scheme and `pair` host with `v=2` | Parser requires `secret`, `group`, and `fingerprint`; `v=1` fails with `unsupportedVersion` |
 | Invitation phrase | 17 words: 16-byte secret and a checksum word | Unknown words and a wrong checksum are rejected; the phrase carries no version |
 | MLS pairing frames | Version 2 domains over the `/v2/pairing` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment aborts pairing |
-| MLS delivery service | `/v2/mls`, `version: 2` | Client rejects any other response version; server rejects other request versions |
+| MLS delivery service | `/v2/mls`, `version: 2` | Client rejects any other response version; server answers other request versions with HTTP 400 `unsupportedVersion` |
 | MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
 | Replication checkpoint | `sync-v2.json`, version 2 | Engine discards an unreadable checkpoint and rebuilds it from MLS state |

@@ -40,6 +40,25 @@ ADDED_COLUMNS = (
 )
 
 
+class UnsupportedVersion(RequestError):
+    code = "unsupportedVersion"
+
+    def body(self) -> dict[str, Any]:
+        return {"error": self.code, "version": VERSION, "supportedVersions": [VERSION], "message": str(self)}
+
+
+def legacy_target_error(target: str) -> UnsupportedVersion | None:
+    if target.startswith("/v1/") or target == "/v1":
+        return UnsupportedVersion(f"protocol version 1 is no longer served; use /v{VERSION} and pair every device again")
+    return None
+
+
+def error_body(error: RequestError) -> dict[str, Any]:
+    if isinstance(error, UnsupportedVersion):
+        return error.body()
+    return {"error": error.code, "version": VERSION}
+
+
 class DeliveryConflict(RequestError):
     status = 409
     code = "epochConflict"
@@ -163,7 +182,7 @@ class MLSDeliveryStore:
 
     def request(self, operation: str, document: dict[str, Any]) -> dict[str, Any]:
         if type(document.get("version")) is not int or document["version"] != VERSION:
-            raise RequestError("unsupported version")
+            raise UnsupportedVersion(f"MLS delivery requires protocol version {VERSION}; pair every device again")
         with self._lock:
             self._expire_committed()
             with self._db:
@@ -425,12 +444,14 @@ class MLSDeliveryServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             method, target, headers, body = await read_http_json_request(reader, maximum_body_bytes=1024 * 1024)
+            if (legacy := legacy_target_error(target)) is not None:
+                raise legacy
             if method != "POST" or not target.startswith("/v2/mls/"):
                 await write_http_response(writer, 404, {"error": "notFound", "version": VERSION})
                 return
             await self.handle_request(target, headers, body, writer)
         except RequestError as error:
-            await write_http_response(writer, error.status, {"error": error.code, "version": VERSION})
+            await write_http_response(writer, error.status, error_body(error))
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception:
@@ -458,7 +479,7 @@ class MLSDeliveryServer:
             result = await asyncio.to_thread(self.store.request, target.removeprefix("/v2/mls/"), document)
             await write_http_response(writer, 409 if "error" in result else 200, result)
         except RequestError as error:
-            await write_http_response(writer, error.status, {"error": error.code, "version": VERSION})
+            await write_http_response(writer, error.status, error_body(error))
         except ConnectionError:
             raise
         except Exception:

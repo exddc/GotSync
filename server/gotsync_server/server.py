@@ -45,7 +45,7 @@ from .http import (
     read_http_body,
     write_http_response,
 )
-from .mls import DEFAULT_RETENTION_SECONDS, MLSDeliveryServer, MLSDeliveryStore
+from .mls import DEFAULT_RETENTION_SECONDS, MLSDeliveryServer, MLSDeliveryStore, error_body, legacy_target_error
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
 
 WEBSOCKET_PATH = "/v2/pairing"
@@ -897,6 +897,8 @@ class RelayServer:
                         held_source=held_source,
                     )
                     return
+                if (legacy := legacy_target_error(target)) is not None:
+                    raise legacy
                 if method != "POST" or not target.startswith(DELIVERY_PATH_PREFIX):
                     await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
                     return
@@ -906,11 +908,7 @@ class RelayServer:
                 await self.mls.handle_request(target, headers, body, writer)
             except RequestError as error:
                 self.service.metrics.increment("delivery_bad_requests")
-                await write_http_response(
-                    writer,
-                    error.status,
-                    {"error": error.code, "version": PROTOCOL_VERSION},
-                )
+                await write_http_response(writer, error.status, error_body(error))
         except ConnectionError:
             pass
         except Exception:

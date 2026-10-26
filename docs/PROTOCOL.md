@@ -12,7 +12,7 @@ from version 1, and [THREAT-MODEL.md](THREAT-MODEL.md) for security limits.
 Each linked set of devices is one MLS group (RFC 9420, ciphersuite
 `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) of up to eight members. The
 OpenMLS state, signing key, and epoch secrets are managed by
-`Packages/GotSyncMLS` and stored encrypted on the device.
+the `GotSyncMLS` module and stored encrypted on the device.
 A member's fingerprint is the SHA-256 of its MLS signature public key. The
 relay's `/v2/mls` delivery service holds KeyPackages and an ordered,
 per-group log of commits and application messages.

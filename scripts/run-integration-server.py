@@ -22,6 +22,7 @@ async def main() -> None:
         (directory / "endpoints.env").write_text(
             f"GOTSYNC_RELAY_URL=ws://127.0.0.1:{server.websocket_port}/v2/pairing\n"
             f"GOTSYNC_MAILBOX_URL=http://127.0.0.1:{server.bound_delivery_port}/v2/mls\n"
+            f"GOTSYNC_MLS_URL=http://127.0.0.1:{server.bound_delivery_port}/v2/mls\n"
         )
         stopped = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):

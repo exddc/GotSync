@@ -1,0 +1,42 @@
+name: Publish MLS binary
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example mls-ffi-0.1.1
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      GOTSYNC_CACHE_DIR: ${{ github.workspace }}/../gotsync-cache
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Build Rust XCFramework and Swift bindings
+        run: scripts/build-mls.sh
+      - name: Check committed bindings
+        run: git diff --exit-code -- Sources/GotSyncMLSBindings
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
+          checksum="$(cut -d ' ' -f 1 "$RUNNER_TEMP/mls-package/gotsync_mlsFFI.xcframework.zip.sha256")"
+          gh release create "$TAG" "$RUNNER_TEMP"/mls-package/* --target "$GITHUB_SHA" --latest=false \
+            --title "MLS binary $TAG" --notes "SwiftPM checksum: \`$checksum\`"
+          {
+            echo "Pin this binary on the same commit, then commit the result:"
+            echo
+            echo "\`\`\`sh"
+            echo "python3 scripts/package-mls.py --pin $TAG $checksum"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
