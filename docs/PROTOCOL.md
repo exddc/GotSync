@@ -239,14 +239,21 @@ An append whose epoch differs from the group's current epoch fails with
 that adds a member carries its Welcome, the KeyPackage reference, and the new
 writer's hash; the relay admits that writer only if the reference belongs to a
 KeyPackage published by it, and otherwise answers `keyPackageUnavailable`. A
-commit can name `removeWriter`, and a proposal revokes its own sender. The
-relay does not parse MLS: it trusts these fields and treats payloads as opaque.
+commit can name `removeWriter`, and a proposal revokes its own sender. Naming
+a writer the relay no longer holds has no effect. The relay does not parse
+MLS: it trusts these fields and treats payloads as opaque.
 
 A revoked writer cannot append. It can read entries up to its removal cursor
 until it acknowledges that cursor or 24 hours pass. The relay deletes entries
-that every current writer has acknowledged. A group log holds at most 10,000
-entries or 16 MiB; past that, appends fail with `deliveryCapacity`. A group
-with no entries expires after 24 hours.
+that every current writer has acknowledged, and any entry 90 days after it
+was accepted. A group log holds at most 10,000 entries or 16 MiB; past that,
+appends fail with `deliveryCapacity`. A group with no entries expires after 24
+hours, and any group expires 90 days after the last request from a member.
+`fetch` answers HTTP 410 `historyExpired` when entries the writer has not
+acknowledged have expired. `fetch`, `ack`, and `append` also answer it for a
+deleted group. The client then stops with `SyncError.syncHistoryExpired`. The
+[server README](../server/README.md#retention) lists the full retention
+policy.
 
 ## Replicated task model
 

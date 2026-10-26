@@ -13,7 +13,8 @@ under protocol version 2:
 The relay does not encrypt, decrypt, or inspect application payloads.
 WebSocket frames are never persisted or buffered before a peer arrives. The
 delivery store persists only opaque MLS messages, KeyPackages, cursors, hashes
-needed for authorization and idempotency, and expiry timestamps.
+needed for authorization and idempotency, and timestamps that drive
+[retention](#retention).
 
 ## Run
 
@@ -40,8 +41,42 @@ an explicit local demo and emits a plaintext-exposure warning.
 The delivery SQLite database defaults to `relay-data/mls.sqlite3`, uses full
 synchronous durability, and is created with mode `0600` in a `0700` directory.
 Override the location with `--database`, the listener with `--delivery-host`
-and `--delivery-port`, and the concurrent request bound (64 by default) with
-`--delivery-max-connections`.
+and `--delivery-port`, the concurrent request bound (64 by default) with
+`--delivery-max-connections`, and the retention period (90 days by default,
+at least 1) with `--retention-days`.
+
+## Retention
+
+The delivery store deletes every record on the schedule below. It applies the
+schedule before each request and once an hour while the relay runs.
+
+| Record | Deleted |
+| --- | --- |
+| Log entry: commit, Welcome, proposal, or application message | When every current member has acknowledged it, or 90 days after the relay accepted it |
+| Acknowledgement cursor of a current member | With its group |
+| Group, with its writer hashes and cursors | 90 days after the last request from any member, or 24 hours after creation if it never received an entry |
+| Writer hash of a removed member | 24 hours after its removal |
+| Rejected-append record | 24 hours after the rejection |
+| KeyPackage | Its payload on the first fetch; the row when a commit consumes it or 15 minutes after publication |
+| Pairing room | When it becomes empty, or 15 minutes after a lone peer arrives; never written to disk |
+
+`--retention-days` changes the 90-day period. A member that falls behind by
+more than that period can no longer follow the group: `fetch` returns HTTP 410
+`historyExpired`, and the client reports `SyncError.syncHistoryExpired` so the
+user pairs the device again. A request for a deleted group returns the same
+error.
+
+Opening a database created before this policy adds the missing columns. Its
+existing entries and groups count as created at that moment.
+
+SQLite runs with `secure_delete` on, so it overwrites deleted rows with zeros
+in the database file. It uses the `DELETE` rollback journal, which it removes
+after each transaction. The journal's freed blocks stay on the filesystem
+until the filesystem reuses them, so keep the database on an encrypted volume.
+
+Backups are the operator's responsibility. Encrypt them and delete each backup
+within the retention period, so that no backup holds a record longer than the
+live store would.
 
 ## Live WebSocket relay
 

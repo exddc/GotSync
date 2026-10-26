@@ -1,10 +1,12 @@
+import asyncio
 import concurrent.futures
 import sqlite3
 import hashlib
 
 import pytest
 
-from gotsync_server.mls import MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized
+from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
+from gotsync_server.server import _argument_parser
 from gotsync_server.http import RequestError, encode_base64url
 
 
@@ -78,7 +80,7 @@ def test_no_crypto_secrets_in_delivery_schema(tmp_path):
     with sqlite3.connect(path) as db:
         columns = {row[1] for table in ("mls_groups", "mls_entries", "mls_packages", "mls_rejections", "mls_writers")
                    for row in db.execute(f"PRAGMA table_info({table})")}
-        assert columns == {"route", "epoch", "cursor", "kind", "payload", "welcome", "package", "reference", "expires", "digest", "writer", "removed_writer", "added_writer", "head", "ack", "removal", "removed_at", "pairing", "created_at"}
+        assert columns == {"route", "epoch", "cursor", "kind", "payload", "welcome", "package", "reference", "expires", "digest", "writer", "removed_writer", "added_writer", "head", "ack", "removal", "removed_at", "pairing", "created_at", "active_at", "expired"}
         assert db.execute("SELECT payload FROM mls_entries").fetchone()[0] == b"opaque MLS bytes"
 
 
@@ -119,8 +121,6 @@ def test_writer_metadata_retries_and_group_capacity(tmp_path, monkeypatch):
     package = request(store, "key-package/publish", payload=payload)["reference"]
     with pytest.raises(DeliveryConflict):
         request(store, "key-package/publish", payload=payload, authorization=encode_base64url(b"c" * 32))
-    with pytest.raises(RequestError):
-        append(store, reference=package, welcome=encode_base64url(b"welcome"), removeWriter=encode_base64url(b"unknown".ljust(32, b"!")))
     assert request(store, "key-package/fetch", reference=package)["payload"] == payload
     append(store, reference=package, welcome=encode_base64url(b"welcome"))
     removed = encode_base64url(hashlib.sha256(b"b" * 32).digest())
@@ -551,3 +551,155 @@ def test_readiness_bounds_sqlite_write_contention(tmp_path):
     assert store.is_ready()
     assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     store.close()
+
+
+DAY = 86400
+RETENTION = 90 * DAY
+
+
+def clock(monkeypatch, now):
+    monkeypatch.setattr("gotsync_server.mls.time.time", lambda: now)
+
+
+def test_unread_entries_expire_and_the_lagging_writer_is_told(tmp_path, monkeypatch):
+    clock(monkeypatch, 1000)
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    group = encode_base64url(b"g" * 32)
+    bob = encode_base64url(b"b" * 32)
+    reference = request(store, "key-package/publish", payload=encode_base64url(b"package"))["reference"]
+    append(store, reference=reference, welcome=encode_base64url(b"welcome"))
+    old = append(store, payload=b"old", epoch=1, kind="application")["entry"]
+    request(store, "ack", route=group, cursor=old["cursor"])
+    clock(monkeypatch, 1000 + RETENTION - 1)
+    assert len(request(store, "fetch", group=group, after=0, authorization=bob)["entries"]) == 2
+    clock(monkeypatch, 1000 + RETENTION)
+    with pytest.raises(HistoryExpired):
+        request(store, "fetch", group=group, after=0, authorization=bob)
+    assert request(store, "fetch", group=group, after=old["cursor"], authorization=bob)["entries"] == []
+    assert request(store, "fetch", group=group, after=old["cursor"])["entries"] == []
+    carol = encode_base64url(b"c" * 32)
+    package = request(store, "key-package/publish", payload=encode_base64url(b"carol package"), authorization=carol)["reference"]
+    welcome = append(store, payload=b"add carol", epoch=1, reference=package, welcome=encode_base64url(b"welcome"),
+                     addWriter=encode_base64url(hashlib.sha256(b"c" * 32).digest()))["entry"]
+    assert request(store, "fetch", group=group, after=0, authorization=carol)["entries"] == [welcome]
+    store.close()
+
+
+def test_idle_groups_expire_with_their_writers(tmp_path, monkeypatch):
+    clock(monkeypatch, 1000)
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    group = encode_base64url(b"g" * 32)
+    request(store, "ack", route=group, cursor=append(store, kind="application")["entry"]["cursor"])
+    clock(monkeypatch, 1000 + RETENTION - DAY)
+    request(store, "fetch", group=group, after=0)
+    clock(monkeypatch, 1000 + 2 * RETENTION - 2 * DAY)
+    request(store, "fetch", group=group, after=0)
+    clock(monkeypatch, 1000 + 3 * RETENTION)
+    for operation, fields in (("fetch", {"group": group, "after": 0}), ("ack", {"route": group, "cursor": 1}),
+                              ("append", {"group": group, "epoch": 0, "kind": "application", "payload": encode_base64url(b"late")})):
+        with pytest.raises(HistoryExpired):
+            request(store, operation, authorization=encode_base64url(b"a" * 32), **fields)
+    for table in ("mls_groups", "mls_writers", "mls_entries", "mls_rejections"):
+        assert store._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    store.close()
+
+
+def test_removed_writers_and_rejections_expire_after_a_day(tmp_path, monkeypatch):
+    clock(monkeypatch, 1000)
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    removed_group(store)
+    unknown = encode_base64url(b"u" * 32)
+    assert append(store, payload=b"rejected", epoch=2, reference=unknown, welcome=encode_base64url(b"w"))["error"] == "keyPackageUnavailable"
+    clock(monkeypatch, 1000 + DAY - 1)
+    request(store, "fetch", group=encode_base64url(b"g" * 32), after=0)
+    assert store._db.execute("SELECT COUNT(*) FROM mls_writers").fetchone()[0] == 2
+    assert store._db.execute("SELECT COUNT(*) FROM mls_rejections").fetchone()[0] == 1
+    clock(monkeypatch, 1000 + DAY)
+    request(store, "fetch", group=encode_base64url(b"g" * 32), after=0)
+    assert store._db.execute("SELECT digest FROM mls_writers").fetchall() == [(hashlib.sha256(b"a" * 32).digest(),)]
+    assert store._db.execute("SELECT COUNT(*) FROM mls_rejections").fetchone()[0] == 0
+    store.close()
+
+
+def test_deleted_payloads_leave_no_bytes_on_disk(tmp_path, monkeypatch):
+    clock(monkeypatch, 1000)
+    path = tmp_path / "mls.sqlite3"
+    store = MLSDeliveryStore(path)
+    acked, aged, package = (marker.encode() * 64 for marker in ("acked-marker", "aged-marker", "package-marker"))
+    cursor = append(store, payload=acked, kind="application")["entry"]["cursor"]
+    request(store, "ack", route=encode_base64url(b"g" * 32), cursor=cursor)
+    append(store, payload=aged, kind="application")
+    reference = request(store, "key-package/publish", payload=encode_base64url(package))["reference"]
+    request(store, "key-package/fetch", reference=reference)
+    clock(monkeypatch, 1000 + RETENTION)
+    store.expire()
+    assert store._db.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    store.close()
+    contents = path.read_bytes()
+    assert all(marker[:32] not in contents for marker in (acked, aged, package))
+    assert not path.with_name(path.name + "-journal").exists()
+
+
+def test_relay_expires_without_requests(tmp_path, monkeypatch):
+    clock(monkeypatch, 1000)
+    server = MLSDeliveryServer(MLSDeliveryStore(tmp_path / "mls.sqlite3"))
+    append(server.store, kind="application")
+
+    async def run():
+        clock(monkeypatch, 1000 + 2 * RETENTION)
+        server.start_expiry(interval=0.01)
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if not server.store._db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0]:
+                break
+        await server.close()
+
+    asyncio.run(run())
+    with sqlite3.connect(tmp_path / "mls.sqlite3") as db:
+        assert db.execute("SELECT COUNT(*) FROM mls_groups").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM mls_entries").fetchone()[0] == 0
+
+
+def test_opens_a_database_with_the_previous_schema(tmp_path, monkeypatch):
+    path = tmp_path / "mls.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            CREATE TABLE mls_groups (route BLOB PRIMARY KEY, epoch INTEGER NOT NULL, head INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
+            CREATE TABLE mls_writers (route BLOB NOT NULL, digest BLOB NOT NULL, ack INTEGER NOT NULL DEFAULT 0, removal INTEGER, removed_at REAL, PRIMARY KEY(route, digest));
+            CREATE TABLE mls_entries (cursor INTEGER PRIMARY KEY AUTOINCREMENT, route BLOB NOT NULL, epoch INTEGER NOT NULL, kind TEXT NOT NULL,
+                payload BLOB NOT NULL, welcome BLOB, package BLOB, removed_writer BLOB, added_writer BLOB, UNIQUE(route, payload));
+            CREATE TABLE mls_rejections (route BLOB NOT NULL, digest BLOB NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(route, digest));
+        """)
+        db.execute("INSERT INTO mls_groups VALUES (?,0,1,1)", (b"g" * 32,))
+        db.execute("INSERT INTO mls_writers(route,digest) VALUES (?,?)", (b"g" * 32, hashlib.sha256(b"a" * 32).digest()))
+        db.execute("INSERT INTO mls_entries(route,epoch,kind,payload) VALUES (?,0,'application',?)", (b"g" * 32, b"old"))
+    clock(monkeypatch, 5000)
+    store = MLSDeliveryStore(path)
+    assert store._db.execute("SELECT created_at FROM mls_entries").fetchone()[0] == 5000
+    assert store._db.execute("SELECT active_at,expired FROM mls_groups").fetchone() == (5000, 0)
+    assert len(request(store, "fetch", group=encode_base64url(b"g" * 32), after=0)["entries"]) == 1
+    append(store, payload=b"new", kind="application")
+    store.close()
+
+
+def test_commit_may_remove_a_writer_the_relay_forgot(tmp_path, monkeypatch):
+    clock(monkeypatch, 1000)
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    reference = request(store, "key-package/publish", payload=encode_base64url(b"package"))["reference"]
+    append(store, reference=reference, welcome=encode_base64url(b"welcome"))
+    append(store, payload=b"bob leaves", epoch=1, kind="proposal", authorization=encode_base64url(b"b" * 32))
+    clock(monkeypatch, 1000 + DAY)
+    bob = encode_base64url(hashlib.sha256(b"b" * 32).digest())
+    assert append(store, payload=b"commit bob removal", epoch=1, removeWriter=bob)["entry"]["removeWriter"] == bob
+    store.close()
+
+
+def test_retention_configuration(tmp_path):
+    for invalid in (DAY - 1, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            MLSDeliveryStore(tmp_path / "mls.sqlite3", retention_seconds=invalid)
+    assert _argument_parser().parse_args([]).retention_days == 90
+    assert _argument_parser().parse_args(["--retention-days", "30"]).retention_days == 30
+    for invalid in ("0.5", "inf", "nan", "soon"):
+        with pytest.raises(SystemExit):
+            _argument_parser().parse_args(["--retention-days", invalid])

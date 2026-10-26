@@ -41,6 +41,9 @@ New `SyncError` cases:
   verify. `mailboxError` and `errorMessage` carry it, `mailboxRequiresRepair`
   is `true`, and `phase` is `.failed` until the application becomes active
   again and retries.
+- `syncHistoryExpired`: the relay deleted entries this device had not yet
+  received, because the device was offline longer than the relay's retention
+  period. It is reported like `syncHistoryBlocked`: unlink and pair again.
 - `removedFromGroup`: another member removed this device. The engine erases
   its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
 - `approvalExpired`: the inviter did not approve the safety code within 10
