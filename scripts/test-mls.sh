@@ -5,7 +5,7 @@ cd "$GOTSYNC_REPO_ROOT"
 export CARGO_TARGET_DIR="$GOTSYNC_CACHE_DIR/rust-mls"
 cargo test --locked --manifest-path mls/Cargo.toml
 scripts/uv.sh pytest server/tests/test_mls.py -q
-scripts/ensure-mls.sh
+scripts/ensure-mls.sh --build-if-missing
 GOTSYNC_MLS_TEST_DIR="$(mktemp -d)"
 GOTSYNC_MLS_SERVER_PID=""
 cleanup() {

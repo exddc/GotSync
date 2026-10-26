@@ -21,7 +21,8 @@ identifiers are:
 
 The relay serves no `/v1` path. The delivery listener answers any `/v1` request
 with HTTP 400 `unsupportedVersion`, `supportedVersions: [2]`, and a message
-that tells the user to pair every device again.
+that tells the user to pair every device again. The pairing WebSocket closes a
+`/v1` connection with code 1008 and the same message as the close reason.
 
 ## Supported contracts
 

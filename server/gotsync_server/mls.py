@@ -14,6 +14,8 @@ from typing import Any, NamedTuple
 
 from .http import (
     RequestError,
+    UnsupportedVersion,
+    legacy_target_error,
     decode_canonical_base64url,
     encode_base64url,
     parse_json_object,
@@ -38,25 +40,6 @@ ADDED_COLUMNS = (
     ("mls_entries", "created_at", "REAL", None),
     ("mls_rejections", "created_at", "REAL", None),
 )
-
-
-class UnsupportedVersion(RequestError):
-    code = "unsupportedVersion"
-
-    def body(self) -> dict[str, Any]:
-        return {"error": self.code, "version": VERSION, "supportedVersions": [VERSION], "message": str(self)}
-
-
-def legacy_target_error(target: str) -> UnsupportedVersion | None:
-    if target.startswith("/v1/") or target == "/v1":
-        return UnsupportedVersion(f"protocol version 1 is no longer served; use /v{VERSION} and pair every device again")
-    return None
-
-
-def error_body(error: RequestError) -> dict[str, Any]:
-    if isinstance(error, UnsupportedVersion):
-        return error.body()
-    return {"error": error.code, "version": VERSION}
 
 
 class DeliveryConflict(RequestError):
@@ -451,7 +434,7 @@ class MLSDeliveryServer:
                 return
             await self.handle_request(target, headers, body, writer)
         except RequestError as error:
-            await write_http_response(writer, error.status, error_body(error))
+            await write_http_response(writer, error.status, error.body())
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception:
@@ -479,7 +462,7 @@ class MLSDeliveryServer:
             result = await asyncio.to_thread(self.store.request, target.removeprefix("/v2/mls/"), document)
             await write_http_response(writer, 409 if "error" in result else 200, result)
         except RequestError as error:
-            await write_http_response(writer, error.status, error_body(error))
+            await write_http_response(writer, error.status, error.body())
         except ConnectionError:
             raise
         except Exception:

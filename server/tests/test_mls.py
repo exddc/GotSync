@@ -5,9 +5,9 @@ import hashlib
 
 import pytest
 
-from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired, UnsupportedVersion
+from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
 from gotsync_server.server import _argument_parser
-from gotsync_server.http import RequestError, encode_base64url
+from gotsync_server.http import RequestError, UnsupportedVersion, encode_base64url
 
 
 def request(store, operation, **values):

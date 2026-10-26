@@ -19,6 +19,7 @@ USAGE = """Usage:
   python3 scripts/package-mls.py --record-inputs | --record-build"""
 REPOSITORY = "exddc/GotSync"
 ARCHIVE = "gotsync_mlsFFI.xcframework.zip"
+TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios")
 root = Path(__file__).resolve().parent.parent
 framework = root / "Artifacts/gotsync_mlsFFI.xcframework"
 bindings = root / "Sources/GotSyncMLSBindings/GotSyncMLSBindings.swift"
@@ -51,6 +52,10 @@ def release_url(tag):
     return f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ARCHIVE}"
 
 
+def differing(current, recorded):
+    return sorted(name for name in current.keys() | recorded.keys() if current.get(name) != recorded.get(name))
+
+
 arguments = sys.argv[1:]
 if arguments == ["--record-inputs"]:
     inputs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +73,19 @@ if len(arguments) == 3 and arguments[0] == "--pin":
     tag, checksum = arguments[1:]
     if not re.fullmatch(r"[0-9a-f]{64}", checksum):
         sys.exit("CHECKSUM must be the 64-character SHA-256 printed by the packaging step.")
+    with urllib.request.urlopen(release_url(tag), timeout=120) as response:
+        published = response.read()
+    if hashlib.sha256(published).hexdigest() != checksum:
+        sys.exit(f"The {tag} archive does not match CHECKSUM.")
+    with tempfile.TemporaryFile() as file:
+        file.write(published)
+        with zipfile.ZipFile(file) as bundle:
+            provenance = json.loads(bundle.read(f"{framework.name}/provenance.json"))
+    if provenance["dirty"]:
+        sys.exit(f"{tag} was built from a dirty checkout.")
+    changed = differing(release_sources(), provenance["sources"])
+    if changed:
+        sys.exit(f"{tag} was built from other MLS inputs: {', '.join(changed)}.")
     pin_path.write_text(json.dumps({"tag": tag, "checksum": checksum, "sources": release_sources()}, indent=2) + "\n")
     text = manifest.read_text()
     text = re.sub(r'url: "[^"]*"', f'url: "{release_url(tag)}"', text, count=1)
@@ -82,7 +100,7 @@ if arguments == ["--check-pin"]:
     if f'url: "{release_url(pin["tag"])}"' not in text or f'checksum: "{pin["checksum"]}"' not in text:
         sys.exit(f"Package.swift does not reference the binary pinned in {pin_path.relative_to(root)}.")
     current = release_sources()
-    changed = sorted(name for name in current.keys() | pin["sources"].keys() if current.get(name) != pin["sources"].get(name))
+    changed = differing(current, pin["sources"])
     if changed:
         sys.exit(
             f'MLS inputs changed since {pin["tag"]}: {", ".join(changed)}.\n'
@@ -109,7 +127,7 @@ metadata = json.loads(subprocess.check_output([
     "cargo", "metadata", "--locked", "--format-version", "1", "--manifest-path", str(root / "mls/Cargo.toml")
 ]))
 included = set()
-for target in ("aarch64-apple-darwin", "aarch64-apple-ios", "aarch64-apple-ios-sim"):
+for target in TARGETS:
     tree = subprocess.check_output([
         "cargo", "tree", "--locked", "--manifest-path", str(root / "mls/Cargo.toml"),
         "--target", target, "--edges", "normal,build", "--prefix", "none", "--format", "{p}"

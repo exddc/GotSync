@@ -42,9 +42,11 @@ who do not change `mls/` can skip the Rust build.
 | `scripts/test-mls-ios.sh` | iOS device build and MLS tests on a temporary simulator |
 | `scripts/check-release-transport.sh` | Demo app Debug and Release builds and their transport rules |
 
-`scripts/test-swift.sh` and `scripts/test-integration.sh` build the macOS
-slice first when `mls/` changed after the last local build, or when no local
-build exists and `cargo` is installed.
+When `Artifacts/` holds a local build and `mls/` changed since, the test
+scripts rebuild it with the same slices first. Without a local build they use
+the pinned binary, except `scripts/test-mls.sh`, which builds the macOS slice.
+A macOS-only build cannot build for iOS: run `scripts/build-mls.sh` or delete
+`Artifacts/` before iOS builds.
 
 CI runs these steps in order on every pull request: Rust tests, the
 XCFramework build, the bindings and pin check, relay tests, real-relay client
@@ -59,15 +61,18 @@ changed inputs.
 
 1. Push the branch.
 2. Run the **Publish MLS binary** workflow on that branch with a new tag, such
-   as `mls-ffi-0.1.1`. It builds the XCFramework, creates a GitHub release, and
-   prints the pin command in the job summary.
+   as `mls-ffi-0.1.1`. It builds the XCFramework, runs the MLS tests on macOS
+   and the iOS simulator, creates a GitHub release, and prints the pin command
+   in the job summary.
 3. Run the printed command on the same commit:
 
    ```sh
    python3 scripts/package-mls.py --pin mls-ffi-0.1.1 CHECKSUM
    ```
 
-   It updates the URL and checksum in `Package.swift` and records the inputs in
+   It downloads the release, checks its checksum, and refuses to pin when the
+   release was built from other MLS inputs than the current checkout. It then
+   updates the URL and checksum in `Package.swift` and records the inputs in
    `mls/release.json`.
 4. Commit both files and push.
 

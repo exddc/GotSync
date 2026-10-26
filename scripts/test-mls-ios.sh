@@ -2,6 +2,7 @@
 set -euo pipefail
 source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
+scripts/ensure-mls.sh --ios
 xcodebuild -scheme GotSync -destination 'generic/platform=iOS' \
     -derivedDataPath "$GOTSYNC_CACHE_DIR/mls-ios" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build
 GOTSYNC_MLS_TEST_SIM=""

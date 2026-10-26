@@ -415,12 +415,16 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.relay.service.room_count, 1)
 
     async def test_only_generic_path_and_binary_frames_are_accepted(self) -> None:
-        for path in ("/v2/pairing?route=leak", "/v1"):
+        for path, reason in (
+            ("/v2/pairing?route=leak", "unsupported endpoint"),
+            ("/v1", "protocol version 1 is no longer served; use /v2 and pair every device again"),
+        ):
             with self.subTest(path=path):
                 wrong_path = await self.open_client(path)
                 with self.assertRaises(ConnectionClosed) as path_close:
                     await wrong_path.recv()
                 self.assertEqual(path_close.exception.rcvd.code, 1008)
+                self.assertEqual(path_close.exception.rcvd.reason, reason)
 
         route = route_text(90)
         first, _ = await self.registered_pair(route)

@@ -21,10 +21,15 @@ jobs:
         with:
           toolchain: 1.99.0
           targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Build Rust XCFramework and Swift bindings
         run: scripts/build-mls.sh
       - name: Check committed bindings
         run: git diff --exit-code -- Sources/GotSyncMLSBindings
+      - name: Test Rust crate, delivery service, and Swift wrapper
+        run: scripts/test-mls.sh
+      - name: Test on iOS simulator
+        run: scripts/test-mls-ios.sh
       - name: Package and publish
         env:
           GH_TOKEN: ${{ github.token }}

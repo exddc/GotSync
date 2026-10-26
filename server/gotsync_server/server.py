@@ -41,11 +41,12 @@ from .admission import (
 from .http import (
     MAX_HTTP_HEADER_BYTES,
     RequestError,
+    legacy_target_error,
     read_http_head,
     read_http_body,
     write_http_response,
 )
-from .mls import DEFAULT_RETENTION_SECONDS, MLSDeliveryServer, MLSDeliveryStore, error_body, legacy_target_error
+from .mls import DEFAULT_RETENTION_SECONDS, MLSDeliveryServer, MLSDeliveryStore
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
 
 WEBSOCKET_PATH = "/v2/pairing"
@@ -343,7 +344,8 @@ class RelayService:
             request = socket.request
             if request is None or request.path != WEBSOCKET_PATH:
                 self.metrics.increment("path_rejections")
-                await self._close(socket, 1008, "unsupported endpoint")
+                legacy = legacy_target_error(request.path) if request is not None else None
+                await self._close(socket, 1008, str(legacy) if legacy else "unsupported endpoint")
                 return
 
             try:
@@ -908,7 +910,7 @@ class RelayServer:
                 await self.mls.handle_request(target, headers, body, writer)
             except RequestError as error:
                 self.service.metrics.increment("delivery_bad_requests")
-                await write_http_response(writer, error.status, error_body(error))
+                await write_http_response(writer, error.status, error.body())
         except ConnectionError:
             pass
         except Exception:
