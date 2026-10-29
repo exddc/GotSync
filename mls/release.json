@@ -1,0 +1,14 @@
+{
+  "tag": "mls-ffi-0.1.0",
+  "checksum": "b418f2033ad6b9e3b603c2bbcabaa5201dd2577fb27034ba0013b95d9fe49851",
+  "sources": {
+    "mls/Cargo.lock": "589f3976e2a29ff294a7387ddcb18fffed3ae5f365abca2fac58c6b7ae75383b",
+    "mls/Cargo.toml": "f12d6f5037ebdda7540a4f811b383b3636aca7d657013a82ed3f18bae9c49e63",
+    "mls/src/bin/uniffi-bindgen.rs": "55a5501b6239f6f219489db85de7ead6d2bf0c927f4fa1cfd674779e33d59c31",
+    "mls/src/lib.rs": "9f7ccabea97efd52a2fd853087082dcd5d5c76dd1aba86cf5b527385b88a263d",
+    "mls/uniffi.toml": "e4b0f63c9ed84cf0f716c219821398e164e024e373d4ebff7976cffc8d0038d0",
+    "rust-toolchain.toml": "515c80a149c1e927d497dbebc399e241822aa0197e8f778c21bf5c136c90afd2",
+    "scripts/build-mls.sh": "9046b59707e22064da9163f4bf2ab2ea3f02c1e071f72b86b9bc34500d1db104",
+    "Sources/GotSyncMLSBindings/GotSyncMLSBindings.swift": "8046bc5b6b7235cc896d9fb77dc777a3404a0ea510b9ed39fc2b7005eb793131"
+  }
+}
