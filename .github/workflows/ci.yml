@@ -59,7 +59,8 @@ jobs:
           )
           SWIFT
           printf 'import GotSync\nprint(SyncConfiguration.self)\n' > "$RUNNER_TEMP/consumer/Sources/Consumer/main.swift"
-          env PATH=/usr/bin:/bin:/usr/sbin:/sbin swift run --package-path "$RUNNER_TEMP/consumer" Consumer
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin swift build --package-path "$RUNNER_TEMP/consumer"
+          "$(swift build --package-path "$RUNNER_TEMP/consumer" --show-bin-path)/Consumer"
       - name: Package binary
         run: python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
       - uses: actions/upload-artifact@v4
