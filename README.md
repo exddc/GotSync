@@ -11,9 +11,11 @@ record schema.
 | Path | Contents |
 | --- | --- |
 | `Sources/GotSync` | Swift library, pairing, recovery, replication, and transport |
-| `Tests/GotSyncTests` | Library tests and real-server integration coverage |
+| `Sources/GotSyncMLS` | Swift wrapper around OpenMLS that the engine uses |
+| `Sources/GotSyncMLSBindings` | Generated UniFFI bindings, committed |
+| `Tests/` | Library tests and real-server integration coverage |
+| `mls/` | Rust crate wrapping OpenMLS, exported through UniFFI |
 | `server/` | Python relay and local Docker setup |
-| `mls/`, `Packages/GotSyncMLS` | OpenMLS bindings and the Swift wrapper the engine uses |
 | `scripts/` | Development, build, and test scripts |
 | `Examples/AccountlessSync` | SwiftUI iPhone demo with a local package dependency |
 | `docs/` | Protocol, compatibility, threat model, security findings, and design notes |
@@ -21,14 +23,13 @@ record schema.
 The root `Package.swift` exports one product, `GotSync`. Adding this repository
 in Swift Package Manager builds the library without the example or Python
 server. It requires Swift 6, iOS 18 or macOS 14. The demo requires iOS 18.6.
-`GotSync` depends on the local `Packages/GotSyncMLS` package, whose
-XCFramework is built from `mls/` and not checked in.
+`GotSync` links a prebuilt OpenMLS XCFramework (iOS device, iOS simulator,
+macOS) that SwiftPM downloads from a GitHub release and verifies by checksum,
+so consumers need no Rust toolchain.
 
 ## Use the library
 
-Run `scripts/build-mls.sh` once to build the OpenMLS XCFramework for macOS and
-iOS (requires the Rust toolchain in `rust-toolchain.toml`). Then add this
-checkout as a local package dependency in Xcode and select `GotSync`.
+Add this repository as a package dependency in Xcode and select `GotSync`.
 
 Create the engine on the main actor, supply your endpoints and storage
 location, and use a separate Keychain service for each application:
@@ -104,6 +105,10 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first.
 Python environment outside the repository in a cache unique to this checkout.
 No virtual environment activation is needed.
 
+The demo depends on this checkout by local path. It uses the XCFramework from
+`scripts/build-mls.sh` when `Artifacts/` contains one, and the pinned release
+binary otherwise.
+
 Run the `AccountlessSync` scheme on iPhone simulators. Choose **Create link** on
 one device and **Join link** on another. After pairing, use **Manage sync** to
 invite additional devices. Debug demo builds use loopback endpoints on the
@@ -157,11 +162,14 @@ Change the numbers if the relay runs with a different `--retention-days`. The
 relay cannot delete backups. Add "Server backups are deleted within 90 days."
 only if the operator enforces that.
 
-## Test
+## Build and test
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers building the Rust library, every
+test suite, and publishing a new binary. In short:
 
 ```sh
+scripts/build-mls.sh
 scripts/uv.sh pytest server/tests -q
-scripts/test-swift.sh
 scripts/test-mls.sh
 scripts/test-integration.sh
 ```

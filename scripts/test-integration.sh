@@ -23,5 +23,5 @@ for ((attempt=0; attempt<100; attempt++)); do
 done
 if [ ! -f "$GOTSYNC_TEST_DIR/endpoints.env" ]; then cat "$GOTSYNC_TEST_DIR/server.log"; exit 1; fi
 source "$GOTSYNC_TEST_DIR/endpoints.env"
-export GOTSYNC_RELAY_URL GOTSYNC_MAILBOX_URL GOTSYNC_INTEGRATION=1 GOTSYNC_REQUIRE_INTEGRATION=1
+export GOTSYNC_RELAY_URL GOTSYNC_MAILBOX_URL GOTSYNC_MLS_URL GOTSYNC_INTEGRATION=1 GOTSYNC_REQUIRE_INTEGRATION=1
 swift test --scratch-path "$GOTSYNC_SWIFT_SCRATCH_PATH" "$@"

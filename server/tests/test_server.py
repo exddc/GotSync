@@ -415,12 +415,16 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.relay.service.room_count, 1)
 
     async def test_only_generic_path_and_binary_frames_are_accepted(self) -> None:
-        for path in ("/v2/pairing?route=leak", "/v1"):
+        for path, reason in (
+            ("/v2/pairing?route=leak", "unsupported endpoint"),
+            ("/v1", "protocol version 1 is no longer served; use /v2 and pair every device again"),
+        ):
             with self.subTest(path=path):
                 wrong_path = await self.open_client(path)
                 with self.assertRaises(ConnectionClosed) as path_close:
                     await wrong_path.recv()
                 self.assertEqual(path_close.exception.rcvd.code, 1008)
+                self.assertEqual(path_close.exception.rcvd.reason, reason)
 
         route = route_text(90)
         first, _ = await self.registered_pair(route)
@@ -613,7 +617,7 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_delivery_listener_serves_only_mls_paths(self) -> None:
-        for target in ("/v1/mailbox/fetch", "/v2/mailbox/fetch", "/v2/mls"):
+        for target in ("/v2/mailbox/fetch", "/v2/mls"):
             with self.subTest(target=target):
                 reader, writer = await asyncio.open_connection(
                     "127.0.0.1", self.relay.bound_delivery_port
@@ -637,3 +641,28 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     json.loads(body), {"error": "notFound", "version": 2}
                 )
+
+    async def test_delivery_listener_rejects_version_1_paths(self) -> None:
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", self.relay.bound_delivery_port
+        )
+        writer.write(
+            (
+                "POST /v1/mailbox/fetch HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 13\r\n"
+                "\r\n"
+                '{"version":1}'
+            ).encode("ascii")
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), 1)
+        writer.close()
+        await writer.wait_closed()
+        head, body = response.split(b"\r\n\r\n", 1)
+        self.assertTrue(head.startswith(b"HTTP/1.1 400 "))
+        document = json.loads(body)
+        self.assertEqual(document["error"], "unsupportedVersion")
+        self.assertEqual(document["supportedVersions"], [2])
+        self.assertIn("pair every device again", document["message"])

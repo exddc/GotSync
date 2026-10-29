@@ -41,6 +41,7 @@ from .admission import (
 from .http import (
     MAX_HTTP_HEADER_BYTES,
     RequestError,
+    legacy_target_error,
     read_http_head,
     read_http_body,
     write_http_response,
@@ -343,7 +344,8 @@ class RelayService:
             request = socket.request
             if request is None or request.path != WEBSOCKET_PATH:
                 self.metrics.increment("path_rejections")
-                await self._close(socket, 1008, "unsupported endpoint")
+                legacy = legacy_target_error(request.path) if request is not None else None
+                await self._close(socket, 1008, str(legacy) if legacy else "unsupported endpoint")
                 return
 
             try:
@@ -897,6 +899,8 @@ class RelayServer:
                         held_source=held_source,
                     )
                     return
+                if (legacy := legacy_target_error(target)) is not None:
+                    raise legacy
                 if method != "POST" or not target.startswith(DELIVERY_PATH_PREFIX):
                     await write_http_response(writer, 404, {"error": "notFound", "version": PROTOCOL_VERSION})
                     return
@@ -906,11 +910,7 @@ class RelayServer:
                 await self.mls.handle_request(target, headers, body, writer)
             except RequestError as error:
                 self.service.metrics.increment("delivery_bad_requests")
-                await write_http_response(
-                    writer,
-                    error.status,
-                    {"error": error.code, "version": PROTOCOL_VERSION},
-                )
+                await write_http_response(writer, error.status, error.body())
         except ConnectionError:
             pass
         except Exception:

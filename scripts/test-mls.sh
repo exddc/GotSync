@@ -5,7 +5,7 @@ cd "$GOTSYNC_REPO_ROOT"
 export CARGO_TARGET_DIR="$GOTSYNC_CACHE_DIR/rust-mls"
 cargo test --locked --manifest-path mls/Cargo.toml
 scripts/uv.sh pytest server/tests/test_mls.py -q
-scripts/ensure-mls.sh
+scripts/ensure-mls.sh --build-if-missing
 GOTSYNC_MLS_TEST_DIR="$(mktemp -d)"
 GOTSYNC_MLS_SERVER_PID=""
 cleanup() {
@@ -25,4 +25,4 @@ for ((attempt=0; attempt<100; attempt++)); do
 done
 if [ ! -f "$GOTSYNC_MLS_TEST_DIR/endpoint" ]; then cat "$GOTSYNC_MLS_TEST_DIR/server.log"; exit 1; fi
 export GOTSYNC_MLS_URL="$(cat "$GOTSYNC_MLS_TEST_DIR/endpoint")"
-swift test --package-path Packages/GotSyncMLS --scratch-path "$GOTSYNC_CACHE_DIR/swift-mls" "$@"
+swift test --scratch-path "$GOTSYNC_SWIFT_SCRATCH_PATH" --filter GotSyncMLSTests "$@"

@@ -19,7 +19,6 @@ server/relay-data/
 .env
 .env.*
 mls/target/
-Packages/GotSyncMLS/Artifacts/
-Packages/GotSyncMLS/Sources/GotSyncMLSBindings/
+/Artifacts/
 certs/
 *.key

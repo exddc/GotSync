@@ -7,7 +7,7 @@ import pytest
 
 from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
 from gotsync_server.server import _argument_parser
-from gotsync_server.http import RequestError, encode_base64url
+from gotsync_server.http import RequestError, UnsupportedVersion, encode_base64url
 
 
 def request(store, operation, **values):
@@ -86,8 +86,9 @@ def test_no_crypto_secrets_in_delivery_schema(tmp_path):
 
 def test_bounds_and_version(tmp_path, monkeypatch):
     store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
-    with pytest.raises(RequestError):
-        store.request("append", {"version": 1})
+    for document in ({"version": 1}, {}, {"version": "2"}, {"version": True}):
+        with pytest.raises(UnsupportedVersion):
+            store.request("append", document)
     with pytest.raises(RequestError):
         append(store, epoch=True)
     with pytest.raises(RequestError):
@@ -389,11 +390,11 @@ def test_http_mount_auth_paging_ack_and_threaded_store(tmp_path, monkeypatch, pr
             return original(*args)
         monkeypatch.setattr(store, "request", tracked)
 
-        async def post(operation, values, token=None):
+        async def post(operation, values, token=None, version=2, prefix="/v2/mls"):
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            body = json.dumps({"version": 2, **values}).encode()
+            body = json.dumps({"version": version, **values}).encode()
             header = f"Authorization: Bearer {token}\r\n" if token else ""
-            writer.write((f"POST /v2/mls/{operation} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n" + header + "\r\n").encode() + body)
+            writer.write((f"POST {prefix}/{operation} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n" + header + "\r\n").encode() + body)
             await writer.drain()
             response = await asyncio.wait_for(reader.read(), 3)
             writer.close()
@@ -404,6 +405,10 @@ def test_http_mount_auth_paging_ack_and_threaded_store(tmp_path, monkeypatch, pr
         try:
             group = encode_base64url(b"g" * 32)
             token = encode_base64url(b"a" * 32)
+            for legacy in ({"version": 1}, {"prefix": "/v1/mls"}, {"prefix": "/v1/mailbox"}):
+                status, body = await post("create", {"group": group}, token, **legacy)
+                assert status == 400 and body["error"] == "unsupportedVersion"
+                assert body["supportedVersions"] == [2] and "pair every device again" in body["message"]
             assert (await post("create", {"group": group}, token))[0] == 200
             status, body = await post("fetch", {"group": group, "after": 0, "authorization": token})
             assert status == 403 and body["version"] == 2

@@ -11,7 +11,7 @@ concurrency:
 jobs:
   apple:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       GOTSYNC_CACHE_DIR: ${{ github.workspace }}/../gotsync-cache
     steps:
@@ -19,30 +19,51 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.99.0
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: mls -> ../../gotsync-cache/rust-mls
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
-      - name: Build Apple XCFramework and Swift bindings
+      - name: Test Rust crate
+        run: cargo test --locked --manifest-path mls/Cargo.toml
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/../gotsync-cache/rust-mls
+      - name: Build Rust XCFramework and Swift bindings
         run: scripts/build-mls.sh
-      - name: Compile Swift for iOS and test on simulator
-        run: scripts/test-mls-ios.sh
-      - name: Test MLS against real delivery service
-        run: scripts/test-mls.sh
-      - name: Verify existing sync behavior
+      - name: Check committed bindings and pinned binary
+        run: |
+          git diff --exit-code -- Sources/GotSyncMLSBindings
+          python3 scripts/package-mls.py --check-pin
+      - name: Test relay
+        run: scripts/uv.sh pytest server/tests -q
+      - name: Test clients against the real relay
         run: scripts/test-integration.sh
-      - name: Check release builds use TLS only
+      - name: Compile for iOS and test MLS on simulator
+        run: scripts/test-mls-ios.sh
+      - name: Build demo app and check release builds use TLS only
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: scripts/check-release-transport.sh
-      - name: Package Swift dependency without Rust requirement
-        run: python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
-      - name: Test packaged dependency without Cargo
+      - name: Consume the pinned binary as a remote package
         run: |
-          unzip -q "$RUNNER_TEMP/mls-package/GotSyncMLS.zip" -d "$RUNNER_TEMP/mls-consumer"
-          env PATH=/usr/bin:/bin:/usr/sbin:/sbin swift test --package-path "$RUNNER_TEMP/mls-consumer/GotSyncMLS"
+          git clone --quiet --no-local "$GITHUB_WORKSPACE" "$RUNNER_TEMP/gotsync-clone"
+          mkdir -p "$RUNNER_TEMP/consumer/Sources/Consumer"
+          cat > "$RUNNER_TEMP/consumer/Package.swift" <<SWIFT
+          // swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(
+              name: "Consumer",
+              platforms: [.macOS(.v14)],
+              dependencies: [.package(path: "$RUNNER_TEMP/gotsync-clone")],
+              targets: [.executableTarget(name: "Consumer", dependencies: [.product(name: "GotSync", package: "gotsync-clone")])]
+          )
+          SWIFT
+          printf 'import GotSync\nprint(SyncConfiguration.self)\n' > "$RUNNER_TEMP/consumer/Sources/Consumer/main.swift"
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin swift build --package-path "$RUNNER_TEMP/consumer"
+          "$(swift build --package-path "$RUNNER_TEMP/consumer" --show-bin-path)/Consumer"
+      - name: Package binary
+        run: python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
       - uses: actions/upload-artifact@v4
         with:
-          name: GotSyncMLS-apple
+          name: gotsync-mlsFFI-apple
           path: ${{ runner.temp }}/mls-package/

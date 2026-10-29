@@ -6,12 +6,32 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from .protocol import PROTOCOL_VERSION
+
 MAX_HTTP_HEADER_BYTES = 8192
 
 
 class RequestError(ValueError):
     code = "invalidRequest"
     status = 400
+
+    def body(self) -> dict[str, Any]:
+        return {"error": self.code, "version": PROTOCOL_VERSION}
+
+
+class UnsupportedVersion(RequestError):
+    code = "unsupportedVersion"
+
+    def body(self) -> dict[str, Any]:
+        return {**super().body(), "supportedVersions": [PROTOCOL_VERSION], "message": str(self)}
+
+
+def legacy_target_error(target: str) -> UnsupportedVersion | None:
+    if target == "/v1" or target.startswith("/v1/"):
+        return UnsupportedVersion(
+            f"protocol version 1 is no longer served; use /v{PROTOCOL_VERSION} and pair every device again"
+        )
+    return None
 
 
 class RequestTooLargeError(RequestError):

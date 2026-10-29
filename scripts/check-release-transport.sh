@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
-scripts/ensure-mls.sh
+scripts/ensure-mls.sh --ios
 GOTSYNC_DERIVED_DATA="$GOTSYNC_CACHE_DIR/example-transport"
 GOTSYNC_BUILD_LOG="$GOTSYNC_CACHE_DIR/example-transport.log"
 build_example() {
