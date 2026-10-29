@@ -1,0 +1,36 @@
+name: Debug consumer
+on:
+  push:
+    branches: [feature/tw-553-sync-mls-repo-work-protocol-version-bump-rust-build-in-ci]
+jobs:
+  consumer:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sw_vers; xcodebuild -version
+          mkdir -p "$RUNNER_TEMP/consumer/Sources/Consumer"
+          cat > "$RUNNER_TEMP/consumer/Package.swift" <<SWIFT
+          // swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(
+              name: "Consumer",
+              platforms: [.macOS(.v14)],
+              dependencies: [.package(path: "$GITHUB_WORKSPACE")],
+              targets: [.executableTarget(name: "Consumer", dependencies: [.product(name: "GotSync", package: "GotSync")])]
+          )
+          SWIFT
+          printf 'import GotSync\nprint(SyncConfiguration.self)\n' > "$RUNNER_TEMP/consumer/Sources/Consumer/main.swift"
+          printf 'print("hello")\n' > "$RUNNER_TEMP/plain.swift"
+          swiftc "$RUNNER_TEMP/plain.swift" -o "$RUNNER_TEMP/plain" && "$RUNNER_TEMP/plain" || echo "plain exit $?"
+          swift build --package-path "$RUNNER_TEMP/consumer" 2>&1 | tail -5
+          exe="$(swift build --package-path "$RUNNER_TEMP/consumer" --show-bin-path)/Consumer"
+          codesign -dvvv "$exe" 2>&1 | head -20 || true
+          codesign --verify --verbose=4 "$exe" || true
+          otool -l "$exe" | grep -A4 LC_BUILD_VERSION || true
+          otool -L "$exe" || true
+          xattr -l "$exe" || true
+          "$exe" || echo "consumer exit $?"
+          sleep 2
+          log show --last 2m --style compact --predicate 'eventMessage CONTAINS[c] "Consumer" OR eventMessage CONTAINS[c] "code signature" OR eventMessage CONTAINS[c] "CODE SIGNING"' | tail -40 || true
