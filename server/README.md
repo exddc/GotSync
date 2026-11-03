@@ -272,6 +272,139 @@ with the proxy's network to the command. Mount an admission token file
 read-only and set `GOTSYNC_ADMISSION_TOKEN_FILE` to its path. Restrict the
 volume and encrypt its backups.
 
+## Deploy with Coolify
+
+`deploy/coolify` runs the relay as a [Coolify](https://coolify.io) Docker
+Compose application behind Coolify's Traefik proxy. The Got Done relay,
+`relay.gotdoneapp.com`, uses this setup on a Hetzner Cloud server in
+Nuremberg, Germany. That server also runs Coolify itself and unrelated web
+applications.
+
+Traefik terminates public TLS with a Let's Encrypt certificate and routes
+`/v2/pairing` to port 8765 and `/v2/mls/` to port 8767. It reaches the relay
+over TLS and verifies the relay's self-signed certificate against a pinned
+copy, so the relay keeps its rule of serving plaintext only on loopback. The
+relay publishes no ports. Port 80 answers Let's Encrypt HTTP-01 challenges and
+returns `404` for every other request, without a redirect to HTTPS.
+
+### Prepare the host
+
+Filter traffic in front of the server, because ports that Docker publishes
+bypass UFW. On Hetzner Cloud, attach a Cloud Firewall with these inbound rules
+and no others:
+
+| Port | Source | Purpose |
+| --- | --- | --- |
+| 22/tcp | Administrator addresses only | SSH |
+| 80/tcp | Any | Let's Encrypt HTTP-01 challenges |
+| 443/tcp, 443/udp | Any | HTTPS and HTTP/3 |
+
+The firewall also closes Coolify's direct dashboard ports 8000, 6001, and
+6002. Before you attach it, give the dashboard its own domain under
+**Settings > General** so that it stays reachable through port 443. Allow only
+key-based SSH logins (`PasswordAuthentication no`), and keep Hetzner's server
+Backups and Snapshots off: Hetzner does not encrypt them with your key.
+
+Run the setup script as root on the server:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/exddc/GotSync/main/server/deploy/coolify/setup-host.sh
+sh setup-host.sh
+```
+
+The script creates `/data/gotsync-relay/data` (mode `0700`, UID 10001) and
+`/data/gotsync-relay/certs`. It generates a P-256 certificate for the name
+`gotsync-relay`, valid for ten years, and writes
+`/data/coolify/proxy/dynamic/gotsync-relay.yaml`. Coolify's Traefik loads that
+file without a restart. It holds:
+
+- the `gotsync-relay` servers transport, which pins the certificate and
+  answers `504` when the relay does not accept a connection within 3 seconds
+  or send response headers within 15 seconds;
+- per-source rate and concurrency limits equal to the relay's defaults, and a
+  1 MiB request body limit on the delivery route;
+- HSTS, and a TLS option that requires TLS 1.2 or newer with AEAD cipher
+  suites.
+
+Running the script again keeps the existing certificate. To rotate it, delete
+`/data/gotsync-relay/certs/tls.*`, run the script, and redeploy the
+application at once: Traefik trusts the new certificate as soon as the script
+finishes, so the relay answers `500` until it restarts. `compose.yaml` mounts
+`/data/gotsync-relay` by that literal path, because Coolify's compose parser
+misreads variables in volume sources. The script's `GOTSYNC_HOST_DIR` and
+`TRAEFIK_DYNAMIC_DIR` variables exist for `scripts/test-deploy.sh`.
+
+For an encrypted store, mount a LUKS2 volume at `/data/gotsync-relay` before
+you run the script. With the key file on the server's root disk, the server
+still reboots unattended. That protects the data on volume snapshots and
+discarded disks, but not from anyone with root on the running server.
+
+### Create the application
+
+The labels need Coolify's proxy at Traefik 3.4 or newer (**Servers > Proxy**);
+older versions do not know `observability.accesslogs`.
+
+1. Point the relay's DNS name at the server with an `A` record. A `CAA` record
+   of `0 issue "letsencrypt.org"` on the same name limits who may issue its
+   certificate.
+2. In Coolify, create an application from the public repository
+   `https://github.com/exddc/GotSync`, branch `main`. Choose the **Docker
+   Compose** build pack, Base Directory `/server/deploy/coolify`, and Docker
+   Compose Location `/compose.yaml`.
+3. Leave the service's domain empty. The labels in `compose.yaml` define both
+   routes, their middlewares, and the certificate resolver.
+4. Deploy.
+
+The two `Host` rules in `compose.yaml` name `relay.gotdoneapp.com`. For
+another name, change both rules in a copy of the file. Write the name
+literally: Coolify escapes `$` in labels by default, so a variable would reach
+Traefik unexpanded.
+
+The compose file passes `--trusted-proxy` for the private IPv4 ranges. Only
+containers on the application's Docker network can reach the relay, and
+Traefik removes any `X-Forwarded-For` header a client sends before it appends
+the client's address. The container runs with a read-only root filesystem, no
+Linux capabilities, `no-new-privileges`, and limits of 512 MB of memory and
+128 processes.
+
+### Logs and backups
+
+Coolify's default Traefik configuration writes no access log. Keep the
+server's **Traffic Analytics** off: it enables a Traefik access log that keeps
+client addresses and `X-Forwarded-For`. Both relay routes set
+`observability.accesslogs=false`, so their requests stay out of that log, but
+requests for the relay's name that match no route would still appear in it.
+The relay prints its four startup lines and nothing per request. Docker keeps
+container output in three rotated files of 10 MB.
+
+The deployment keeps no backups. If the database is lost, every client
+receives `historyExpired` and pairs again. If you add backups, encrypt them
+before they leave the server (restic does this), leave out the `mls_packages`
+table, and delete each backup within the retention period.
+
+### Verify
+
+`scripts/test-deploy.sh` builds the image and runs `setup-host.sh` and
+`compose.yaml` behind Traefik v3.7 with Coolify's proxy arguments. It replaces
+only the host directory, and it does not run Coolify's own compose parser,
+which adds a container name, the application network, an image tag, and an
+`.env` file. It checks routing, backend certificate pinning, TLS versions and
+cipher suites, the proxy limits, admission by the forwarded client address, a
+pairing socket that stays idle for 65 seconds, and the absence of relay
+entries in the logs. CI runs it on every pull request.
+
+After a deployment, check the public endpoint:
+
+```sh
+# 400 with "version":2 in the body: the request reached the relay over backend TLS
+curl -si -X POST https://relay.gotdoneapp.com/v2/mls/fetch \
+  -H 'Content-Type: application/json' -d '{}'
+# 404 without a Location header
+curl -si http://relay.gotdoneapp.com/v2/mls/fetch
+# Only 80 and 443 open (22 only from administrator addresses)
+nmap -Pn -p 22,80,443,6001,6002,8000,8765-8767 relay.gotdoneapp.com
+```
+
 ## Protocol versions
 
 The relay speaks only protocol version 2. WebSocket registration must carry

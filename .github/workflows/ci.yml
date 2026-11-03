@@ -67,3 +67,10 @@ jobs:
         with:
           name: gotsync-mlsFFI-apple
           path: ${{ runner.temp }}/mls-package/
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the Coolify deployment behind Traefik
+        run: scripts/test-deploy.sh

@@ -41,6 +41,7 @@ who do not change `mls/` can skip the Rust build.
 | `scripts/test-mls.sh` | Rust and relay MLS tests, then MLS Swift tests against the delivery service |
 | `scripts/test-mls-ios.sh` | iOS device build and MLS tests on a temporary simulator |
 | `scripts/check-release-transport.sh` | Demo app Debug and Release builds and their transport rules |
+| `scripts/test-deploy.sh` | Coolify compose file and host setup behind Traefik, in Docker |
 
 When `Artifacts/` holds a local build and `mls/` changed since, the test
 scripts rebuild it with the same slices first. Without a local build they use
@@ -51,7 +52,8 @@ A macOS-only build cannot build for iOS: run `scripts/build-mls.sh` or delete
 CI runs these steps in order on every pull request: Rust tests, the
 XCFramework build, the bindings and pin check, relay tests, real-relay client
 tests, iOS tests, the demo builds, and a remote-consumer build from a clean
-clone that downloads the pinned binary.
+clone that downloads the pinned binary. A separate Linux job runs
+`scripts/test-deploy.sh`.
 
 ## Publish a new binary
 
