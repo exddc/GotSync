@@ -2,7 +2,8 @@ FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:0.7.18 /uv /uvx /bin/
 WORKDIR /app
 ENV UV_PROJECT_ENVIRONMENT=/opt/gotsync/python \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 RUN groupadd --gid 10001 gotsync && useradd --uid 10001 --gid gotsync --no-create-home gotsync
 COPY pyproject.toml uv.lock LICENSE ./
 COPY gotsync_server ./gotsync_server
