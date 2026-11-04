@@ -72,5 +72,5 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Test the Coolify deployment behind Traefik
+      - name: Test the example deployment behind Traefik
         run: scripts/test-deploy.sh

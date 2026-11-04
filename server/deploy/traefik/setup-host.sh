@@ -1,8 +1,13 @@
 #!/bin/sh
 set -eu
 
+if [ "$#" -ne 1 ] || [ ! -d "$1" ]; then
+    echo "usage: $0 EXISTING_TRAEFIK_DYNAMIC_DIRECTORY" >&2
+    exit 64
+fi
+
 host_dir=${GOTSYNC_HOST_DIR:-/data/gotsync-relay}
-dynamic_dir=${TRAEFIK_DYNAMIC_DIR:-/data/coolify/proxy/dynamic}
+dynamic_dir=$1
 relay_id=10001
 
 install -d -m 755 "$host_dir"
@@ -18,7 +23,6 @@ chown "0:$relay_id" "$host_dir/certs/tls.crt" "$host_dir/certs/tls.key"
 chmod 644 "$host_dir/certs/tls.crt"
 chmod 640 "$host_dir/certs/tls.key"
 
-install -d -m 755 "$dynamic_dir"
 config="$dynamic_dir/gotsync-relay.yaml"
 {
     cat <<'YAML'

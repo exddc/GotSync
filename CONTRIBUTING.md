@@ -41,7 +41,7 @@ who do not change `mls/` can skip the Rust build.
 | `scripts/test-mls.sh` | Rust and relay MLS tests, then MLS Swift tests against the delivery service |
 | `scripts/test-mls-ios.sh` | iOS device build and MLS tests on a temporary simulator |
 | `scripts/check-release-transport.sh` | Demo app Debug and Release builds and their transport rules |
-| `scripts/test-deploy.sh` | Coolify compose file and host setup behind Traefik, in Docker |
+| `scripts/test-deploy.sh` | Example deployment in `server/deploy/traefik` behind Traefik, in Docker |
 
 When `Artifacts/` holds a local build and `mls/` changed since, the test
 scripts rebuild it with the same slices first. Without a local build they use

@@ -115,7 +115,7 @@ invite additional devices. Debug demo builds use loopback endpoints on the
 Mac. Physical devices require reachable endpoints.
 
 The [server README](server/README.md) covers Docker, ports, persistence, TLS
-proxy requirements, and [deployment with Coolify](server/README.md#deploy-with-coolify).
+proxy requirements, and [deploying a public relay](server/README.md#deploy-a-public-relay).
 No public hosted service is provisioned by this repository.
 
 ## Delivery and security limits

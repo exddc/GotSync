@@ -4,14 +4,11 @@ source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
 
 project=gotsync-deploy-test
-compose_file=server/deploy/coolify/compose.yaml
+compose_file=server/deploy/traefik/compose.yaml
 traefik_image=traefik:v3.7
 setup_image=python:3.12-slim
 work="$(mktemp -d)"
-relay_host="$(docker compose -f "$compose_file" config --format json | python3 -I -c '
-import json, re, sys
-labels = json.load(sys.stdin)["services"]["relay"]["labels"]
-print(re.search(r"Host\(`([^`]+)`\)", labels["traefik.http.routers.gotsync-mls.rule"])[1])')"
+export GOTSYNC_RELAY_HOST=relay.example.test
 
 printf '%s\n' "services:" "  relay:" "    volumes:" \
     "      - $work/host/data:/data" "      - $work/host/certs:/certs:ro" > "$work/host-dir.yaml"
@@ -47,13 +44,14 @@ wait_for() {
 }
 
 echo "== setup-host.sh"
-docker run --rm -v "$work:/work" -v "$PWD/server/deploy/coolify/setup-host.sh:/setup-host.sh:ro" \
-    -e GOTSYNC_HOST_DIR=/work/host -e TRAEFIK_DYNAMIC_DIR=/work/proxy/dynamic \
+docker run --rm -v "$work:/work" -v "$PWD/server/deploy/traefik/setup-host.sh:/setup-host.sh:ro" \
+    -e GOTSYNC_HOST_DIR=/work/host \
     "$setup_image" sh -c '
-        sh /setup-host.sh
+        mkdir -p /work/proxy/dynamic
+        sh /setup-host.sh /work/proxy/dynamic
         mkdir -p /work/proxy/test /work/check
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
-            -subj /CN='"$relay_host"' -addext subjectAltName=DNS:'"$relay_host"' \
+            -subj /CN='"$GOTSYNC_RELAY_HOST"' -addext subjectAltName=DNS:'"$GOTSYNC_RELAY_HOST"' \
             -keyout /work/proxy/test/tls.key -out /work/proxy/test/tls.crt 2>/dev/null
         cp /work/proxy/test/tls.crt /work/check/ca.crt
         chmod 644 /work/check/ca.crt
@@ -85,7 +83,7 @@ echo "== relay"
 compose up -d --build --wait --quiet-pull
 docker network connect "${project}_default" "$project-traefik"
 docker run -d --name "$project-client" --network "$project-a" --ip 198.51.100.10 \
-    -e GOTSYNC_RELAY_HOST="$relay_host" \
+    -e GOTSYNC_RELAY_HOST \
     -v "$PWD/scripts/deploy-check.py:/check/deploy-check.py:ro" -v "$work/check/ca.crt:/check/ca.crt:ro" \
     --entrypoint sleep "$project-relay" infinity >/dev/null
 docker network connect --ip 192.0.2.10 "$project-b" "$project-client"

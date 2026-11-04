@@ -153,22 +153,20 @@ perimeter rate limits and DDoS protection, firewalling the relay ports, backup
 policy, and deployment monitoring. See the relay README for the perimeter
 checklist.
 
-## Got Done deployment
+## Hosting
 
-The Got Done relay at `relay.gotdoneapp.com` runs on a Hetzner Cloud server in
-Nuremberg, Germany, set up as the
-[Coolify deployment](../server/README.md#deploy-with-coolify) describes. The
-same server runs Coolify, which controls Docker with root privileges, and
-unrelated web applications. An attacker who compromises any of them, or
-Hetzner at the hypervisor, gains the position of the malicious relay described
-above. That position yields ciphertext, group IDs, IP addresses, timing, and
-sizes, and allows denial of service. It also includes the Traefik proxy, which
-sees pairing frames after TLS ends; those frames stay encrypted under keys
-derived from the invitation secret. MLS keeps task contents out of reach.
+A relay host often runs more than the relay: the TLS proxy, a container
+platform that controls Docker with root privileges, or unrelated
+applications. An attacker who compromises any of them, or the hosting
+provider, gains the position of the malicious relay described above. That
+position yields ciphertext, group IDs, IP addresses, timing, and sizes, and
+allows denial of service. The TLS proxy also sees pairing frames after TLS
+ends; those frames stay encrypted under keys derived from the invitation
+secret. MLS keeps task contents out of reach.
 
-The proxy writes no access log for the relay while Coolify's Traffic Analytics
-stays off for the server. The relay keeps client addresses only in memory for
-rate limiting. The deployment keeps no backups.
+The [example deployment](../server/README.md#deploy-a-public-relay) keeps
+requests on the relay routes out of the proxy access log and keeps no backups.
+The relay keeps client addresses only in memory for rate limiting.
 
 ## Delivery and loss
 

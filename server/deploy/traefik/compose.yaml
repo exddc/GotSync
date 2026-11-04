@@ -1,3 +1,5 @@
+name: gotsync-relay
+
 services:
   relay:
     build:
@@ -32,9 +34,9 @@ services:
         max-file: "3"
     labels:
       - traefik.enable=true
-      - traefik.http.routers.gotsync-mls.rule=Host(`relay.gotdoneapp.com`) && PathPrefix(`/v2/mls/`)
-      - traefik.http.routers.gotsync-mls.entrypoints=https
-      - traefik.http.routers.gotsync-mls.tls.certresolver=letsencrypt
+      - traefik.http.routers.gotsync-mls.rule=Host(`${GOTSYNC_RELAY_HOST:?}`) && PathPrefix(`/v2/mls/`)
+      - traefik.http.routers.gotsync-mls.entrypoints=${TRAEFIK_ENTRYPOINT:-https}
+      - traefik.http.routers.gotsync-mls.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
       - traefik.http.routers.gotsync-mls.tls.options=gotsync@file
       - traefik.http.routers.gotsync-mls.observability.accesslogs=false
       - traefik.http.routers.gotsync-mls.middlewares=gotsync-hsts@file,gotsync-mls-rate@file,gotsync-mls-inflight@file,gotsync-mls-body@file
@@ -42,9 +44,9 @@ services:
       - traefik.http.services.gotsync-mls.loadbalancer.server.port=8767
       - traefik.http.services.gotsync-mls.loadbalancer.server.scheme=https
       - traefik.http.services.gotsync-mls.loadbalancer.serverstransport=gotsync-relay@file
-      - traefik.http.routers.gotsync-pairing.rule=Host(`relay.gotdoneapp.com`) && Path(`/v2/pairing`)
-      - traefik.http.routers.gotsync-pairing.entrypoints=https
-      - traefik.http.routers.gotsync-pairing.tls.certresolver=letsencrypt
+      - traefik.http.routers.gotsync-pairing.rule=Host(`${GOTSYNC_RELAY_HOST:?}`) && Path(`/v2/pairing`)
+      - traefik.http.routers.gotsync-pairing.entrypoints=${TRAEFIK_ENTRYPOINT:-https}
+      - traefik.http.routers.gotsync-pairing.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
       - traefik.http.routers.gotsync-pairing.tls.options=gotsync@file
       - traefik.http.routers.gotsync-pairing.observability.accesslogs=false
       - traefik.http.routers.gotsync-pairing.middlewares=gotsync-hsts@file,gotsync-pairing-rate@file,gotsync-pairing-inflight@file
