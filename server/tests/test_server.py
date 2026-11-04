@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import gc
 import io
 import json
 import os
@@ -592,6 +593,35 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(reader.read(), 2), b"")
         writer.close()
         await writer.wait_closed()
+
+    async def test_tls_delivery_ignores_data_after_close_notify(self) -> None:
+        await self.restart_relay(tls=server_tls_context(self.certificate, self.key))
+        client_tls = ssl.create_default_context(cafile=self.certificate)
+        client_tls.check_hostname = False
+        unhandled: list[dict[str, Any]] = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: unhandled.append(context)
+        )
+
+        for _ in range(20):
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", self.relay.bound_delivery_port, ssl=client_tls
+            )
+            writer.write(
+                b"GET /healthz HTTP/1.1\r\nHost: relay\r\nContent-Length: 65536\r\n\r\n"
+            )
+            await writer.drain()
+            await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+            with contextlib.suppress(ConnectionError, ssl.SSLError):
+                writer.write(b"x" * 65536)
+                await writer.drain()
+            writer.close()
+            with contextlib.suppress(ConnectionError, ssl.SSLError):
+                await writer.wait_closed()
+        await wait_until(lambda: not self.relay._delivery_tasks, timeout=2)
+        gc.collect()
+
+        self.assertEqual(unhandled, [])
 
     def test_cli_requires_certificate_and_key_together(self) -> None:
         for arguments in (["--tls-cert", "cert.pem"], ["--tls-key", "key.pem"]):
