@@ -637,23 +637,23 @@ final class ReplicaTests: XCTestCase {
 
     func testIntakeKeepsLowestDeferredSequencesWithinLimit() throws {
         var replica = try seededReplica(taskCount: ReplicaLimits.maxTasks)
-        let operations = [UInt8(1), 2].flatMap { origin in
-            (1...3).map { sequence in
-                operation(
-                    origin: origin, sequence: UInt64(sequence), lamport: 2_000 + UInt64(sequence),
-                    taskID: task(UInt16(500 + Int(origin) * 10 + sequence)),
+        var operations: [TaskOperation] = []
+        for origin: UInt8 in [1, 2] {
+            for sequence: UInt64 in 1...3 {
+                let taskNumber = UInt16(origin) * 10 + UInt16(sequence)
+                operations.append(operation(
+                    origin: origin, sequence: sequence, lamport: 2_000 + sequence,
+                    taskID: task(500 + taskNumber),
                     mutation: .create(title: "Blocked", completed: false)
-                )
+                ))
             }
         }
 
         let intake = try replica.applyAvailable(operations, deferredLimit: 4)
 
         XCTAssertEqual(intake.accepted, 0)
-        XCTAssertEqual(
-            intake.deferred.map { [$0.originDeviceID: $0.originSequence] },
-            [[device(1): 1], [device(1): 2], [device(2): 1], [device(2): 2]]
-        )
+        let kept: [TaskOperation] = [operations[0], operations[1], operations[3], operations[4]]
+        XCTAssertEqual(intake.deferred, kept)
     }
 
     func testIntakeDefersOperationsOverOperationAndOriginLimits() throws {
