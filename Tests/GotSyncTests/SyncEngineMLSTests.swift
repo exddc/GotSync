@@ -659,7 +659,12 @@ final class SyncEngineMLSTests: XCTestCase {
                     XCTFail("removed state processed a later entry", file: file, line: line)
                 } catch MLSClientError.invalidState {}
             } else {
-                try await replay.process(entry.delivery, cursor: entry.cursor)
+                do {
+                    try await replay.process(entry.delivery, cursor: entry.cursor)
+                } catch MLSClientError.capacityReached {
+                    try await replay.acknowledgeInbox(through: entry.cursor)
+                    try await replay.process(entry.delivery, cursor: entry.cursor)
+                }
                 removed = try await replay.isRemoved()
             }
         }
@@ -738,6 +743,110 @@ final class SyncEngineMLSTests: XCTestCase {
         }
     }
 
+    private static let backlogTask = "Sent while the leaver was offline"
+
+    /// The leaver is offline while the host adds a task and then sends more
+    /// messages than an inbox holds. The leaver has a persisted send pending.
+    private func offlineBacklog(_ names: [String]) async throws -> (host: SyncEngine, leaver: SyncEngine, pending: MLSDelivery) {
+        let linked = try await linkedGroup(names)
+        await linked[1].stop()
+        XCTAssertTrue(linked[0].addTask(title: Self.backlogTask))
+        try await wait("task uploaded") { linked[0].pendingMailboxOperationCount == 0 }
+        await linked[0].stop()
+        let hostSession = try XCTUnwrap(linked[0].mlsSessionForTesting)
+        let leaverSession = try XCTUnwrap(linked[1].mlsSessionForTesting)
+        let hello = try ReplicationMessage.hello(vector: ReplicaVersionVector(), provider: nil).encoded()
+        for _ in 0..<1001 { _ = try await hostSession.send(hello) }
+        let pending = try await leaverSession.client.prepareMessage(hello)
+        return (linked[0], linked[1], pending)
+    }
+
+    private func assertDepartedThroughBacklog(
+        host name: String,
+        leaver: SyncEngine,
+        pending: MLSDelivery,
+        retained: MLSClient,
+        replay: MLSClient,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let group = pending.group
+        let log = await relay.log(group: group)
+        let sent = log.filter { $0.delivery.payload == pending.payload }
+        let proposals = log.filter { $0.delivery.kind == .proposal }
+        XCTAssertEqual(sent.count, 1, "pending send was not delivered once", file: file, line: line)
+        XCTAssertEqual(proposals.count, 1, "leave proposal was not published once", file: file, line: line)
+        let proposal = try XCTUnwrap(proposals.first, file: file, line: line)
+        XCTAssertGreaterThan(proposal.cursor, try XCTUnwrap(sent.first, file: file, line: line).cursor, file: file, line: line)
+        let authorization = try await retained.transportAuthorization()
+        let removal = await relay.removalCursor(of: authorization, group: group)
+        XCTAssertEqual(removal, proposal.cursor, file: file, line: line)
+        let freshGroup = try await leaver.mlsSessionForTesting?.group()
+        let freshInbox = try await leaver.mlsSessionForTesting?.inbox()
+        XCTAssertNil(freshGroup, file: file, line: line)
+        XCTAssertEqual(freshInbox, [], file: file, line: line)
+        XCTAssertFalse(leaver.tasks.contains { $0.titleValue == Self.backlogTask }, file: file, line: line)
+
+        let host = engine(name)
+        try await wait("removal committed", file: file, line: line) { host.isPaired && host.linkedMemberCount == 1 }
+        let title = "After backlog leave"
+        XCTAssertTrue(host.addTask(title: title), file: file, line: line)
+        try await wait("host uploaded", file: file, line: line) { host.pendingMailboxOperationCount == 0 }
+        XCTAssertFalse(leaver.tasks.contains { $0.titleValue == title }, file: file, line: line)
+        try await assertLockedOut(retained, replay: replay, group: group, file: file, line: line)
+    }
+
+    func testLeaveThroughPendingSendAndFullInboxRevokesWriter() async throws {
+        let (host, leaver, pending) = try await offlineBacklog(["backlog-host", "backlog-leaver"])
+        let retained = try await retainedState(of: "backlog-leaver", engine: leaver, copy: "backlog-retained")
+        let replay = try await retainedState(of: "backlog-leaver", engine: leaver, copy: "backlog-replay")
+        let kept = leaver.tasks
+        leaver.unlinkAndKeepTasks()
+        XCTAssertFalse(leaver.isPaired)
+        let departures = root.appendingPathComponent("backlog-leaver").appendingPathComponent(SyncEngine.departuresDirectoryName)
+        try await wait("departure published", timeout: .seconds(120)) {
+            ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
+        }
+        XCTAssertEqual(leaver.tasks, kept)
+        let hostMembers = try await host.mlsSessionForTesting?.members()
+        XCTAssertEqual(hostMembers?.count, 2)
+        try await assertDepartedThroughBacklog(host: "backlog-host", leaver: leaver, pending: pending, retained: retained, replay: replay)
+    }
+
+    func testBacklogLeaveSurvivesInterruptedFetchesAndRestart() async throws {
+        let (_, leaver, pending) = try await offlineBacklog(["resume-host", "resume-leaver"])
+        let retained = try await retainedState(of: "resume-leaver", engine: leaver, copy: "resume-retained")
+        let replay = try await retainedState(of: "resume-leaver", engine: leaver, copy: "resume-replay")
+        let authorization = try await retained.transportAuthorization()
+        await relay.limitFetches(by: authorization, to: 60)
+        leaver.unlinkAndKeepTasks()
+        try await wait("fetches interrupted", timeout: .seconds(120)) { await self.relay.interruptedFetches >= 2 }
+        await leaver.stop()
+        let departures = root.appendingPathComponent("resume-leaver").appendingPathComponent(SyncEngine.departuresDirectoryName)
+        let slots = try FileManager.default.contentsOfDirectory(atPath: departures.path)
+        XCTAssertEqual(slots.count, 1)
+        let slot = try XCTUnwrap(slots.first)
+        let slotKey = try XCTUnwrap(stores["resume-leaver"]?.read(account: "\(SecretStoreMLSStateKey.account).departing.\(slot)"))
+        let interrupted = try MLSClient(
+            directory: departures.appendingPathComponent(slot),
+            deviceID: leaver.localDeviceID,
+            stateKey: InMemoryStateKeyProvider(key: SymmetricKey(data: slotKey))
+        )
+        let resumeCursor = try await interrupted.cursor()
+        let staleCursor = try await retained.cursor()
+        XCTAssertGreaterThan(resumeCursor, staleCursor)
+        let interruptedLog = await relay.log(group: pending.group)
+        XCTAssertFalse(interruptedLog.contains { $0.delivery.kind == .proposal })
+        await relay.limitFetches(by: authorization, to: nil)
+
+        let restarted = engine("resume-leaver", departureRetryDelayNanoseconds: 1_000_000...20_000_000)
+        XCTAssertFalse(restarted.isPaired)
+        try await wait("departure published", timeout: .seconds(120)) {
+            ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
+        }
+        try await assertDepartedThroughBacklog(host: "resume-host", leaver: restarted, pending: pending, retained: retained, replay: replay)
+    }
+
     func testLeaveKeepsRetryingUntilRelayIsReachable() async throws {
         let host = engine("retry-host")
         let leaver = engine("retry-leaver", departureRetryDelayNanoseconds: 1_000_000...20_000_000)
@@ -748,6 +857,23 @@ final class SyncEngineMLSTests: XCTestCase {
         await relay.setAppendsUnavailable(false)
         try await wait("removal committed") { host.linkedMemberCount == 1 && host.isPaired }
         let departures = root.appendingPathComponent("retry-leaver").appendingPathComponent(SyncEngine.departuresDirectoryName)
+        try await wait("departure erased") {
+            ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
+        }
+    }
+
+    func testUndecryptableDepartureIsErased() async throws {
+        let host = engine("unreadable-host")
+        let leaver = engine("unreadable-leaver", departureRetryDelayNanoseconds: 1_000_000...20_000_000)
+        try await pair(host, leaver)
+        await relay.setAppendsUnavailable(true)
+        leaver.unlinkAndKeepTasks()
+        try await wait("attempts failed") { await self.relay.rejectedAppends > 2 }
+        let departures = root.appendingPathComponent("unreadable-leaver").appendingPathComponent(SyncEngine.departuresDirectoryName)
+        let slot = try XCTUnwrap(try FileManager.default.contentsOfDirectory(atPath: departures.path).first)
+        try stores["unreadable-leaver"]?.write(
+            Data(repeating: 7, count: 32), account: "\(SecretStoreMLSStateKey.account).departing.\(slot)"
+        )
         try await wait("departure erased") {
             ((try? FileManager.default.contentsOfDirectory(atPath: departures.path)) ?? []).isEmpty
         }

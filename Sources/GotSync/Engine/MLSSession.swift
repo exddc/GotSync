@@ -44,6 +44,7 @@ actor MLSSession {
     private let transport: any MLSRelayTransport
     private let fetchLimit: Int
     private var acknowledged: UInt64 = 0
+    private var keepsInbox = true
     private var tail: Task<Void, Never>?
 
     init(
@@ -151,15 +152,27 @@ actor MLSSession {
     }
 
     /// Publishes a proposal removing this member and revokes its relay
-    /// access. Another member commits the removal.
+    /// access. Another member commits the removal. From then on the session
+    /// drops unread plaintext when its inbox is full, and a full relay log
+    /// makes it catch up and acknowledge first, so neither backlog can block
+    /// the leave.
     func leave() async throws {
         try await exclusive { session in
+            session.keepsInbox = false
             guard let group = try await session.client.group() else { throw MLSSessionError.notInGroup }
+            if try await session.client.isRemoved() {
+                try await session.acknowledgeRemoval(group: group)
+                throw MLSSessionError.removed
+            }
             let authorization = try await session.client.transportAuthorization()
             for _ in 0..<Self.maximumSubmitAttempts {
                 if try await session.client.isRemoved() { throw MLSSessionError.removed }
                 if let pending = try await session.client.pendingDelivery(), pending.kind != .proposal {
-                    _ = try await session.deliverPending()
+                    do {
+                        _ = try await session.deliverPending()
+                    } catch MLSRelayError.capacityReached {
+                        _ = try await session.catchUp()
+                    }
                     continue
                 }
                 let proposal: MLSDelivery
@@ -171,7 +184,7 @@ actor MLSSession {
                 let result: MLSAppendResult
                 do {
                     result = try await session.transport.append(proposal, authorization: authorization)
-                } catch MLSRelayError.epochConflict {
+                } catch MLSRelayError.epochConflict, MLSRelayError.capacityReached {
                     _ = try await session.catchUp()
                     continue
                 }
@@ -291,13 +304,22 @@ actor MLSSession {
             )
             guard !entries.isEmpty else { return processed }
             for entry in entries {
-                try await client.process(entry.delivery, cursor: entry.cursor)
+                try await process(entry)
                 processed += 1
                 if try await client.isRemoved() {
                     try await acknowledgeRemoval(group: group)
                     return processed
                 }
             }
+        }
+    }
+
+    private func process(_ entry: MLSRelayEntry) async throws {
+        do {
+            try await client.process(entry.delivery, cursor: entry.cursor)
+        } catch MLSClientError.capacityReached where !keepsInbox {
+            try await client.acknowledgeInbox(through: entry.cursor)
+            try await client.process(entry.delivery, cursor: entry.cursor)
         }
     }
 

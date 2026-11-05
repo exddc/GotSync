@@ -1931,7 +1931,7 @@ public final class SyncEngine {
         }
     }
 
-    /// Returns whether every departure slot was published or discarded.
+    /// Returns whether every departure slot was published or settled.
     private func publishDepartures() async -> Bool {
         var complete = true
         for slot in departureSlots() {
@@ -1943,7 +1943,7 @@ public final class SyncEngine {
                 try await departing.leave()
             } catch is CancellationError {
                 return false
-            } catch let error where Self.isRetriableDeparture(error) {
+            } catch let error where !Self.isSettledDeparture(error) {
                 complete = false
                 continue
             } catch {}
@@ -1952,15 +1952,17 @@ public final class SyncEngine {
         return complete
     }
 
-    private static func isRetriableDeparture(_ error: Error) -> Bool {
+    /// Whether a failed leave can never succeed: the MLS state or the relay
+    /// already excludes the departing identity, the history it must process
+    /// has expired, or its state can no longer be decrypted. Any other
+    /// failure keeps its slot for a retry.
+    private static func isSettledDeparture(_ error: Error) -> Bool {
         switch error {
-        case MLSRelayError.unauthorized, MLSRelayError.invalidRequest, MLSRelayError.unsupportedVersion,
-             MLSRelayError.historyExpired:
-            return false
-        case MLSSessionError.unresolvedConflict, MLSClientError.storageUnavailable:
+        case MLSSessionError.removed, MLSSessionError.notInGroup, MLSRelayError.unauthorized, MLSRelayError.historyExpired,
+             MLSStoreError.unreadable:
             return true
         default:
-            return isTransientTransportFailure(error)
+            return false
         }
     }
 
