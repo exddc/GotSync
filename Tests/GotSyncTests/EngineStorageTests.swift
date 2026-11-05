@@ -473,4 +473,26 @@ final class EngineStorageTests: XCTestCase {
         engine.eraseLocalData()
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
+
+    func testReplyObligationStaysWithinOriginLimitAcrossRestart() throws {
+        let requested = (0..<ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let held = (0..<ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let request = try ReplicaVersionVector(Dictionary(uniqueKeysWithValues: requested.map { ($0, 1) }))
+        var obligation = ReplyObligation()
+        obligation.merge(request, provider: true)
+        obligation.merge(request, provider: false)
+        obligation.advance(past: held.map {
+            TaskOperation(originDeviceID: $0, originSequence: 1, lamport: 1, taskID: UUID(), mutation: .setCompleted(true))
+        })
+        obligation.retain(origins: held)
+        let own = try XCTUnwrap(obligation.own)
+        let provided = try XCTUnwrap(obligation.provided)
+        XCTAssertEqual(Set(own.origins), Set(held))
+        XCTAssertEqual(Set(provided.origins), Set(held))
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+    }
 }

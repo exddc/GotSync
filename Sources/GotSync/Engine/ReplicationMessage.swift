@@ -190,6 +190,15 @@ struct ReplyObligation: Codable, Equatable, Sendable {
         }
     }
 
+    /// Drops entries for origins this device holds no operations from. They
+    /// never select an operation to send, and keeping them could exceed the
+    /// origin limit that loading enforces.
+    mutating func retain(origins: [ReplicaDeviceID]) {
+        let kept = Set(origins)
+        own = own.map { $0.retaining(kept) }
+        provided = provided.map { $0.retaining(kept) }
+    }
+
     private static func lower(_ current: ReplicaVersionVector?, _ vector: ReplicaVersionVector) -> ReplicaVersionVector {
         guard let current else { return vector }
         var result = ReplicaVersionVector()
@@ -226,5 +235,13 @@ struct ReplyObligation: Codable, Equatable, Sendable {
 private extension ReplicaVersionVector {
     mutating func raise(_ operation: TaskOperation) {
         setSequence(max(self[operation.originDeviceID], operation.originSequence), for: operation.originDeviceID)
+    }
+
+    func retaining(_ kept: Set<ReplicaDeviceID>) -> ReplicaVersionVector {
+        var result = ReplicaVersionVector()
+        for origin in origins where kept.contains(origin) {
+            result.setSequence(self[origin], for: origin)
+        }
+        return result
     }
 }

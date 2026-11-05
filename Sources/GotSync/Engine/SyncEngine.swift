@@ -1776,6 +1776,7 @@ public final class SyncEngine {
                 continue
             }
             obligation.merge(vector, provider: hello.message.provider == fingerprint)
+            obligation.retain(origins: replica.versionVector.origins)
             if hello.index >= held {
                 answeredHeldHelloCursors.insert(cursor)
             }
@@ -1888,6 +1889,7 @@ public final class SyncEngine {
             }
             var remaining = obligation
             remaining.advance(past: batch ?? [])
+            remaining.retain(origins: replica.versionVector.origins)
             let next: ReplyObligation? = batch == nil ? nil : remaining
             try ReplyObligation.save(next, to: replyObligationURL)
             replyObligation = next
