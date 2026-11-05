@@ -52,8 +52,9 @@ New `SyncError` cases:
   It counts retained origins, including those of removed devices, plus one
   slot for each current member and this device, up to
   `ReplicaLimits.maxOrigins` (128). Creating, inviting,
-  or joining fails before anything is linked; a joiner refused after approval
-  sees `pairingDeclined`. Current members keep syncing.
+  or joining fails before anything is linked. The inviter counts the joiner's
+  history too, and both devices report this error when the merged history
+  would not fit. Current members keep syncing.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`

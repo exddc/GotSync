@@ -100,12 +100,8 @@ final class SyncEngineMLSTests: XCTestCase {
         try await XCTUnwrapAsync(await engine.mlsSessionForTesting?.fingerprint())
     }
 
-    private func engineWithRetiredOrigins(_ name: String, count: Int) async throws -> SyncEngine {
-        let seeded = engine(name)
-        let deviceID = try ReplicaDeviceID(bytes: seeded.localDeviceID)
-        await seeded.stop()
-        var replica = try TaskReplica(deviceID: deviceID)
-        let operations = (1...count).map {
+    private func retiredOperations(_ count: Int) -> [TaskOperation] {
+        (1...count).map {
             TaskOperation(
                 originDeviceID: ReplicaDeviceID(uuid: UUID()),
                 originSequence: 1,
@@ -114,6 +110,17 @@ final class SyncEngineMLSTests: XCTestCase {
                 mutation: .create(title: "Retired \($0)", completed: false)
             )
         }
+    }
+
+    private func engineWithRetiredOrigins(_ name: String, count: Int) async throws -> SyncEngine {
+        try await engineWithHistory(name, operations: retiredOperations(count))
+    }
+
+    private func engineWithHistory(_ name: String, operations: [TaskOperation]) async throws -> SyncEngine {
+        let seeded = engine(name)
+        let deviceID = try ReplicaDeviceID(bytes: seeded.localDeviceID)
+        await seeded.stop()
+        var replica = try TaskReplica(deviceID: deviceID)
         for batch in try OperationBatcher.batches(operations) {
             try replica.applyRemote(batch)
         }
@@ -222,7 +229,7 @@ final class SyncEngineMLSTests: XCTestCase {
             secondErrors.messages.contains(SyncError.taskHistoryAtCapacity.errorDescription!)
         }
         XCTAssertFalse(fourth.isPaired)
-        XCTAssertEqual(fourth.errorMessage, SyncError.pairingDeclined.errorDescription)
+        XCTAssertEqual(fourth.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
 
         XCTAssertTrue(third.addTask(title: "Last slot"))
         try await wait("last slot syncs") {
@@ -244,8 +251,8 @@ final class SyncEngineMLSTests: XCTestCase {
         defer { gate.release() }
 
         let transient = engine("slot-transient")
-        XCTAssertTrue(transient.addTask(title: "Transient task"))
         try await pair(second, transient)
+        XCTAssertTrue(transient.addTask(title: "Transient task"))
         try await wait("transient uploaded while host drain is paused") {
             gate.isPaused && transient.pendingMailboxOperationCount == 0
                 && second.tasks.contains { $0.titleValue == "Transient task" }
@@ -302,6 +309,87 @@ final class SyncEngineMLSTests: XCTestCase {
             SyncEngine.originSlots(retained: origins, pending: Set(origins), memberCount: 1),
             4
         )
+    }
+
+    func testDisjointHistoriesBeyondCapacityAreRefusedBeforeAdmission() async throws {
+        let host = try await engineWithRetiredOrigins("disjoint-host", count: 70)
+        let joiner = try await engineWithRetiredOrigins("disjoint-joiner", count: 70)
+        let hostTasks = Set(host.tasks.map(\.id))
+        let joinerTasks = Set(joiner.tasks.map(\.id))
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+        XCTAssertFalse(joiner.isTaskHistoryAtCapacity)
+
+        let url = try await invite(host)
+        let groupID = try XCTUnwrap(Invitation.from(url: url, scheme: "gotsync-tests").groupID)
+        joiner.joinPrivateSync(url: url)
+        try await wait("both refused") {
+            host.phase == .failed && joiner.phase == .failed && !host.canCancelPairing && !joiner.canCancelPairing
+        }
+        XCTAssertEqual(host.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+        XCTAssertEqual(joiner.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+        XCTAssertFalse(host.isHostApprovalPending)
+        XCTAssertFalse(host.isPaired)
+        XCTAssertFalse(joiner.isPaired)
+        let hostGroup = try await host.mlsSessionForTesting?.group()
+        let joinerGroup = try await joiner.mlsSessionForTesting?.group()
+        XCTAssertNil(hostGroup)
+        XCTAssertNil(joinerGroup)
+        let log = await relay.log(group: groupID)
+        XCTAssertTrue(log.isEmpty)
+        XCTAssertEqual(Set(host.tasks.map(\.id)), hostTasks)
+        XCTAssertEqual(Set(joiner.tasks.map(\.id)), joinerTasks)
+    }
+
+    func testOverlappingHistoriesWithinCapacityPairAndConverge() async throws {
+        let shared = retiredOperations(95)
+        let host = try await engineWithHistory("overlap-host", operations: shared + retiredOperations(5))
+        let joiner = try await engineWithHistory("overlap-joiner", operations: shared + retiredOperations(5))
+        try await pair(host, joiner)
+        try await wait("union converges") {
+            host.tasks.count == 105 && Set(host.tasks.map(\.id)) == Set(joiner.tasks.map(\.id))
+        }
+        XCTAssertNil(host.errorMessage)
+        XCTAssertNil(joiner.errorMessage)
+    }
+
+    func testPairingResponseCarriesCanonicalBoundedOriginInventory() throws {
+        let invitation = try Invitation.generate(
+            groupID: Data(repeating: 1, count: 32), inviterFingerprint: Data(repeating: 2, count: 32)
+        )
+        let origins = (1...ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let fixed = Data(repeating: 4, count: 32)
+        let response = PairingFrame.response(
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: origins
+        )
+        let opened = try PairingFrame.open(response.seal(for: invitation, from: .fromJoiner), for: invitation, from: .fromJoiner)
+        XCTAssertEqual(opened, .response(
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: origins.sorted()
+        ))
+        XCTAssertThrowsError(try PairingFrame.response(
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: [origins[0], origins[0]]
+        ).seal(for: invitation, from: .fromJoiner))
+        XCTAssertEqual(
+            try PairingFrame.open(PairingFrame.historyFull.seal(for: invitation, from: .fromInviter), for: invitation, from: .fromInviter),
+            .historyFull
+        )
+
+        let sorted = origins.sorted()
+        let invalidBodies: [Data] = [
+            fixed + fixed + fixed,
+            fixed + fixed + fixed + Data([2]) + sorted[1].bytes + sorted[0].bytes,
+            fixed + fixed + fixed + Data([2]) + sorted[0].bytes,
+            fixed + fixed + fixed + Data([UInt8(ReplicaLimits.maxOrigins + 1)])
+                + sorted.reduce(Data()) { $0 + $1.bytes } + Data(repeating: 0xFF, count: 16),
+        ]
+        for body in invalidBodies {
+            XCTAssertThrowsError(try PairingFrame.open(sealed(body, kind: 2, key: invitation.responseKey), for: invitation, from: .fromJoiner))
+        }
+        XCTAssertThrowsError(try PairingFrame.open(sealed(Data([3]), kind: 3, key: invitation.offerKey), for: invitation, from: .fromInviter))
+    }
+
+    private func sealed(_ body: Data, kind: UInt8, key: SymmetricKey) throws -> Data {
+        let associated = Data("\(ProtocolDomains.namespace)/mls-pairing-frame/v2".utf8) + Data([kind])
+        return try Data([kind]) + ChaChaPoly.seal(body, using: key, authenticating: associated).combined
     }
 
     func testJoinerWithFullTaskHistoryIsRefusedBeforeLinking() async throws {
@@ -502,7 +590,7 @@ final class SyncEngineMLSTests: XCTestCase {
             joinerNonce: nonce
         )).seal(for: invitation, from: .fromJoiner)
         let reveal = try PairingFrame.response(
-            keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce
+            keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce, origins: []
         ).seal(for: invitation, from: .fromJoiner)
         await rendezvous.setInterceptor { frame in
             switch try? PairingFrame.open(frame, for: invitation, from: .fromJoiner) {
@@ -562,7 +650,7 @@ final class SyncEngineMLSTests: XCTestCase {
                 try await connection.send(commitment(ground))
             } else {
                 try await connection.send(PairingFrame.response(
-                    keyPackageReference: ground.reference, joinerFingerprint: ground.fingerprint, joinerNonce: nonce
+                    keyPackageReference: ground.reference, joinerFingerprint: ground.fingerprint, joinerNonce: nonce, origins: []
                 ).seal(for: invitation, from: .fromJoiner))
             }
             try await wait("inviter rejects") { host.phase == .failed }
@@ -1124,7 +1212,7 @@ final class SyncEngineMLSTests: XCTestCase {
                 )).seal(for: invitation, from: .fromJoiner))
             case .nonce:
                 try await connection.send(PairingFrame.response(
-                    keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce
+                    keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce, origins: []
                 ).seal(for: invitation, from: .fromJoiner))
                 answered = true
             default:

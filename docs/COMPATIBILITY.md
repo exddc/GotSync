@@ -32,7 +32,7 @@ that tells the user to pair every device again. The pairing WebSocket closes a
 | Relay control JSON | `version: 2` | Client rejects unsupported control before acting on it |
 | Invitation URL | Consumer-specific scheme and `pair` host with `v=2` | Parser requires `secret`, `group`, and `fingerprint`; `v=1` fails with `unsupportedVersion` |
 | Invitation phrase | 17 words: 16-byte secret and a checksum word | Unknown words and a wrong checksum are rejected; the phrase carries no version |
-| MLS pairing frames | Version 2 domains over the `/v2/pairing` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment aborts pairing |
+| MLS pairing frames | Version 2 domains over the `/v2/pairing` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment, or lacks a canonical origin list, aborts pairing |
 | MLS delivery service | `/v2/mls`, `version: 2` | Client rejects any other response version; server answers other request versions with HTTP 400 `unsupportedVersion` |
 | MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
@@ -93,6 +93,17 @@ every device in a group before a ninth device edits its tasks. An earlier
 build cannot open an archive with more than eight origins: it starts in the
 failed phase with a too-many-origins error, leaves the archive in place, and
 the tasks return after updating again.
+
+## Pairing origin inventory
+
+The pairing response now ends with the joiner's origin list, and decision
+value 2 refuses a joiner whose history would not fit. Builds before this
+change send a 96-byte response and accept only decision values 0 and 1.
+Pairing between an earlier build and a current build therefore fails in
+either direction before any safety code is shown: the inviter cannot read
+the other build's response and reports `SyncError.invalidPairMessage`, then
+declines, so the joiner reports `SyncError.pairingDeclined`. Devices that are already linked keep syncing; only new pairings
+need every device updated.
 
 ## Future changes
 

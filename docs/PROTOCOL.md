@@ -55,8 +55,13 @@ ciphertext, tag). The associated data is
 | 1 offer | inviter to joiner | group ID ‖ inviter fingerprint |
 | 4 commitment | joiner to inviter | 32-byte commitment `C` |
 | 5 nonce | inviter to joiner | 32-byte inviter nonce `Ni` |
-| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` |
-| 3 decision | either | one byte: 1 added, 0 declined or cancelled |
+| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` ‖ origin count `n` (one byte, at most 128) ‖ `n` 16-byte origin IDs |
+| 3 decision | either | one byte: 1 added, 0 declined or cancelled, 2 refused because the task history is full (inviter only) |
+
+The response lists every origin in the joiner's replica in strictly ascending
+byte order. A receiver rejects a response with more than 128 origins, a body
+length other than `97 + 16n` bytes, or origins that are unsorted or repeated.
+A frame is at most 2,174 bytes.
 
 The exchange runs in this order:
 
@@ -69,8 +74,14 @@ The exchange runs in this order:
    answers with a random `Ni`. It repeats the same `Ni` if the same commitment
    arrives again after a reconnect. A different commitment aborts the attempt.
 4. The joiner accepts one `Ni` per attempt, then sends the response. The
-   inviter recomputes `C` from the response and aborts on a mismatch.
-5. The inviter fetches the KeyPackage, checks that its SHA-256 equals the
+   inviter recomputes `C` from the response and aborts on a mismatch. The
+   origin list is not part of `C` or of the safety code; the frame's
+   authenticated encryption under the invitation key protects it.
+5. The inviter checks the merged task history (see
+   [replica capacity](#replica-capacity)). If it has no room, the inviter
+   sends decision 2 and stops before it shows a safety code, so nobody can
+   approve the attempt.
+6. The inviter fetches the KeyPackage, checks that its SHA-256 equals the
    reference, and both devices show the safety code.
 
 The safety code is the first four bytes of SHA-256 over
@@ -319,25 +330,37 @@ therefore counts twice, which can refuse a device up to eight slots early; a
 full group of eight still has room for at least 120 origins over its lifetime.
 Linking needs one free slot for the other device.
 
-Each device checks before pairing starts, so `createPrivateSync()`,
-`inviteToGroup()`, and `joinPrivateSync(url:)` or `joinPrivateSync(phrase:)`
-fail with `SyncError.taskHistoryAtCapacity` and nothing is linked. A linked
-inviter checks again after the safety code is approved, against the MLS
-roster it has just synchronized and the origins in delivered application
-messages it has not applied yet. A device that another member added in the
-meantime is counted, and so is a removed device whose edits are still waiting
-in the inbox. If two members' Adds still race for the last slot, an
-inviter whose roster exceeds the limit after its Add removes the new member
-the same way it removes a joiner that declined during the Add. In both late
-cases the inviter reports `SyncError.taskHistoryAtCapacity` and the joiner
-reports `SyncError.pairingDeclined`, because a decision frame carries no
-reason. Current members keep syncing.
+Each device checks its own history before pairing starts, so
+`createPrivateSync()`, `inviteToGroup()`, and `joinPrivateSync(url:)` or
+`joinPrivateSync(phrase:)` fail with `SyncError.taskHistoryAtCapacity` and
+nothing is linked.
 
-Pairing frames do not carry replica contents, so each side counts only the
-origins it already holds. A joiner that brings origins from an earlier group
-can still push the merged history past the limit, and the receiving replica
-rejects operations from origins beyond it. A device that edited the history
-before, left, and links again still needs a free slot. Version 2 does not
+The inviter then checks the union of both histories. Its count covers its own
+retained origins, the origins named by delivered application messages it has
+not applied yet, every origin in the joiner's response, and one slot for each
+current member plus the joiner. Each origin counts once, however many of
+these sources name it. The inviter runs this check three times:
+
+1. when the response arrives, before the inviter shows a safety code or
+   creates a group;
+2. after approval, against the MLS roster and inbox it has just synchronized,
+   so a device another member added in the meantime is counted, and so is a
+   removed device whose edits are still waiting in the inbox;
+3. after its Add, against the roster and inbox after any conflict catch-up.
+
+If the first or second check fails, the joiner gets no MLS leaf or Welcome. If
+the third fails because two members' Adds raced for the last slot, the
+inviter removes the new member the same way it removes a joiner that declined
+during the Add. In every case the inviter sends decision 2, both devices
+report `SyncError.taskHistoryAtCapacity`, and every local task stays on both
+devices. Current members keep syncing.
+
+A joiner that has already edited counts both as an origin and as a member, so
+it can be refused one slot early. A device that edited the history before,
+left, and links again still needs a free slot. A member admitted by another
+member at the same moment counts only once its own history reaches the log,
+so two concurrent admissions can together exceed the limit; the receiving
+replica then rejects operations from origins beyond it. Version 2 does not
 compact retired origins: a task history without a free slot cannot gain
 another contributing device.
 

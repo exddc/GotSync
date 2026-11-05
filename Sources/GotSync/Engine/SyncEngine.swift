@@ -268,6 +268,7 @@ public final class SyncEngine {
     private var activeInvitation: Invitation?
     private var approvalContinuation: CheckedContinuation<ApprovalOutcome, Never>?
     private var peerDecision: Bool?
+    private var peerRefusedForTaskHistory = false
     private var reconcileTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var syncCycleTask: Task<Void, Never>?
@@ -479,6 +480,32 @@ public final class SyncEngine {
             origins.formUnion(decoded.vector?.origins ?? [])
         }
         return origins
+    }
+
+    /// Slots in use once a joiner holding `joinerOrigins` is counted with the
+    /// group's retained, pending, and reserved origins.
+    private func admissionSlots(
+        session: MLSSession,
+        linked: Bool,
+        joinerOrigins: Set<ReplicaDeviceID>,
+        memberCount: Int
+    ) async throws -> Int {
+        var pending = joinerOrigins
+        if linked {
+            try await pending.formUnion(pendingOrigins(session: session))
+        }
+        return originSlotsInUse(memberCount: memberCount, pending: pending)
+    }
+
+    private func refuseJoinerForTaskHistory(
+        on connection: any PairingConnection,
+        invitation: Invitation
+    ) async throws -> Never {
+        if let frame = try? PairingFrame.historyFull.seal(for: invitation, from: .fromInviter) {
+            try? await connection.send(frame)
+        }
+        await connection.cancel()
+        throw SyncError.taskHistoryAtCapacity
     }
 
     public var linkedDevices: [LinkedDevice] {
@@ -930,6 +957,7 @@ public final class SyncEngine {
         pairingAttemptID = attemptID
         pairingDeadline = deadline
         peerDecision = nil
+        peerRefusedForTaskHistory = false
         return attemptID
     }
 
@@ -957,6 +985,13 @@ public final class SyncEngine {
             let connection = response.connection
             let reference = response.keyPackageReference
             let joinerFingerprint = response.joinerFingerprint
+            let joinerOrigins = Set(response.origins)
+            let currentMembers = linked ? try await session.members().count : 1
+            guard try await admissionSlots(
+                session: session, linked: linked, joinerOrigins: joinerOrigins, memberCount: currentMembers
+            ) < ReplicaLimits.maxOrigins else {
+                try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
+            }
             pairingExpiryTask?.cancel()
             pairingExpiryTask = nil
             guard
@@ -1003,10 +1038,11 @@ public final class SyncEngine {
             if linked {
                 try await session.synchronize()
                 try await processRemovals(session: session)
-                let members = try await session.members().count
-                let pending = try await pendingOrigins(session: session)
-                guard originSlotsInUse(memberCount: members, pending: pending) < ReplicaLimits.maxOrigins else {
-                    throw SyncError.taskHistoryAtCapacity
+                guard try await admissionSlots(
+                    session: session, linked: true, joinerOrigins: joinerOrigins,
+                    memberCount: session.members().count
+                ) < ReplicaLimits.maxOrigins else {
+                    try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
                 }
             } else {
                 try await session.createGroup(groupID)
@@ -1030,9 +1066,8 @@ public final class SyncEngine {
                 throw SyncError.pairingDeclined
             }
             let roster = try await session.members().map(ReplicationCheckpoint.Member.init)
-            let overflowed = try await originSlotsInUse(
-                memberCount: roster.count,
-                pending: pendingOrigins(session: session)
+            let overflowed = try await admissionSlots(
+                session: session, linked: true, joinerOrigins: joinerOrigins, memberCount: roster.count
             ) > ReplicaLimits.maxOrigins
             var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
                 ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
@@ -1050,11 +1085,7 @@ public final class SyncEngine {
                 throw SyncError.pairingDeclined
             }
             if overflowed {
-                if let frame = try? PairingFrame.decision(approved: false).seal(for: invitation, from: .fromInviter) {
-                    try? await connection.send(frame)
-                }
-                await connection.cancel()
-                throw SyncError.taskHistoryAtCapacity
+                try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
             }
             if let frame = try? PairingFrame.decision(approved: true).seal(for: invitation, from: .fromInviter) {
                 try? await connection.send(frame)
@@ -1072,6 +1103,7 @@ public final class SyncEngine {
         let joinerFingerprint: Data
         let inviterNonce: Data
         let joinerNonce: Data
+        let origins: [ReplicaDeviceID]
     }
 
     /// Accepts exactly one joiner commitment per invitation and answers it
@@ -1106,7 +1138,7 @@ public final class SyncEngine {
                             let nonce = try bound?.nonce ?? Data.secureRandom(count: 32)
                             bound = (commitment, nonce)
                             try await connection.send(PairingFrame.nonce(nonce).seal(for: invitation, from: .fromInviter))
-                        case .response(let reference, let fingerprint, let joinerNonce):
+                        case .response(let reference, let fingerprint, let joinerNonce, let origins):
                             guard let bound, PairingSafetyCode.commitment(
                                 groupID: groupID,
                                 inviterFingerprint: inviterFingerprint,
@@ -1121,11 +1153,12 @@ public final class SyncEngine {
                                 keyPackageReference: reference,
                                 joinerFingerprint: fingerprint,
                                 inviterNonce: bound.nonce,
-                                joinerNonce: joinerNonce
+                                joinerNonce: joinerNonce,
+                                origins: origins
                             )
                         case .decision:
                             throw SyncError.pairingDeclined
-                        case .offer, .nonce:
+                        case .offer, .nonce, .historyFull:
                             throw SyncError.invalidPairMessage
                         }
                     case .error(let code):
@@ -1172,7 +1205,8 @@ public final class SyncEngine {
                 PairingFrame.response(
                     keyPackageReference: published.reference,
                     joinerFingerprint: published.fingerprint,
-                    joinerNonce: joinerNonce
+                    joinerNonce: joinerNonce,
+                    origins: replica.versionVector.origins
                 ).seal(for: invitation, from: .fromJoiner)
             )
             safetyCode = PairingSafetyCode.code(
@@ -1195,7 +1229,7 @@ public final class SyncEngine {
                     throw SyncError.invitationExpired
                 }
                 if peerDecision == false {
-                    throw SyncError.pairingDeclined
+                    throw peerRefusedForTaskHistory ? SyncError.taskHistoryAtCapacity : SyncError.pairingDeclined
                 }
                 do {
                     if try await session.join(
@@ -1246,6 +1280,8 @@ public final class SyncEngine {
                     continue
                 case .decision:
                     throw SyncError.pairingDeclined
+                case .historyFull:
+                    throw SyncError.taskHistoryAtCapacity
                 case .commitment, .response:
                     throw SyncError.invalidPairMessage
                 }
@@ -1275,6 +1311,8 @@ public final class SyncEngine {
                             return (connection, group, fingerprint)
                         case .decision:
                             throw SyncError.pairingDeclined
+                        case .historyFull:
+                            throw SyncError.taskHistoryAtCapacity
                         case .commitment, .nonce, .response:
                             throw SyncError.invalidPairMessage
                         }
@@ -1347,13 +1385,19 @@ public final class SyncEngine {
         pairingReaderTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let event = try? await connection.receive() else { return }
-                guard
-                    case .binary(let frame) = event,
-                    case .decision(let approved)? = try? PairingFrame.open(frame, for: invitation, from: .fromInviter)
-                else {
+                guard case .binary(let frame) = event else { continue }
+                let approved: Bool
+                let historyFull: Bool
+                switch try? PairingFrame.open(frame, for: invitation, from: .fromInviter) {
+                case .decision(let decision)?:
+                    (approved, historyFull) = (decision, false)
+                case .historyFull?:
+                    (approved, historyFull) = (false, true)
+                default:
                     continue
                 }
                 guard let self, self.pairingAttemptID == attemptID else { return }
+                if historyFull { self.peerRefusedForTaskHistory = true }
                 self.peerDecision = approved
                 if approved { return }
             }
@@ -1434,6 +1478,7 @@ public final class SyncEngine {
         pairingConnection = nil
         activeInvitation = nil
         peerDecision = nil
+        peerRefusedForTaskHistory = false
         invitationPhrase = nil
         invitationURL = nil
         invitationExpiresAt = nil
