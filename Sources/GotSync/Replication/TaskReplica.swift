@@ -4,7 +4,14 @@ struct TaskReplica: Sendable {
     private(set) var archive: ReplicaArchive
     let persistenceURL: URL?
 
-    init(deviceID: ReplicaDeviceID, persistenceURL: URL? = nil) throws {
+    /// Loads the archive at `persistenceURL`, or creates one whose local
+    /// operations use `newOrigin`. A `nil` origin creates a version 1 archive
+    /// that uses `deviceID` as its origin.
+    init(
+        deviceID: ReplicaDeviceID,
+        persistenceURL: URL? = nil,
+        newOrigin: ReplicaDeviceID?
+    ) throws {
         self.persistenceURL = persistenceURL
         if let persistenceURL, FileManager.default.fileExists(atPath: persistenceURL.path) {
             let data = try Data(contentsOf: persistenceURL)
@@ -19,8 +26,11 @@ struct TaskReplica: Sendable {
             archive = stored
         } else {
             archive = ReplicaArchive(
-                formatVersion: ReplicaLimits.archiveFormatVersion,
+                formatVersion: newOrigin == nil
+                    ? ReplicaLimits.legacyArchiveFormatVersion
+                    : ReplicaLimits.archiveFormatVersion,
                 deviceID: deviceID,
+                originDeviceID: newOrigin,
                 nextLocalOriginSequence: 1,
                 lamport: 0,
                 versionVector: ReplicaVersionVector(),
@@ -40,6 +50,10 @@ struct TaskReplica: Sendable {
 
     var deviceID: ReplicaDeviceID {
         archive.deviceID
+    }
+
+    var localOrigin: ReplicaDeviceID {
+        archive.localOrigin
     }
 
     var lamport: UInt64 {
@@ -152,6 +166,42 @@ struct TaskReplica: Sendable {
             .sorted(by: ReplicaOrdering.operations)
     }
 
+    /// Returns the first of `operations` whose ID is retained, or appears
+    /// earlier in `operations`, with different content.
+    func forkedOperation(in operations: [TaskOperation]) throws -> TaskOperation? {
+        var seen: [OperationID: TaskOperation] = [:]
+        var retained: [OperationID: TaskOperation]?
+        for operation in operations {
+            let id = OperationID(operation)
+            if let earlier = seen[id] {
+                if !earlier.isIdentical(to: operation) {
+                    return operation
+                }
+                continue
+            }
+            seen[id] = operation
+            guard operation.originSequence <= archive.versionVector[operation.originDeviceID] else {
+                continue
+            }
+            if retained == nil {
+                retained = Dictionary(
+                    archive.operations.map { (OperationID($0), $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+            }
+            guard let existing = retained?[id] else {
+                throw ReplicaError.retainedOperationMissing(
+                    origin: operation.originDeviceID,
+                    sequence: operation.originSequence
+                )
+            }
+            if !existing.isIdentical(to: operation) {
+                return operation
+            }
+        }
+        return nil
+    }
+
     func atomicArchiveData() throws -> Data {
         try archive.canonicalData()
     }
@@ -168,7 +218,7 @@ struct TaskReplica: Sendable {
         }
 
         let operation = TaskOperation(
-            originDeviceID: archive.deviceID,
+            originDeviceID: archive.localOrigin,
             originSequence: archive.nextLocalOriginSequence,
             lamport: archive.lamport + 1,
             taskID: taskID,
@@ -228,7 +278,7 @@ struct TaskReplica: Sendable {
         guard archive.operations.count < ReplicaLimits.maxOperations else {
             throw ReplicaError.tooManyOperations(archive.operations.count + 1)
         }
-        if operation.originDeviceID == archive.deviceID,
+        if operation.originDeviceID == archive.localOrigin,
            operation.originSequence == UInt64.max {
             throw ReplicaError.originSequenceExhausted
         }
@@ -239,7 +289,7 @@ struct TaskReplica: Sendable {
             operation.originSequence,
             for: operation.originDeviceID
         )
-        if operation.originDeviceID == archive.deviceID {
+        if operation.originDeviceID == archive.localOrigin {
             archive.nextLocalOriginSequence = operation.originSequence + 1
         }
         archive.lamport = max(archive.lamport, operation.lamport)
@@ -435,7 +485,14 @@ struct TaskReplica: Sendable {
     }
 
     private static func validateArchive(_ archive: ReplicaArchive) throws {
-        guard archive.formatVersion == ReplicaLimits.archiveFormatVersion else {
+        switch (archive.formatVersion, archive.originDeviceID) {
+        case (ReplicaLimits.legacyArchiveFormatVersion, nil),
+             (ReplicaLimits.archiveFormatVersion, .some):
+            break
+        case (ReplicaLimits.legacyArchiveFormatVersion, .some),
+             (ReplicaLimits.archiveFormatVersion, nil):
+            throw ReplicaError.corruptArchive("The origin does not match the archive version.")
+        default:
             throw ReplicaError.unsupportedArchiveVersion(archive.formatVersion)
         }
         guard archive.taskRecords.count <= ReplicaLimits.maxTasks else {
@@ -481,7 +538,7 @@ struct TaskReplica: Sendable {
             throw ReplicaError.corruptArchive("The Lamport clock does not match the log.")
         }
         guard archive.nextLocalOriginSequence
-            == archive.versionVector[archive.deviceID] + 1
+            == archive.versionVector[archive.localOrigin] + 1
         else {
             throw ReplicaError.corruptArchive("The next local sequence is inconsistent.")
         }

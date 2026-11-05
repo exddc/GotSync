@@ -100,6 +100,106 @@ final class SyncEngineMLSTests: XCTestCase {
         try await XCTUnwrapAsync(await engine.mlsSessionForTesting?.fingerprint())
     }
 
+    func testEraseRestartAndRelinkConvergesRetainedAndNewTasks() async throws {
+        try await assertEraseRestartAndRelinkConverges(versionOneArchive: false)
+    }
+
+    func testEraseAfterUpgradeFromVersionOneArchiveConverges() async throws {
+        try await assertEraseRestartAndRelinkConverges(versionOneArchive: true)
+    }
+
+    private func assertEraseRestartAndRelinkConverges(versionOneArchive: Bool) async throws {
+        if versionOneArchive {
+            let store = MemorySecretStore()
+            stores["erase-peer"] = store
+            let identity = try InstallIdentity.loadOrCreate(store: store)
+            let directory = root.appendingPathComponent("erase-peer")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            _ = try TaskReplica(
+                deviceID: ReplicaDeviceID(bytes: identity.deviceID),
+                persistenceURL: directory.appendingPathComponent("replica-v1.json")
+            )
+        }
+        let host = engine("erase-host")
+        let peer = engine("erase-peer")
+        XCTAssertTrue(peer.addTask(title: "Before erase"))
+        let originBeforeErase = peer.replicaForTesting.localOrigin
+        if versionOneArchive {
+            XCTAssertEqual(originBeforeErase.bytes, peer.localDeviceID)
+        } else {
+            XCTAssertNotEqual(originBeforeErase.bytes, peer.localDeviceID)
+        }
+        try await pair(host, peer)
+        try await wait("initial copy") { host.tasks.map(\.titleValue) == ["Before erase"] && peer.phase == .synced }
+
+        let stableID = peer.localDeviceID
+        peer.eraseLocalData()
+        XCTAssertEqual(peer.localDeviceID, stableID)
+        XCTAssertTrue(peer.tasks.isEmpty)
+        XCTAssertNotEqual(peer.replicaForTesting.localOrigin, originBeforeErase)
+        try await wait("departure completes") { host.linkedMemberCount == 1 }
+        await peer.stop()
+
+        let restarted = engine("erase-peer")
+        XCTAssertEqual(restarted.localDeviceID, stableID)
+        XCTAssertEqual(restarted.replicaForTesting.localOrigin, peer.replicaForTesting.localOrigin)
+        XCTAssertTrue(restarted.addTask(title: "After erase"))
+        try await pair(host, restarted)
+        let expected: Set<String> = ["Before erase", "After erase"]
+        try await wait("relinked converges") {
+            Set(host.tasks.compactMap(\.titleValue)) == expected
+                && Set(restarted.tasks.compactMap(\.titleValue)) == expected
+                && host.phase == .synced && restarted.phase == .synced
+                && host.pendingMailboxOperationCount == 0 && restarted.pendingMailboxOperationCount == 0
+        }
+        XCTAssertEqual(host.tasks.map(\.id), restarted.tasks.map(\.id))
+
+        XCTAssertTrue(host.addTask(title: "After relink"))
+        try await wait("edits keep flowing") { restarted.tasks.count == 3 }
+        XCTAssertNil(host.mailboxError)
+        XCTAssertNil(restarted.mailboxError)
+    }
+
+    func testReusedOperationIDWithDifferentContentStopsSync() async throws {
+        let store = MemorySecretStore()
+        stores["legacy-peer"] = store
+        let identity = try InstallIdentity.loadOrCreate(store: store)
+        let installOrigin = try ReplicaDeviceID(bytes: identity.deviceID)
+        let peerDirectory = root.appendingPathComponent("legacy-peer")
+        let archiveURL = peerDirectory.appendingPathComponent("replica-v1.json")
+        try FileManager.default.createDirectory(at: peerDirectory, withIntermediateDirectories: true)
+        var before = try TaskReplica(deviceID: installOrigin, persistenceURL: archiveURL)
+        try before.createTask(title: "Before erase")
+
+        let host = engine("legacy-host")
+        let peer = engine("legacy-peer")
+        XCTAssertEqual(peer.replicaForTesting.localOrigin, installOrigin)
+        try await pair(host, peer)
+        try await wait("initial copy") { host.tasks.map(\.titleValue) == ["Before erase"] && peer.phase == .synced }
+        peer.eraseLocalData()
+        try await wait("departure completes") { host.linkedMemberCount == 1 }
+        await peer.stop()
+
+        try FileManager.default.removeItem(at: archiveURL)
+        var reused = try TaskReplica(deviceID: installOrigin, persistenceURL: archiveURL)
+        try reused.createTask(title: "After erase")
+        try reused.createTask(title: "Second after erase")
+        let relinked = engine("legacy-peer")
+        XCTAssertEqual(relinked.replicaForTesting.localOrigin, installOrigin)
+        let hostArchive = try host.replicaForTesting.atomicArchiveData()
+        try await pair(host, relinked)
+
+        try await wait("conflict surfaced") { host.mailboxError == .syncHistoryConflict }
+        XCTAssertEqual(host.phase, .failed)
+        XCTAssertTrue(host.mailboxRequiresRepair)
+        XCTAssertEqual(host.errorMessage, SyncError.syncHistoryConflict.errorDescription)
+        XCTAssertTrue(host.isPaired)
+        XCTAssertEqual(host.tasks.map(\.titleValue), ["Before erase"])
+        XCTAssertEqual(try host.replicaForTesting.atomicArchiveData(), hostArchive)
+        let inbox = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertFalse(inbox.isEmpty)
+    }
+
     func testPairingMergesBothReplicasAndReplicatesEdits() async throws {
         let host = engine("host")
         let joiner = engine("joiner")

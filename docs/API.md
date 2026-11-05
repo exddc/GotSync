@@ -44,6 +44,14 @@ New `SyncError` cases:
 - `syncHistoryExpired`: the relay deleted entries this device had not yet
   received, because the device was offline longer than the relay's retention
   period. It is reported like `syncHistoryBlocked`: unlink and pair again.
+- `syncHistoryConflict`: another device sent an operation whose ID this
+  device already holds with different content. It is reported like
+  `syncHistoryBlocked`. The engine applies nothing from that inbox read, and
+  the conflicting entry stays in the MLS inbox. A
+  device erased by an earlier version reused its old operation IDs and causes
+  this. Unlink the device that reports it, erase the other device, and link
+  them again; tasks created on the other device since its earlier erase are
+  lost.
 - `removedFromGroup`: another member removed this device. The engine erases
   its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
 - `approvalExpired`: the inviter did not approve the safety code within 10
@@ -102,6 +110,8 @@ the MLS state into a departure journal and publishes a proposal removing this
 device in the background; another member commits it. The journal is erased
 once the relay accepts the proposal. Both calls switch to a new MLS identity
 and fingerprint at once, so the same install can be invited again.
+`eraseLocalData()` also gives the new empty replica a new operation origin, so
+tasks created after the erase converge with the tasks other devices kept.
 
 `SecretStore` gains `write(_:account:accessibility:)`. Its default
 implementation calls `write(_:account:)`. `KeychainStore` stores the MLS state
