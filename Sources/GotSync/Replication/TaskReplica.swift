@@ -146,6 +146,116 @@ struct TaskReplica: Sendable {
         return acceptedCount
     }
 
+    /// Applies every operation whose origin sequence is next, repeating until
+    /// no more apply. A valid operation that exceeds a replica limit is
+    /// deferred together with every later operation from its origin, and
+    /// invalid operations are dropped. Each origin in `previouslyDeferred` is
+    /// retried with its first operation only.
+    mutating func applyAvailable(
+        _ operations: [TaskOperation],
+        previouslyDeferred: [TaskOperation] = [],
+        deferredLimit: Int = ReplicaLimits.maxOperations
+    ) throws -> RemoteIntake {
+        var intake = RemoteIntake()
+        var blocked = try retryDeferredHeads(previouslyDeferred, accepted: &intake.accepted)
+        var deferred: [TaskOperation] = []
+        var remaining = (previouslyDeferred + operations).sorted(by: ReplicaOrdering.operations)
+        while !remaining.isEmpty {
+            var vector = versionVector
+            var ready: [TaskOperation] = []
+            var waiting: [TaskOperation] = []
+            for operation in remaining {
+                let current = vector[operation.originDeviceID]
+                if operation.originSequence <= current {
+                    continue
+                } else if blocked.contains(operation.originDeviceID) {
+                    deferred.append(operation)
+                } else if operation.originSequence == current + 1 {
+                    ready.append(operation)
+                    vector.setSequence(operation.originSequence, for: operation.originDeviceID)
+                } else {
+                    waiting.append(operation)
+                }
+            }
+            remaining = waiting
+            guard !ready.isEmpty else {
+                break
+            }
+            for batch in try OperationBatcher.batches(ready) {
+                deferred += batch.filter { blocked.contains($0.originDeviceID) }
+                let open = batch.filter { !blocked.contains($0.originDeviceID) }
+                do {
+                    intake.accepted += try applyRemote(open)
+                } catch is ReplicaError {
+                    for operation in open {
+                        guard !blocked.contains(operation.originDeviceID) else {
+                            deferred.append(operation)
+                            continue
+                        }
+                        do {
+                            intake.accepted += try applyRemote([operation])
+                        } catch let error as ReplicaError where error.isCapacityLimit {
+                            blocked.insert(operation.originDeviceID)
+                            deferred.append(operation)
+                        } catch is ReplicaError {}
+                    }
+                }
+            }
+        }
+        intake.deferred = try Self.bounded(deferred, limit: deferredLimit)
+        intake.waiting = remaining
+        return intake
+    }
+
+    private mutating func retryDeferredHeads(
+        _ deferred: [TaskOperation],
+        accepted: inout Int
+    ) throws -> Set<ReplicaDeviceID> {
+        var blocked: Set<ReplicaDeviceID> = []
+        for origin in Set(deferred.map(\.originDeviceID)).sorted() {
+            let next = versionVector[origin] + 1
+            guard let head = deferred.first(where: {
+                $0.originDeviceID == origin && $0.originSequence == next
+            }) else {
+                continue
+            }
+            do {
+                accepted += try applyRemote([head])
+            } catch let error as ReplicaError where error.isCapacityLimit {
+                blocked.insert(origin)
+            } catch is ReplicaError {}
+        }
+        return blocked
+    }
+
+    /// Drops invalid and repeated operations and keeps the lowest sequences
+    /// when more than `limit` remain. Two operations with one ID but different
+    /// content throw, so the inbox holding them is not acknowledged.
+    private static func bounded(_ deferred: [TaskOperation], limit: Int) throws -> [TaskOperation] {
+        var byID: [OperationID: TaskOperation] = [:]
+        for operation in deferred where (try? validateOperation(operation)) != nil {
+            let id = OperationID(operation)
+            if let existing = byID[id] {
+                guard existing == operation else {
+                    throw ReplicaError.operationFork(
+                        origin: operation.originDeviceID,
+                        sequence: operation.originSequence
+                    )
+                }
+            } else {
+                byID[id] = operation
+            }
+        }
+        return byID.values
+            .sorted {
+                $0.originSequence != $1.originSequence
+                    ? $0.originSequence < $1.originSequence
+                    : $0.originDeviceID < $1.originDeviceID
+            }
+            .prefix(limit)
+            .sorted(by: ReplicaOrdering.operations)
+    }
+
     func operations(missingFrom peer: ReplicaVersionVector) -> [TaskOperation] {
         archive.operations
             .filter { $0.originSequence > peer[$0.originDeviceID] }
@@ -568,6 +678,14 @@ struct TaskReplica: Sendable {
             sequence = operation.originSequence
         }
     }
+}
+
+struct RemoteIntake: Equatable, Sendable {
+    var accepted = 0
+    /// Operations waiting on an earlier sequence from their origin.
+    var waiting: [TaskOperation] = []
+    /// Valid operations that this replica cannot hold within its limits.
+    var deferred: [TaskOperation] = []
 }
 
 private func replace<Value>(

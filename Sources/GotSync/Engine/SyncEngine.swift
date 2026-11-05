@@ -40,6 +40,10 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case syncHistoryExpired
     case removedFromGroup
     case approvalExpired
+    /// Linked devices sent valid changes that would exceed this device's task,
+    /// change-history, or device-history limit. They are kept on this device,
+    /// unapplied, until they fit or the link ends.
+    case replicaCapacityReached
 
     public var errorDescription: String? {
         switch self {
@@ -72,6 +76,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "This iPhone was removed from the sync group. Your tasks are safe on this iPhone."
         case .approvalExpired:
             "The safety code was not confirmed in time. Nothing was linked. Create a new invitation and try again."
+        case .replicaCapacityReached:
+            "This iPhone reached its limit for tasks or sync history. Changes from your other devices are saved here but cannot be shown. Your tasks are safe."
         }
     }
 
@@ -133,7 +139,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         case .invitationExpired, .pairingDeclined, .groupAtCapacity,
              .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
              .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
-             .syncHistoryExpired, .removedFromGroup, .approvalExpired:
+             .syncHistoryExpired, .removedFromGroup, .approvalExpired, .replicaCapacityReached:
             return false
         }
     }
@@ -164,6 +170,7 @@ public final class SyncEngine {
             mailboxErrorMessage: mailboxErrorMessage,
             mailboxRequiresRepair: mailboxRequiresRepair,
             mailboxCapacityReached: mailboxCapacityReached,
+            unappliedRemoteOperationCount: unappliedRemoteOperationCount,
             showsLinkCompleteCelebration: showsLinkCompleteCelebration,
             activePairingRole: activePairingRole,
             showsSavingNotice: showsSavingNotice,
@@ -223,6 +230,9 @@ public final class SyncEngine {
     public private(set) var mailboxErrorMessage: String? = nil { didSet { publishState() } }
     public private(set) var mailboxRequiresRepair = false { didSet { publishState() } }
     public private(set) var mailboxCapacityReached = false { didSet { publishState() } }
+    /// Valid remote operations kept on disk because applying them would exceed
+    /// a replica limit. While nonzero, sync reports `.replicaCapacityReached`.
+    public var unappliedRemoteOperationCount: Int { deferredOperations.count }
     public private(set) var showsLinkCompleteCelebration = false { didSet { publishState() } }
     /// Host vs joiner for the in-flight pairing attempt (presentation only).
     public private(set) var activePairingRole: DeviceRole? = nil { didSet { publishState() } }
@@ -242,6 +252,7 @@ public final class SyncEngine {
     private let deviceID: ReplicaDeviceID
     private let persistenceURL: URL
     private let checkpointURL: URL
+    private let deferredOperationsURL: URL
     private let mlsRoot: URL
     private var mlsDirectory: URL
     private let departuresDirectory: URL
@@ -250,6 +261,7 @@ public final class SyncEngine {
     private var replica: TaskReplica
     private var session: MLSSession?
     private var checkpoint: ReplicationCheckpoint? { didSet { publishState() } }
+    private var deferredOperations: [TaskOperation] = [] { didSet { publishState() } }
     private let pairingRetryDelayNanoseconds: UInt64
     private let syncIntervalNanoseconds: UInt64
     private let approvalTimeoutNanoseconds: UInt64
@@ -276,6 +288,7 @@ public final class SyncEngine {
     private var syncFailureCount = 0
     private var nextSyncAttemptAt = Date.distantPast
     private var lastCycleSucceeded = false
+    private var retriesDeferredWithoutMessages = true
     private var isHistoryBlocked = false
     private var appIsActive = true
     private var pendingMailboxSince: Date?
@@ -327,6 +340,7 @@ public final class SyncEngine {
         self.provisionalMemberWindow = provisionalMemberWindow
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
+        deferredOperationsURL = baseDirectory.appendingPathComponent(DeferredOperationStore.filename)
         mlsRoot = MLSSession.directory(in: baseDirectory)
         mlsDirectory = Self.currentMLSDirectory(in: mlsRoot)
         departuresDirectory = baseDirectory.appendingPathComponent(Self.departuresDirectoryName, isDirectory: true)
@@ -391,13 +405,21 @@ public final class SyncEngine {
                     checkpoint = nil
                 }
                 do {
+                    deferredOperations = try DeferredOperationStore.load(from: deferredOperationsURL)
+                } catch {
+                    try DeferredOperationStore.remove(at: deferredOperationsURL)
+                    deferredOperations = []
+                }
+                do {
                     session = try openSession()
                 } catch let error where Self.isUnrecoverableSessionState(error) {
                     try eraseCurrentMLSState()
                     session = try openSession()
                     if checkpoint != nil {
                         try ReplicationCheckpoint.remove(at: checkpointURL)
+                        try DeferredOperationStore.remove(at: deferredOperationsURL)
                         checkpoint = nil
+                        deferredOperations = []
                         notice = .relinkRequired
                     }
                 }
@@ -688,6 +710,7 @@ public final class SyncEngine {
                 mlsRoot: mlsRoot,
                 markerURL: markerURL
             )
+            deferredOperations = []
             mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
             session = try openSession()
             hasDurableStorage = true
@@ -720,6 +743,7 @@ public final class SyncEngine {
             }
             try ReplicationCheckpoint.remove(at: checkpointURL)
             try ReplicationCheckpoint.remove(at: joinIntentURL)
+            try discardDeferredOperations()
             try eraseCurrentMLSState()
             session = try openSession()
         } catch {
@@ -1426,7 +1450,7 @@ public final class SyncEngine {
         if isHistoryBlocked {
             phase = .failed
         } else {
-            phase = lastCycleSucceeded ? .synced : .connecting
+            phase = lastCycleSucceeded && deferredOperations.isEmpty ? .synced : .connecting
             startSyncLoop()
         }
     }
@@ -1482,6 +1506,7 @@ public final class SyncEngine {
                 startSyncLoop()
             } else if checkpoint != nil {
                 try ReplicationCheckpoint.remove(at: checkpointURL)
+                try discardDeferredOperations()
                 checkpoint = nil
                 isPaired = false
                 phase = .unpaired
@@ -1580,16 +1605,19 @@ public final class SyncEngine {
         syncFailureCount = 0
         nextSyncAttemptAt = .distantPast
         lastCycleSucceeded = true
-        if mailboxError != nil { mailboxError = nil }
-        if mailboxErrorMessage != nil { mailboxErrorMessage = nil }
+        let blocked: SyncError? = deferredOperations.isEmpty ? nil : .replicaCapacityReached
+        let message = blocked.map { Self.displayMessage(for: $0) }
+        if mailboxError != blocked { mailboxError = blocked }
+        if mailboxErrorMessage != message { mailboxErrorMessage = message }
         if mailboxRequiresRepair { mailboxRequiresRepair = false }
         if mailboxCapacityReached { mailboxCapacityReached = false }
         if mailboxState != .available { mailboxState = .available }
         guard pairingTask == nil, appIsActive else {
             return
         }
-        if errorMessage != nil { errorMessage = nil }
-        if phase != .synced { phase = .synced }
+        let settled: SyncPhase = blocked == nil ? .synced : .failed
+        if errorMessage != message { errorMessage = message }
+        if phase != settled { phase = settled }
     }
 
     private func syncFailed(_ error: Error) {
@@ -1656,7 +1684,7 @@ public final class SyncEngine {
 
     private func drainInbox(session: MLSSession) async throws {
         let messages = try await session.inbox()
-        guard let last = messages.last else {
+        guard !messages.isEmpty || (retriesDeferredWithoutMessages && !deferredOperations.isEmpty) else {
             return
         }
         let fingerprint = try await session.fingerprint()
@@ -1680,7 +1708,7 @@ public final class SyncEngine {
                 hellos.append(decoded)
             }
         }
-        let accepted = try applyRemoteOperations(&pool)
+        let (accepted, resumedDeferred) = try applyRemoteOperations(&pool)
         if accepted > 0 {
             publishReplica()
             lastSyncedAt = Date()
@@ -1690,10 +1718,12 @@ public final class SyncEngine {
             try await answer(hello, fingerprint: fingerprint, session: session)
             try requireCurrent(session)
         }
-        if !pool.isEmpty {
+        if !pool.isEmpty || resumedDeferred {
             try await send(.hello(vector: replica.versionVector, provider: nil), session: session)
         }
-        try await session.acknowledgeInbox(through: last.cursor)
+        if let last = messages.last {
+            try await session.acknowledgeInbox(through: last.cursor)
+        }
     }
 
     private func requireCurrent(_ session: MLSSession) throws {
@@ -1702,45 +1732,28 @@ public final class SyncEngine {
         }
     }
 
-    /// Applies every operation whose origin sequence is next, repeating until
-    /// no more apply. Operations still waiting on a gap remain in `pool`.
-    private func applyRemoteOperations(_ pool: inout [TaskOperation]) throws -> Int {
-        var remaining = pool.sorted(by: ReplicaOrdering.operations)
-        var accepted = 0
-        while !remaining.isEmpty {
-            var vector = replica.versionVector
-            var ready: [TaskOperation] = []
-            var waiting: [TaskOperation] = []
-            for operation in remaining {
-                let current = vector[operation.originDeviceID]
-                if operation.originSequence <= current {
-                    continue
-                } else if operation.originSequence == current + 1 {
-                    ready.append(operation)
-                    vector.setSequence(operation.originSequence, for: operation.originDeviceID)
-                } else {
-                    waiting.append(operation)
-                }
-            }
-            guard !ready.isEmpty else {
-                remaining = waiting
-                break
-            }
-            for batch in try OperationBatcher.batches(ready) {
-                do {
-                    accepted += try replica.applyRemote(batch)
-                } catch is ReplicaError {
-                    for operation in batch {
-                        do {
-                            accepted += try replica.applyRemote([operation])
-                        } catch is ReplicaError {}
-                    }
-                }
-            }
-            remaining = waiting
+    /// Applies every operation whose origin sequence is next. Operations still
+    /// waiting on a gap remain in `pool`. Operations over a replica limit are
+    /// saved, so acknowledging the inbox afterwards does not discard them.
+    /// `resumedDeferred` reports that earlier deferred operations applied.
+    private func applyRemoteOperations(_ pool: inout [TaskOperation]) throws -> (accepted: Int, resumedDeferred: Bool) {
+        let previous = deferredOperations
+        let intake = try replica.applyAvailable(
+            pool, previouslyDeferred: previous, deferredLimit: DeferredOperationStore.maximumCount
+        )
+        retriesDeferredWithoutMessages = false
+        if intake.deferred != previous {
+            try DeferredOperationStore.save(intake.deferred, to: deferredOperationsURL)
+            deferredOperations = intake.deferred
         }
-        pool = remaining
-        return accepted
+        pool = intake.waiting
+        let vector = replica.versionVector
+        return (intake.accepted, previous.contains { $0.originSequence <= vector[$0.originDeviceID] })
+    }
+
+    private func discardDeferredOperations() throws {
+        try DeferredOperationStore.remove(at: deferredOperationsURL)
+        deferredOperations = []
     }
 
     private func answer(_ hello: ReplicationMessage, fingerprint: Data, session: MLSSession) async throws {
@@ -2149,6 +2162,8 @@ public final class SyncEngine {
             return .removed
         case MLSRelayError.historyExpired:
             return .blocked(.syncHistoryExpired)
+        case ReplicaError.operationFork:
+            return .blocked(.syncHistoryBlocked)
         case MLSSessionError.unresolvedConflict, is SyncCycleError:
             return .transient
         case MLSClientError.storageUnavailable, MLSClientError.capacityReached, is MLSStoreError:
@@ -2199,6 +2214,9 @@ public final class SyncEngine {
             at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
         )
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
+        try DeferredOperationStore.remove(
+            at: persistenceURL.deletingLastPathComponent().appendingPathComponent(DeferredOperationStore.filename)
+        )
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
         }

@@ -392,4 +392,39 @@ final class EngineStorageTests: XCTestCase {
             ).isEmpty
         )
     }
+
+    @MainActor
+    func testDeferredOperationsAreLoadedAtLaunchAndErased() throws {
+        let keychain = MemorySecretStore(service: "com.gotdone.relay.tests.\(UUID().uuidString)")
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+        try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        let deferredURL = baseDirectory.appendingPathComponent(DeferredOperationStore.filename)
+        let operations = (1...3).map {
+            TaskOperation(
+                originDeviceID: ReplicaDeviceID(uuid: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!),
+                originSequence: UInt64($0),
+                lamport: UInt64($0),
+                taskID: UUID(),
+                mutation: .create(title: "Deferred \($0)", completed: false)
+            )
+        }
+
+        try DeferredOperationStore.save(operations, to: deferredURL)
+        XCTAssertEqual(try DeferredOperationStore.load(from: deferredURL), operations)
+
+        let model = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        XCTAssertEqual(model.unappliedRemoteOperationCount, 3)
+        XCTAssertEqual(model.state.unappliedRemoteOperationCount, 3)
+        model.eraseLocalData()
+        XCTAssertEqual(model.unappliedRemoteOperationCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
+
+        try Data("not deferred operations".utf8).write(to: deferredURL)
+        let relaunched = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        XCTAssertEqual(relaunched.unappliedRemoteOperationCount, 0)
+        XCTAssertNotEqual(relaunched.phase, .failed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
+    }
 }

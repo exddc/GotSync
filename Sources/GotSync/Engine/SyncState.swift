@@ -20,6 +20,7 @@ public struct SyncState: Sendable {
     public let mailboxErrorMessage: String?
     public let mailboxRequiresRepair: Bool
     public let mailboxCapacityReached: Bool
+    public let unappliedRemoteOperationCount: Int
     public let showsLinkCompleteCelebration: Bool
     public let activePairingRole: DeviceRole?
     public let showsSavingNotice: Bool

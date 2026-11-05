@@ -102,6 +102,13 @@ final class SyncAppModel: ObservableObject {
         if self.mailboxError == .unsupportedProtocolVersion {
             return SyncNotice(kind: .retrying, title: "Sync needs an update", detail: "Your tasks stay on this device. Update the app or contact the server operator to resume syncing.")
         }
+        if self.mailboxError == .replicaCapacityReached {
+            return SyncNotice(
+                kind: .retrying,
+                title: "Sync limit reached",
+                detail: "This iPhone can’t show more changes from your other phones. They stay saved here, and your tasks are safe."
+            )
+        }
         if self.phase == .failed || self.mailboxRequiresRepair {
             return SyncNotice(
                 kind: .repair,

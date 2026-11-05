@@ -48,6 +48,19 @@ New `SyncError` cases:
   its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
 - `approvalExpired`: the inviter did not approve the safety code within 10
   minutes. Nothing was linked.
+- `replicaCapacityReached`: linked devices sent valid changes that would
+  exceed this device's limit of 1,000 tasks including deleted ones, 10,000
+  retained changes, or 8 contributing devices. The engine saves up to 10,000
+  of those changes, lowest sequences first, before it acknowledges the
+  messages that carried them. It retries them after launch and whenever new
+  messages arrive, and counts them in `unappliedRemoteOperationCount`. While
+  any remain, `mailboxError` and `errorMessage` carry this case and `phase` is
+  `.failed`, but sync keeps running. `mailboxRequiresRepair` stays `false`,
+  because pairing again does not free capacity. Unlinking, removal, and
+  `eraseLocalData()` discard the saved changes; the group's other members
+  still hold them. A saved change that conflicts with a later copy of the same
+  change stops sync with `syncHistoryBlocked` and leaves the message
+  unacknowledged.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`

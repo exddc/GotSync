@@ -117,3 +117,42 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
         }
     }
 }
+
+/// Remote operations that are valid but exceed a replica limit. They are saved
+/// before the inbox messages that carried them are acknowledged.
+enum DeferredOperationStore {
+    static let filename = "replica-v1.deferred.json"
+    static let version = 1
+    static let maximumCount = ReplicaLimits.maxOperations
+
+    private struct Stored: Codable {
+        let version: Int
+        let operations: [TaskOperation]
+    }
+
+    static func load(from url: URL) throws -> [TaskOperation] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let stored = try ReplicaCanonicalJSON.decode(Stored.self, from: Data(contentsOf: url))
+        guard stored.version == version, stored.operations.count <= maximumCount else {
+            throw ReplicaError.corruptArchive("The deferred operations are unreadable.")
+        }
+        return stored.operations
+    }
+
+    static func save(_ operations: [TaskOperation], to url: URL) throws {
+        guard !operations.isEmpty else {
+            try remove(at: url)
+            return
+        }
+        try ProtectedStorage.write(
+            ReplicaCanonicalJSON.encode(Stored(version: version, operations: operations)),
+            to: url
+        )
+    }
+
+    static func remove(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+}

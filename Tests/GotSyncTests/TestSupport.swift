@@ -321,3 +321,79 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     private static func digest(_ data: Data) -> Data { Data(SHA256.hash(data: data)) }
 }
+
+/// Builds a valid replica archive directly, so tests can reach replica limits
+/// without applying thousands of operations one at a time.
+enum ReplicaFixture {
+    static func taskID(_ index: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-4000-8000-%012X", index))!
+    }
+
+    static func archive(
+        deviceID: ReplicaDeviceID,
+        taskCount: Int,
+        toggleCount: Int = 0,
+        foreignOrigins: [ReplicaDeviceID] = []
+    ) throws -> Data {
+        precondition(taskCount > 0)
+        var lamport: UInt64 = 0
+        var operations: [TaskOperation] = []
+        var records: [ReplicatedTask] = []
+        for index in 1...taskCount {
+            lamport += 1
+            let operation = TaskOperation(
+                originDeviceID: deviceID,
+                originSequence: lamport,
+                lamport: lamport,
+                taskID: taskID(index),
+                mutation: .create(title: "Task \(index)", completed: false)
+            )
+            operations.append(operation)
+            records.append(ReplicatedTask(
+                id: operation.taskID,
+                title: LWWRegister(value: "Task \(index)", stamp: operation.stamp),
+                completed: LWWRegister(value: false, stamp: operation.stamp),
+                deletion: nil
+            ))
+        }
+        let toggled = records[0].id
+        var completed = records[0].completed!
+        var vector = [deviceID: UInt64(taskCount)]
+        for _ in 0..<toggleCount {
+            lamport += 1
+            let operation = TaskOperation(
+                originDeviceID: deviceID,
+                originSequence: lamport,
+                lamport: lamport,
+                taskID: toggled,
+                mutation: .setCompleted(!completed.value)
+            )
+            operations.append(operation)
+            completed = LWWRegister(value: !completed.value, stamp: operation.stamp)
+            vector[deviceID] = lamport
+        }
+        for origin in foreignOrigins {
+            lamport += 1
+            let operation = TaskOperation(
+                originDeviceID: origin,
+                originSequence: 1,
+                lamport: lamport,
+                taskID: toggled,
+                mutation: .setCompleted(!completed.value)
+            )
+            operations.append(operation)
+            completed = LWWRegister(value: !completed.value, stamp: operation.stamp)
+            vector[origin] = 1
+        }
+        records[0].completed = completed
+        return try ReplicaArchive(
+            formatVersion: ReplicaLimits.archiveFormatVersion,
+            deviceID: deviceID,
+            nextLocalOriginSequence: vector[deviceID]! + 1,
+            lamport: lamport,
+            versionVector: ReplicaVersionVector(vector),
+            taskRecords: records,
+            operations: operations
+        ).canonicalData()
+    }
+}

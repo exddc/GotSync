@@ -140,6 +140,13 @@ editable; unlink and pair again to keep syncing. A device that stays offline
 longer than the relay keeps its unread updates reports
 `SyncError.syncHistoryExpired` and recovers the same way.
 
+A replica holds at most 1,000 tasks including deleted ones, 10,000 retained
+changes, and changes from 8 devices. When valid changes from linked devices
+would exceed a limit, the engine keeps them on the device without showing them
+and reports `SyncError.replicaCapacityReached` instead of a completed sync.
+Pairing devices whose combined tasks exceed a limit links them and reports the
+same error.
+
 Removing a device stops it from reading later changes, but it keeps the tasks
 it already has and cannot be wiped remotely. Any member can remove any other
 member; there is no administrator. The MLS integration and the pairing-frame
