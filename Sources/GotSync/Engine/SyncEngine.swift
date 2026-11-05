@@ -271,8 +271,11 @@ public final class SyncEngine {
     private var peerRefusedForTaskHistory = false
     private(set) var lastPairingFailure: SyncError?
     private var lastKnownEpoch: UInt64 = 0
+    private var reservationRequestCycles = 0
+    private static let reservationRequestInterval = 5
     var reservationHookForTesting: (@MainActor () async -> Void)?
     var afterAddHookForTesting: (@MainActor () throws -> Void)?
+    var beforeReservationRequestHookForTesting: (@MainActor () throws -> Void)?
     private var reconcileTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var syncCycleTask: Task<Void, Never>?
@@ -636,24 +639,35 @@ public final class SyncEngine {
         }
     }
 
-    /// A new member whose provider left before sending reservations asks
-    /// another member to provide them.
-    private func requestReservationsIfProviderLeft(session: MLSSession) async throws {
+    /// A new member still waiting for reservations asks again every few sync
+    /// cycles, moving to the next member each time. Only members that have
+    /// their own reservations answer, so any snapshot addressed to this member
+    /// is complete. Repeating the request also recovers one that was never
+    /// sent, for example after a restart.
+    private func requestReservationsIfStillWaiting(session: MLSSession) async throws {
         guard let current = checkpoint, current.reservationsVisible == false, !current.joinPending else {
+            reservationRequestCycles = 0
             return
         }
         let own = try await session.fingerprint()
         let roster = try await session.members().map(\.fingerprint)
-        guard let provider = current.reservationsProvider, !roster.contains(provider),
-              let next = roster.filter({ $0 != own }).sorted(by: { $0.lexicographicallyPrecedes($1) }).first
-        else {
+            .filter { $0 != own }
+            .sorted { $0.lexicographicallyPrecedes($1) }
+        let providerLeft = current.reservationsProvider.map { !roster.contains($0) } ?? true
+        reservationRequestCycles += 1
+        guard !roster.isEmpty, providerLeft || reservationRequestCycles >= Self.reservationRequestInterval else {
             return
         }
-        guard var latest = checkpoint, latest.group == current.group else {
+        reservationRequestCycles = 0
+        let next = current.reservationsProvider
+            .flatMap { provider in roster.first { !$0.lexicographicallyPrecedes(provider) && $0 != provider } }
+            ?? roster[0]
+        guard var latest = checkpoint, latest.group == current.group, latest.reservationsVisible == false else {
             return
         }
         latest.reservationsProvider = next
         try saveCheckpoint(latest)
+        try beforeReservationRequestHookForTesting?()
         try await send(.hello(vector: replica.versionVector, provider: next), session: session)
     }
 
@@ -1340,11 +1354,9 @@ public final class SyncEngine {
             var added = false
             for _ in 0..<Self.maximumAddAttempts where !added {
                 try requireCurrentPairingAttempt(attemptID)
-                guard try await claim.allowsAdd(atEpoch: session.epoch()) else {
-                    break
-                }
                 if case .accepted = try await session.add(
-                    keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference
+                    keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference,
+                    beforeEpoch: claim.epoch &+ OriginReservation.leaseEpochs
                 ) {
                     added = true
                 }
@@ -2075,7 +2087,7 @@ public final class SyncEngine {
         try await drainInbox(session: session)
         try await processRemovals(session: session)
         try await releaseAbandonedReservations(session: session)
-        try await requestReservationsIfProviderLeft(session: session)
+        try await requestReservationsIfStillWaiting(session: session)
         if checkpoint?.joinPending == true {
             try await announceJoin(session: session)
         }
@@ -2121,8 +2133,7 @@ public final class SyncEngine {
         if var current = checkpoint, !updates.isEmpty || !(current.originReservations ?? []).isEmpty {
             let waiting = current.reservationsVisible == false
             let snapshot = waiting ? updates.first {
-                $0.message.kind == .reservations && $0.sender == current.reservationsProvider
-                    && $0.message.member == fingerprint
+                $0.message.kind == .reservations && $0.message.member == fingerprint
             } : nil
             let merged = Self.merge(
                 updates.filter { $0.message.kind != .reservations || $0.cursor == snapshot?.cursor },
@@ -2224,7 +2235,7 @@ public final class SyncEngine {
             return isProvider
         }
         try await send(operations, session: session)
-        if isProvider {
+        if isProvider, checkpoint?.reservationsVisible != false {
             try await send(
                 .reservations(
                     checkpoint?.originReservations ?? [],
@@ -2752,5 +2763,6 @@ extension SyncEngine {
     var awaitsReservationsForTesting: Bool { checkpoint?.reservationsVisible == false }
     var reservationsForTesting: [OriginReservation] { checkpoint?.originReservations ?? [] }
     var provisionalMembersForTesting: [Data] { checkpoint?.provisionalMembers.map(\.fingerprint) ?? [] }
+    var reservationsProviderForTesting: Data? { checkpoint?.reservationsProvider }
     var mlsDirectoryForTesting: URL { mlsDirectory }
 }

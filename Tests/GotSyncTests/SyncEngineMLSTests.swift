@@ -687,6 +687,93 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("snapshot arrives") { !joiner.awaitsReservationsForTesting }
     }
 
+    func testExpiredLeaseCannotAuthorizeALateAdd() async throws {
+        let (host, second, first, other, group) = try await linkedPairWithDisjointJoiners("lease")
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        let gate = SyncTestGate()
+        host.reservationHookForTesting = { await gate.pause() }
+        defer { gate.release() }
+        first.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && first.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("host reserved") { gate.isPaused }
+        host.reservationHookForTesting = nil
+        let commitsPerCycle = 2
+        for cycle in 1...Int(OriginReservation.leaseEpochs) / commitsPerCycle {
+            let transient = engine("lease-transient-\(cycle)")
+            try await pair(second, transient)
+            let transientFingerprint = try await fingerprint(transient)
+            XCTAssertTrue(second.removeDevice(fingerprint: transientFingerprint))
+            try await wait("transient \(cycle) removed") { second.linkedMemberCount == 2 }
+            await transient.stop()
+        }
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(second)])
+        try await pair(second, other)
+        gate.release()
+        try await wait("host attempt ends") { !host.canCancelPairing && (first.isPaired || first.phase == .failed) }
+        XCTAssertFalse(first.isPaired)
+        XCTAssertEqual(host.lastPairingFailure, .invalidPairMessage)
+        await relay.holdApplications(except: nil)
+        for engine in [host, second, first, other] { engine.applicationDidBecomeActive() }
+        try await settle([host, second, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host, second], group: group)
+        XCTAssertTrue(other.isPaired)
+    }
+
+    func testReplacementProviderMustHoldItsOwnReservations() async throws {
+        let (host, second, first, other, _) = try await linkedPairWithDisjointJoiners("replace")
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(second)])
+        try await pair(host, first)
+        let late = engine("replace-late")
+        let later = engine("replace-later")
+        try await pair(host, late)
+        try await pair(host, later)
+        XCTAssertTrue(late.awaitsReservationsForTesting)
+        XCTAssertTrue(later.awaitsReservationsForTesting)
+        let hostFingerprint = try await fingerprint(host)
+        XCTAssertTrue(second.removeDevice(fingerprint: hostFingerprint))
+        try await wait("host removed") { second.linkedMemberCount == 4 }
+        await relay.holdApplications(except: [
+            try await authorization(second), try await authorization(late), try await authorization(later),
+        ])
+        for engine in [second, late, later] { engine.applicationDidBecomeActive() }
+        try await wait("complete snapshots", timeout: .seconds(30)) {
+            !late.awaitsReservationsForTesting && !later.awaitsReservationsForTesting
+        }
+        let firstFingerprint = try await fingerprint(first)
+        XCTAssertTrue(late.reservationsForTesting.contains { $0.member == firstFingerprint })
+        XCTAssertTrue(later.reservationsForTesting.contains { $0.member == firstFingerprint })
+        other.joinPrivateSync(url: try await invite(late))
+        try await wait("other refused") { other.phase == .failed && !late.canCancelPairing }
+        XCTAssertEqual(late.lastPairingFailure, .taskHistoryAtCapacity)
+        await relay.holdApplications(except: nil)
+    }
+
+    func testUnsentReplacementRequestIsRetriedAfterRestart() async throws {
+        let host = engine("unsent-host")
+        let second = engine("unsent-second")
+        try await pair(host, second)
+        try await wait("second sees reservations") { !second.awaitsReservationsForTesting }
+        let gate = SyncTestGate()
+        host.inboxReadHookForTesting = { await gate.pause() }
+        defer { gate.release() }
+        var joiner = engine("unsent-joiner")
+        try await pair(host, joiner)
+        try await wait("host stops answering") { gate.isPaused }
+        try await wait("joiner announced") { joiner.phase == .synced }
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+        joiner.beforeReservationRequestHookForTesting = { throw CancellationError() }
+        let hostFingerprint = try await fingerprint(host)
+        let secondFingerprint = try await fingerprint(second)
+        XCTAssertTrue(second.removeDevice(fingerprint: hostFingerprint))
+        try await wait("replacement saved but not sent") { joiner.reservationsProviderForTesting == secondFingerprint }
+        await joiner.stop()
+        joiner = engine("unsent-joiner")
+        try await wait("request retried", timeout: .seconds(20)) {
+            joiner.isPaired && !joiner.awaitsReservationsForTesting
+        }
+    }
+
     func testReservationMergeKeepsOrderOwnershipAndLocalEvidence() {
         let owner = Data(repeating: 1, count: 32)
         let stranger = Data(repeating: 2, count: 32)

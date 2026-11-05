@@ -124,10 +124,25 @@ actor MLSSession {
         }
     }
 
-    func add(keyPackage: Data, verifiedFingerprint: Data, reference: Data) async throws -> MLSSubmission {
+    /// With `beforeEpoch`, the Add is prepared only while the group epoch is
+    /// below it; otherwise the result is `.superseded`. The check runs in the
+    /// same serialized step that prepares the commit.
+    func add(
+        keyPackage: Data,
+        verifiedFingerprint: Data,
+        reference: Data,
+        beforeEpoch: UInt64? = nil
+    ) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit {
-                try await $0.prepareAdd(keyPackage: keyPackage, verifiedFingerprint: verifiedFingerprint, reference: reference)
+            try await session.submit { client in
+                if let beforeEpoch {
+                    guard try await client.epoch() < beforeEpoch else {
+                        return nil
+                    }
+                }
+                return try await client.prepareAdd(
+                    keyPackage: keyPackage, verifiedFingerprint: verifiedFingerprint, reference: reference
+                )
             }
         }
     }

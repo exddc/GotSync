@@ -394,7 +394,7 @@ refuse; that loses a joiner but never admits one that does not fit.
 
 A reservation is a lease measured in MLS epochs, never wall-clock time. The
 owner adds the joiner only while the group epoch is below the reservation's
-epoch plus 8. A competing commit discards a prepared Add instead of moving it
+epoch plus 8, checked in the same serialized step that prepares the Add. A competing commit discards a prepared Add instead of moving it
 to a later epoch, so the Add can apply only within that window. A member that
 has processed the window without seeing the joiner join knows the Add can no
 longer happen and drops the reservation. A reservation counts while it is
@@ -410,16 +410,17 @@ member.
 
 A new member cannot read reservations published before it joined. When the
 inviter answers the new member's join `hello`, it sends a `reservations`
-message for that member with every claim it holds. The new member accepts
-only the snapshot addressed to it by the member it asked, and merges claims
-by their original log cursor. A known claim keeps its local state, and a
-release that arrives before the snapshot is kept, so a late snapshot never
-undoes a release or an admission. Members that already have their snapshot
-ignore later ones. Until the snapshot arrives, the new member refuses to
-invite and reports `SyncError.privateSyncUnreachable`. If its inviter leaves
-the group first, it sends a new `hello` naming another member, which answers
-the same way. This state survives restarts, including recovery after an
-interrupted join.
+message for that member with every claim it holds. Only a member that has
+its own snapshot answers, so a snapshot addressed to the new member is
+complete as of the `hello` it answers. The new member merges claims by their
+original log cursor. A known claim keeps its local state, and a release that
+arrives before the snapshot is kept, so a late snapshot never undoes a
+release or an admission. Members that already have their snapshot ignore
+later ones. Until the snapshot arrives, the new member refuses to invite and
+reports `SyncError.privateSyncUnreachable`. While it waits, it sends a new
+`hello` naming the next member every five sync cycles, and at once if the
+member it asked has left. This state survives restarts, including recovery
+after an interrupted join or a request that was never sent.
 
 Admission refuses while 16 or more claims are active. In normal use a group
 of eight has far fewer. A checkpoint never drops an active claim below 64
