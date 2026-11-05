@@ -183,6 +183,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var groups: [Data: Group] = [:]
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
+    private var droppedWriterAppend: (writer: Data, accepted: Int)?
     private var appendsUnavailable = false
     private(set) var rejectedAppends = 0
     private var failWelcomeAcknowledgement = false
@@ -192,6 +193,12 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var acknowledgementCount = 0
 
     func dropNextAppendResponse() { dropAppendResponse = true }
+    /// Drops the response to `authorization`'s next new application entry
+    /// after `accepted` more, then makes appends unavailable.
+    func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int) {
+        droppedWriterAppend = (Self.digest(authorization), accepted)
+    }
+    var isWriterAppendDropPending: Bool { droppedWriterAppend != nil }
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
     func expireHistory(group: Data) { expiredGroups.insert(group) }
 
@@ -280,6 +287,14 @@ actor FakeMLSRelay: MLSRelayTransport {
         for removed in [delivery.removeWriter, delivery.kind == .proposal ? sender : nil].compactMap({ $0 })
         where groups[delivery.group]?.writers[removed]?.removal == nil {
             groups[delivery.group]?.writers[removed]?.removal = cursor
+        }
+        if let drop = droppedWriterAppend, drop.writer == sender, delivery.kind == .application {
+            guard drop.accepted > 0 else {
+                droppedWriterAppend = nil
+                appendsUnavailable = true
+                throw URLError(.networkConnectionLost)
+            }
+            droppedWriterAppend = (drop.writer, drop.accepted - 1)
         }
         return try respond(.accepted(cursor: cursor))
     }

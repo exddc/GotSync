@@ -438,4 +438,39 @@ final class EngineStorageTests: XCTestCase {
         XCTAssertEqual(repaired.phase, .unpaired)
         XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
     }
+
+    @MainActor
+    func testReplyObligationKeepsLowestRequestAndFailsClosedWhenUnreadable() throws {
+        let a = ReplicaDeviceID(uuid: UUID())
+        let b = ReplicaDeviceID(uuid: UUID())
+        var obligation = ReplyObligation()
+        obligation.merge(try ReplicaVersionVector([a: 5, b: 2]), provider: true)
+        obligation.merge(try ReplicaVersionVector([a: 3]), provider: true)
+        XCTAssertEqual(obligation.provided, try ReplicaVersionVector([a: 3]))
+        XCTAssertNil(obligation.own)
+        obligation.advance(past: (4...6).map {
+            TaskOperation(originDeviceID: a, originSequence: $0, lamport: $0, taskID: UUID(), mutation: .setCompleted(true))
+        })
+        XCTAssertEqual(obligation.provided, try ReplicaVersionVector([a: 6]))
+
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+        try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        let url = baseDirectory.appendingPathComponent(ReplyObligation.filename)
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+        try ReplyObligation.save(nil, to: url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        let unreadable = Data("not a reply obligation".utf8)
+        try unreadable.write(to: url)
+        let keychain = MemorySecretStore(service: "com.gotdone.relay.tests.\(UUID().uuidString)")
+        let engine = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        XCTAssertEqual(engine.phase, .failed)
+        XCTAssertEqual(engine.errorMessage, SyncError.localStorageUnavailable.errorDescription)
+        XCTAssertEqual(try Data(contentsOf: url), unreadable)
+        engine.eraseLocalData()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
 }

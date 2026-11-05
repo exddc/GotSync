@@ -63,7 +63,10 @@ New `SyncError` cases:
   still hold them. A full store blocks inbox progress until the device unlinks
   or erases. Local uploads continue while the delivery inbox is full, until a
   commit from another member waits behind the held messages; MLS must process
-  that commit before this device can send again. If the saved changes cannot be read at launch, the file is kept,
+  that commit before this device can send again. Requests from other members for
+  missing changes are saved before their messages are acknowledged and
+  answered after catching up, one batch at a time, resuming after a failed
+  send or restart. If the saved changes or saved requests cannot be read at launch, the files are kept,
   the engine reports `localStorageUnavailable` in `mailboxError` and
   `errorMessage` with `phase` `.failed`, sets `mailboxRequiresRepair` while
   linked, and neither syncs nor pairs. `unlinkAndKeepTasks()` or

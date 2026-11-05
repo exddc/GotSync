@@ -156,3 +156,75 @@ enum DeferredOperationStore {
         }
     }
 }
+
+/// Hellos this device acknowledged before answering them in full. Answers are
+/// sent from here after the log is caught up, one batch at a time, and resume
+/// after a failed send or a restart.
+struct ReplyObligation: Codable, Equatable, Sendable {
+    static let filename = "sync-v2-replies.json"
+    static let version = 1
+
+    var version = Self.version
+    /// Lowest vector among hellos that ask for this device's own operations.
+    var own: ReplicaVersionVector?
+    /// Lowest vector among hellos that name this device as provider, which
+    /// asks for every origin.
+    var provided: ReplicaVersionVector?
+
+    var isEmpty: Bool { own == nil && provided == nil }
+
+    mutating func merge(_ vector: ReplicaVersionVector, provider: Bool) {
+        if provider {
+            provided = Self.lower(provided, vector)
+        } else {
+            own = Self.lower(own, vector)
+        }
+    }
+
+    /// Records that `operations`, a prefix of the answer in replica order,
+    /// was delivered.
+    mutating func advance(past operations: [TaskOperation]) {
+        for operation in operations {
+            own?.raise(operation)
+            provided?.raise(operation)
+        }
+    }
+
+    private static func lower(_ current: ReplicaVersionVector?, _ vector: ReplicaVersionVector) -> ReplicaVersionVector {
+        guard let current else { return vector }
+        var result = ReplicaVersionVector()
+        for origin in current.origins {
+            result.setSequence(min(current[origin], vector[origin]), for: origin)
+        }
+        return result
+    }
+
+    static func load(from url: URL) throws -> ReplyObligation? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let stored = try ReplicaCanonicalJSON.decode(ReplyObligation.self, from: Data(contentsOf: url))
+        guard stored.version == version else {
+            throw ReplicaError.corruptArchive("The reply obligation is unreadable.")
+        }
+        return stored.isEmpty ? nil : stored
+    }
+
+    static func save(_ obligation: ReplyObligation?, to url: URL) throws {
+        guard let obligation, !obligation.isEmpty else {
+            try remove(at: url)
+            return
+        }
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(obligation), to: url)
+    }
+
+    static func remove(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+}
+
+private extension ReplicaVersionVector {
+    mutating func raise(_ operation: TaskOperation) {
+        setSequence(max(self[operation.originDeviceID], operation.originSequence), for: operation.originDeviceID)
+    }
+}

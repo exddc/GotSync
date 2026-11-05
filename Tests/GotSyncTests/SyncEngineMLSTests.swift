@@ -1187,6 +1187,95 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("upload after recovery") { peer.tasks.contains { $0.titleValue == "Outbound 3" } }
     }
 
+    func testHeldHelloIsAnsweredAfterCommitBehindFullInbox() async throws {
+        var host = engine("hh-host")
+        XCTAssertTrue(host.addTask(title: "Host task"))
+        let peer = engine("hh-peer")
+        let third = engine("hh-third")
+        try await pair(host, peer)
+        try await pair(host, third)
+        try await wait("linked") {
+            [host, peer, third].allSatisfy {
+                $0.linkedMemberCount == 3 && $0.phase == .synced && $0.pendingMailboxOperationCount == 0
+            } && peer.tasks.contains { $0.titleValue == "Host task" }
+        }
+        let thirdFingerprint = try await fingerprint(third)
+
+        await relay.setAppendsUnavailable(true)
+        XCTAssertTrue(host.addTask(title: "Pending"))
+        try await wait("pending delivery left behind") {
+            try await host.mlsSessionForTesting?.pendingDelivery() != nil && host.mailboxState == .unavailable
+        }
+        await restartable(host)
+        await restartable(third)
+        await relay.setAppendsUnavailable(false)
+
+        let session = try XCTUnwrap(peer.mlsSessionForTesting)
+        guard case .accepted = try await session.send(
+            ReplicationMessage.hello(vector: ReplicaVersionVector(), provider: nil).encoded()
+        ) else {
+            return XCTFail("The hello was not delivered.")
+        }
+        let origin = ReplicaDeviceID(uuid: UUID())
+        let task = UUID()
+        try await send([create(origin, 1, task: task, title: "Busy")], from: peer)
+        for sequence: UInt64 in 2...1_050 {
+            try await send([toggle(origin, sequence, task: task)], from: peer)
+        }
+        XCTAssertTrue(peer.removeDevice(fingerprint: thirdFingerprint))
+        try await wait("commit behind the full inbox", timeout: .seconds(60)) { peer.linkedMemberCount == 2 }
+
+        host = engine("hh-host")
+        try await wait("recovered", timeout: .seconds(60)) {
+            host.phase == .synced && host.linkedMemberCount == 2
+                && host.tasks.first { $0.id == task }?.isCompleted == true
+                && peer.tasks.contains { $0.titleValue == "Pending" }
+        }
+        let inbox = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertTrue(inbox.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("hh-host/\(ReplyObligation.filename)").path
+        ))
+    }
+
+    func testProviderReplySpansBatchesAcrossLostResponseAndRestart() async throws {
+        var host = try await seededEngine("reply-host", taskCount: 600)
+        let first = engine("reply-first")
+        try await pair(host, first)
+        let obligationURL = root.appendingPathComponent("reply-host/\(ReplyObligation.filename)")
+        try await wait("first copy", timeout: .seconds(30)) {
+            first.tasks.count == 600 && host.pendingMailboxOperationCount == 0 && host.phase == .synced
+                && !FileManager.default.fileExists(atPath: obligationURL.path)
+        }
+        let authorization = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.client.transportAuthorization())
+        var replyBatches = 0
+        host.replyBatchHookForTesting = { [relay] in
+            replyBatches += 1
+            if replyBatches == 2 {
+                await relay?.dropAppendResponse(of: authorization, afterAccepting: 0)
+            }
+        }
+
+        let joiner = engine("reply-joiner")
+        try await pair(host, joiner)
+        try await wait("second reply batch lost", timeout: .seconds(30)) {
+            await !self.relay.isWriterAppendDropPending && host.mailboxState == .unavailable
+        }
+        try await wait("accepted reply batches received") {
+            joiner.tasks.count == 2 * ReplicaLimits.maxBatchOperations
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: obligationURL.path))
+
+        await restartable(host)
+        await relay.setAppendsUnavailable(false)
+        host = engine("reply-host")
+        try await wait("every reply delivered", timeout: .seconds(30)) {
+            joiner.tasks.count == 600 && host.phase == .synced
+        }
+        XCTAssertEqual(Set(joiner.tasks.map(\.id)), Set(first.tasks.map(\.id)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: obligationURL.path))
+    }
+
     func testConflictingCopyOfDeferredHeadIsRejectedOnceItFits() async throws {
         var host = try await seededEngine("fork-host", taskCount: ReplicaLimits.maxTasks)
         let peer = engine("fork-peer")

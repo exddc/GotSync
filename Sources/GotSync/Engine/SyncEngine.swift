@@ -254,6 +254,7 @@ public final class SyncEngine {
     private let persistenceURL: URL
     private let checkpointURL: URL
     private let deferredOperationsURL: URL
+    private let replyObligationURL: URL
     private let mlsRoot: URL
     private var mlsDirectory: URL
     private let departuresDirectory: URL
@@ -286,18 +287,20 @@ public final class SyncEngine {
     private var departureTask: Task<Void, Never>?
     private var syncCycleID: UUID?
     var inboxReadHookForTesting: (@MainActor () async -> Void)?
+    var replyBatchHookForTesting: (@MainActor () async -> Void)?
     private var syncCycleRequested = false
     private var syncFailureCount = 0
     private var nextSyncAttemptAt = Date.distantPast
     private var lastCycleSucceeded = false
     private var retriesDeferredWithoutMessages = true
-    /// The deferred file exists but cannot be read. Sync stays off so it is
-    /// never overwritten; unlinking or erasing discards it.
-    private var isDeferredStoreUnreadable = false
+    /// The deferred or reply file exists but cannot be read. Sync stays off
+    /// so neither is overwritten; unlinking or erasing discards both.
+    private var isHeldSyncStateUnreadable = false
     /// The last drain left messages unacknowledged because their blocked
     /// operations did not fit.
     private var isInboxBackpressured = false
     private var answeredHeldHelloCursors: Set<UInt64> = []
+    private var replyObligation: ReplyObligation?
     private var isHistoryBlocked = false
     private var appIsActive = true
     private var pendingMailboxSince: Date?
@@ -352,6 +355,7 @@ public final class SyncEngine {
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
         deferredOperationsURL = baseDirectory.appendingPathComponent(DeferredOperationStore.filename)
+        replyObligationURL = baseDirectory.appendingPathComponent(ReplyObligation.filename)
         mlsRoot = MLSSession.directory(in: baseDirectory)
         mlsDirectory = Self.currentMLSDirectory(in: mlsRoot)
         departuresDirectory = baseDirectory.appendingPathComponent(Self.departuresDirectoryName, isDirectory: true)
@@ -417,8 +421,9 @@ public final class SyncEngine {
                 }
                 do {
                     deferredOperations = try DeferredOperationStore.load(from: deferredOperationsURL)
+                    replyObligation = try ReplyObligation.load(from: replyObligationURL)
                 } catch {
-                    isDeferredStoreUnreadable = true
+                    isHeldSyncStateUnreadable = true
                 }
                 do {
                     session = try openSession()
@@ -428,8 +433,10 @@ public final class SyncEngine {
                     if checkpoint != nil {
                         try ReplicationCheckpoint.remove(at: checkpointURL)
                         try DeferredOperationStore.remove(at: deferredOperationsURL)
+                        try ReplyObligation.remove(at: replyObligationURL)
                         checkpoint = nil
                         deferredOperations = []
+                        replyObligation = nil
                         notice = .relinkRequired
                     }
                 }
@@ -446,7 +453,7 @@ public final class SyncEngine {
         if let bootError {
             phase = .failed
             errorMessage = Self.displayMessage(for: bootError)
-        } else if isDeferredStoreUnreadable {
+        } else if isHeldSyncStateUnreadable {
             phase = .failed
             mailboxError = .localStorageUnavailable
             mailboxErrorMessage = Self.displayMessage(for: SyncError.localStorageUnavailable)
@@ -728,7 +735,8 @@ public final class SyncEngine {
                 markerURL: markerURL
             )
             deferredOperations = []
-            isDeferredStoreUnreadable = false
+            replyObligation = nil
+            isHeldSyncStateUnreadable = false
             isInboxBackpressured = false
             mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
             session = try openSession()
@@ -803,7 +811,7 @@ public final class SyncEngine {
         appIsActive = false
         syncLoopTask?.cancel()
         syncLoopTask = nil
-        guard isPaired, pairingTask == nil, !isHistoryBlocked, !isDeferredStoreUnreadable else {
+        guard isPaired, pairingTask == nil, !isHistoryBlocked, !isHeldSyncStateUnreadable else {
             return
         }
         phase = .offline
@@ -878,7 +886,7 @@ public final class SyncEngine {
     // MARK: - Pairing
 
     private func beginInvitation(linked: Bool) {
-        guard let session, !isDeferredStoreUnreadable else {
+        guard let session, !isHeldSyncStateUnreadable else {
             fail(SyncError.localStorageUnavailable)
             return
         }
@@ -904,7 +912,7 @@ public final class SyncEngine {
     }
 
     private func beginJoin(with invitation: Invitation) {
-        guard let session, !isDeferredStoreUnreadable else {
+        guard let session, !isHeldSyncStateUnreadable else {
             fail(SyncError.localStorageUnavailable)
             return
         }
@@ -1548,7 +1556,7 @@ public final class SyncEngine {
             isPaired,
             session != nil,
             !isHistoryBlocked,
-            !isDeferredStoreUnreadable
+            !isHeldSyncStateUnreadable
         else {
             return
         }
@@ -1576,7 +1584,7 @@ public final class SyncEngine {
             hasDurableStorage,
             isPaired,
             !isHistoryBlocked,
-            !isDeferredStoreUnreadable,
+            !isHeldSyncStateUnreadable,
             appIsActive || allowInactive,
             force || Date() >= nextSyncAttemptAt,
             let session
@@ -1681,7 +1689,12 @@ public final class SyncEngine {
         guard hasDurableStorage else {
             throw SyncError.localStorageUnavailable
         }
-        _ = try await session.flush()
+        var flushed = true
+        do {
+            _ = try await session.flush()
+        } catch MLSClientError.capacityReached {
+            flushed = false
+        }
         try await drainInbox(session: session, retriesDeferred: false)
         var synchronized = false
         for _ in 0..<4 where !synchronized {
@@ -1698,6 +1711,10 @@ public final class SyncEngine {
             throw MLSSessionError.removed
         }
         try await drainInbox(session: session)
+        if !flushed {
+            _ = try await session.flush()
+        }
+        try await sendReplies(session: session)
         try await processRemovals(session: session)
         if checkpoint?.joinPending == true {
             try await announceJoin(session: session)
@@ -1708,9 +1725,9 @@ public final class SyncEngine {
     /// `retriesDeferred` allows a retry of deferred operations with an empty
     /// inbox. Pass `false` before fetching, so that a fetched copy of a
     /// deferred operation is compared with it before either applies.
-    /// Returns whether any message was acknowledged. Held messages are
-    /// acknowledged before anything is sent, except from the first hello that
-    /// still needs an answer, so a send that must catch up finds inbox room.
+    /// Returns whether any message was acknowledged. Hellos become a saved
+    /// reply obligation before acknowledgement and are answered by
+    /// `sendReplies`, so no send can hold messages in the inbox.
     @discardableResult
     private func drainInbox(session: MLSSession, retriesDeferred: Bool = true) async throws -> Bool {
         let messages = try await session.inbox()
@@ -1750,23 +1767,26 @@ public final class SyncEngine {
         }
         let held = application.heldArrivals
         isInboxBackpressured = held < messages.count
-        let pending = hellos.filter { $0.index < held || !answeredHeldHelloCursors.contains(messages[$0.index].cursor) }
-        let beforeAnswers = min(pending.first?.index ?? held, held)
-        if beforeAnswers > 0 {
-            try await session.acknowledgeInbox(through: messages[beforeAnswers - 1].cursor)
-        }
-        for hello in pending {
-            try await answer(hello.message, fingerprint: fingerprint, session: session)
-            try requireCurrent(session)
+        var obligation = replyObligation ?? ReplyObligation()
+        for hello in hellos {
+            let cursor = messages[hello.index].cursor
+            guard hello.index < held || !answeredHeldHelloCursors.contains(cursor),
+                  let vector = hello.message.vector
+            else {
+                continue
+            }
+            obligation.merge(vector, provider: hello.message.provider == fingerprint)
             if hello.index >= held {
-                answeredHeldHelloCursors.insert(messages[hello.index].cursor)
+                answeredHeldHelloCursors.insert(cursor)
             }
         }
-        if held > beforeAnswers {
-            try await session.acknowledgeInbox(through: messages[held - 1].cursor)
+        if obligation != (replyObligation ?? ReplyObligation()) {
+            try ReplyObligation.save(obligation, to: replyObligationURL)
+            replyObligation = obligation
         }
         if held > 0 {
             let acknowledged = messages[held - 1].cursor
+            try await session.acknowledgeInbox(through: acknowledged)
             answeredHeldHelloCursors = answeredHeldHelloCursors.filter { $0 > acknowledged }
         }
         if (!pool.isEmpty && held > 0) || application.resumedDeferred {
@@ -1832,24 +1852,46 @@ public final class SyncEngine {
 
     private func discardDeferredOperations() throws {
         try DeferredOperationStore.remove(at: deferredOperationsURL)
+        try ReplyObligation.remove(at: replyObligationURL)
         deferredOperations = []
-        isDeferredStoreUnreadable = false
+        replyObligation = nil
+        isHeldSyncStateUnreadable = false
         isInboxBackpressured = false
         answeredHeldHelloCursors = []
     }
 
-    private func answer(_ hello: ReplicationMessage, fingerprint: Data, session: MLSSession) async throws {
-        guard let vector = hello.vector, let uploadedThrough = checkpoint?.uploadedThrough else {
-            return
-        }
-        let isProvider = hello.provider == fingerprint
-        let operations = replica.operations(missingFrom: vector).filter {
-            if $0.originDeviceID == deviceID {
-                return $0.originSequence <= uploadedThrough
+    /// Sends what saved hellos asked for: this device's uploaded operations,
+    /// and every origin for a hello that named this device as provider.
+    private func sendReplies(session: MLSSession) async throws {
+        while let obligation = replyObligation {
+            guard let uploadedThrough = checkpoint?.uploadedThrough else {
+                return
             }
-            return isProvider
+            var answer: [TaskReplica.OperationID: TaskOperation] = [:]
+            if let own = obligation.own {
+                for operation in replica.operations(missingFrom: own)
+                where operation.originDeviceID == deviceID && operation.originSequence <= uploadedThrough {
+                    answer[TaskReplica.OperationID(operation)] = operation
+                }
+            }
+            if let provided = obligation.provided {
+                for operation in replica.operations(missingFrom: provided)
+                where operation.originDeviceID != deviceID || operation.originSequence <= uploadedThrough {
+                    answer[TaskReplica.OperationID(operation)] = operation
+                }
+            }
+            let batch = try OperationBatcher.batches(answer.values.sorted(by: ReplicaOrdering.operations)).first
+            if let batch {
+                await replyBatchHookForTesting?()
+                try await send(.operations(batch), session: session)
+                try requireCurrent(session)
+            }
+            var remaining = obligation
+            remaining.advance(past: batch ?? [])
+            let next: ReplyObligation? = batch == nil ? nil : remaining
+            try ReplyObligation.save(next, to: replyObligationURL)
+            replyObligation = next
         }
-        try await send(operations, session: session)
     }
 
     private func announceJoin(session: MLSSession) async throws {
@@ -2298,6 +2340,9 @@ public final class SyncEngine {
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
         try DeferredOperationStore.remove(
             at: persistenceURL.deletingLastPathComponent().appendingPathComponent(DeferredOperationStore.filename)
+        )
+        try ReplyObligation.remove(
+            at: persistenceURL.deletingLastPathComponent().appendingPathComponent(ReplyObligation.filename)
         )
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
