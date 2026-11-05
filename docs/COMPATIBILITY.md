@@ -105,6 +105,12 @@ the other build's response and reports `SyncError.invalidPairMessage`, then
 declines, so the joiner reports `SyncError.pairingDeclined`. Devices that are already linked keep syncing; only new pairings
 need every device updated.
 
+Current builds also send `reservation`, `release`, and `reservations`
+replication messages. Earlier builds skip them, so an earlier build neither
+publishes nor counts reservations, and a device it invites never receives a
+snapshot and cannot invite while that inviter stays in the group. Update
+every device before inviting.
+
 ## Future changes
 
 Within version 2, preserve required fields, hash and HKDF labels, canonical

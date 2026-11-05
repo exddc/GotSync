@@ -53,8 +53,13 @@ New `SyncError` cases:
   slot for each current member and this device, up to
   `ReplicaLimits.maxOrigins` (128). Creating, inviting,
   or joining fails before anything is linked. The inviter counts the joiner's
-  history too, and both devices report this error when the merged history
-  would not fit. Current members keep syncing.
+  history and every device another member is adding at the same time, and
+  both devices report this error when the merged history would not fit.
+  Current members keep syncing.
+
+A device that has just joined cannot invite until its inviter has sent it the
+group's pending reservations, usually within one sync cycle. Until then,
+`inviteToGroup()` fails with `SyncError.privateSyncUnreachable`.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`

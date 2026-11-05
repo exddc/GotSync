@@ -191,7 +191,19 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var lastPublishedReference: Data?
     private(set) var acknowledgementCount = 0
 
+    private var heldApplicationWriters: Set<Data>?
+
     func dropNextAppendResponse() { dropAppendResponse = true }
+    /// Rejects application messages from every writer except `authorizations`
+    /// until called with `nil`.
+    func holdApplications(except authorizations: [Data]?) {
+        heldApplicationWriters = authorizations.map { Set($0.map(Self.digest)) }
+    }
+
+    func activeWriterCount(group: Data) -> Int {
+        groups[group]?.writers.values.filter { $0.removal == nil }.count ?? 0
+    }
+
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
     func expireHistory(group: Data) { expiredGroups.insert(group) }
 
@@ -259,6 +271,9 @@ actor FakeMLSRelay: MLSRelayTransport {
             throw URLError(.notConnectedToInternet)
         }
         if expiredGroups.contains(delivery.group) { throw MLSRelayError.historyExpired }
+        if let allowed = heldApplicationWriters, delivery.kind == .application, !allowed.contains(Self.digest(authorization)) {
+            throw URLError(.notConnectedToInternet)
+        }
         guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
             throw MLSRelayError.unauthorized
         }

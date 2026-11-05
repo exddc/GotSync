@@ -194,6 +194,7 @@ final class SyncEngineMLSTests: XCTestCase {
         try await pair(host, second)
         try await wait("second has history") {
             second.tasks.count == ReplicaLimits.maxOrigins - 3 && second.linkedMemberCount == 2
+                && !second.awaitsReservationsForTesting
         }
         XCTAssertFalse(host.isTaskHistoryAtCapacity)
         XCTAssertFalse(second.isTaskHistoryAtCapacity)
@@ -218,16 +219,12 @@ final class SyncEngineMLSTests: XCTestCase {
     func testApprovalRechecksTaskHistoryAgainstMembersAddedMeanwhile() async throws {
         let (host, second) = try await membersSharingOneFreeOriginSlot()
         let (third, fourth) = try await pendingJoiners(host, second)
-        let secondErrors = ErrorMessageLog(second)
-        defer { secondErrors.stop() }
 
         host.approveSafetyCode()
         try await wait("third linked") { third.isPaired && host.linkedMemberCount == 3 }
         second.approveSafetyCode()
         try await wait("fourth refused") { fourth.phase == .failed && !second.canCancelPairing }
-        try await wait("inviter reports capacity") {
-            secondErrors.messages.contains(SyncError.taskHistoryAtCapacity.errorDescription!)
-        }
+        XCTAssertEqual(second.lastPairingFailure, .taskHistoryAtCapacity)
         XCTAssertFalse(fourth.isPaired)
         XCTAssertEqual(fourth.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
 
@@ -263,13 +260,9 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("transient removed") { second.linkedMemberCount == 2 }
         XCTAssertFalse(host.tasks.contains { $0.titleValue == "Transient task" })
 
-        let hostErrors = ErrorMessageLog(host)
-        defer { hostErrors.stop() }
         host.approveSafetyCode()
         try await wait("late refused") { late.phase == .failed && !host.canCancelPairing }
-        try await wait("host reports capacity") {
-            hostErrors.messages.contains(SyncError.taskHistoryAtCapacity.errorDescription!)
-        }
+        XCTAssertEqual(host.lastPairingFailure, .taskHistoryAtCapacity)
         XCTAssertFalse(late.isPaired)
         gate.release()
         try await wait("host applies transient edit") {
@@ -390,6 +383,429 @@ final class SyncEngineMLSTests: XCTestCase {
     private func sealed(_ body: Data, kind: UInt8, key: SymmetricKey) throws -> Data {
         let associated = Data("\(ProtocolDomains.namespace)/mls-pairing-frame/v2".utf8) + Data([kind])
         return try Data([kind]) + ChaChaPoly.seal(body, using: key, authenticating: associated).combined
+    }
+
+    private func authorization(_ engine: SyncEngine) async throws -> Data {
+        try await XCTUnwrapAsync(engine.mlsSessionForTesting).client.transportAuthorization()
+    }
+
+    private func settle(_ engines: [SyncEngine]) async throws {
+        var last: [Int] = []
+        var stable = 0
+        for _ in 0..<150 {
+            let snapshot = engines.flatMap { [$0.tasks.count, $0.pendingMailboxOperationCount, $0.linkedMemberCount] }
+            stable = snapshot == last ? stable + 1 : 0
+            last = snapshot
+            if stable >= 20 { return }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTFail("devices did not settle")
+    }
+
+    private func assertAtMostOneJoinerLinked(
+        _ joiners: [SyncEngine],
+        localTasks: [Set<UUID>],
+        members: [SyncEngine],
+        group: Data,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let linked = Set(members[0].linkedDevices.map(\.deviceID))
+        let admitted = joiners.filter { $0.isPaired && linked.contains($0.localDeviceID) }
+        XCTAssertLessThanOrEqual(admitted.count, 1, file: file, line: line)
+        let sets = Set((members + admitted).map { Set($0.tasks.map(\.id)) })
+        XCTAssertEqual(sets.count, 1, "linked devices diverge", file: file, line: line)
+        for (joiner, tasks) in zip(joiners, localTasks) where !admitted.contains(where: { $0 === joiner }) {
+            XCTAssertFalse(joiner.isPaired, file: file, line: line)
+            XCTAssertTrue(Set(joiner.tasks.map(\.id)).isSuperset(of: tasks), file: file, line: line)
+            let leftover = try await joiner.mlsSessionForTesting?.group()
+            XCTAssertNil(leftover, "refused joiner kept MLS group state", file: file, line: line)
+        }
+        for member in members {
+            XCTAssertEqual(member.linkedMemberCount, members.count + admitted.count, file: file, line: line)
+        }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, members.count + admitted.count, file: file, line: line)
+    }
+
+    private func linkedPairWithDisjointJoiners(
+        _ prefix: String,
+        shared: Int = 0,
+        own: Int = 70
+    ) async throws -> (SyncEngine, SyncEngine, SyncEngine, SyncEngine, Data) {
+        let host = engine("\(prefix)-host")
+        let second = engine("\(prefix)-second")
+        try await pair(host, second)
+        try await wait("second sees reservations") { !second.awaitsReservationsForTesting }
+        let common = shared > 0 ? retiredOperations(shared) : []
+        let first = try await engineWithHistory("\(prefix)-j1", operations: common + retiredOperations(own))
+        let other = try await engineWithHistory("\(prefix)-j2", operations: common + retiredOperations(own))
+        return (host, second, first, other, try await groupID(host))
+    }
+
+    private func approveConcurrently(
+        host: SyncEngine, second: SyncEngine, first: SyncEngine, other: SyncEngine
+    ) async throws {
+        first.joinPrivateSync(url: try await invite(host))
+        other.joinPrivateSync(url: try await invite(second))
+        try await wait("both safety codes") {
+            host.isHostApprovalPending && second.isHostApprovalPending && first.safetyCode != nil && other.safetyCode != nil
+        }
+        host.approveSafetyCode()
+        second.approveSafetyCode()
+        try await wait("both decisions final") {
+            !host.canCancelPairing && !second.canCancelPairing
+                && [first, other].allSatisfy { $0.isPaired || $0.phase == .failed }
+        }
+    }
+
+    func testConcurrentInvitersAdmitAtMostOneDisjointJoiner() async throws {
+        let (host, second, first, other, group) = try await linkedPairWithDisjointJoiners("cc")
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        try await approveConcurrently(host: host, second: second, first: first, other: other)
+        try await settle([host, second, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host, second], group: group)
+    }
+
+    func testConcurrentInvitersCountJoinerWhoseHistoryIsHeld() async throws {
+        let (host, second, first, other, group) = try await linkedPairWithDisjointJoiners("held")
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(second)])
+        try await approveConcurrently(host: host, second: second, first: first, other: other)
+        await relay.holdApplications(except: nil)
+        for engine in [host, second, first, other] { engine.applicationDidBecomeActive() }
+        try await settle([host, second, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host, second], group: group)
+    }
+
+    func testInvitationAfterEarlierJoinerWelcomeCountsItsReservation() async throws {
+        let (host, second, first, other, group) = try await linkedPairWithDisjointJoiners("seq")
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(second)])
+        try await pair(host, first)
+        try await wait("second sees first", timeout: .seconds(20)) { second.linkedMemberCount == 3 }
+        other.joinPrivateSync(url: try await invite(second))
+        try await wait("other refused") { other.phase == .failed && !second.canCancelPairing }
+        XCTAssertEqual(other.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+        await relay.holdApplications(except: nil)
+        for engine in [host, second, first, other] { engine.applicationDidBecomeActive() }
+        try await settle([host, second, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host, second], group: group)
+        XCTAssertTrue(first.isPaired)
+    }
+
+    func testFoundingReservationSurvivesRestartAndRefusesDisjointSecondJoiner() async throws {
+        var host = engine("found-host")
+        let first = try await engineWithRetiredOrigins("found-j1", count: 70)
+        let other = try await engineWithRetiredOrigins("found-j2", count: 70)
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        await relay.holdApplications(except: [try await authorization(host)])
+        try await pair(host, first)
+        let group = try await groupID(host)
+        await host.stop()
+        host = engine("found-host")
+        try await wait("restarted host linked") { host.isPaired && host.linkedMemberCount == 2 }
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+        other.joinPrivateSync(url: try await invite(host))
+        try await wait("other refused") { other.phase == .failed && !host.canCancelPairing }
+        XCTAssertEqual(other.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+        await relay.holdApplications(except: nil)
+        for engine in [host, first, other] { engine.applicationDidBecomeActive() }
+        try await settle([host, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host], group: group)
+        XCTAssertTrue(first.isPaired)
+        XCTAssertEqual(Set(host.tasks.map(\.id)), local[0])
+    }
+
+    func testConcurrentJoinersWithOverlappingHistoriesWithinCapacityBothLink() async throws {
+        let (host, second, first, other, _) = try await linkedPairWithDisjointJoiners("overlap", shared: 50, own: 10)
+        try await approveConcurrently(host: host, second: second, first: first, other: other)
+        XCTAssertTrue(first.isPaired)
+        XCTAssertTrue(other.isPaired)
+        try await wait("four members converge", timeout: .seconds(20)) {
+            [host, second, first, other].allSatisfy { $0.linkedMemberCount == 4 && $0.tasks.count == 70 }
+        }
+    }
+
+    func testNewMemberInvitesOnlyAfterItsInviterSendsReservations() async throws {
+        let host = engine("visible-host")
+        XCTAssertTrue(host.addTask(title: "Host task"))
+        let joiner = engine("visible-joiner")
+        await relay.holdApplications(except: [try await authorization(host)])
+        try await pair(host, joiner)
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+        joiner.createPrivateSync()
+        XCTAssertNil(joiner.invitationURL)
+        XCTAssertEqual(joiner.errorMessage, SyncError.privateSyncUnreachable.errorDescription)
+        await relay.holdApplications(except: nil)
+        joiner.applicationDidBecomeActive()
+        try await wait("snapshot arrives") { !joiner.awaitsReservationsForTesting }
+        joiner.createPrivateSync()
+        try await wait("joiner invites") { joiner.invitationURL != nil }
+        XCTAssertEqual(joiner.tasks.map(\.titleValue), ["Host task"])
+        joiner.cancelPairing(preserveLink: true)
+    }
+
+    func testEarlierClaimWinsWhenBothInvitersReserveBeforeEitherAdds() async throws {
+        let (host, second, first, other, group) = try await linkedPairWithDisjointJoiners("forced")
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        let hostGate = SyncTestGate()
+        let secondGate = SyncTestGate()
+        host.reservationHookForTesting = { await hostGate.pause() }
+        second.reservationHookForTesting = { await secondGate.pause() }
+        first.joinPrivateSync(url: try await invite(host))
+        other.joinPrivateSync(url: try await invite(second))
+        try await wait("both safety codes") {
+            host.isHostApprovalPending && second.isHostApprovalPending && first.safetyCode != nil && other.safetyCode != nil
+        }
+        host.approveSafetyCode()
+        second.approveSafetyCode()
+        try await wait("both reserved") { hostGate.isPaused && secondGate.isPaused }
+        let owners = [try await fingerprint(host), try await fingerprint(second)]
+        let cursors = zip([host, second], owners).map { engine, owner in
+            engine.reservationsForTesting.first { $0.owner == owner }?.cursor ?? 0
+        }
+        XCTAssertFalse(cursors.contains(0))
+        hostGate.release()
+        secondGate.release()
+        try await wait("both decisions final") {
+            !host.canCancelPairing && !second.canCancelPairing
+                && [first, other].allSatisfy { $0.isPaired || $0.phase == .failed }
+        }
+        let winner = cursors[0] < cursors[1] ? first : other
+        XCTAssertTrue(winner.isPaired)
+        XCTAssertEqual((cursors[0] < cursors[1] ? second : host).lastPairingFailure, .taskHistoryAtCapacity)
+        try await settle([host, second, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host, second], group: group)
+    }
+
+    func testCancelledAdmissionReleasesItsReservation() async throws {
+        let host = engine("cancel-host")
+        let second = engine("cancel-second")
+        try await pair(host, second)
+        try await wait("second sees reservations") { !second.awaitsReservationsForTesting }
+        let joiner = try await engineWithRetiredOrigins("cancel-joiner", count: 70)
+        let gate = SyncTestGate()
+        host.reservationHookForTesting = { await gate.pause() }
+        joiner.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && joiner.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("reserved") { gate.isPaused }
+        let claim = try XCTUnwrap(host.reservationsForTesting.last)
+        host.cancelPairing(preserveLink: true)
+        gate.release()
+        try await wait("released by its owner") {
+            host.reservationsForTesting.allSatisfy { $0.cursor != claim.cursor || $0.released }
+        }
+        try await wait("others drop it") { !second.reservationsForTesting.contains { $0.cursor == claim.cursor } }
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+        let writers = await relay.activeWriterCount(group: try await groupID(host))
+        XCTAssertEqual(writers, 2)
+    }
+
+    func testFoundingClaimSurvivesCrashBetweenAddAndCheckpoint() async throws {
+        var host = engine("crash-host")
+        let first = try await engineWithRetiredOrigins("crash-j1", count: 70)
+        let other = try await engineWithRetiredOrigins("crash-j2", count: 70)
+        await relay.holdApplications(except: [try await authorization(host)])
+        host.afterAddHookForTesting = { throw CancellationError() }
+        first.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && first.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("first joined") { first.isPaired }
+        await host.stop()
+        host = engine("crash-host")
+        try await wait("recovered link") { host.isPaired && host.linkedMemberCount == 2 }
+        let firstFingerprint = try await fingerprint(first)
+        XCTAssertEqual(host.reservationsForTesting.map(\.member), [firstFingerprint])
+        other.joinPrivateSync(url: try await invite(host))
+        try await wait("other refused") { other.phase == .failed && !host.canCancelPairing }
+        XCTAssertEqual(other.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+        await relay.holdApplications(except: nil)
+    }
+
+    func testDrainDoesNotOverwriteAdmissionStateSavedMeanwhile() async throws {
+        let host = engine("overwrite-host")
+        let second = engine("overwrite-second")
+        try await pair(host, second)
+        try await wait("second sees reservations") { !second.awaitsReservationsForTesting }
+        let joiner = try await engineWithRetiredOrigins("overwrite-joiner", count: 5)
+        joiner.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && joiner.safetyCode != nil }
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(second)])
+        let gate = SyncTestGate()
+        host.inboxReadHookForTesting = { await gate.pause() }
+        XCTAssertTrue(second.addTask(title: "Fills the host inbox"))
+        try await wait("host drain paused") { gate.isPaused }
+        host.inboxReadHookForTesting = nil
+        host.approveSafetyCode()
+        try await wait("joiner admitted") { joiner.isPaired && !host.canCancelPairing }
+        let joinerFingerprint = try await fingerprint(joiner)
+        gate.release()
+        try await wait("drain finished") { host.tasks.contains { $0.titleValue == "Fills the host inbox" } }
+        XCTAssertTrue(host.reservationsForTesting.contains { $0.member == joinerFingerprint })
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(joinerFingerprint))
+        await relay.holdApplications(except: nil)
+    }
+
+    func testNewMemberAsksAnotherMemberWhenItsProviderLeaves() async throws {
+        let host = engine("leaving-host")
+        let second = engine("leaving-second")
+        try await pair(host, second)
+        try await wait("second sees reservations") { !second.awaitsReservationsForTesting }
+        let joiner = engine("leaving-joiner")
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(second)])
+        try await pair(host, joiner)
+        try await wait("second sees joiner") { second.linkedMemberCount == 3 }
+        let hostFingerprint = try await fingerprint(host)
+        XCTAssertTrue(second.removeDevice(fingerprint: hostFingerprint))
+        try await wait("provider removed") { second.linkedMemberCount == 2 }
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+        await relay.holdApplications(except: nil)
+        joiner.applicationDidBecomeActive()
+        try await wait("second provides reservations", timeout: .seconds(20)) { !joiner.awaitsReservationsForTesting }
+    }
+
+    func testRecoveredJoinerStillWaitsForReservations() async throws {
+        let host = engine("recover-host")
+        XCTAssertTrue(host.addTask(title: "Host task"))
+        await relay.failNextWelcomeAcknowledgement()
+        var joiner = engine("recover-joiner")
+        joiner.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && joiner.safetyCode != nil }
+        await relay.holdApplications(except: [try await authorization(host)])
+        host.approveSafetyCode()
+        try await wait("interrupted after admission") { joiner.phase == .failed }
+        await joiner.stop()
+        joiner = engine("recover-joiner")
+        try await wait("recovered membership") { joiner.isPaired }
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+        joiner.createPrivateSync()
+        XCTAssertNil(joiner.invitationURL)
+        await relay.holdApplications(except: nil)
+        joiner.applicationDidBecomeActive()
+        try await wait("snapshot arrives") { !joiner.awaitsReservationsForTesting }
+    }
+
+    func testReservationMergeKeepsOrderOwnershipAndLocalEvidence() {
+        let owner = Data(repeating: 1, count: 32)
+        let stranger = Data(repeating: 2, count: 32)
+        let member = Data(repeating: 3, count: 32)
+        let origins = (1...3).map { _ in ReplicaDeviceID(uuid: UUID()) }.sorted()
+        func update(_ cursor: UInt64, _ sender: Data, _ message: ReplicationMessage) -> SyncEngine.ReservationUpdate {
+            SyncEngine.ReservationUpdate(cursor: cursor, sender: sender, message: message)
+        }
+        let claimed = SyncEngine.merge([
+            update(9, owner, .reservation(member: member, origins: origins, epoch: 4)),
+            update(5, owner, .reservation(member: stranger, origins: [origins[0]], epoch: 4)),
+            update(10, stranger, .release(member: member, reservation: 9)),
+            update(11, owner, .release(member: member, reservation: 5)),
+        ], into: [], snapshotsFor: nil)
+        XCTAssertEqual(claimed.map(\.cursor), [5, 9])
+        XCTAssertEqual(claimed.map(\.released), [false, false])
+        XCTAssertEqual(claimed[1].owner, owner)
+        XCTAssertEqual(claimed[1].origins, origins)
+
+        let released = SyncEngine.merge(
+            [update(12, owner, .release(member: member, reservation: 9))], into: claimed, snapshotsFor: nil
+        )
+        XCTAssertEqual(released.map(\.released), [false, true])
+        var stale = claimed
+        stale.append(OriginReservation(member: stranger, owner: owner, origins: [], epoch: 1, cursor: 30))
+        let snapshot = SyncEngine.merge(
+            [update(20, owner, .reservations(stale, overflowed: false, for: member))], into: released, snapshotsFor: member
+        )
+        XCTAssertEqual(snapshot.map(\.cursor), [5, 9])
+        XCTAssertEqual(snapshot.map(\.released), [false, true])
+        XCTAssertEqual(
+            SyncEngine.merge([update(20, owner, .reservations(stale, overflowed: false, for: member))], into: [], snapshotsFor: nil),
+            []
+        )
+        XCTAssertEqual(
+            SyncEngine.merge([update(20, owner, .reservations(stale, overflowed: false, for: stranger))], into: [], snapshotsFor: member),
+            []
+        )
+
+        let tombstoned = SyncEngine.merge([
+            update(12, owner, .release(member: member, reservation: 9)),
+            update(20, owner, .reservations(claimed, overflowed: false, for: member)),
+        ], into: [], snapshotsFor: member)
+        XCTAssertEqual(tombstoned.first { $0.cursor == 9 }?.released, true)
+        let later = SyncEngine.merge(
+            [update(20, owner, .reservations(claimed, overflowed: false, for: member))],
+            into: SyncEngine.merge([update(12, owner, .release(member: member, reservation: 9))], into: [], snapshotsFor: member),
+            snapshotsFor: member
+        )
+        XCTAssertEqual(later.first { $0.cursor == 9 }?.released, true)
+    }
+
+    func testReservationLeaseUsesEpochsAndNeverLapsesForMembers() {
+        let member = Data(repeating: 3, count: 32)
+        let origins = (1...2).map { _ in ReplicaDeviceID(uuid: UUID()) }.sorted()
+        var claim = OriginReservation(member: member, owner: member, origins: origins, epoch: 10, cursor: 1)
+        let lastEpoch = 10 + OriginReservation.leaseEpochs - 1
+        XCTAssertTrue(claim.allowsAdd(atEpoch: lastEpoch))
+        XCTAssertFalse(claim.allowsAdd(atEpoch: lastEpoch + 1))
+        XCTAssertTrue(claim.isActive(roster: [], epoch: lastEpoch))
+        XCTAssertFalse(claim.isActive(roster: [], epoch: lastEpoch + 1))
+        XCTAssertTrue(claim.isActive(roster: [member], epoch: 1_000))
+        claim.released = true
+        XCTAssertFalse(claim.isActive(roster: [], epoch: 10))
+        XCTAssertTrue(claim.isActive(roster: [member], epoch: 10))
+
+        func prune(_ entries: [OriginReservation], roster: Set<Data>, epoch: UInt64, retained: Set<ReplicaDeviceID>, keepReleases: Bool = false) -> [OriginReservation] {
+            SyncEngine.prune(entries, roster: roster, epoch: epoch, retained: retained, keepReleases: keepReleases).kept
+        }
+        let pending = OriginReservation(member: member, owner: member, origins: origins, epoch: 10, cursor: 1)
+        XCTAssertEqual(prune([pending], roster: [], epoch: lastEpoch, retained: []), [pending])
+        XCTAssertEqual(prune([pending], roster: [], epoch: lastEpoch + 1, retained: []), [])
+        let joined = prune([pending], roster: [member], epoch: 1_000, retained: [origins[0]])
+        XCTAssertEqual(joined.map(\.admitted), [true])
+        XCTAssertEqual(prune(joined, roster: [member], epoch: 1_000, retained: Set(origins)), [])
+        XCTAssertEqual(prune(joined, roster: [], epoch: 1_000, retained: []), [])
+        var tombstone = pending
+        tombstone.released = true
+        XCTAssertEqual(prune([tombstone], roster: [], epoch: 10, retained: [], keepReleases: true), [tombstone])
+        XCTAssertEqual(prune([tombstone], roster: [], epoch: 10, retained: []), [])
+
+        func claims(_ count: Int) -> [OriginReservation] {
+            (1...UInt64(count)).map {
+                OriginReservation(member: Data(repeating: UInt8($0 % 250), count: 32), owner: member, origins: [], epoch: 10, cursor: $0)
+            }
+        }
+        let active = SyncEngine.prune(claims(OriginReservation.maximumActive + 1), roster: [], epoch: 10, retained: [], keepReleases: false)
+        XCTAssertEqual(active.kept.count, OriginReservation.maximumActive + 1)
+        XCTAssertFalse(active.overflowed)
+        let flood = SyncEngine.prune(claims(OriginReservation.maximumStored + 1), roster: [], epoch: 10, retained: [], keepReleases: false)
+        XCTAssertEqual(flood.kept.count, OriginReservation.maximumStored)
+        XCTAssertTrue(flood.overflowed)
+    }
+
+    func testReservationMessagesAreCanonicalAndBounded() throws {
+        let member = Data(repeating: 3, count: 32)
+        let origins = (1...ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let reservation = ReplicationMessage.reservation(member: member, origins: origins, epoch: 2)
+        XCTAssertEqual(try ReplicationMessage.decode(reservation.encoded()), reservation)
+        XCTAssertEqual(reservation.origins, origins.sorted())
+        let release = ReplicationMessage.release(member: member, reservation: 7)
+        XCTAssertEqual(try ReplicationMessage.decode(release.encoded()), release)
+        let snapshot = ReplicationMessage.reservations(
+            [OriginReservation(member: member, owner: member, origins: origins.sorted(), epoch: 2, cursor: 7)],
+            overflowed: true, for: member
+        )
+        XCTAssertEqual(try ReplicationMessage.decode(snapshot.encoded()), snapshot)
+
+        var unsorted = reservation
+        unsorted.origins = origins.sorted().reversed()
+        var oversized = reservation
+        oversized.origins = (origins + [ReplicaDeviceID(uuid: UUID())]).sorted()
+        var unbound = release
+        unbound.reservation = nil
+        var anonymous = snapshot
+        anonymous.member = nil
+        for message in [unsorted, oversized, unbound, anonymous] {
+            XCTAssertThrowsError(try ReplicationMessage.decode(ReplicaCanonicalJSON.encode(message)))
+        }
     }
 
     func testJoinerWithFullTaskHistoryIsRefusedBeforeLinking() async throws {
@@ -908,7 +1324,9 @@ final class SyncEngineMLSTests: XCTestCase {
             linked.append(joiner)
             let expected = linked.count
             let current = linked
-            try await wait("membership") { current.allSatisfy { $0.linkedMemberCount == expected } }
+            try await wait("membership") {
+                current.allSatisfy { $0.linkedMemberCount == expected && !$0.awaitsReservationsForTesting }
+            }
         }
         let all = linked
         try await wait("synced") { all.allSatisfy { $0.phase == .synced && $0.pendingMailboxOperationCount == 0 } }
@@ -920,7 +1338,14 @@ final class SyncEngineMLSTests: XCTestCase {
     private func retainedState(of name: String, engine: SyncEngine, copy: String) async throws -> MLSClient {
         let source = engine.mlsDirectoryForTesting
         let destination = root.appendingPathComponent(copy)
-        try FileManager.default.copyItem(at: source, to: destination)
+        for attempt in 1...5 {
+            do {
+                try FileManager.default.copyItem(at: source, to: destination)
+                break
+            } catch CocoaError.fileNoSuchFile where attempt < 5 {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
         let key = try XCTUnwrap(stores[name]?.read(account: SecretStoreMLSStateKey.account))
         return try MLSClient(
             directory: destination,
@@ -1265,25 +1690,4 @@ private final class SyncTestGate {
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
     try XCTUnwrap(value, file: file, line: line)
-}
-
-@MainActor
-private final class ErrorMessageLog {
-    private(set) var messages: [String] = []
-    private var observer: Task<Void, Never>?
-
-    init(_ engine: SyncEngine) {
-        let states = engine.states()
-        observer = Task { [weak self] in
-            for await state in states {
-                if let message = state.errorMessage {
-                    self?.messages.append(message)
-                }
-            }
-        }
-    }
-
-    func stop() {
-        observer?.cancel()
-    }
 }

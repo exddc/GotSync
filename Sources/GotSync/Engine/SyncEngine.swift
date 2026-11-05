@@ -269,6 +269,10 @@ public final class SyncEngine {
     private var approvalContinuation: CheckedContinuation<ApprovalOutcome, Never>?
     private var peerDecision: Bool?
     private var peerRefusedForTaskHistory = false
+    private(set) var lastPairingFailure: SyncError?
+    private var lastKnownEpoch: UInt64 = 0
+    var reservationHookForTesting: (@MainActor () async -> Void)?
+    var afterAddHookForTesting: (@MainActor () throws -> Void)?
     private var reconcileTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var syncCycleTask: Task<Void, Never>?
@@ -453,7 +457,18 @@ public final class SyncEngine {
     /// retained origin holds a slot, and every current member, including this
     /// device, reserves one more whether or not it has edited yet.
     public var isTaskHistoryAtCapacity: Bool {
-        originSlotsInUse(memberCount: linkedDeviceIDs.count) >= ReplicaLimits.maxOrigins
+        guard checkpoint?.reservationsOverflowed != true else {
+            return true
+        }
+        let roster = Set(checkpoint?.members.map(\.fingerprint) ?? [])
+        let claims = (checkpoint?.originReservations ?? []).filter { $0.isActive(roster: roster, epoch: lastKnownEpoch) }
+        guard claims.count < OriginReservation.maximumActive else {
+            return true
+        }
+        return originSlotsInUse(
+            memberCount: roster.union(claims.map(\.member)).count,
+            pending: Set(claims.flatMap(\.origins))
+        ) >= ReplicaLimits.maxOrigins
     }
 
     private func originSlotsInUse(memberCount: Int, pending: Set<ReplicaDeviceID> = []) -> Int {
@@ -468,33 +483,293 @@ public final class SyncEngine {
         Set(retained).union(pending).count + max(memberCount, 1)
     }
 
-    /// Origins named by application messages that MLS has delivered but the
-    /// replica has not applied yet, including those from removed members.
-    private func pendingOrigins(session: MLSSession) async throws -> Set<ReplicaDeviceID> {
-        var origins: Set<ReplicaDeviceID> = []
+    private struct AdmissionView {
+        var pending: Set<ReplicaDeviceID> = []
+        var reservations: [OriginReservation] = []
+    }
+
+    /// Origins the group has already committed to but this replica has not
+    /// retained: operations and hello vectors delivered but not applied yet,
+    /// plus every reservation known from the inbox or the checkpoint. The
+    /// inbox is read before the checkpoint because a drain saves reservations
+    /// before it acknowledges the inbox. Any received operation the engine
+    /// holds without applying must add its origin to `pending` here too.
+    private func admissionView(session: MLSSession) async throws -> AdmissionView {
+        var view = AdmissionView()
+        var updates: [ReservationUpdate] = []
         for message in try await session.inbox() {
             guard let decoded = try? ReplicationMessage.decode(message.plaintext) else {
                 continue
             }
-            origins.formUnion(decoded.operations?.map(\.originDeviceID) ?? [])
-            origins.formUnion(decoded.vector?.origins ?? [])
+            view.pending.formUnion(decoded.operations?.map(\.originDeviceID) ?? [])
+            view.pending.formUnion(decoded.vector?.origins ?? [])
+            if ReservationUpdate.kinds.contains(decoded.kind) {
+                updates.append(ReservationUpdate(cursor: message.cursor, sender: message.sender, message: decoded))
+            }
         }
-        return origins
+        view.reservations = Self.merge(updates, into: checkpoint?.originReservations ?? [], snapshotsFor: nil)
+        return view
     }
 
-    /// Slots in use once a joiner holding `joinerOrigins` is counted with the
-    /// group's retained, pending, and reserved origins.
-    private func admissionSlots(
+    private enum Admission {
+        case fits
+        case taskHistoryFull
+        case groupFull
+    }
+
+    /// Counts the joiner against every origin and member slot the group has
+    /// committed to. With `before`, only claims earlier in the relay log
+    /// count, so of two claims the later one always counts the earlier.
+    private func admission(
+        of joiner: Data,
+        origins joinerOrigins: Set<ReplicaDeviceID>,
         session: MLSSession,
         linked: Bool,
-        joinerOrigins: Set<ReplicaDeviceID>,
-        memberCount: Int
-    ) async throws -> Int {
-        var pending = joinerOrigins
-        if linked {
-            try await pending.formUnion(pendingOrigins(session: session))
+        before cursor: UInt64?
+    ) async throws -> Admission {
+        guard checkpoint?.reservationsOverflowed != true else {
+            return .taskHistoryFull
         }
-        return originSlotsInUse(memberCount: memberCount, pending: pending)
+        var roster: Set<Data> = [try await session.fingerprint()]
+        var view = AdmissionView()
+        var epoch: UInt64 = 0
+        if linked {
+            epoch = try await session.epoch()
+            view = try await admissionView(session: session)
+            roster = Set(try await session.members().map(\.fingerprint))
+            lastKnownEpoch = max(lastKnownEpoch, epoch)
+        }
+        let claims = view.reservations.filter { claim in
+            claim.isActive(roster: roster, epoch: epoch) && cursor.map { claim.cursor < $0 } ?? true
+        }
+        guard claims.count < OriginReservation.maximumActive else {
+            return .taskHistoryFull
+        }
+        let members = roster.union(claims.map(\.member)).union([joiner])
+        guard members.count <= Self.maximumGroupSize else {
+            return .groupFull
+        }
+        let pending = view.pending.union(claims.flatMap(\.origins)).union(joinerOrigins)
+        return originSlotsInUse(memberCount: members.count, pending: pending) <= ReplicaLimits.maxOrigins
+            ? .fits : .taskHistoryFull
+    }
+
+    private func requireAdmission(
+        of joiner: Data,
+        origins: Set<ReplicaDeviceID>,
+        session: MLSSession,
+        linked: Bool,
+        before cursor: UInt64?,
+        connection: any PairingConnection,
+        invitation: Invitation
+    ) async throws {
+        switch try await admission(of: joiner, origins: origins, session: session, linked: linked, before: cursor) {
+        case .fits:
+            return
+        case .taskHistoryFull:
+            try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
+        case .groupFull:
+            throw SyncError.groupAtCapacity
+        }
+    }
+
+    /// Publishes a claim for `joiner` and returns it as recorded at its log
+    /// position. A linked inviter also saves it before adding anyone.
+    private func reserve(
+        _ joiner: Data,
+        origins: Set<ReplicaDeviceID>,
+        session: MLSSession
+    ) async throws -> OriginReservation {
+        let epoch = try await session.epoch()
+        let message = ReplicationMessage.reservation(member: joiner, origins: Array(origins), epoch: epoch)
+        guard case .accepted(let cursor) = try await session.send(message.encoded()) else {
+            throw SyncCycleError.notDelivered
+        }
+        let claim = OriginReservation(
+            member: joiner, owner: try await session.fingerprint(), origins: message.origins ?? [],
+            epoch: epoch, cursor: cursor
+        )
+        if var current = checkpoint {
+            current.originReservations = Self.upserting(claim, into: current.originReservations ?? [])
+            try saveCheckpoint(current)
+        } else {
+            try saveFoundingClaims(Self.upserting(claim, into: loadFoundingClaims()))
+        }
+        return claim
+    }
+
+    /// Withdraws a claim. A device never receives its own messages, so the
+    /// claim is also marked released here.
+    private func releaseReservation(_ claim: OriginReservation, session: MLSSession) async {
+        let message = ReplicationMessage.release(member: claim.member, reservation: claim.cursor)
+        guard (try? await session.send(message.encoded())).map({ if case .accepted = $0 { true } else { false } }) == true else {
+            return
+        }
+        var released = claim
+        released.released = true
+        if var current = checkpoint {
+            current.originReservations = Self.upserting(released, into: current.originReservations ?? [], replacing: true)
+            try? saveCheckpoint(current)
+        } else {
+            try? saveFoundingClaims(Self.upserting(released, into: loadFoundingClaims(), replacing: true))
+        }
+    }
+
+    /// Releases this device's own claims that no pairing will use: their
+    /// device never joined, the lease still runs, and no Add is waiting to be
+    /// sent.
+    private func releaseAbandonedReservations(session: MLSSession) async throws {
+        guard pairingTask == nil, !(checkpoint?.originReservations ?? []).isEmpty else {
+            return
+        }
+        let own = try await session.fingerprint()
+        let epoch = try await session.epoch()
+        let roster = Set(try await session.members().map(\.fingerprint))
+        guard try await session.pendingDelivery() == nil, pairingTask == nil else {
+            return
+        }
+        let abandoned = (checkpoint?.originReservations ?? []).filter {
+            $0.owner == own && !$0.released && !$0.admitted && !roster.contains($0.member) && $0.allowsAdd(atEpoch: epoch)
+        }
+        for claim in abandoned {
+            await releaseReservation(claim, session: session)
+        }
+    }
+
+    /// A new member whose provider left before sending reservations asks
+    /// another member to provide them.
+    private func requestReservationsIfProviderLeft(session: MLSSession) async throws {
+        guard let current = checkpoint, current.reservationsVisible == false, !current.joinPending else {
+            return
+        }
+        let own = try await session.fingerprint()
+        let roster = try await session.members().map(\.fingerprint)
+        guard let provider = current.reservationsProvider, !roster.contains(provider),
+              let next = roster.filter({ $0 != own }).sorted(by: { $0.lexicographicallyPrecedes($1) }).first
+        else {
+            return
+        }
+        guard var latest = checkpoint, latest.group == current.group else {
+            return
+        }
+        latest.reservationsProvider = next
+        try saveCheckpoint(latest)
+        try await send(.hello(vector: replica.versionVector, provider: next), session: session)
+    }
+
+    private var foundingClaimsURL: URL {
+        checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename)
+    }
+
+    private func loadFoundingClaims() -> [OriginReservation] {
+        guard let data = try? Data(contentsOf: foundingClaimsURL) else {
+            return []
+        }
+        return (try? ReplicaCanonicalJSON.decode([OriginReservation].self, from: data)) ?? []
+    }
+
+    private func saveFoundingClaims(_ claims: [OriginReservation]) throws {
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(claims), to: foundingClaimsURL)
+    }
+
+    static func upserting(
+        _ claim: OriginReservation,
+        into entries: [OriginReservation],
+        replacing: Bool = false
+    ) -> [OriginReservation] {
+        if let index = entries.firstIndex(where: { $0.cursor == claim.cursor }) {
+            guard replacing else {
+                return entries
+            }
+            var result = entries
+            result[index] = claim
+            return result
+        }
+        return (entries + [claim]).sorted { $0.cursor < $1.cursor }
+    }
+
+    struct ReservationUpdate {
+        static let kinds: Set<ReplicationMessage.Kind> = [.reservation, .release, .reservations]
+
+        let cursor: UInt64
+        let sender: Data
+        let message: ReplicationMessage
+    }
+
+    /// Adds claims by their original log position. A claim already known keeps
+    /// its local state, so a late or repeated snapshot cannot undo a release
+    /// or an admission. Only a claim's owner can release it, and a release
+    /// for a claim not yet known is kept so a later snapshot cannot revive
+    /// it. Snapshots apply only to the member named by `snapshotsFor`.
+    static func merge(
+        _ updates: [ReservationUpdate],
+        into stored: [OriginReservation],
+        snapshotsFor member: Data?
+    ) -> [OriginReservation] {
+        var entries: [OriginReservation] = []
+        func insert(_ entry: OriginReservation) {
+            if !entries.contains(where: { $0.cursor == entry.cursor }) {
+                entries.append(entry)
+            }
+        }
+        stored.forEach(insert)
+        for update in updates.sorted(by: { $0.cursor < $1.cursor }) {
+            let message = update.message
+            switch message.kind {
+            case .reservation:
+                if let member = message.member, let origins = message.origins, let epoch = message.epoch {
+                    insert(OriginReservation(
+                        member: member, owner: update.sender, origins: origins, epoch: epoch, cursor: update.cursor
+                    ))
+                }
+            case .release:
+                guard let releasedMember = message.member, let cursor = message.reservation, cursor < update.cursor else {
+                    break
+                }
+                if let index = entries.firstIndex(where: { $0.cursor == cursor }) {
+                    if entries[index].member == releasedMember && entries[index].owner == update.sender {
+                        entries[index].released = true
+                    }
+                } else {
+                    insert(OriginReservation(
+                        member: releasedMember, owner: update.sender, origins: [], epoch: 0, cursor: cursor, released: true
+                    ))
+                }
+            case .reservations:
+                guard let member, message.member == member else {
+                    break
+                }
+                (message.reservations ?? []).filter { $0.cursor < update.cursor }.forEach(insert)
+            case .operations, .hello:
+                break
+            }
+        }
+        return entries.sorted { $0.cursor < $1.cursor }
+    }
+
+    /// Drops a claim once it can no longer matter: its device left after
+    /// joining, its retained history covers it, it was released, or its Add
+    /// can no longer happen. A member still waiting for its snapshot keeps
+    /// releases. `overflowed` reports claims beyond what a checkpoint stores.
+    static func prune(
+        _ entries: [OriginReservation],
+        roster: Set<Data>,
+        epoch: UInt64,
+        retained: Set<ReplicaDeviceID>,
+        keepReleases: Bool
+    ) -> (kept: [OriginReservation], overflowed: Bool) {
+        let kept = entries.compactMap { entry -> OriginReservation? in
+            var entry = entry
+            if roster.contains(entry.member) {
+                entry.admitted = true
+                return Set(entry.origins).isSubset(of: retained) ? nil : entry
+            }
+            if entry.released {
+                return keepReleases ? entry : nil
+            }
+            return entry.isActive(roster: roster, epoch: epoch) ? entry : nil
+        }
+        return (Array(kept.prefix(OriginReservation.maximumStored)), kept.count > OriginReservation.maximumStored)
     }
 
     private func refuseJoinerForTaskHistory(
@@ -596,6 +871,10 @@ public final class SyncEngine {
         }
         if isGroupAtCapacity {
             fail(SyncError.groupAtCapacity)
+            return
+        }
+        if checkpoint?.reservationsVisible == false {
+            fail(SyncError.privateSyncUnreachable)
             return
         }
         beginInvitation(linked: true)
@@ -958,6 +1237,7 @@ public final class SyncEngine {
         pairingDeadline = deadline
         peerDecision = nil
         peerRefusedForTaskHistory = false
+        lastPairingFailure = nil
         return attemptID
     }
 
@@ -986,12 +1266,10 @@ public final class SyncEngine {
             let reference = response.keyPackageReference
             let joinerFingerprint = response.joinerFingerprint
             let joinerOrigins = Set(response.origins)
-            let currentMembers = linked ? try await session.members().count : 1
-            guard try await admissionSlots(
-                session: session, linked: linked, joinerOrigins: joinerOrigins, memberCount: currentMembers
-            ) < ReplicaLimits.maxOrigins else {
-                try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
-            }
+            try await requireAdmission(
+                of: joinerFingerprint, origins: joinerOrigins, session: session, linked: linked,
+                before: nil, connection: connection, invitation: invitation
+            )
             pairingExpiryTask?.cancel()
             pairingExpiryTask = nil
             guard
@@ -1038,25 +1316,44 @@ public final class SyncEngine {
             if linked {
                 try await session.synchronize()
                 try await processRemovals(session: session)
-                guard try await admissionSlots(
-                    session: session, linked: true, joinerOrigins: joinerOrigins,
-                    memberCount: session.members().count
-                ) < ReplicaLimits.maxOrigins else {
-                    try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
-                }
+                try await requireAdmission(
+                    of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true,
+                    before: nil, connection: connection, invitation: invitation
+                )
             } else {
                 try await session.createGroup(groupID)
+            }
+            let claim = try await reserve(joinerFingerprint, origins: joinerOrigins, session: session)
+            await reservationHookForTesting?()
+            try requireCurrentPairingAttempt(attemptID)
+            if linked {
+                do {
+                    try await requireAdmission(
+                        of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true,
+                        before: claim.cursor, connection: connection, invitation: invitation
+                    )
+                } catch {
+                    await releaseReservation(claim, session: session)
+                    throw error
+                }
             }
             var added = false
             for _ in 0..<Self.maximumAddAttempts where !added {
                 try requireCurrentPairingAttempt(attemptID)
+                guard try await claim.allowsAdd(atEpoch: session.epoch()) else {
+                    break
+                }
                 if case .accepted = try await session.add(
                     keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference
                 ) {
                     added = true
                 }
             }
-            guard added else { throw SyncError.invalidPairMessage }
+            guard added else {
+                await releaseReservation(claim, session: session)
+                throw SyncError.invalidPairMessage
+            }
+            try afterAddHookForTesting?()
             pairingReaderTask?.cancel()
             pairingReaderTask = nil
             let declined = peerDecision == false
@@ -1066,12 +1363,16 @@ public final class SyncEngine {
                 throw SyncError.pairingDeclined
             }
             let roster = try await session.members().map(ReplicationCheckpoint.Member.init)
-            let overflowed = try await admissionSlots(
-                session: session, linked: true, joinerOrigins: joinerOrigins, memberCount: roster.count
-            ) > ReplicaLimits.maxOrigins
+            let overflow = try await admission(
+                of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true, before: claim.cursor
+            )
+            let overflowed = overflow != .fits
             var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
                 ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
             current.members = roster
+            current.originReservations = (loadFoundingClaims() + [claim]).reduce(current.originReservations ?? []) {
+                Self.upserting($1, into: $0)
+            }
             if declined || overflowed {
                 current.pendingRemovals.append(joinerFingerprint)
             } else {
@@ -1080,12 +1381,20 @@ public final class SyncEngine {
                 ))
             }
             try saveCheckpoint(current)
+            try ReplicationCheckpoint.remove(at: foundingClaimsURL)
             if declined {
                 await connection.cancel()
                 throw SyncError.pairingDeclined
             }
-            if overflowed {
+            if overflow == .taskHistoryFull {
                 try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
+            }
+            if overflow == .groupFull {
+                if let frame = try? PairingFrame.decision(approved: false).seal(for: invitation, from: .fromInviter) {
+                    try? await connection.send(frame)
+                }
+                await connection.cancel()
+                throw SyncError.groupAtCapacity
             }
             if let frame = try? PairingFrame.decision(approved: true).seal(for: invitation, from: .fromInviter) {
                 try? await connection.send(frame)
@@ -1216,9 +1525,11 @@ public final class SyncEngine {
                 inviterNonce: inviterNonce,
                 joinerNonce: joinerNonce
             )
-            let joinIntent = ReplicationCheckpoint(
+            var joinIntent = ReplicationCheckpoint(
                 group: groupID, members: [], joinPending: true, provider: inviterFingerprint
             )
+            joinIntent.reservationsVisible = false
+            joinIntent.reservationsProvider = inviterFingerprint
             try joinIntent.save(to: joinIntentURL)
             phase = .verifying
             listenForInviterDecision(on: connection, invitation: invitation, attemptID: attemptID)
@@ -1516,6 +1827,7 @@ public final class SyncEngine {
             try? resetSession()
         }
         let mapped = SyncError.fromTransport(error)
+        lastPairingFailure = mapped as? SyncError ?? .invalidPairMessage
         errorMessage = Self.displayMessage(for: mapped is SyncError ? mapped : SyncError.invalidPairMessage)
         if isPaired {
             restorePhaseAfterPairing()
@@ -1572,14 +1884,22 @@ public final class SyncEngine {
                     current.members = roster.map(ReplicationCheckpoint.Member.init)
                     try saveCheckpoint(current)
                 } else {
-                    let intent = try? ReplicationCheckpoint.load(from: joinIntentURL)
-                    try saveCheckpoint(ReplicationCheckpoint(
+                    let intent = (try? ReplicationCheckpoint.load(from: joinIntentURL)).flatMap { $0.group == group ? $0 : nil }
+                    var rebuilt = ReplicationCheckpoint(
                         group: group,
                         members: roster.map(ReplicationCheckpoint.Member.init),
                         joinPending: true,
-                        provider: intent?.group == group ? intent?.provider : nil
-                    ))
+                        provider: intent?.provider
+                    )
+                    rebuilt.reservationsVisible = intent?.reservationsVisible
+                    rebuilt.reservationsProvider = intent?.reservationsProvider
+                    let founding = loadFoundingClaims()
+                    if !founding.isEmpty {
+                        rebuilt.originReservations = founding
+                    }
+                    try saveCheckpoint(rebuilt)
                     try ReplicationCheckpoint.remove(at: joinIntentURL)
+                    try ReplicationCheckpoint.remove(at: foundingClaimsURL)
                 }
                 if !isPaired {
                     isPaired = true
@@ -1754,6 +2074,8 @@ public final class SyncEngine {
         }
         try await drainInbox(session: session)
         try await processRemovals(session: session)
+        try await releaseAbandonedReservations(session: session)
+        try await requestReservationsIfProviderLeft(session: session)
         if checkpoint?.joinPending == true {
             try await announceJoin(session: session)
         }
@@ -1774,26 +2096,62 @@ public final class SyncEngine {
             try saveCheckpoint(current)
         }
         var pool: [TaskOperation] = []
-        var hellos: [ReplicationMessage] = []
-        for message in messages where message.sender != fingerprint {
+        var hellos: [(sender: Data, message: ReplicationMessage)] = []
+        var updates: [ReservationUpdate] = []
+        for message in messages {
             guard let decoded = try? ReplicationMessage.decode(message.plaintext) else {
                 continue
             }
             switch decoded.kind {
-            case .operations:
+            case .operations where message.sender != fingerprint:
                 pool.append(contentsOf: decoded.operations ?? [])
-            case .hello:
-                hellos.append(decoded)
+            case .hello where message.sender != fingerprint:
+                hellos.append((message.sender, decoded))
+            case .reservation, .release, .reservations:
+                updates.append(ReservationUpdate(cursor: message.cursor, sender: message.sender, message: decoded))
+            case .operations, .hello:
+                break
             }
         }
         let accepted = try applyRemoteOperations(&pool)
+        let epoch = try await session.epoch()
+        let roster = Set(try await session.members().map(\.fingerprint))
+        lastKnownEpoch = max(lastKnownEpoch, epoch)
+        try requireCurrent(session)
+        if var current = checkpoint, !updates.isEmpty || !(current.originReservations ?? []).isEmpty {
+            let waiting = current.reservationsVisible == false
+            let snapshot = waiting ? updates.first {
+                $0.message.kind == .reservations && $0.sender == current.reservationsProvider
+                    && $0.message.member == fingerprint
+            } : nil
+            let merged = Self.merge(
+                updates.filter { $0.message.kind != .reservations || $0.cursor == snapshot?.cursor },
+                into: current.originReservations ?? [],
+                snapshotsFor: waiting ? fingerprint : nil
+            )
+            let pruned = Self.prune(
+                merged, roster: roster, epoch: epoch,
+                retained: Set(replica.versionVector.origins), keepReleases: waiting && snapshot == nil
+            )
+            current.originReservations = pruned.kept
+            if pruned.overflowed || snapshot?.message.overflowed == true {
+                current.reservationsOverflowed = true
+            }
+            if snapshot != nil {
+                current.reservationsVisible = true
+                current.reservationsProvider = nil
+            }
+            if current != checkpoint {
+                try saveCheckpoint(current)
+            }
+        }
         if accepted > 0 {
             publishReplica()
             lastSyncedAt = Date()
             lastMailboxReceivedAt = Date()
         }
         for hello in hellos {
-            try await answer(hello, fingerprint: fingerprint, session: session)
+            try await answer(hello.message, from: hello.sender, fingerprint: fingerprint, session: session)
             try requireCurrent(session)
         }
         if !pool.isEmpty {
@@ -1849,7 +2207,12 @@ public final class SyncEngine {
         return accepted
     }
 
-    private func answer(_ hello: ReplicationMessage, fingerprint: Data, session: MLSSession) async throws {
+    private func answer(
+        _ hello: ReplicationMessage,
+        from sender: Data,
+        fingerprint: Data,
+        session: MLSSession
+    ) async throws {
         guard let vector = hello.vector, let uploadedThrough = checkpoint?.uploadedThrough else {
             return
         }
@@ -1861,6 +2224,16 @@ public final class SyncEngine {
             return isProvider
         }
         try await send(operations, session: session)
+        if isProvider {
+            try await send(
+                .reservations(
+                    checkpoint?.originReservations ?? [],
+                    overflowed: checkpoint?.reservationsOverflowed == true,
+                    for: sender
+                ),
+                session: session
+            )
+        }
     }
 
     private func announceJoin(session: MLSSession) async throws {
@@ -2109,6 +2482,7 @@ public final class SyncEngine {
     /// that is still open can then never create journal files next to the
     /// database of the session that replaced it.
     private func eraseCurrentMLSState() throws {
+        try ReplicationCheckpoint.remove(at: foundingClaimsURL)
         try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
         mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
     }
@@ -2304,6 +2678,9 @@ public final class SyncEngine {
         try ReplicationCheckpoint.remove(
             at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
         )
+        try ReplicationCheckpoint.remove(
+            at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename)
+        )
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
@@ -2372,5 +2749,8 @@ extension ReplicationCheckpoint.Member {
 
 extension SyncEngine {
     var mlsSessionForTesting: MLSSession? { session }
+    var awaitsReservationsForTesting: Bool { checkpoint?.reservationsVisible == false }
+    var reservationsForTesting: [OriginReservation] { checkpoint?.originReservations ?? [] }
+    var provisionalMembersForTesting: [Data] { checkpoint?.provisionalMembers.map(\.fingerprint) ?? [] }
     var mlsDirectoryForTesting: URL { mlsDirectory }
 }
