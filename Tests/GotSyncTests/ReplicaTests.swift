@@ -635,25 +635,69 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(roomy.tasks.first?.isCompleted, true)
     }
 
-    func testIntakeKeepsLowestDeferredSequencesWithinLimit() throws {
+    func testIntakeDefersEveryBlockedOperationWithoutTruncating() throws {
         var replica = try seededReplica(taskCount: ReplicaLimits.maxTasks)
         var operations: [TaskOperation] = []
         for origin: UInt8 in [1, 2] {
-            for sequence: UInt64 in 1...3 {
-                let taskNumber = UInt16(origin) * 10 + UInt16(sequence)
+            for sequence: UInt64 in 1...5_001 {
+                let mutation: TaskMutation = sequence == 1
+                    ? .create(title: "Blocked", completed: false)
+                    : .setCompleted(sequence % 2 == 0)
                 operations.append(operation(
-                    origin: origin, sequence: sequence, lamport: 2_000 + sequence,
-                    taskID: task(500 + taskNumber),
-                    mutation: .create(title: "Blocked", completed: false)
+                    origin: origin, sequence: sequence, lamport: 20_000 + sequence,
+                    taskID: task(UInt16(origin)), mutation: mutation
                 ))
             }
         }
 
-        let intake = try replica.applyAvailable(operations, deferredLimit: 4)
+        let intake = try replica.applyAvailable(operations)
 
         XCTAssertEqual(intake.accepted, 0)
-        let kept: [TaskOperation] = [operations[0], operations[1], operations[3], operations[4]]
-        XCTAssertEqual(intake.deferred, kept)
+        XCTAssertTrue(intake.waiting.isEmpty)
+        XCTAssertEqual(intake.deferred.count, operations.count)
+    }
+
+    func testIntakeRejectsConflictingCopiesBeforeApplyingAnything() throws {
+        let saved = operation(
+            origin: 1, sequence: 1, lamport: 1, taskID: task(500), mutation: .create(title: "Saved", completed: false)
+        )
+        let conflicting = operation(
+            origin: 1, sequence: 1, lamport: 1, taskID: task(500),
+            mutation: .create(title: "Conflicting", completed: false)
+        )
+        var roomy = try TaskReplica(deviceID: device(9))
+        XCTAssertThrowsError(try roomy.applyAvailable([conflicting], previouslyDeferred: [saved])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+        XCTAssertEqual(roomy.versionVector[device(1)], 0)
+        XCTAssertTrue(roomy.taskRecords.isEmpty)
+
+        try roomy.applyRemote([saved])
+        XCTAssertThrowsError(try roomy.applyAvailable([conflicting])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+        var fresh = try TaskReplica(deviceID: device(9))
+        XCTAssertThrowsError(try fresh.applyAvailable([saved, conflicting])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+    }
+
+    func testIntakeRejectsByteDifferentUnicodeCopyOfBlockedOperation() throws {
+        let composed = operation(
+            origin: 1, sequence: 1, lamport: 2_000, taskID: task(500), mutation: .create(title: "Caf\u{E9}", completed: false)
+        )
+        let decomposed = operation(
+            origin: 1, sequence: 1, lamport: 2_000, taskID: task(500), mutation: .create(title: "Cafe\u{301}", completed: false)
+        )
+        XCTAssertEqual(composed, decomposed)
+        XCTAssertNotEqual(try composed.canonicalData(), try decomposed.canonicalData())
+
+        var full = try seededReplica(taskCount: ReplicaLimits.maxTasks)
+        let archive = try full.atomicArchiveData()
+        XCTAssertThrowsError(try full.applyAvailable([decomposed], previouslyDeferred: [composed])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+        XCTAssertEqual(try full.atomicArchiveData(), archive)
     }
 
     func testIntakeDefersOperationsOverOperationAndOriginLimits() throws {

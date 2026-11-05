@@ -133,7 +133,7 @@ enum DeferredOperationStore {
     static func load(from url: URL) throws -> [TaskOperation] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let stored = try ReplicaCanonicalJSON.decode(Stored.self, from: Data(contentsOf: url))
-        guard stored.version == version, stored.operations.count <= maximumCount else {
+        guard stored.version == version else {
             throw ReplicaError.corruptArchive("The deferred operations are unreadable.")
         }
         return stored.operations

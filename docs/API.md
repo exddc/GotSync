@@ -50,17 +50,27 @@ New `SyncError` cases:
   minutes. Nothing was linked.
 - `replicaCapacityReached`: linked devices sent valid changes that would
   exceed this device's limit of 1,000 tasks including deleted ones, 10,000
-  retained changes, or 8 contributing devices. The engine saves up to 10,000
-  of those changes, lowest sequences first, before it acknowledges the
-  messages that carried them. It retries them after launch and whenever new
-  messages arrive, and counts them in `unappliedRemoteOperationCount`. While
-  any remain, `mailboxError` and `errorMessage` carry this case and `phase` is
-  `.failed`, but sync keeps running. `mailboxRequiresRepair` stays `false`,
-  because pairing again does not free capacity. Unlinking, removal, and
+  retained changes, or 8 contributing devices. The engine saves those changes
+  before it acknowledges the messages that carried them, and counts them in
+  `unappliedRemoteOperationCount`. It saves at most 10,000. When the next
+  message does not fit, that message and every later one stay unacknowledged
+  in the delivery inbox; nothing saved is replaced. Saved changes are retried
+  after launch and whenever new messages arrive. While any remain,
+  `mailboxError` and `errorMessage` carry this case and `phase` is `.failed`,
+  but sync keeps running. `mailboxRequiresRepair` stays `false`, because
+  pairing again does not free capacity. Unlinking, removal, and
   `eraseLocalData()` discard the saved changes; the group's other members
-  still hold them. A saved change that conflicts with a later copy of the same
-  change stops sync with `syncHistoryBlocked` and leaves the message
-  unacknowledged.
+  still hold them. A full store blocks inbox progress until the device unlinks
+  or erases. If the saved changes cannot be read at launch, the file is kept,
+  the engine reports `localStorageUnavailable` in `mailboxError` and
+  `errorMessage` with `phase` `.failed`, sets `mailboxRequiresRepair` while
+  linked, and neither syncs nor pairs. `unlinkAndKeepTasks()` or
+  `eraseLocalData()` clears it.
+
+  Before applying anything, the engine compares each received change with
+  every retained, saved, and received change that has the same origin and
+  sequence, byte for byte. A mismatch stops sync with `syncHistoryBlocked` and
+  leaves the message unacknowledged.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`

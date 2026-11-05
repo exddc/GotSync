@@ -48,6 +48,10 @@ extension ReplicaError {
             false
         }
     }
+
+    var isFork: Bool {
+        if case .operationFork = self { true } else { false }
+    }
 }
 
 extension ReplicaError: LocalizedError {

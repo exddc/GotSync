@@ -233,6 +233,7 @@ public final class SyncEngine {
     /// Valid remote operations kept on disk because applying them would exceed
     /// a replica limit. While nonzero, sync reports `.replicaCapacityReached`.
     public var unappliedRemoteOperationCount: Int { deferredOperations.count }
+    private var isReplicaCapacityBlocked: Bool { !deferredOperations.isEmpty || isInboxBackpressured }
     public private(set) var showsLinkCompleteCelebration = false { didSet { publishState() } }
     /// Host vs joiner for the in-flight pairing attempt (presentation only).
     public private(set) var activePairingRole: DeviceRole? = nil { didSet { publishState() } }
@@ -267,6 +268,7 @@ public final class SyncEngine {
     private let approvalTimeoutNanoseconds: UInt64
     private let provisionalMemberWindow: TimeInterval
     private let departureRetryDelayNanoseconds: ClosedRange<UInt64>
+    private let deferredOperationLimit: Int
 
     private var pairingAttemptID: UUID?
     private var pairingDeadline: Date?
@@ -289,6 +291,13 @@ public final class SyncEngine {
     private var nextSyncAttemptAt = Date.distantPast
     private var lastCycleSucceeded = false
     private var retriesDeferredWithoutMessages = true
+    /// The deferred file exists but cannot be read. Sync stays off so it is
+    /// never overwritten; unlinking or erasing discards it.
+    private var isDeferredStoreUnreadable = false
+    /// The last drain left messages unacknowledged because their blocked
+    /// operations did not fit.
+    private var isInboxBackpressured = false
+    private var answeredHeldHelloCursors: Set<UInt64> = []
     private var isHistoryBlocked = false
     private var appIsActive = true
     private var pendingMailboxSince: Date?
@@ -321,7 +330,8 @@ public final class SyncEngine {
         syncIntervalNanoseconds: UInt64 = 2_000_000_000,
         approvalTimeoutNanoseconds: UInt64 = SyncTiming.approvalTimeoutNanoseconds,
         provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
-        departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000
+        departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000,
+        deferredOperationLimit: Int = DeferredOperationStore.maximumCount
     ) {
         let baseDirectory = configuration.storageDirectory
         relayURL = configuration.endpoints.relayURL
@@ -337,6 +347,7 @@ public final class SyncEngine {
         self.syncIntervalNanoseconds = syncIntervalNanoseconds
         self.approvalTimeoutNanoseconds = approvalTimeoutNanoseconds
         self.departureRetryDelayNanoseconds = departureRetryDelayNanoseconds
+        self.deferredOperationLimit = deferredOperationLimit
         self.provisionalMemberWindow = provisionalMemberWindow
         persistenceURL = baseDirectory.appendingPathComponent("replica-v1.json")
         checkpointURL = baseDirectory.appendingPathComponent(ReplicationCheckpoint.filename)
@@ -407,8 +418,7 @@ public final class SyncEngine {
                 do {
                     deferredOperations = try DeferredOperationStore.load(from: deferredOperationsURL)
                 } catch {
-                    try DeferredOperationStore.remove(at: deferredOperationsURL)
-                    deferredOperations = []
+                    isDeferredStoreUnreadable = true
                 }
                 do {
                     session = try openSession()
@@ -436,6 +446,13 @@ public final class SyncEngine {
         if let bootError {
             phase = .failed
             errorMessage = Self.displayMessage(for: bootError)
+        } else if isDeferredStoreUnreadable {
+            phase = .failed
+            mailboxError = .localStorageUnavailable
+            mailboxErrorMessage = Self.displayMessage(for: SyncError.localStorageUnavailable)
+            mailboxRequiresRepair = isPaired
+            mailboxState = .unavailable
+            errorMessage = mailboxErrorMessage
         } else if isPaired {
             phase = .connecting
         } else {
@@ -711,6 +728,8 @@ public final class SyncEngine {
                 markerURL: markerURL
             )
             deferredOperations = []
+            isDeferredStoreUnreadable = false
+            isInboxBackpressured = false
             mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
             session = try openSession()
             hasDurableStorage = true
@@ -784,7 +803,7 @@ public final class SyncEngine {
         appIsActive = false
         syncLoopTask?.cancel()
         syncLoopTask = nil
-        guard isPaired, pairingTask == nil, !isHistoryBlocked else {
+        guard isPaired, pairingTask == nil, !isHistoryBlocked, !isDeferredStoreUnreadable else {
             return
         }
         phase = .offline
@@ -859,7 +878,7 @@ public final class SyncEngine {
     // MARK: - Pairing
 
     private func beginInvitation(linked: Bool) {
-        guard let session else {
+        guard let session, !isDeferredStoreUnreadable else {
             fail(SyncError.localStorageUnavailable)
             return
         }
@@ -885,7 +904,7 @@ public final class SyncEngine {
     }
 
     private func beginJoin(with invitation: Invitation) {
-        guard let session else {
+        guard let session, !isDeferredStoreUnreadable else {
             fail(SyncError.localStorageUnavailable)
             return
         }
@@ -1450,7 +1469,7 @@ public final class SyncEngine {
         if isHistoryBlocked {
             phase = .failed
         } else {
-            phase = lastCycleSucceeded && deferredOperations.isEmpty ? .synced : .connecting
+            phase = lastCycleSucceeded && !isReplicaCapacityBlocked ? .synced : .connecting
             startSyncLoop()
         }
     }
@@ -1528,7 +1547,8 @@ public final class SyncEngine {
             hasDurableStorage,
             isPaired,
             session != nil,
-            !isHistoryBlocked
+            !isHistoryBlocked,
+            !isDeferredStoreUnreadable
         else {
             return
         }
@@ -1556,6 +1576,7 @@ public final class SyncEngine {
             hasDurableStorage,
             isPaired,
             !isHistoryBlocked,
+            !isDeferredStoreUnreadable,
             appIsActive || allowInactive,
             force || Date() >= nextSyncAttemptAt,
             let session
@@ -1605,7 +1626,7 @@ public final class SyncEngine {
         syncFailureCount = 0
         nextSyncAttemptAt = .distantPast
         lastCycleSucceeded = true
-        let blocked: SyncError? = deferredOperations.isEmpty ? nil : .replicaCapacityReached
+        let blocked: SyncError? = isReplicaCapacityBlocked ? .replicaCapacityReached : nil
         let message = blocked.map { Self.displayMessage(for: $0) }
         if mailboxError != blocked { mailboxError = blocked }
         if mailboxErrorMessage != message { mailboxErrorMessage = message }
@@ -1661,14 +1682,16 @@ public final class SyncEngine {
             throw SyncError.localStorageUnavailable
         }
         _ = try await session.flush()
-        try await drainInbox(session: session)
+        try await drainInbox(session: session, retriesDeferred: false)
         var synchronized = false
         for _ in 0..<4 where !synchronized {
             do {
                 try await session.synchronize()
                 synchronized = true
             } catch MLSClientError.capacityReached {
-                try await drainInbox(session: session)
+                guard try await drainInbox(session: session) else {
+                    break
+                }
             }
         }
         if try await session.isRemoved() {
@@ -1682,10 +1705,17 @@ public final class SyncEngine {
         try await uploadLocalOperations(session: session)
     }
 
-    private func drainInbox(session: MLSSession) async throws {
+    /// `retriesDeferred` allows a retry of deferred operations with an empty
+    /// inbox. Pass `false` before fetching, so that a fetched copy of a
+    /// deferred operation is compared with it before either applies.
+    /// Returns whether any message was acknowledged.
+    @discardableResult
+    private func drainInbox(session: MLSSession, retriesDeferred: Bool = true) async throws -> Bool {
         let messages = try await session.inbox()
-        guard !messages.isEmpty || (retriesDeferredWithoutMessages && !deferredOperations.isEmpty) else {
-            return
+        guard !messages.isEmpty
+            || (retriesDeferred && retriesDeferredWithoutMessages && !deferredOperations.isEmpty)
+        else {
+            return false
         }
         let fingerprint = try await session.fingerprint()
         await inboxReadHookForTesting?()
@@ -1695,35 +1725,49 @@ public final class SyncEngine {
             current.provisionalMembers.removeAll { senders.contains($0.fingerprint) }
             try saveCheckpoint(current)
         }
-        var pool: [TaskOperation] = []
-        var hellos: [ReplicationMessage] = []
-        for message in messages where message.sender != fingerprint {
-            guard let decoded = try? ReplicationMessage.decode(message.plaintext) else {
-                continue
+        var arrivals: [[TaskOperation]] = []
+        var hellos: [(index: Int, message: ReplicationMessage)] = []
+        for (index, message) in messages.enumerated() {
+            var operations: [TaskOperation] = []
+            if message.sender != fingerprint, let decoded = try? ReplicationMessage.decode(message.plaintext) {
+                switch decoded.kind {
+                case .operations:
+                    operations = decoded.operations ?? []
+                case .hello:
+                    hellos.append((index, decoded))
+                }
             }
-            switch decoded.kind {
-            case .operations:
-                pool.append(contentsOf: decoded.operations ?? [])
-            case .hello:
-                hellos.append(decoded)
-            }
+            arrivals.append(operations)
         }
-        let (accepted, resumedDeferred) = try applyRemoteOperations(&pool)
-        if accepted > 0 {
+        var pool = arrivals.flatMap { $0 }
+        let application = try applyRemoteOperations(&pool, arrivals: arrivals)
+        if application.accepted > 0 {
             publishReplica()
             lastSyncedAt = Date()
             lastMailboxReceivedAt = Date()
         }
+        isInboxBackpressured = application.heldArrivals < messages.count
         for hello in hellos {
-            try await answer(hello, fingerprint: fingerprint, session: session)
+            let cursor = messages[hello.index].cursor
+            guard hello.index < application.heldArrivals || !answeredHeldHelloCursors.contains(cursor) else {
+                continue
+            }
+            try await answer(hello.message, fingerprint: fingerprint, session: session)
             try requireCurrent(session)
+            if hello.index >= application.heldArrivals {
+                answeredHeldHelloCursors.insert(cursor)
+            }
         }
-        if !pool.isEmpty || resumedDeferred {
+        if (!pool.isEmpty && application.heldArrivals > 0) || application.resumedDeferred {
             try await send(.hello(vector: replica.versionVector, provider: nil), session: session)
         }
-        if let last = messages.last {
-            try await session.acknowledgeInbox(through: last.cursor)
+        guard application.heldArrivals > 0 else {
+            return false
         }
+        let acknowledged = messages[application.heldArrivals - 1].cursor
+        try await session.acknowledgeInbox(through: acknowledged)
+        answeredHeldHelloCursors = answeredHeldHelloCursors.filter { $0 > acknowledged }
+        return true
     }
 
     private func requireCurrent(_ session: MLSSession) throws {
@@ -1732,28 +1776,61 @@ public final class SyncEngine {
         }
     }
 
+    private struct RemoteApplication {
+        let accepted: Int
+        /// Earlier deferred operations applied.
+        let resumedDeferred: Bool
+        /// Leading arrivals whose operations are now applied, saved, or
+        /// dropped as invalid. Only those may be acknowledged.
+        let heldArrivals: Int
+    }
+
     /// Applies every operation whose origin sequence is next. Operations still
     /// waiting on a gap remain in `pool`. Operations over a replica limit are
-    /// saved, so acknowledging the inbox afterwards does not discard them.
-    /// `resumedDeferred` reports that earlier deferred operations applied.
-    private func applyRemoteOperations(_ pool: inout [TaskOperation]) throws -> (accepted: Int, resumedDeferred: Bool) {
+    /// saved while they fit within `deferredOperationLimit`; the arrivals after
+    /// the first one that does not fit stay unacknowledged in the inbox.
+    private func applyRemoteOperations(
+        _ pool: inout [TaskOperation],
+        arrivals: [[TaskOperation]]
+    ) throws -> RemoteApplication {
+        typealias ID = TaskReplica.OperationID
         let previous = deferredOperations
-        let intake = try replica.applyAvailable(
-            pool, previouslyDeferred: previous, deferredLimit: DeferredOperationStore.maximumCount
-        )
+        let intake = try replica.applyAvailable(pool, previouslyDeferred: previous)
         retriesDeferredWithoutMessages = false
-        if intake.deferred != previous {
-            try DeferredOperationStore.save(intake.deferred, to: deferredOperationsURL)
-            deferredOperations = intake.deferred
+        let blocked = Set(intake.deferred.map(ID.init))
+        let waiting = Set(intake.waiting.map(ID.init))
+        var saved = Set(previous.map(ID.init)).intersection(blocked.union(waiting))
+        var heldArrivals = 0
+        for operations in arrivals {
+            let added = Set(operations.map(ID.init)).intersection(blocked).subtracting(saved)
+            guard added.isEmpty || saved.count + added.count <= deferredOperationLimit else {
+                break
+            }
+            saved.formUnion(added)
+            heldArrivals += 1
+        }
+        let deferred = (intake.deferred + intake.waiting)
+            .filter { saved.contains(ID($0)) }
+            .sorted(by: ReplicaOrdering.operations)
+        if deferred != previous {
+            try DeferredOperationStore.save(deferred, to: deferredOperationsURL)
+            deferredOperations = deferred
         }
         pool = intake.waiting
         let vector = replica.versionVector
-        return (intake.accepted, previous.contains { $0.originSequence <= vector[$0.originDeviceID] })
+        return RemoteApplication(
+            accepted: intake.accepted,
+            resumedDeferred: previous.contains { $0.originSequence <= vector[$0.originDeviceID] },
+            heldArrivals: heldArrivals
+        )
     }
 
     private func discardDeferredOperations() throws {
         try DeferredOperationStore.remove(at: deferredOperationsURL)
         deferredOperations = []
+        isDeferredStoreUnreadable = false
+        isInboxBackpressured = false
+        answeredHeldHelloCursors = []
     }
 
     private func answer(_ hello: ReplicationMessage, fingerprint: Data, session: MLSSession) async throws {

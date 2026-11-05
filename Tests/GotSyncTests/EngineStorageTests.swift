@@ -421,10 +421,21 @@ final class EngineStorageTests: XCTestCase {
         XCTAssertEqual(model.unappliedRemoteOperationCount, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
 
-        try Data("not deferred operations".utf8).write(to: deferredURL)
-        let relaunched = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
-        XCTAssertEqual(relaunched.unappliedRemoteOperationCount, 0)
-        XCTAssertNotEqual(relaunched.phase, .failed)
+        let unreadable = Data("not deferred operations".utf8)
+        try unreadable.write(to: deferredURL)
+        for _ in 0..<2 {
+            let relaunched = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+            XCTAssertEqual(relaunched.phase, .failed)
+            XCTAssertEqual(relaunched.errorMessage, SyncError.localStorageUnavailable.errorDescription)
+            XCTAssertFalse(relaunched.isPaired)
+            relaunched.createPrivateSync()
+            XCTAssertNil(relaunched.invitationURL)
+            XCTAssertEqual(relaunched.phase, .failed)
+            XCTAssertEqual(try Data(contentsOf: deferredURL), unreadable)
+        }
+        let repaired = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        repaired.eraseLocalData()
+        XCTAssertEqual(repaired.phase, .unpaired)
         XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
     }
 }
