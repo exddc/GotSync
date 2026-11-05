@@ -34,6 +34,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case privateSyncUnreachable
     case localStorageUnavailable
     case groupAtCapacity
+    case taskHistoryAtCapacity
     case unsupportedProtocolVersion
     case relinkRequired
     case syncHistoryBlocked
@@ -60,6 +61,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "Local storage is unavailable. Restart the app after fixing storage."
         case .groupAtCapacity:
             "The group is at its device limit."
+        case .taskHistoryAtCapacity:
+            "This task history has no room for another device. It keeps changes from up to \(ReplicaLimits.maxOrigins) devices, counting removed devices, and keeps one slot for each linked device. Devices already linked keep syncing."
         case .unsupportedProtocolVersion:
             "The sync service uses an unsupported protocol version."
         case .relinkRequired:
@@ -130,7 +133,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         switch sync {
         case .privateSyncUnreachable, .relay:
             return true
-        case .invitationExpired, .pairingDeclined, .groupAtCapacity,
+        case .invitationExpired, .pairingDeclined, .groupAtCapacity, .taskHistoryAtCapacity,
              .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
              .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
              .syncHistoryExpired, .removedFromGroup, .approvalExpired:
@@ -442,6 +445,18 @@ public final class SyncEngine {
 
     public var isGroupAtCapacity: Bool {
         linkedMemberCount >= Self.maximumGroupSize
+    }
+
+    /// Whether linking one more device could leave the replica unable to
+    /// accept a new origin from that device or a current member. Every
+    /// retained origin holds a slot, and every current member, including this
+    /// device, reserves one more whether or not it has edited yet.
+    public var isTaskHistoryAtCapacity: Bool {
+        originSlotsInUse(memberCount: linkedDeviceIDs.count) >= ReplicaLimits.maxOrigins
+    }
+
+    private func originSlotsInUse(memberCount: Int) -> Int {
+        replica.versionVector.entries.count + max(memberCount, 1)
     }
 
     public var linkedDevices: [LinkedDevice] {
@@ -839,6 +854,10 @@ public final class SyncEngine {
             fail(SyncError.localStorageUnavailable)
             return
         }
+        if isTaskHistoryAtCapacity {
+            fail(SyncError.taskHistoryAtCapacity)
+            return
+        }
         let deadline = Date().addingTimeInterval(SyncTiming.invitationTimeToLive)
         safetyCode = nil
         errorMessage = nil
@@ -863,6 +882,10 @@ public final class SyncEngine {
     private func beginJoin(with invitation: Invitation) {
         guard let session else {
             fail(SyncError.localStorageUnavailable)
+            return
+        }
+        if isTaskHistoryAtCapacity {
+            fail(SyncError.taskHistoryAtCapacity)
             return
         }
         invitationPhrase = nil
@@ -958,6 +981,9 @@ public final class SyncEngine {
             if linked {
                 try await session.synchronize()
                 try await processRemovals(session: session)
+                guard try await originSlotsInUse(memberCount: session.members().count) < ReplicaLimits.maxOrigins else {
+                    throw SyncError.taskHistoryAtCapacity
+                }
             } else {
                 try await session.createGroup(groupID)
             }
@@ -980,10 +1006,11 @@ public final class SyncEngine {
                 throw SyncError.pairingDeclined
             }
             let roster = try await session.members().map(ReplicationCheckpoint.Member.init)
+            let overflowed = originSlotsInUse(memberCount: roster.count) > ReplicaLimits.maxOrigins
             var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
                 ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
             current.members = roster
-            if declined {
+            if declined || overflowed {
                 current.pendingRemovals.append(joinerFingerprint)
             } else {
                 current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
@@ -994,6 +1021,13 @@ public final class SyncEngine {
             if declined {
                 await connection.cancel()
                 throw SyncError.pairingDeclined
+            }
+            if overflowed {
+                if let frame = try? PairingFrame.decision(approved: false).seal(for: invitation, from: .fromInviter) {
+                    try? await connection.send(frame)
+                }
+                await connection.cancel()
+                throw SyncError.taskHistoryAtCapacity
             }
             if let frame = try? PairingFrame.decision(approved: true).seal(for: invitation, from: .fromInviter) {
                 try? await connection.send(frame)

@@ -392,6 +392,62 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(third.originSequence, 3)
     }
 
+    func testRetiredOriginsOutnumberingTheGroupLimitSurviveReloadAndCatchUp() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let hostURL = directory.appendingPathComponent("host.json")
+        var host = try TaskReplica(deviceID: device(1), persistenceURL: hostURL)
+        try host.createTask(id: task(1), title: "Host")
+        for origin in 2...ReplicaLimits.maxOrigins {
+            try host.applyRemote([
+                operation(
+                    origin: UInt8(origin),
+                    sequence: 1,
+                    lamport: 1,
+                    taskID: task(UInt16(origin)),
+                    mutation: .create(title: "Device \(origin)", completed: false)
+                )
+            ])
+        }
+        XCTAssertEqual(host.versionVector.entries.count, ReplicaLimits.maxOrigins)
+
+        let reloaded = try TaskReplica(deviceID: device(1), persistenceURL: hostURL)
+        XCTAssertEqual(try reloaded.atomicArchiveData(), try host.atomicArchiveData())
+        XCTAssertEqual(reloaded.tasks.count, ReplicaLimits.maxOrigins)
+
+        var replacement = try TaskReplica(deviceID: device(1 + UInt8(ReplicaLimits.maxOrigins)))
+        let missing = reloaded.operations(missingFrom: replacement.versionVector)
+        for batch in try OperationBatcher.batches(missing) {
+            try replacement.applyRemote(batch)
+        }
+        XCTAssertEqual(replacement.versionVector, reloaded.versionVector)
+        XCTAssertEqual(replacement.tasks.map(\.id), reloaded.tasks.map(\.id))
+        XCTAssertThrowsError(try replacement.createTask(title: "One origin too many")) {
+            XCTAssertEqual($0 as? ReplicaError, .tooManyOrigins(ReplicaLimits.maxOrigins + 1))
+        }
+    }
+
+    func testHelloCarriesEveryRetainedOriginWithinThePlaintextLimit() throws {
+        let full = try ReplicaVersionVector(
+            Dictionary(uniqueKeysWithValues: (1...ReplicaLimits.maxOrigins).map {
+                (device(UInt8($0)), UInt64.max)
+            })
+        )
+        let encoded = try ReplicationMessage.hello(vector: full, provider: Data(repeating: 7, count: 32)).encoded()
+        XCTAssertLessThan(encoded.count, 10 * 1_024)
+        XCTAssertEqual(try ReplicationMessage.decode(encoded).vector, full)
+
+        let entries = (1...ReplicaLimits.maxOrigins + 1).map {
+            ReplicaVersionVector.Entry(originDeviceID: device(UInt8($0)), sequence: 1)
+        }
+        let oversized = try ReplicaCanonicalJSON.encode(entries)
+        let message = Data(#"{"kind":"hello","vector":"#.utf8) + oversized + Data(#","version":2}"#.utf8)
+        XCTAssertThrowsError(try ReplicationMessage.decode(message)) {
+            XCTAssertEqual($0 as? ReplicaError, .tooManyOrigins(ReplicaLimits.maxOrigins + 1))
+        }
+    }
+
     func testMissingOperationsAndVectorEntriesAreDeterministicallySorted() throws {
         var replica = try TaskReplica(deviceID: device(9))
         let originTwoCreate = operation(
@@ -429,7 +485,7 @@ final class ReplicaTests: XCTestCase {
     }
 
     func testTitleBatchOriginTaskAndOperationBounds() throws {
-        var replica = try TaskReplica(deviceID: device(9))
+        var replica = try TaskReplica(deviceID: device(250))
 
         XCTAssertThrowsError(
             try replica.createTask(id: task(12), title: String(repeating: "a", count: 201))
@@ -459,7 +515,7 @@ final class ReplicaTests: XCTestCase {
             XCTAssertEqual($0 as? ReplicaError, .batchExceedsOperationLimit(257))
         }
 
-        for origin in 1...8 {
+        for origin in 1...ReplicaLimits.maxOrigins {
             try replica.applyRemote([
                 operation(
                     origin: UInt8(origin),
@@ -473,25 +529,25 @@ final class ReplicaTests: XCTestCase {
         XCTAssertThrowsError(
             try replica.applyRemote([
                 operation(
-                    origin: 10,
+                    origin: UInt8(ReplicaLimits.maxOrigins + 1),
                     sequence: 1,
                     lamport: 1,
-                    taskID: task(200),
+                    taskID: task(400),
                     mutation: .delete
                 )
             ])
         ) {
-            XCTAssertEqual($0 as? ReplicaError, .tooManyOrigins(9))
+            XCTAssertEqual($0 as? ReplicaError, .tooManyOrigins(ReplicaLimits.maxOrigins + 1))
         }
 
         XCTAssertThrowsError(
             try ReplicaVersionVector(
-                Dictionary(uniqueKeysWithValues: (1...9).map {
+                Dictionary(uniqueKeysWithValues: (1...ReplicaLimits.maxOrigins + 1).map {
                     (device(UInt8($0)), UInt64(1))
                 })
             )
         ) {
-            XCTAssertEqual($0 as? ReplicaError, .tooManyOrigins(9))
+            XCTAssertEqual($0 as? ReplicaError, .tooManyOrigins(ReplicaLimits.maxOrigins + 1))
         }
 
         XCTAssertThrowsError(try ReplicaDeviceID(bytes: Data(repeating: 1, count: 15))) {

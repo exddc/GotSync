@@ -100,6 +100,180 @@ final class SyncEngineMLSTests: XCTestCase {
         try await XCTUnwrapAsync(await engine.mlsSessionForTesting?.fingerprint())
     }
 
+    private func engineWithRetiredOrigins(_ name: String, count: Int) async throws -> SyncEngine {
+        let seeded = engine(name)
+        let deviceID = try ReplicaDeviceID(bytes: seeded.localDeviceID)
+        await seeded.stop()
+        var replica = try TaskReplica(deviceID: deviceID)
+        let operations = (1...count).map {
+            TaskOperation(
+                originDeviceID: ReplicaDeviceID(uuid: UUID()),
+                originSequence: 1,
+                lamport: 1,
+                taskID: UUID(),
+                mutation: .create(title: "Retired \($0)", completed: false)
+            )
+        }
+        for batch in try OperationBatcher.batches(operations) {
+            try replica.applyRemote(batch)
+        }
+        try ProtectedStorage.write(
+            replica.atomicArchiveData(),
+            to: root.appendingPathComponent("\(name)/replica-v1.json")
+        )
+        return engine(name)
+    }
+
+    func testReplacementDevicesBeyondTheGroupLimitKeepEveryTask() async throws {
+        var host = engine("replacement-host")
+        XCTAssertTrue(host.addTask(title: "Host task"))
+        let replacements = 10
+        for n in 1...replacements {
+            let peer = engine("replacement-peer-\(n)")
+            XCTAssertTrue(peer.addTask(title: "Peer \(n) task"))
+            try await pair(host, peer)
+            try await wait("replacement \(n) history") {
+                host.tasks.count == n + 1 && peer.tasks.count == n + 1
+                    && host.pendingMailboxOperationCount == 0 && peer.pendingMailboxOperationCount == 0
+            }
+            XCTAssertEqual(host.linkedMemberCount, 2)
+            let peerFingerprint = try await fingerprint(peer)
+            XCTAssertTrue(host.removeDevice(fingerprint: peerFingerprint))
+            try await wait("replacement \(n) removed") { host.linkedMemberCount == 1 }
+            await peer.stop()
+        }
+        let expected = Set(["Host task"] + (1...replacements).map { "Peer \($0) task" })
+        XCTAssertEqual(Set(host.tasks.compactMap(\.titleValue)), expected)
+        XCTAssertNil(host.errorMessage)
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+
+        await host.stop()
+        host = engine("replacement-host")
+        XCTAssertEqual(Set(host.tasks.compactMap(\.titleValue)), expected)
+        let latecomer = engine("replacement-latecomer")
+        try await pair(host, latecomer)
+        try await wait("latecomer catch-up") { Set(latecomer.tasks.compactMap(\.titleValue)) == expected }
+        XCTAssertTrue(latecomer.addTask(title: "Latecomer task"))
+        try await wait("latecomer contributes") { host.tasks.count == expected.count + 1 }
+    }
+
+    func testFullTaskHistoryRefusesAnotherDeviceBeforeLinking() async throws {
+        let host = try await engineWithRetiredOrigins("capacity-host", count: ReplicaLimits.maxOrigins - 4)
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+        let peer = engine("capacity-peer")
+        try await pair(host, peer)
+        XCTAssertTrue(peer.addTask(title: "Peer task"))
+        XCTAssertTrue(host.addTask(title: "Host task"))
+        try await wait("full history converges") {
+            host.tasks.count == ReplicaLimits.maxOrigins - 2 && peer.tasks.count == ReplicaLimits.maxOrigins - 2
+        }
+        XCTAssertTrue(host.isTaskHistoryAtCapacity)
+        XCTAssertTrue(peer.isTaskHistoryAtCapacity)
+
+        host.createPrivateSync()
+        XCTAssertNil(host.invitationURL)
+        XCTAssertFalse(host.canCancelPairing)
+        XCTAssertEqual(host.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+
+        XCTAssertTrue(host.addTask(title: "Still syncing"))
+        try await wait("linked devices keep syncing") {
+            peer.tasks.contains { $0.titleValue == "Still syncing" }
+        }
+    }
+
+    private func membersSharingOneFreeOriginSlot() async throws -> (SyncEngine, SyncEngine) {
+        let host = try await engineWithRetiredOrigins("slot-host", count: ReplicaLimits.maxOrigins - 3)
+        let second = engine("slot-second")
+        try await pair(host, second)
+        try await wait("second has history") {
+            second.tasks.count == ReplicaLimits.maxOrigins - 3 && second.linkedMemberCount == 2
+        }
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+        XCTAssertFalse(second.isTaskHistoryAtCapacity)
+        return (host, second)
+    }
+
+    private func pendingJoiners(
+        _ host: SyncEngine,
+        _ second: SyncEngine
+    ) async throws -> (SyncEngine, SyncEngine) {
+        let third = engine("slot-third")
+        let fourth = engine("slot-fourth")
+        third.joinPrivateSync(url: try await invite(host))
+        fourth.joinPrivateSync(url: try await invite(second))
+        try await wait("both safety codes") {
+            host.isHostApprovalPending && second.isHostApprovalPending
+                && third.safetyCode != nil && fourth.safetyCode != nil
+        }
+        return (third, fourth)
+    }
+
+    func testApprovalRechecksTaskHistoryAgainstMembersAddedMeanwhile() async throws {
+        let (host, second) = try await membersSharingOneFreeOriginSlot()
+        let (third, fourth) = try await pendingJoiners(host, second)
+        let secondErrors = ErrorMessageLog(second)
+        defer { secondErrors.stop() }
+
+        host.approveSafetyCode()
+        try await wait("third linked") { third.isPaired && host.linkedMemberCount == 3 }
+        second.approveSafetyCode()
+        try await wait("fourth refused") { fourth.phase == .failed && !second.canCancelPairing }
+        try await wait("inviter reports capacity") {
+            secondErrors.messages.contains(SyncError.taskHistoryAtCapacity.errorDescription!)
+        }
+        XCTAssertFalse(fourth.isPaired)
+        XCTAssertEqual(fourth.errorMessage, SyncError.pairingDeclined.errorDescription)
+
+        XCTAssertTrue(third.addTask(title: "Last slot"))
+        try await wait("last slot syncs") {
+            [host, second].allSatisfy { engine in
+                engine.linkedMemberCount == 3 && engine.tasks.contains { $0.titleValue == "Last slot" }
+            }
+        }
+        XCTAssertTrue(host.isTaskHistoryAtCapacity)
+        XCTAssertTrue(second.isTaskHistoryAtCapacity)
+    }
+
+    func testConcurrentApprovalsNeverAdmitPastTaskHistoryCapacity() async throws {
+        let (host, second) = try await membersSharingOneFreeOriginSlot()
+        let (third, fourth) = try await pendingJoiners(host, second)
+
+        host.approveSafetyCode()
+        second.approveSafetyCode()
+        try await wait("both attempts end") {
+            !host.canCancelPairing && !second.canCancelPairing
+                && [third, fourth].allSatisfy { $0.isPaired || $0.phase == .failed }
+        }
+        try await wait("removals settle") {
+            [host, second].allSatisfy { engine in
+                engine.linkedDevices.allSatisfy { !$0.isRemovalPending } && engine.linkedMemberCount <= 3
+            }
+        }
+        let linked = Set(host.linkedDevices.map(\.deviceID))
+        XCTAssertTrue(linked.isSuperset(of: [host.localDeviceID, second.localDeviceID]))
+        XCTAssertFalse(linked.contains(third.localDeviceID) && linked.contains(fourth.localDeviceID))
+        XCTAssertLessThanOrEqual(linked.count, 3)
+    }
+
+    func testJoinerWithFullTaskHistoryIsRefusedBeforeLinking() async throws {
+        let joiner = try await engineWithRetiredOrigins("full-joiner", count: ReplicaLimits.maxOrigins - 1)
+        XCTAssertTrue(joiner.isTaskHistoryAtCapacity)
+        let host = engine("roomy-host")
+        let url = try await invite(host)
+
+        joiner.joinPrivateSync(url: url)
+        XCTAssertEqual(joiner.phase, .failed)
+        XCTAssertEqual(joiner.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+        XCTAssertFalse(joiner.canCancelPairing)
+        XCTAssertNil(joiner.safetyCode)
+        XCTAssertFalse(joiner.isPaired)
+        XCTAssertEqual(joiner.tasks.count, ReplicaLimits.maxOrigins - 1)
+
+        joiner.createPrivateSync()
+        XCTAssertNil(joiner.invitationURL)
+        XCTAssertEqual(joiner.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+    }
+
     func testPairingMergesBothReplicasAndReplicatesEdits() async throws {
         let host = engine("host")
         let joiner = engine("joiner")
@@ -954,4 +1128,25 @@ private final class SyncTestGate {
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
     try XCTUnwrap(value, file: file, line: line)
+}
+
+@MainActor
+private final class ErrorMessageLog {
+    private(set) var messages: [String] = []
+    private var observer: Task<Void, Never>?
+
+    init(_ engine: SyncEngine) {
+        let states = engine.states()
+        observer = Task { [weak self] in
+            for await state in states {
+                if let message = state.errorMessage {
+                    self?.messages.append(message)
+                }
+            }
+        }
+    }
+
+    func stop() {
+        observer?.cancel()
+    }
 }

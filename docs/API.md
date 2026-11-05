@@ -48,6 +48,12 @@ New `SyncError` cases:
   its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
 - `approvalExpired`: the inviter did not approve the safety code within 10
   minutes. Nothing was linked.
+- `taskHistoryAtCapacity`: the task history has no room for another device.
+  It counts retained origins, including those of removed devices, plus one
+  slot for each current member and this device, up to
+  `ReplicaLimits.maxOrigins` (128). Creating, inviting,
+  or joining fails before anything is linked; a joiner refused after approval
+  sees `pairingDeclined`. Current members keep syncing.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`
@@ -96,6 +102,11 @@ for a fingerprint outside the group. Sync cycles commit saved removals until
 the device is gone, after restarts and conflicting commits as well. The entry
 disappears from `linkedDevices` once the commit is accepted. A group may
 shrink to this device alone; it stays paired and can invite again.
+
+Removing a device frees a group slot but not its slot in the task history.
+`isTaskHistoryAtCapacity` is `true` when linking one more device would leave
+no room for a new origin from that device or a current member. It is separate
+from `isGroupAtCapacity`, which counts current members only.
 
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this

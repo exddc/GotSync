@@ -300,6 +300,45 @@ If the install identity or persistent replica cannot be opened, the engine
 enters a fatal local error state: it does not open the MLS session, sync,
 accept edits, or acknowledge remote operations through an in-memory fallback.
 
+### Replica capacity
+
+A replica holds at most 1,000 task records and tombstones, 10,000 operations,
+and 128 origins. An origin is a device whose operations the replica retains.
+Removing or unlinking a device keeps its origin, because later joiners need
+its operations to rebuild the same tasks. The origin limit therefore counts
+every device that has edited the task history, while the MLS group separately
+limits how many devices are members at once to eight. A `hello` that carries
+all 128 vector entries stays under 10 KiB, and every origin holds at least one
+of the 10,000 retained operations.
+
+The engine counts the slots in use: every origin its replica retains, plus one
+slot for each current member, including this device, whether or not that
+member has edited. It does not match members to origins, because a replica's
+origin need not equal its member's device ID. A member that has already edited
+therefore counts twice, which can refuse a device up to eight slots early; a
+full group of eight still has room for at least 120 origins over its lifetime.
+Linking needs one free slot for the other device.
+
+Each device checks before pairing starts, so `createPrivateSync()`,
+`inviteToGroup()`, and `joinPrivateSync(url:)` or `joinPrivateSync(phrase:)`
+fail with `SyncError.taskHistoryAtCapacity` and nothing is linked. A linked
+inviter checks again after the safety code is approved, against the MLS
+roster it has just synchronized, so a device another member added in the
+meantime is counted. If two members' Adds still race for the last slot, an
+inviter whose roster exceeds the limit after its Add removes the new member
+the same way it removes a joiner that declined during the Add. In both late
+cases the inviter reports `SyncError.taskHistoryAtCapacity` and the joiner
+reports `SyncError.pairingDeclined`, because a decision frame carries no
+reason. Current members keep syncing.
+
+Pairing frames do not carry replica contents, so each side counts only the
+origins it already holds. A joiner that brings origins from an earlier group
+can still push the merged history past the limit, and the receiving replica
+rejects operations from origins beyond it. A device that edited the history
+before, left, and links again still needs a free slot. Version 2 does not
+compact retired origins: a task history without a free slot cannot gain
+another contributing device.
+
 A local edit atomically persists the operation, materialized state, next origin
 sequence, Lamport clock, and local vector before it is sent. A remote batch
 atomically persists every accepted operation, materialized state, updated

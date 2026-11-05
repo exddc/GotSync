@@ -37,7 +37,7 @@ that tells the user to pair every device again. The pairing WebSocket closes a
 | MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
 | Replication checkpoint | `sync-v2.json`, version 2 | Engine discards an unreadable checkpoint and rebuilds it from MLS state |
-| Replica archive | `replica-v1.json`, format 1 | Unchanged by the cutover; replica validation rejects unsupported archives |
+| Replica archive | `replica-v1.json`, format 1 | Unchanged by the cutover; replica validation rejects unsupported archives and more than 128 origins |
 
 The relay's `/healthz` reports `supportedVersions: [2]`.
 
@@ -81,6 +81,18 @@ Production consumers must use the same relay origin for pairing and delivery.
 `SyncConfiguration.mailboxURL` in `/v2/mls`. The demo's application
 identifier and Keychain service create an independent install; it does not
 migrate another application's sandbox or credentials.
+
+## Origin limit
+
+Earlier version 2 builds accept at most eight origins in a replica, a version
+vector, or a `hello`. Current builds accept 128 with the same archive format
+and message shape. In a group that mixes builds, an earlier build rejects
+operations from a ninth origin, so it misses that device's edits. It also
+skips any `hello` with more than eight entries and does not answer it. Update
+every device in a group before a ninth device edits its tasks. An earlier
+build cannot open an archive with more than eight origins: it starts in the
+failed phase with a too-many-origins error, leaves the archive in place, and
+the tasks return after updating again.
 
 ## Future changes
 
