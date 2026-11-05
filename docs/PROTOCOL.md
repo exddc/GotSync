@@ -128,9 +128,12 @@ before it answers hellos and acknowledges the MLS inbox. A replay after a
 crash is idempotent.
 
 `sync-v2.json` in the storage directory records the group ID, each member's
-device ID and fingerprint, the highest own sequence uploaded, whether the join
-announcement is pending, requested removals, and provisional members. The MLS
-state remains the source of truth: on launch, a group with at least two
+device ID and fingerprint, the highest own sequence uploaded and the local
+origin it counts, whether the join announcement is pending, requested
+removals, and provisional members. A sequence recorded for another origin
+counts as nothing uploaded, so a replica recreated under a new origin while
+the link survives uploads all its edits. A checkpoint without an origin counts
+the device ID, as version 1 archives do. The MLS state remains the source of truth: on launch, a group with at least two
 members is linked even if the file is missing. Before a joiner waits for
 admission it writes the group ID and inviter fingerprint to
 `sync-v2-join.json`, so a joiner that stops after admission but before

@@ -1756,7 +1756,7 @@ public final class SyncEngine {
     }
 
     private func answer(_ hello: ReplicationMessage, fingerprint: Data, session: MLSSession) async throws {
-        guard let vector = hello.vector, let uploadedThrough = checkpoint?.uploadedThrough else {
+        guard let vector = hello.vector, let uploadedThrough = checkpoint.map(uploadedLocalSequence) else {
             return
         }
         let isProvider = hello.provider == fingerprint
@@ -1783,7 +1783,10 @@ public final class SyncEngine {
         }
         current.joinPending = false
         current.provider = nil
-        current.uploadedThrough = max(current.uploadedThrough, vector[replica.localOrigin])
+        current.setUploadedThrough(
+            max(uploadedLocalSequence(in: current), vector[replica.localOrigin]),
+            origin: replica.localOrigin
+        )
         try saveCheckpoint(current)
         lastMailboxStoredAt = Date()
         refreshPendingMailboxCount()
@@ -1792,23 +1795,25 @@ public final class SyncEngine {
     private func uploadLocalOperations(session: MLSSession) async throws {
         while var current = checkpoint {
             let localSequence = replica.versionVector[replica.localOrigin]
-            if current.uploadedThrough > localSequence {
-                current.uploadedThrough = localSequence
+            var uploadedThrough = uploadedLocalSequence(in: current)
+            if uploadedThrough > localSequence {
+                uploadedThrough = localSequence
+                current.setUploadedThrough(localSequence, origin: replica.localOrigin)
                 try saveCheckpoint(current)
             }
-            guard current.uploadedThrough < localSequence else {
+            guard uploadedThrough < localSequence else {
                 break
             }
             let pending = replica.retainedOperations.filter {
-                $0.originDeviceID == replica.localOrigin && $0.originSequence > current.uploadedThrough
+                $0.originDeviceID == replica.localOrigin && $0.originSequence > uploadedThrough
             }
-            guard pending.first?.originSequence == current.uploadedThrough + 1,
+            guard pending.first?.originSequence == uploadedThrough + 1,
                   let batch = try OperationBatcher.batches(pending).first,
                   let last = batch.last
             else {
                 throw ReplicaError.sequenceGap(
                     origin: replica.localOrigin,
-                    expected: current.uploadedThrough + 1,
+                    expected: uploadedThrough + 1,
                     received: pending.first?.originSequence ?? 0
                 )
             }
@@ -1817,7 +1822,10 @@ public final class SyncEngine {
             guard var latest = checkpoint, latest.group == current.group else {
                 throw CancellationError()
             }
-            latest.uploadedThrough = max(latest.uploadedThrough, last.originSequence)
+            latest.setUploadedThrough(
+                max(uploadedLocalSequence(in: latest), last.originSequence),
+                origin: replica.localOrigin
+            )
             try saveCheckpoint(latest)
             lastMailboxStoredAt = Date()
             refreshPendingMailboxCount()
@@ -2038,6 +2046,10 @@ public final class SyncEngine {
         return newest ?? freshMLSDirectory(in: root)
     }
 
+    private func uploadedLocalSequence(in checkpoint: ReplicationCheckpoint) -> UInt64 {
+        checkpoint.uploadedThrough(origin: replica.localOrigin, deviceID: deviceID)
+    }
+
     private func saveCheckpoint(_ value: ReplicationCheckpoint) throws {
         try value.save(to: checkpointURL)
         checkpoint = value
@@ -2096,7 +2108,7 @@ public final class SyncEngine {
 
     private func refreshPendingMailboxCount() {
         let localSequence = replica.versionVector[replica.localOrigin]
-        let uploaded = checkpoint?.uploadedThrough ?? 0
+        let uploaded = checkpoint.map(uploadedLocalSequence) ?? 0
         let pending = localSequence > uploaded ? Int(localSequence - uploaded) : 0
         if pending == 0 {
             if pendingMailboxOperationCount != 0 { pendingMailboxOperationCount = 0 }

@@ -160,6 +160,53 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertNil(restarted.mailboxError)
     }
 
+    func testMissingArchiveWithSurvivingLinkUploadsFromItsNewOrigin() async throws {
+        try await assertMissingArchiveUploadsFromNewOrigin(versionOneCheckpoint: false)
+    }
+
+    func testMissingArchiveWithVersionOneCheckpointUploadsFromItsNewOrigin() async throws {
+        try await assertMissingArchiveUploadsFromNewOrigin(versionOneCheckpoint: true)
+    }
+
+    private func assertMissingArchiveUploadsFromNewOrigin(versionOneCheckpoint: Bool) async throws {
+        let host = engine("archive-host")
+        let peer = engine("archive-peer")
+        XCTAssertTrue(peer.addTask(title: "First"))
+        XCTAssertTrue(peer.addTask(title: "Second"))
+        try await pair(host, peer)
+        try await wait("uploaded") {
+            host.tasks.count == 2 && peer.phase == .synced && peer.pendingMailboxOperationCount == 0
+        }
+        let previousOrigin = peer.replicaForTesting.localOrigin
+        await peer.stop()
+
+        let directory = root.appendingPathComponent("archive-peer")
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("replica-v1.json"))
+        let checkpointURL = directory.appendingPathComponent(ReplicationCheckpoint.filename)
+        var checkpoint = try XCTUnwrap(ReplicationCheckpoint.load(from: checkpointURL))
+        XCTAssertEqual(checkpoint.uploadedThrough, 2)
+        XCTAssertEqual(checkpoint.uploadOrigin, previousOrigin)
+        if versionOneCheckpoint {
+            checkpoint.uploadOrigin = nil
+            try checkpoint.save(to: checkpointURL)
+        }
+
+        let interrupted = engine("archive-peer")
+        let newOrigin = interrupted.replicaForTesting.localOrigin
+        XCTAssertNotEqual(newOrigin, previousOrigin)
+        await interrupted.stop()
+
+        let restarted = engine("archive-peer")
+        XCTAssertTrue(restarted.isPaired)
+        XCTAssertEqual(restarted.replicaForTesting.localOrigin, newOrigin)
+        XCTAssertTrue(restarted.addTask(title: "After archive loss"))
+        XCTAssertEqual(restarted.pendingMailboxOperationCount, 1)
+        try await wait("new origin uploads") {
+            host.tasks.contains { $0.titleValue == "After archive loss" }
+                && restarted.pendingMailboxOperationCount == 0
+        }
+    }
+
     func testReusedOperationIDWithDifferentContentStopsSync() async throws {
         let store = MemorySecretStore()
         stores["legacy-peer"] = store

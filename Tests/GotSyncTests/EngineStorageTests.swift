@@ -219,6 +219,24 @@ final class EngineStorageTests: XCTestCase {
         XCTAssertNotNil(model.errorMessage)
     }
 
+    func testUploadWatermarkCountsOnlyItsOrigin() {
+        let deviceID = ReplicaDeviceID(uuid: UUID())
+        let origin = ReplicaDeviceID(uuid: UUID())
+        var checkpoint = ReplicationCheckpoint(
+            group: Data(repeating: 1, count: 32),
+            members: [],
+            joinPending: false,
+            provider: nil
+        )
+        checkpoint.uploadedThrough = 5
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: deviceID, deviceID: deviceID), 5)
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: origin, deviceID: deviceID), 0)
+
+        checkpoint.setUploadedThrough(3, origin: origin)
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: origin, deviceID: deviceID), 3)
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: deviceID, deviceID: deviceID), 0)
+    }
+
     @MainActor
     func testLegacyPendingJoinIsDiscardedAndArchivePreserved() throws {
         let service = "com.gotdone.relay.tests.\(UUID().uuidString)"
