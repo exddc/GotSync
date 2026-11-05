@@ -114,8 +114,9 @@ one device and **Join link** on another. After pairing, use **Manage sync** to
 invite additional devices. Debug demo builds use loopback endpoints on the
 Mac. Physical devices require reachable endpoints.
 
-The [server README](server/README.md) covers Docker, ports, persistence, and TLS
-proxy requirements. No public hosted service is provisioned by this repository.
+The [server README](server/README.md) covers Docker, ports, persistence, TLS
+proxy requirements, and [deploying a public relay](server/README.md#deploy-a-public-relay).
+No public hosted service is provisioned by this repository.
 
 ## Delivery and security limits
 

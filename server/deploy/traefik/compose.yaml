@@ -1,0 +1,56 @@
+name: gotsync-relay
+
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command:
+      - --host=0.0.0.0
+      - --delivery-host=0.0.0.0
+      - --tls-cert=/certs/tls.crt
+      - --tls-key=/certs/tls.key
+      - --database=/data/mls.sqlite3
+      - --trusted-proxy=10.0.0.0/8
+      - --trusted-proxy=172.16.0.0/12
+      - --trusted-proxy=192.168.0.0/16
+    volumes:
+      - /data/gotsync-relay/data:/data
+      - /data/gotsync-relay/certs:/certs:ro
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.gotsync-mls.rule=Host(`${GOTSYNC_RELAY_HOST:?}`) && PathPrefix(`/v2/mls/`)
+      - traefik.http.routers.gotsync-mls.entrypoints=${TRAEFIK_ENTRYPOINT:-https}
+      - traefik.http.routers.gotsync-mls.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
+      - traefik.http.routers.gotsync-mls.tls.options=gotsync@file
+      - traefik.http.routers.gotsync-mls.observability.accesslogs=false
+      - traefik.http.routers.gotsync-mls.middlewares=gotsync-hsts@file,gotsync-mls-rate@file,gotsync-mls-inflight@file,gotsync-mls-body@file
+      - traefik.http.routers.gotsync-mls.service=gotsync-mls
+      - traefik.http.services.gotsync-mls.loadbalancer.server.port=8767
+      - traefik.http.services.gotsync-mls.loadbalancer.server.scheme=https
+      - traefik.http.services.gotsync-mls.loadbalancer.serverstransport=gotsync-relay@file
+      - traefik.http.routers.gotsync-pairing.rule=Host(`${GOTSYNC_RELAY_HOST:?}`) && Path(`/v2/pairing`)
+      - traefik.http.routers.gotsync-pairing.entrypoints=${TRAEFIK_ENTRYPOINT:-https}
+      - traefik.http.routers.gotsync-pairing.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
+      - traefik.http.routers.gotsync-pairing.tls.options=gotsync@file
+      - traefik.http.routers.gotsync-pairing.observability.accesslogs=false
+      - traefik.http.routers.gotsync-pairing.middlewares=gotsync-hsts@file,gotsync-pairing-rate@file,gotsync-pairing-inflight@file
+      - traefik.http.routers.gotsync-pairing.service=gotsync-pairing
+      - traefik.http.services.gotsync-pairing.loadbalancer.server.port=8765
+      - traefik.http.services.gotsync-pairing.loadbalancer.server.scheme=https
+      - traefik.http.services.gotsync-pairing.loadbalancer.serverstransport=gotsync-relay@file

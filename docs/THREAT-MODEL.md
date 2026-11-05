@@ -153,6 +153,21 @@ perimeter rate limits and DDoS protection, firewalling the relay ports, backup
 policy, and deployment monitoring. See the relay README for the perimeter
 checklist.
 
+## Hosting
+
+A relay host often runs more than the relay: the TLS proxy, a container
+platform that controls Docker with root privileges, or unrelated
+applications. An attacker who compromises any of them, or the hosting
+provider, gains the position of the malicious relay described above. That
+position yields ciphertext, group IDs, IP addresses, timing, and sizes, and
+allows denial of service. The TLS proxy also sees pairing frames after TLS
+ends; those frames stay encrypted under keys derived from the invitation
+secret. MLS keeps task contents out of reach.
+
+The [example deployment](../server/README.md#deploy-a-public-relay) keeps
+requests on the relay routes out of the proxy access log and keeps no backups.
+The relay keeps client addresses only in memory for rate limiting.
+
 ## Delivery and loss
 
 The engine receives while its application is active. Background send is best

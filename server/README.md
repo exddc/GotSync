@@ -272,6 +272,141 @@ with the proxy's network to the command. Mount an admission token file
 read-only and set `GOTSYNC_ADMISSION_TOKEN_FILE` to its path. Restrict the
 volume and encrypt its backups.
 
+## Deploy a public relay
+
+A public relay needs a host name, a TLS proxy in front of the relay, and the
+controls in [Perimeter for a public relay](#perimeter-for-a-public-relay). The
+proxy terminates HTTPS and WSS with a certificate from a trusted CA and routes
+`/v2/pairing` to port 8765 and `/v2/mls/` to port 8767. A proxy in another
+container or on another host reaches the relay over TLS; only a proxy on the
+same host may use plain HTTP to a relay bound to loopback.
+
+`deploy/traefik` is an example of such a deployment with Docker Compose and
+Traefik 3.4 or newer. It works with any Traefik that has a Docker provider and
+a file provider that watches a directory, whether you run Traefik yourself or
+a hosting platform runs it for you. Traefik verifies the relay's self-signed
+certificate against a pinned copy, and the relay publishes no ports.
+
+### Prepare the host
+
+Allow inbound traffic only to these ports, with a firewall that filters in
+front of the server, such as your hosting provider's network firewall. Ports
+that Docker publishes bypass host firewalls such as UFW.
+
+| Port | Source | Purpose |
+| --- | --- | --- |
+| 22/tcp | Administrator addresses only | SSH |
+| 80/tcp | Any | ACME HTTP-01 challenges |
+| 443/tcp, 443/udp | Any | HTTPS and HTTP/3 |
+
+Reach the dashboards of other tools on the server through port 443 or a VPN,
+not through their own ports. Allow only key-based SSH logins
+(`PasswordAuthentication no`). Provider-side backups and snapshots of the
+server copy the relay database, so keep them off unless they are encrypted
+with a key you hold.
+
+Run the setup script as root on the server, with the directory that Traefik's
+file provider watches:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/exddc/GotSync/main/server/deploy/traefik/setup-host.sh
+sh setup-host.sh /path/to/traefik/dynamic
+```
+
+The script creates `/data/gotsync-relay/data` (mode `0700`, UID 10001) and
+`/data/gotsync-relay/certs`. It generates a P-256 certificate for the name
+`gotsync-relay`, valid for ten years, and writes `gotsync-relay.yaml` to the
+Traefik directory. Traefik loads that file without a restart. It holds:
+
+- the `gotsync-relay` servers transport, which pins the certificate and
+  answers `504` when the relay does not accept a connection within 3 seconds
+  or send response headers within 15 seconds;
+- per-source rate and concurrency limits equal to the relay's defaults, and a
+  1 MiB request body limit on the delivery route;
+- HSTS, and a TLS option that requires TLS 1.2 or newer with AEAD cipher
+  suites.
+
+Running the script again keeps the existing certificate. To rotate it, delete
+`/data/gotsync-relay/certs/tls.*`, run the script, and restart the relay at
+once: Traefik trusts the new certificate as soon as the script finishes, so
+requests fail with `500` until the relay restarts. To keep the files
+somewhere else, set `GOTSYNC_HOST_DIR` for the script and override both
+volumes of `compose.yaml` in a compose override file.
+
+For an encrypted store, mount a LUKS2 volume at `/data/gotsync-relay` before
+you run the script. With the key file on the server's root disk, the server
+still reboots unattended. That protects the data on volume snapshots and
+discarded disks, but not from anyone with root on the running server.
+
+### Run the relay
+
+1. Point the relay's host name at the server with an `A` record. A `CAA`
+   record such as `0 issue "letsencrypt.org"` on the same name limits who may
+   issue its certificate.
+2. Put `GOTSYNC_RELAY_HOST=relay.example.com` in `server/deploy/traefik/.env`,
+   or export it. If your Traefik names its HTTPS entry point or certificate
+   resolver something other than `https` and `letsencrypt`, also set
+   `TRAEFIK_ENTRYPOINT` and `TRAEFIK_CERT_RESOLVER`.
+3. Run `docker compose up -d --build` in `server/deploy/traefik`, then connect
+   Traefik to the relay's network with
+   `docker network connect gotsync-relay_default <traefik-container>`.
+
+A platform that deploys a compose file from a Git repository can use
+`server/deploy/traefik/compose.yaml` as it is, with the variables set in the
+platform. If the platform escapes `$` in labels, turn that off for this
+application, or Traefik receives the variable names instead of their values.
+Leave the platform's domain setting empty, because the labels already define
+both routes, their middlewares, and the certificate resolver.
+
+Add an `AAAA` record only if Traefik sees the addresses of IPv6 clients.
+Docker forwards IPv6 connections to a container on an IPv4-only network from
+the bridge gateway address, so every IPv6 client would share one rate-limit
+source.
+
+The compose file passes `--trusted-proxy` for the private IPv4 ranges. Only
+containers on the relay's Docker networks can reach it, and Traefik removes any
+`X-Forwarded-For` header a client sends before it appends the client's
+address, unless its entry point sets `forwardedHeaders.insecure` or
+`forwardedHeaders.trustedIPs`. The container runs with a read-only root
+filesystem, no Linux capabilities, `no-new-privileges`, and limits of 512 MB of
+memory and 128 processes.
+
+### Logs and backups
+
+Both relay routes set `observability.accesslogs=false`, so a Traefik access
+log leaves their requests out. Requests for the relay's host name that match
+neither route still appear in it, with client addresses. The relay prints its
+four startup lines and nothing per request. Docker keeps container output in
+three rotated files of 10 MB.
+
+The database in `/data/gotsync-relay/data` holds the delivery log and the
+KeyPackage store. The example keeps no backups. If the database is lost, every
+client receives `historyExpired` and pairs again. If you add backups, encrypt
+them before they leave the server (restic does this), leave out the
+`mls_packages` table, and delete each backup within the retention period.
+
+### Verify
+
+`scripts/test-deploy.sh` builds the image and runs `setup-host.sh` and
+`compose.yaml` behind Traefik v3.7, with a test host name and host directory.
+It checks routing, backend certificate pinning, TLS versions and cipher
+suites, the proxy limits, admission by the forwarded client address, a pairing
+socket that stays idle for 65 seconds, and the absence of relay entries in the
+logs. CI runs it on every pull request. It does not cover changes that a
+platform makes to the compose file before it deploys it.
+
+After a deployment, check the public endpoint:
+
+```sh
+host=relay.example.com
+# 400 with "version":2 in the body: the request reached the relay over backend TLS
+curl -si -X POST "https://$host/v2/mls/fetch" -H 'Content-Type: application/json' -d '{}'
+# 404, or a redirect to HTTPS: never a JSON body with "version":2
+curl -si "http://$host/v2/mls/fetch"
+# Only 80 and 443 open, and 22 only from administrator addresses
+nmap -Pn -p- "$host"
+```
+
 ## Protocol versions
 
 The relay speaks only protocol version 2. WebSocket registration must carry
