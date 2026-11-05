@@ -1708,7 +1708,9 @@ public final class SyncEngine {
     /// `retriesDeferred` allows a retry of deferred operations with an empty
     /// inbox. Pass `false` before fetching, so that a fetched copy of a
     /// deferred operation is compared with it before either applies.
-    /// Returns whether any message was acknowledged.
+    /// Returns whether any message was acknowledged. Held messages are
+    /// acknowledged before anything is sent, except from the first hello that
+    /// still needs an answer, so a send that must catch up finds inbox room.
     @discardableResult
     private func drainInbox(session: MLSSession, retriesDeferred: Bool = true) async throws -> Bool {
         let messages = try await session.inbox()
@@ -1746,28 +1748,31 @@ public final class SyncEngine {
             lastSyncedAt = Date()
             lastMailboxReceivedAt = Date()
         }
-        isInboxBackpressured = application.heldArrivals < messages.count
-        for hello in hellos {
-            let cursor = messages[hello.index].cursor
-            guard hello.index < application.heldArrivals || !answeredHeldHelloCursors.contains(cursor) else {
-                continue
-            }
+        let held = application.heldArrivals
+        isInboxBackpressured = held < messages.count
+        let pending = hellos.filter { $0.index < held || !answeredHeldHelloCursors.contains(messages[$0.index].cursor) }
+        let beforeAnswers = min(pending.first?.index ?? held, held)
+        if beforeAnswers > 0 {
+            try await session.acknowledgeInbox(through: messages[beforeAnswers - 1].cursor)
+        }
+        for hello in pending {
             try await answer(hello.message, fingerprint: fingerprint, session: session)
             try requireCurrent(session)
-            if hello.index >= application.heldArrivals {
-                answeredHeldHelloCursors.insert(cursor)
+            if hello.index >= held {
+                answeredHeldHelloCursors.insert(messages[hello.index].cursor)
             }
         }
-        if (!pool.isEmpty && application.heldArrivals > 0) || application.resumedDeferred {
+        if held > beforeAnswers {
+            try await session.acknowledgeInbox(through: messages[held - 1].cursor)
+        }
+        if held > 0 {
+            let acknowledged = messages[held - 1].cursor
+            answeredHeldHelloCursors = answeredHeldHelloCursors.filter { $0 > acknowledged }
+        }
+        if (!pool.isEmpty && held > 0) || application.resumedDeferred {
             try await send(.hello(vector: replica.versionVector, provider: nil), session: session)
         }
-        guard application.heldArrivals > 0 else {
-            return false
-        }
-        let acknowledged = messages[application.heldArrivals - 1].cursor
-        try await session.acknowledgeInbox(through: acknowledged)
-        answeredHeldHelloCursors = answeredHeldHelloCursors.filter { $0 > acknowledged }
-        return true
+        return held > 0
     }
 
     private func requireCurrent(_ session: MLSSession) throws {

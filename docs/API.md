@@ -61,7 +61,9 @@ New `SyncError` cases:
   pairing again does not free capacity. Unlinking, removal, and
   `eraseLocalData()` discard the saved changes; the group's other members
   still hold them. A full store blocks inbox progress until the device unlinks
-  or erases. If the saved changes cannot be read at launch, the file is kept,
+  or erases. Local uploads continue while the delivery inbox is full, until a
+  commit from another member waits behind the held messages; MLS must process
+  that commit before this device can send again. If the saved changes cannot be read at launch, the file is kept,
   the engine reports `localStorageUnavailable` in `mailboxError` and
   `errorMessage` with `phase` `.failed`, sets `mailboxRequiresRepair` while
   linked, and neither syncs nor pairs. `unlinkAndKeepTasks()` or

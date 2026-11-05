@@ -169,6 +169,19 @@ public actor MLSClient {
         }
     }
 
+    /// Clears a pending application message after the relay accepted it,
+    /// when the inbox is too full to process the log up to that message. The
+    /// log copy is later recorded as a rejected cursor, like any message this
+    /// member cannot decrypt.
+    public func confirmAcceptedApplication(_ delivery: MLSDelivery) throws {
+        try mutate { record in
+            guard delivery.kind == .application else { throw MLSClientError.invalidState }
+            guard record.pending == delivery else { return }
+            record.pending = nil
+            record.pendingPlaintext = nil
+        }
+    }
+
     public func join(welcome: Data, group: Data, verifiedInviterFingerprint: Data, cursor: UInt64) throws {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }

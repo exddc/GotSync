@@ -1100,6 +1100,93 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertEqual(host.tasks.map(\.titleValue), ["Kept"])
     }
 
+    private func replaceArchive(_ name: String, deviceID: ReplicaDeviceID, dropping origins: [ReplicaDeviceID]) throws {
+        let url = root.appendingPathComponent("\(name)/replica-v1.json")
+        let archive = try ReplicaArchive.decodeCanonical(from: Data(contentsOf: url))
+        let kept = archive.operations
+            .filter { !origins.contains($0.originDeviceID) }
+            .sorted(by: ReplicaOrdering.operations)
+        try FileManager.default.removeItem(at: url)
+        var replica = try TaskReplica(deviceID: deviceID, persistenceURL: url)
+        for batch in try OperationBatcher.batches(kept) {
+            try replica.applyRemote(batch)
+        }
+    }
+
+    func testUploadsProgressWhileHeldInboxIsFullAndEverythingAppliesOnceItFits() async throws {
+        let foreign = (1..<ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        var host = try await seededEngine(
+            "held-host", taskCount: 1, foreignOrigins: foreign, deferredOperationLimit: 1
+        )
+        let hostID = try ReplicaDeviceID(bytes: host.localDeviceID)
+        let peer = engine("held-peer")
+        let third = engine("held-third")
+        try await pair(host, peer)
+        try await pair(host, third)
+        try await wait("linked") {
+            [host, peer, third].allSatisfy { $0.linkedMemberCount == 3 && $0.phase == .synced }
+        }
+
+        try await send([create(ReplicaDeviceID(uuid: UUID()), 1, title: "Saved")], from: peer)
+        try await waitForCapacityReport(host, unapplied: 1)
+        let blockedOrigin = ReplicaDeviceID(uuid: UUID())
+        let blockedTask = UUID()
+        try await send([create(blockedOrigin, 1, task: blockedTask, title: "Blocked")], from: peer)
+        for sequence: UInt64 in 2...1_001 {
+            try await send([toggle(blockedOrigin, sequence, task: blockedTask)], from: peer)
+        }
+        try await wait("held inbox full", timeout: .seconds(60)) {
+            try await host.mlsSessionForTesting?.inbox().count == 1_000
+        }
+        let storeURL = root.appendingPathComponent("held-host/\(DeferredOperationStore.filename)")
+        let storedBytes = try Data(contentsOf: storeURL)
+
+        XCTAssertTrue(host.addTask(title: "Outbound 1"))
+        try await wait("first upload", timeout: .seconds(30)) {
+            peer.tasks.contains { $0.titleValue == "Outbound 1" } && host.pendingMailboxOperationCount == 0
+        }
+        try await waitForCapacityReport(host, unapplied: 1)
+
+        await restartable(host)
+        host = engine("held-host", deferredOperationLimit: 1)
+        try await waitForCapacityReport(host, unapplied: 1)
+        await relay.dropNextAppendResponse()
+        XCTAssertTrue(host.addTask(title: "Outbound 2"))
+        try await wait("upload after restart and lost response", timeout: .seconds(30)) {
+            peer.tasks.contains { $0.titleValue == "Outbound 2" } && host.pendingMailboxOperationCount == 0
+        }
+        try await waitForCapacityReport(host, unapplied: 1)
+        let held = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertEqual(held.count, 1_000)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storedBytes)
+        XCTAssertEqual(peer.tasks.filter { $0.titleValue?.hasPrefix("Outbound") == true }.count, 2)
+
+        let thirdFingerprint = try await fingerprint(third)
+        XCTAssertTrue(peer.removeDevice(fingerprint: thirdFingerprint))
+        try await wait("commit behind the held inbox") { peer.linkedMemberCount == 2 }
+        try await send([TaskOperation(
+            originDeviceID: blockedOrigin, originSequence: 1_002, lamport: 7_000, taskID: blockedTask,
+            mutation: .setTitle("Final")
+        )], from: peer)
+
+        await restartable(host)
+        try replaceArchive("held-host", deviceID: hostID, dropping: Array(foreign.prefix(2)))
+        host = engine("held-host")
+        try await wait("everything applied", timeout: .seconds(60)) {
+            host.unappliedRemoteOperationCount == 0 && host.phase == .synced && host.linkedMemberCount == 2
+                && host.tasks.first { $0.id == blockedTask }?.titleValue == "Final"
+        }
+        let drained = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertTrue(drained.isEmpty)
+        XCTAssertNil(host.mailboxError)
+        XCTAssertTrue(host.tasks.contains { $0.titleValue == "Saved" })
+        XCTAssertEqual(host.tasks.filter { $0.titleValue?.hasPrefix("Outbound") == true }.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeURL.path))
+
+        XCTAssertTrue(host.addTask(title: "Outbound 3"))
+        try await wait("upload after recovery") { peer.tasks.contains { $0.titleValue == "Outbound 3" } }
+    }
+
     func testConflictingCopyOfDeferredHeadIsRejectedOnceItFits() async throws {
         var host = try await seededEngine("fork-host", taskCount: ReplicaLimits.maxTasks)
         let peer = engine("fork-peer")
