@@ -104,8 +104,9 @@ socket receives a `routeFull` error and closes.
 After registration, clients may send only binary messages. The relay forwards
 them unchanged only while both peers are live. A message sent before the peer
 arrives is dropped immediately. WebSocket compression is disabled. Messages
-are limited to 512 KiB, and each destination has a forwarding queue capped at
-16 frames and 1 MiB.
+are limited to 512 KiB and 4,096 fragments; the relay closes a socket that
+exceeds either limit with code `1009`. Each destination has a forwarding queue
+capped at 16 frames and 1 MiB.
 
 ## MLS delivery service
 
