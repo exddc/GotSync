@@ -234,6 +234,42 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertTrue(second.isTaskHistoryAtCapacity)
     }
 
+    func testApprovalCountsUnappliedEditsOfAMemberRemovedMeanwhile() async throws {
+        let (host, second) = try await membersSharingOneFreeOriginSlot()
+        let late = engine("slot-late")
+        late.joinPrivateSync(url: try await invite(host))
+        try await wait("late safety code") { host.isHostApprovalPending && late.safetyCode != nil }
+        let gate = SyncTestGate()
+        host.inboxReadHookForTesting = { await gate.pause() }
+        defer { gate.release() }
+
+        let transient = engine("slot-transient")
+        XCTAssertTrue(transient.addTask(title: "Transient task"))
+        try await pair(second, transient)
+        try await wait("transient uploaded while host drain is paused") {
+            gate.isPaused && transient.pendingMailboxOperationCount == 0
+                && second.tasks.contains { $0.titleValue == "Transient task" }
+        }
+        host.inboxReadHookForTesting = nil
+        let transientFingerprint = try await fingerprint(transient)
+        XCTAssertTrue(second.removeDevice(fingerprint: transientFingerprint))
+        try await wait("transient removed") { second.linkedMemberCount == 2 }
+        XCTAssertFalse(host.tasks.contains { $0.titleValue == "Transient task" })
+
+        let hostErrors = ErrorMessageLog(host)
+        defer { hostErrors.stop() }
+        host.approveSafetyCode()
+        try await wait("late refused") { late.phase == .failed && !host.canCancelPairing }
+        try await wait("host reports capacity") {
+            hostErrors.messages.contains(SyncError.taskHistoryAtCapacity.errorDescription!)
+        }
+        XCTAssertFalse(late.isPaired)
+        gate.release()
+        try await wait("host applies transient edit") {
+            host.tasks.contains { $0.titleValue == "Transient task" } && host.linkedMemberCount == 2
+        }
+    }
+
     func testConcurrentApprovalsNeverAdmitPastTaskHistoryCapacity() async throws {
         let (host, second) = try await membersSharingOneFreeOriginSlot()
         let (third, fourth) = try await pendingJoiners(host, second)
@@ -253,6 +289,19 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertTrue(linked.isSuperset(of: [host.localDeviceID, second.localDeviceID]))
         XCTAssertFalse(linked.contains(third.localDeviceID) && linked.contains(fourth.localDeviceID))
         XCTAssertLessThanOrEqual(linked.count, 3)
+    }
+
+    func testOriginSlotsCountEachRetainedOrPendingOriginOnceAndReserveMembers() {
+        let origins = (1...3).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        XCTAssertEqual(SyncEngine.originSlots(retained: [], pending: [], memberCount: 0), 1)
+        XCTAssertEqual(
+            SyncEngine.originSlots(retained: [origins[0], origins[1]], pending: [origins[1], origins[2]], memberCount: 2),
+            5
+        )
+        XCTAssertEqual(
+            SyncEngine.originSlots(retained: origins, pending: Set(origins), memberCount: 1),
+            4
+        )
     }
 
     func testJoinerWithFullTaskHistoryIsRefusedBeforeLinking() async throws {

@@ -323,8 +323,10 @@ Each device checks before pairing starts, so `createPrivateSync()`,
 `inviteToGroup()`, and `joinPrivateSync(url:)` or `joinPrivateSync(phrase:)`
 fail with `SyncError.taskHistoryAtCapacity` and nothing is linked. A linked
 inviter checks again after the safety code is approved, against the MLS
-roster it has just synchronized, so a device another member added in the
-meantime is counted. If two members' Adds still race for the last slot, an
+roster it has just synchronized and the origins in delivered application
+messages it has not applied yet. A device that another member added in the
+meantime is counted, and so is a removed device whose edits are still waiting
+in the inbox. If two members' Adds still race for the last slot, an
 inviter whose roster exceeds the limit after its Add removes the new member
 the same way it removes a joiner that declined during the Add. In both late
 cases the inviter reports `SyncError.taskHistoryAtCapacity` and the joiner

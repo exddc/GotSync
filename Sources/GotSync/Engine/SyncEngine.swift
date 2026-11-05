@@ -202,7 +202,7 @@ public final class SyncEngine {
         pairingConflictBackupFilename,
     ]
     static let departuresDirectoryName = "mls-v2-departing"
-    private static let maximumGroupSize = 8
+    public nonisolated static let maximumGroupSize = 8
     private static let maximumAddAttempts = 3
     private static let maximumRemovalAttempts = 8
     private static let maximumDepartures = 8
@@ -455,8 +455,30 @@ public final class SyncEngine {
         originSlotsInUse(memberCount: linkedDeviceIDs.count) >= ReplicaLimits.maxOrigins
     }
 
-    private func originSlotsInUse(memberCount: Int) -> Int {
-        replica.versionVector.entries.count + max(memberCount, 1)
+    private func originSlotsInUse(memberCount: Int, pending: Set<ReplicaDeviceID> = []) -> Int {
+        Self.originSlots(retained: replica.versionVector.origins, pending: pending, memberCount: memberCount)
+    }
+
+    static func originSlots(
+        retained: [ReplicaDeviceID],
+        pending: Set<ReplicaDeviceID>,
+        memberCount: Int
+    ) -> Int {
+        Set(retained).union(pending).count + max(memberCount, 1)
+    }
+
+    /// Origins named by application messages that MLS has delivered but the
+    /// replica has not applied yet, including those from removed members.
+    private func pendingOrigins(session: MLSSession) async throws -> Set<ReplicaDeviceID> {
+        var origins: Set<ReplicaDeviceID> = []
+        for message in try await session.inbox() {
+            guard let decoded = try? ReplicationMessage.decode(message.plaintext) else {
+                continue
+            }
+            origins.formUnion(decoded.operations?.map(\.originDeviceID) ?? [])
+            origins.formUnion(decoded.vector?.origins ?? [])
+        }
+        return origins
     }
 
     public var linkedDevices: [LinkedDevice] {
@@ -981,7 +1003,9 @@ public final class SyncEngine {
             if linked {
                 try await session.synchronize()
                 try await processRemovals(session: session)
-                guard try await originSlotsInUse(memberCount: session.members().count) < ReplicaLimits.maxOrigins else {
+                let members = try await session.members().count
+                let pending = try await pendingOrigins(session: session)
+                guard originSlotsInUse(memberCount: members, pending: pending) < ReplicaLimits.maxOrigins else {
                     throw SyncError.taskHistoryAtCapacity
                 }
             } else {
@@ -1006,7 +1030,10 @@ public final class SyncEngine {
                 throw SyncError.pairingDeclined
             }
             let roster = try await session.members().map(ReplicationCheckpoint.Member.init)
-            let overflowed = originSlotsInUse(memberCount: roster.count) > ReplicaLimits.maxOrigins
+            let overflowed = try await originSlotsInUse(
+                memberCount: roster.count,
+                pending: pendingOrigins(session: session)
+            ) > ReplicaLimits.maxOrigins
             var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
                 ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
             current.members = roster

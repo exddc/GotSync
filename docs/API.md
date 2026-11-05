@@ -106,7 +106,8 @@ shrink to this device alone; it stays paired and can invite again.
 Removing a device frees a group slot but not its slot in the task history.
 `isTaskHistoryAtCapacity` is `true` when linking one more device would leave
 no room for a new origin from that device or a current member. It is separate
-from `isGroupAtCapacity`, which counts current members only.
+from `isGroupAtCapacity`, which counts current members only against
+`SyncEngine.maximumGroupSize` (8).
 
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this
