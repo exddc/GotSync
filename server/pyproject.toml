@@ -7,7 +7,7 @@ name = "gotsync-server"
 version = "0.1.0"
 description = "An opaque pairing relay and MLS delivery service for GotSync"
 requires-python = ">=3.11"
-dependencies = ["websockets==15.0.1"]
+dependencies = ["websockets==17.4"]
 license = "MIT"
 license-files = ["LICENSE"]
 

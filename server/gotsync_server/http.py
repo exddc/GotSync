@@ -4,11 +4,13 @@ import asyncio
 import base64
 import json
 from collections.abc import Mapping
+from http import HTTPStatus
 from typing import Any
 
 from .protocol import PROTOCOL_VERSION
 
 MAX_HTTP_HEADER_BYTES = 8192
+REASON_OVERRIDES = {413: "Content Too Large"}
 
 
 class RequestError(ValueError):
@@ -198,23 +200,11 @@ async def write_http_response(
     document: dict[str, Any],
     headers: Mapping[str, str] | None = None,
 ) -> None:
-    reasons = {
-        200: "OK",
-        400: "Bad Request",
-        401: "Unauthorized",
-        403: "Forbidden",
-        404: "Not Found",
-        409: "Conflict",
-        413: "Content Too Large",
-        429: "Too Many Requests",
-        431: "Request Header Fields Too Large",
-        500: "Internal Server Error",
-        503: "Service Unavailable",
-    }
+    reason = REASON_OVERRIDES.get(status) or HTTPStatus(status).phrase
     body = encode_json_document(document)
     extra = "".join(f"{name}: {value}\r\n" for name, value in (headers or {}).items())
     head = (
-        f"HTTP/1.1 {status} {reasons[status]}\r\n"
+        f"HTTP/1.1 {status} {reason}\r\n"
         "Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n"
         "Cache-Control: no-store\r\n"

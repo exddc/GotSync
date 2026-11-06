@@ -38,6 +38,20 @@ final class MLSSessionTests: XCTestCase {
         return (alice, bob, group)
     }
 
+    private func realRelay() throws -> HTTPMLSRelayTransport? {
+        guard ProcessInfo.processInfo.environment["GOTSYNC_INTEGRATION"] == "1" else {
+            if ProcessInfo.processInfo.environment["GOTSYNC_REQUIRE_INTEGRATION"] == "1" {
+                XCTFail("The required relay integration environment is missing.")
+                return nil
+            }
+            throw XCTSkip("Run scripts/test-integration.sh to start the real relay.")
+        }
+        let mailboxURL = try XCTUnwrap(URL(string: ProcessInfo.processInfo.environment["GOTSYNC_MAILBOX_URL"] ?? ""))
+        let relayURL = try XCTUnwrap(URL(string: ProcessInfo.processInfo.environment["GOTSYNC_RELAY_URL"] ?? ""))
+        let endpoints = try SyncEndpointConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, policy: .localDevelopment)
+        return HTTPMLSRelayTransport(baseURL: endpoints.mailboxURL, policy: .localDevelopment)
+    }
+
     private func admit(_ joining: MLSSession, by inviter: MLSSession, group: Data) async throws {
         let token = try Data.secureRandom(count: 32)
         let published = try await joining.publishKeyPackage(pairingToken: token)
@@ -383,18 +397,25 @@ final class MLSSessionTests: XCTestCase {
         } catch { XCTAssertEqual(error as? MLSRelayError, .insecureTransport) }
     }
 
-    func testThreeSessionsThroughRealRelay() async throws {
-        guard ProcessInfo.processInfo.environment["GOTSYNC_INTEGRATION"] == "1" else {
-            if ProcessInfo.processInfo.environment["GOTSYNC_REQUIRE_INTEGRATION"] == "1" {
-                XCTFail("The required relay integration environment is missing.")
-                return
-            }
-            throw XCTSkip("Run scripts/test-integration.sh to start the real relay.")
+    func testRealRelayReportsMissingGroupAsExpiredHistory() async throws {
+        guard let relay = try realRelay() else { return }
+        let group = try Data.secureRandom(count: 32)
+        let authorization = try Data.secureRandom(count: 32)
+        do {
+            _ = try await relay.fetch(group: group, after: 0, limit: 1, authorization: authorization)
+            XCTFail("Fetched from a group the relay does not hold")
+        } catch {
+            XCTAssertEqual(error as? MLSRelayError, .historyExpired)
+            XCTAssertEqual(SyncError.fromTransport(error) as? SyncError, .syncHistoryExpired)
         }
-        let mailboxURL = try XCTUnwrap(URL(string: ProcessInfo.processInfo.environment["GOTSYNC_MAILBOX_URL"] ?? ""))
-        let relayURL = try XCTUnwrap(URL(string: ProcessInfo.processInfo.environment["GOTSYNC_RELAY_URL"] ?? ""))
-        let endpoints = try SyncEndpointConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, policy: .localDevelopment)
-        let relay = HTTPMLSRelayTransport(baseURL: endpoints.mailboxURL, policy: .localDevelopment)
+        do {
+            try await relay.acknowledge(group: group, through: 0, authorization: authorization)
+            XCTFail("Acknowledged a group the relay does not hold")
+        } catch { XCTAssertEqual(error as? MLSRelayError, .historyExpired) }
+    }
+
+    func testThreeSessionsThroughRealRelay() async throws {
+        guard let relay = try realRelay() else { return }
 
         let (alice, bob, group) = try await pair(relay)
         let token = try Data.secureRandom(count: 32)

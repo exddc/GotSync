@@ -590,6 +590,94 @@ def test_unread_entries_expire_and_the_lagging_writer_is_told(tmp_path, monkeypa
     store.close()
 
 
+@pytest.mark.parametrize("production", [False, True])
+def test_http_reports_expired_history_as_gone(tmp_path, monkeypatch, production):
+    import json
+    from gotsync_server.server import RelayServer
+
+    clock(monkeypatch, 1000)
+
+    async def run():
+        if production:
+            server = RelayServer(port=0, metrics_port=0, delivery_port=0, delivery_database_path=tmp_path / "mls.sqlite3")
+            await server.start()
+            port = server.bound_delivery_port
+            store = server.mls.store
+        else:
+            store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+            server = MLSDeliveryServer(store)
+            port = await server.start()
+
+        async def post(operation, values, token):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            body = json.dumps({"version": 2, **values}).encode()
+            writer.write((f"POST /v2/mls/{operation} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                          f"Authorization: Bearer {token}\r\n\r\n").encode() + body)
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(), 3)
+            writer.close()
+            await writer.wait_closed()
+            head, body = response.split(b"\r\n\r\n", 1)
+            return head.split(b"\r\n", 1)[0], json.loads(body)
+
+        gone = (b"HTTP/1.1 410 Gone", {"error": "historyExpired", "version": 2})
+        try:
+            alice = encode_base64url(b"a" * 32)
+            missing = encode_base64url(b"m" * 32)
+            for operation, fields in (("fetch", {"group": missing, "after": 0}), ("ack", {"route": missing, "cursor": 0}),
+                                      ("append", {"group": missing, "epoch": 0, "kind": "application", "payload": encode_base64url(b"late")})):
+                assert await post(operation, fields, alice) == gone
+
+            group = encode_base64url(b"g" * 32)
+            bob = encode_base64url(b"b" * 32)
+            reference = request(store, "key-package/publish", payload=encode_base64url(b"package"))["reference"]
+            append(store, reference=reference, welcome=encode_base64url(b"welcome"))
+            old = append(store, payload=b"old", epoch=1, kind="application")["entry"]
+            request(store, "ack", route=group, cursor=old["cursor"])
+            clock(monkeypatch, 1000 + RETENTION)
+            assert await post("fetch", {"group": group, "after": 0}, bob) == gone
+            assert await post("fetch", {"group": group, "after": old["cursor"]}, bob) == (b"HTTP/1.1 200 OK", {"entries": [], "version": 2})
+            status, body = await post("fetch", {"group": group, "after": 0}, encode_base64url(b"x" * 32))
+            assert status.startswith(b"HTTP/1.1 403") and body == {"error": "unauthorized", "version": 2}
+        finally:
+            await server.close()
+
+    asyncio.run(run())
+
+
+def test_every_request_error_status_is_encodable():
+    import gotsync_server.mls
+    from gotsync_server.http import RequestTooLargeError, write_http_response
+
+    class Writer:
+        def __init__(self):
+            self.data = b""
+
+        def write(self, data):
+            self.data += data
+
+        async def drain(self):
+            pass
+
+    def subclasses(cls):
+        for subclass in cls.__subclasses__():
+            yield subclass
+            yield from subclasses(subclass)
+
+    async def encode(error):
+        writer = Writer()
+        await write_http_response(writer, error.status, error.body())
+        return writer.data
+
+    errors = {cls.status: cls for cls in (RequestError, *subclasses(RequestError))}
+    assert {400, 403, 409, 410, 413, 429, 431} <= errors.keys()
+    for status, cls in errors.items():
+        response = asyncio.run(encode(cls("failure")))
+        assert response.startswith(f"HTTP/1.1 {status} ".encode())
+    assert asyncio.run(encode(RequestTooLargeError("big"))).startswith(b"HTTP/1.1 413 Content Too Large\r\n")
+    assert asyncio.run(encode(gotsync_server.mls.HistoryExpired("gone"))).endswith(b'{"error":"historyExpired","version":2}')
+
+
 def test_idle_groups_expire_with_their_writers(tmp_path, monkeypatch):
     clock(monkeypatch, 1000)
     store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
