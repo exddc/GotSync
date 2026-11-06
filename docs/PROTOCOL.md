@@ -55,8 +55,13 @@ ciphertext, tag). The associated data is
 | 1 offer | inviter to joiner | group ID ‖ inviter fingerprint |
 | 4 commitment | joiner to inviter | 32-byte commitment `C` |
 | 5 nonce | inviter to joiner | 32-byte inviter nonce `Ni` |
-| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` |
-| 3 decision | either | one byte: 1 added, 0 declined or cancelled |
+| 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` ‖ origin count `n` (one byte, at most 128) ‖ `n` 16-byte origin IDs |
+| 3 decision | either | one byte: 1 added, 0 declined or cancelled, 2 refused because the task history is full (inviter only) |
+
+The response lists every origin in the joiner's replica, including origins of
+saved operations that exceed a replica limit, in strictly ascending byte order. A receiver rejects a response with more than 128 origins, a body
+length other than `97 + 16n` bytes, or origins that are unsorted or repeated.
+A frame is at most 2,174 bytes.
 
 The exchange runs in this order:
 
@@ -69,8 +74,14 @@ The exchange runs in this order:
    answers with a random `Ni`. It repeats the same `Ni` if the same commitment
    arrives again after a reconnect. A different commitment aborts the attempt.
 4. The joiner accepts one `Ni` per attempt, then sends the response. The
-   inviter recomputes `C` from the response and aborts on a mismatch.
-5. The inviter fetches the KeyPackage, checks that its SHA-256 equals the
+   inviter recomputes `C` from the response and aborts on a mismatch. The
+   origin list is not part of `C` or of the safety code; the frame's
+   authenticated encryption under the invitation key protects it.
+5. The inviter checks the merged task history (see
+   [replica capacity](#replica-capacity)). If it has no room, the inviter
+   sends decision 2 and stops before it shows a safety code, so nobody can
+   approve the attempt.
+6. The inviter fetches the KeyPackage, checks that its SHA-256 equals the
    reference, and both devices show the safety code.
 
 The safety code is the first four bytes of SHA-256 over
@@ -114,6 +125,16 @@ Application message plaintext is canonical JSON with `version: 2`:
 - `operations` carries up to 256 task operations from any origin.
 - `hello` carries the sender's version vector and an optional `provider`
   fingerprint.
+- `reservation` carries a joiner `member` fingerprint, its sorted origin list
+  (at most 128), and the sender's MLS `epoch`.
+- `release` carries `member` and the log cursor `reservation` of the sender's
+  own claim that it withdraws.
+- `reservations` carries a new member's fingerprint as `member`, at most 64
+  claims, and `overflowed` when the sender stopped storing claims. Each claim
+  has its member, owner, origins, epoch, log cursor, and `released` and
+  `admitted` flags.
+
+[Replica capacity](#replica-capacity) describes how the last three are used.
 
 A receiver applies each operation whose origin sequence is next. It repeats
 until nothing more applies, then sends a `hello` without a provider if
@@ -123,14 +144,20 @@ as `provider` also sends every other missing origin.
 
 After joining, a device sends a `hello` that names its inviter as provider and
 then all retained operations. Each device then uploads its own operations in
-sequence. The engine applies received operations and persists the replica
-before it answers hellos and acknowledges the MLS inbox. A replay after a
+sequence. Before it acknowledges the MLS inbox, the engine applies received
+operations, persists the replica, and saves what each `hello` asks for. It
+answers saved requests afterwards, one batch at a time. A replay after a
 crash is idempotent.
 
 `sync-v2.json` in the storage directory records the group ID, each member's
-device ID and fingerprint, the highest own sequence uploaded, whether the join
-announcement is pending, requested removals, and provisional members. The MLS
-state remains the source of truth: on launch, a group with at least two
+device ID and fingerprint, the highest own sequence uploaded and the local
+origin it counts, whether the join announcement is pending, requested
+removals, provisional members, the reservations it knows, and whether this
+member still waits for its reservations snapshot. A sequence recorded for
+another origin counts as nothing uploaded, so a replica recreated under a new
+origin while the link survives uploads all its edits. A checkpoint without an
+origin counts the device ID, as version 1 archives do. The MLS state remains
+the source of truth: on launch, a group with at least two
 members is linked even if the file is missing. Before a joiner waits for
 admission it writes the group ID and inviter fingerprint to
 `sync-v2-join.json`, so a joiner that stops after admission but before
@@ -296,17 +323,182 @@ Each replica persists:
 
 - materialized task records and tombstones;
 - every operation;
-- its next local origin sequence;
+- the origin of its local operations and its next sequence;
 - its Lamport clock;
 - the highest contiguous sequence seen for each origin.
 
 An install-scoped 128-bit replica device ID is generated on first launch,
 before any task or pairing operation, and stored with a `ThisDeviceOnly`
-Keychain class. It is not regenerated when the device leaves a group. Origin sequences
+Keychain class. It is not regenerated when the device leaves a group. The
+archive records this ID and refuses to load under another one.
+
+Local operations use a separate random 128-bit origin that the engine
+generates whenever it creates a replica archive: on first launch, after
+`eraseLocalData()`, and when the archive is missing, as after a reinstall that
+kept the Keychain. The origin is stored in the archive (format version 2), so
+it survives restarts, and an interrupted erase that runs again at launch
+generates another one. Operations created after an erase therefore never
+reuse the IDs of earlier operations that other devices still hold. A version 1
+archive has no stored origin and keeps using the device ID. Origin sequences
 begin at one; zero means that no operation from an origin has been applied.
 If the install identity or persistent replica cannot be opened, the engine
 enters a fatal local error state: it does not open the MLS session, sync,
 accept edits, or acknowledge remote operations through an in-memory fallback.
+
+### Replica capacity
+
+A replica holds at most 1,000 task records and tombstones, 10,000 operations,
+and 128 origins. An origin is a device whose operations the replica retains.
+Removing or unlinking a device keeps its origin, because later joiners need
+its operations to rebuild the same tasks. The origin limit therefore counts
+every device that has edited the task history, while the MLS group separately
+limits how many devices are members at once to eight. A `hello` that carries
+all 128 vector entries stays under 10 KiB, and every origin holds at least one
+of the 10,000 retained operations.
+
+The engine counts the slots in use: every origin its replica retains or holds
+in saved operations that exceed a replica limit, plus one slot for each current
+member, including this device, whether or not that
+member has edited. It does not match members to origins, because a replica's
+origin need not equal its member's device ID. A member that has already edited
+therefore counts twice, which can refuse a device up to eight slots early; a
+full group of eight still has room for at least 120 origins over its lifetime.
+Linking needs one free slot for the other device.
+
+Each device checks its own history before pairing starts, so
+`createPrivateSync()`, `inviteToGroup()`, and `joinPrivateSync(url:)` or
+`joinPrivateSync(phrase:)` fail with `SyncError.taskHistoryAtCapacity` and
+nothing is linked.
+
+The inviter then checks the union of both histories with everything the group
+has already committed to. The count covers:
+
+- its own retained origins and the origins of operations it saved without
+  applying because they exceed a replica limit;
+- the origins named by operations and hellos it has received but not applied;
+- every active reservation (described below);
+- every origin in the joiner's response;
+- one slot for each current member, each reserved device, and the joiner,
+  which must also stay within eight.
+
+Each origin counts once, however many of these sources name it. Any received
+operation that the engine keeps without applying must add its origin to the
+same set.
+
+#### Reservations
+
+A joiner's history reaches the log only after it joins, so before every Add
+the inviter publishes a `reservation` for the joiner as an MLS application
+message. The relay log orders all reservations. Every member saves each
+reservation it receives in its checkpoint before it acknowledges the inbox,
+and reservations survive restarts. The inviter:
+
+1. checks when the response arrives, before it shows a safety code or creates
+   a group;
+2. after approval, synchronizes, commits pending removals, and checks again
+   against every active reservation;
+3. publishes its reservation and saves it before any Add. A linked inviter
+   saves the attempt in its checkpoint before sending it, and the claim once
+   the relay accepts it. A founding inviter, which has no checkpoint yet,
+   saves it in `sync-v2-claims.json` right after it creates the group, and
+   recovery after a crash moves it into the rebuilt checkpoint;
+4. checks again, counting only reservations earlier in the log than its own;
+5. adds the joiner, and checks once more after the Add.
+
+Of any two reservations, the later one's check counts the earlier one, so two
+devices whose histories do not fit together are never both admitted. If both
+inviters refuse, both joiners stay unlinked, which is safe. A failed check
+before the Add means the joiner gets no MLS leaf, Welcome, or relay write
+access. A failed check after the Add removes the new member the same way the
+inviter removes a joiner that declined during the Add. In every case the
+inviter sends decision 2, both devices report `SyncError.taskHistoryAtCapacity`,
+and every local task stays on both devices. Current members keep syncing. The
+check after the Add still counts the origins and slots of later claims that
+have already reached the inbox or roster, so the earlier inviter can also
+refuse; that loses a joiner but never admits one that does not fit.
+
+A reservation is a lease measured in MLS epochs, never wall-clock time. The
+owner adds the joiner only while the group epoch is below the reservation's
+epoch plus 8, checked in the same serialized step that prepares the Add. A competing commit discards a prepared Add instead of moving it
+to a later epoch, so the Add can apply only within that window. A member that
+has processed the window without seeing the joiner join knows the Add can no
+longer happen and drops the reservation. A reservation counts while it is
+leased, and for as long as its device is a member, regardless of lease or
+release. It is dropped once its device leaves after joining, or once the
+device's history covers its origins. When an owner refuses a joiner or none
+of its Adds is accepted, it publishes a `release` for that one reservation.
+A sync cycle also releases the device's own claims that no pairing will use:
+the attempt was cancelled or the app restarted, the joiner never joined, the
+lease still runs, and no Add is waiting to be sent. Only the owner can
+release a claim, and a release never frees slots of a device that is a
+member.
+
+The relay can accept a reservation without its answer reaching the owner.
+The log never returns a member's own messages to its inbox, so the owner's
+MLS client records where each of its last 64 reservations landed, with a
+SHA-256 digest of the plaintext. Other messages are not recorded and cannot
+push a reservation out. Each sync cycle, also after a restart, first
+delivers any message still pending, then turns each saved attempt into a
+claim at the cursor where it landed and releases it as above. An attempt
+that never landed is dropped, but never while its send is still running,
+even after its pairing was cancelled. The owner starts no reservation while
+an earlier attempt is unresolved.
+
+An Add can land although its answer never reaches the founding inviter, so
+an unlinked device with a group never concludes from its local roster that
+it is alone. When the app starts, after a failed or cancelled invitation,
+and before it invites again, it catches up with the log, registering the
+group again if the relay never saw it, and delivers any pending message. If
+the roster then holds another member, the device builds its checkpoint with
+its founding claims, and the members those claims added stay provisional
+until they send a message. It then handles the invitation as a linked
+inviter, with the same refusals. Only a settled log showing the device
+alone, with nothing pending, lets it found the group afresh and discard the
+claims file; otherwise the invitation fails with
+`SyncError.privateSyncUnreachable`. A device that finds it was removed, or
+that the relay no longer keeps the group's history, starts a new MLS
+identity and reports `removedFromGroup` or `syncHistoryExpired`; its next
+invitation founds a new group. A device that joined someone else's group
+never takes this path.
+
+If `sync-v2-claims.json` exists but does not decode, the founding inviter
+never treats it as empty. It keeps the bytes as
+`sync-v2-claims-unreadable.json`. When the log shows nobody was added, it
+starts a new file. When it finds members it added, it counts each of their
+histories as unknown: it refuses to invite or answer snapshot requests
+until that member's next `hello` arrives, and the `hello`'s vector becomes
+that member's claim. Such a member is also provisional, so one that never
+sends a message is removed, and a member that leaves no longer blocks
+invitations.
+
+A new member cannot read reservations published before it joined. When the
+inviter answers the new member's join `hello`, it sends a `reservations`
+message for that member with every claim it holds. The member named as
+provider saves each such request before it acknowledges the inbox, sends the
+whole missing history first, and sends the snapshot afterwards. It holds the
+snapshot back while it keeps operations it has not applied, because its
+history is then incomplete, and the requester moves on to the next member. It
+forgets a request only after the snapshot is sent or the requester has left. Only a member that has
+its own snapshot answers, so a snapshot addressed to the new member is
+complete as of the `hello` it answers. The new member merges claims by their
+original log cursor. A known claim keeps its local state, and a release that
+arrives before the snapshot is kept, so a late snapshot never undoes a
+release or an admission. Members that already have their snapshot ignore
+later ones. Until the snapshot arrives, the new member refuses to invite and
+reports `SyncError.privateSyncUnreachable`. While it waits, it sends a new
+`hello` naming the next member every five sync cycles, and at once if the
+member it asked has left. This state survives restarts, including recovery
+after an interrupted join or a request that was never sent.
+
+Admission refuses while 16 or more claims are active. In normal use a group
+of eight has far fewer. A checkpoint never drops an active claim below 64
+stored claims. Past 64, it keeps 64, marks the checkpoint overflowed, passes
+that flag on in snapshots, and refuses every further admission on that link.
+
+A joiner that has already edited counts both as an origin and as a member, so
+it can be refused one slot early. A device that edited the history before,
+left, and links again still needs a free slot. Version 2 does not compact retired origins: a task history without a free
+slot cannot gain another contributing device.
 
 A local edit atomically persists the operation, materialized state, next origin
 sequence, Lamport clock, and local vector before it is sent. A remote batch
@@ -317,7 +509,11 @@ complete replica archive.
 
 Operations are idempotent by `(originDeviceID, originSequence)`. A repeated ID
 must have byte-identical canonical content; different content for an existing
-ID is a fork, and the whole batch is rejected.
+ID is a fork, and the whole batch is rejected. Before it applies anything from
+an inbox read, the engine also compares every received operation with its
+retained copy and with other received copies of the same ID. On a fork it
+reports `SyncError.syncHistoryConflict`, applies nothing, and does not
+acknowledge the MLS inbox, so neither copy is silently dropped.
 
 Mutation cases and apply rules:
 

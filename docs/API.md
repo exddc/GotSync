@@ -44,10 +44,70 @@ New `SyncError` cases:
 - `syncHistoryExpired`: the relay deleted entries this device had not yet
   received, because the device was offline longer than the relay's retention
   period. It is reported like `syncHistoryBlocked`: unlink and pair again.
+- `syncHistoryConflict`: another device sent an operation whose ID this
+  device already holds with different content. It is reported like
+  `syncHistoryBlocked`. The engine applies nothing from that inbox read, and
+  the conflicting entry stays in the MLS inbox. A
+  device erased by an earlier version reused its old operation IDs and causes
+  this. Unlink the device that reports it, erase the other device, and link
+  them again; tasks created on the other device since its earlier erase are
+  lost.
 - `removedFromGroup`: another member removed this device. The engine erases
   its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
 - `approvalExpired`: the inviter did not approve the safety code within 10
   minutes. Nothing was linked.
+- `taskHistoryAtCapacity`: the task history has no room for another device.
+  It counts retained origins, including those of removed devices, origins of
+  changes saved under `replicaCapacityReached`, plus one slot for each current
+  member and this device, up to
+  `ReplicaLimits.maxOrigins` (128). Creating, inviting,
+  or joining fails before anything is linked. The inviter counts the joiner's
+  history and every device another member is adding at the same time, and
+  both devices report this error when the merged history would not fit.
+  Current members keep syncing.
+- `replicaCapacityReached`: linked devices sent valid changes that would
+  exceed this device's limit of 1,000 tasks including deleted ones, 10,000
+  retained changes, or 128 origins over the history's lifetime. The engine
+  saves those changes before it acknowledges the messages that carried them,
+  and counts them in
+  `unappliedRemoteOperationCount`. It saves at most 10,000. When the next
+  message does not fit, that message and every later one stay unacknowledged
+  in the delivery inbox; nothing saved is replaced. Saved changes are retried
+  after launch and whenever new messages arrive. While any remain,
+  `mailboxError` and `errorMessage` carry this case and `phase` is `.failed`,
+  but sync keeps running. `mailboxRequiresRepair` stays `false`, because
+  pairing again does not free capacity. Unlinking, removal, and
+  `eraseLocalData()` discard the saved changes; the group's other members
+  still hold them. A full store blocks inbox progress until the device unlinks
+  or erases. Local uploads continue while the delivery inbox is full, until a
+  commit from another member waits behind the held messages; MLS must process
+  that commit before this device can send again. Requests from other members for
+  missing changes are saved before their messages are acknowledged and
+  answered after catching up, one batch at a time, resuming after a failed
+  send or restart. A member that asked this device for the whole history then
+  gets the reservations snapshot, once this device knows every pending
+  reservation itself and holds no saved changes. While it holds some, that
+  member asks another member. If the saved changes or saved requests cannot be read
+  at launch, the files are kept, the engine reports `localStorageUnavailable` in `mailboxError` and
+  `errorMessage` with `phase` `.failed`, sets `mailboxRequiresRepair` while
+  linked, and neither syncs nor pairs. `unlinkAndKeepTasks()` or
+  `eraseLocalData()` clears it.
+
+  Before applying anything, the engine compares each received change with
+  every retained, saved, and received change that has the same origin and
+  sequence, byte for byte. A mismatch stops sync with `syncHistoryConflict` and
+  leaves the message unacknowledged.
+
+A device that has just joined cannot invite until its inviter has sent it the
+group's pending reservations, usually within one sync cycle. Until then,
+`inviteToGroup()` fails with `SyncError.privateSyncUnreachable`. The same
+applies to a device that created a group, crashed while adding its first
+member, and then could not read its saved reservations: it cannot invite
+until that member's history arrives on its next sync. An unlinked device that
+already created a group first checks the relay's log, because an earlier
+invitation may have added someone without the device learning it. If the
+relay cannot be reached, `createPrivateSync()` fails with
+`SyncError.privateSyncUnreachable`.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`
@@ -97,11 +157,19 @@ the device is gone, after restarts and conflicting commits as well. The entry
 disappears from `linkedDevices` once the commit is accepted. A group may
 shrink to this device alone; it stays paired and can invite again.
 
+Removing a device frees a group slot but not its slot in the task history.
+`isTaskHistoryAtCapacity` is `true` when linking one more device would leave
+no room for a new origin from that device or a current member. It is separate
+from `isGroupAtCapacity`, which counts current members only against
+`SyncEngine.maximumGroupSize` (8).
+
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this
 device in the background; another member commits it. The journal is erased
 once the relay accepts the proposal. Both calls switch to a new MLS identity
 and fingerprint at once, so the same install can be invited again.
+`eraseLocalData()` also gives the new empty replica a new operation origin, so
+tasks created after the erase converge with the tasks other devices kept.
 
 `SecretStore` gains `write(_:account:accessibility:)`. Its default
 implementation calls `write(_:account:)`. `KeychainStore` stores the MLS state

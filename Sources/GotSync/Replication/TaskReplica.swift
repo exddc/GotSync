@@ -4,7 +4,14 @@ struct TaskReplica: Sendable {
     private(set) var archive: ReplicaArchive
     let persistenceURL: URL?
 
-    init(deviceID: ReplicaDeviceID, persistenceURL: URL? = nil) throws {
+    /// Loads the archive at `persistenceURL`, or creates one whose local
+    /// operations use `newOrigin`. A `nil` origin creates a version 1 archive
+    /// that uses `deviceID` as its origin.
+    init(
+        deviceID: ReplicaDeviceID,
+        persistenceURL: URL? = nil,
+        newOrigin: ReplicaDeviceID?
+    ) throws {
         self.persistenceURL = persistenceURL
         if let persistenceURL, FileManager.default.fileExists(atPath: persistenceURL.path) {
             let data = try Data(contentsOf: persistenceURL)
@@ -19,8 +26,11 @@ struct TaskReplica: Sendable {
             archive = stored
         } else {
             archive = ReplicaArchive(
-                formatVersion: ReplicaLimits.archiveFormatVersion,
+                formatVersion: newOrigin == nil
+                    ? ReplicaLimits.legacyArchiveFormatVersion
+                    : ReplicaLimits.archiveFormatVersion,
                 deviceID: deviceID,
+                originDeviceID: newOrigin,
                 nextLocalOriginSequence: 1,
                 lamport: 0,
                 versionVector: ReplicaVersionVector(),
@@ -40,6 +50,10 @@ struct TaskReplica: Sendable {
 
     var deviceID: ReplicaDeviceID {
         archive.deviceID
+    }
+
+    var localOrigin: ReplicaDeviceID {
+        archive.localOrigin
     }
 
     var lamport: UInt64 {
@@ -146,10 +160,166 @@ struct TaskReplica: Sendable {
         return acceptedCount
     }
 
+    /// Applies every operation whose origin sequence is next, repeating until
+    /// no more apply. A valid operation that exceeds a replica limit is
+    /// deferred together with every later operation from its origin, and
+    /// invalid operations are dropped. Each origin in `previouslyDeferred` is
+    /// retried with its first operation only. Nothing is applied when an
+    /// incoming operation conflicts with a retained, deferred, or other
+    /// incoming operation.
+    mutating func applyAvailable(
+        _ operations: [TaskOperation],
+        previouslyDeferred: [TaskOperation] = []
+    ) throws -> RemoteIntake {
+        try requireConsistentIdentity(operations, deferred: previouslyDeferred)
+        var intake = RemoteIntake()
+        var blocked = try retryDeferredHeads(previouslyDeferred, accepted: &intake.accepted)
+        var deferred: [TaskOperation] = []
+        var remaining = (previouslyDeferred + operations).sorted(by: ReplicaOrdering.operations)
+        while !remaining.isEmpty {
+            var vector = versionVector
+            var ready: [TaskOperation] = []
+            var waiting: [TaskOperation] = []
+            for operation in remaining {
+                let current = vector[operation.originDeviceID]
+                if operation.originSequence <= current {
+                    continue
+                } else if blocked.contains(operation.originDeviceID) {
+                    deferred.append(operation)
+                } else if operation.originSequence == current + 1 {
+                    ready.append(operation)
+                    vector.setSequence(operation.originSequence, for: operation.originDeviceID)
+                } else {
+                    waiting.append(operation)
+                }
+            }
+            remaining = waiting
+            guard !ready.isEmpty else {
+                break
+            }
+            for batch in try OperationBatcher.batches(ready) {
+                deferred += batch.filter { blocked.contains($0.originDeviceID) }
+                let open = batch.filter { !blocked.contains($0.originDeviceID) }
+                do {
+                    intake.accepted += try applyRemote(open)
+                } catch is ReplicaError {
+                    for operation in open {
+                        guard !blocked.contains(operation.originDeviceID) else {
+                            deferred.append(operation)
+                            continue
+                        }
+                        do {
+                            intake.accepted += try applyRemote([operation])
+                        } catch let error as ReplicaError where error.isCapacityLimit {
+                            blocked.insert(operation.originDeviceID)
+                            deferred.append(operation)
+                        } catch let error as ReplicaError where error.isFork {
+                            throw error
+                        } catch is ReplicaError {}
+                    }
+                }
+            }
+        }
+        intake.deferred = Self.deduplicated(deferred)
+        intake.waiting = remaining
+        return intake
+    }
+
+    private mutating func retryDeferredHeads(
+        _ deferred: [TaskOperation],
+        accepted: inout Int
+    ) throws -> Set<ReplicaDeviceID> {
+        var blocked: Set<ReplicaDeviceID> = []
+        for origin in Set(deferred.map(\.originDeviceID)).sorted() {
+            let next = versionVector[origin] + 1
+            guard let head = deferred.first(where: {
+                $0.originDeviceID == origin && $0.originSequence == next
+            }) else {
+                continue
+            }
+            do {
+                accepted += try applyRemote([head])
+            } catch let error as ReplicaError where error.isCapacityLimit {
+                blocked.insert(origin)
+            } catch let error as ReplicaError where error.isFork {
+                throw error
+            } catch is ReplicaError {}
+        }
+        return blocked
+    }
+
+    /// Throws `operationFork` when a deferred or incoming operation shares its
+    /// origin and sequence with another operation but not its canonical bytes.
+    private func requireConsistentIdentity(
+        _ incoming: [TaskOperation],
+        deferred: [TaskOperation]
+    ) throws {
+        var candidates: [OperationID: TaskOperation] = [:]
+        for operation in deferred + incoming {
+            guard let existing = candidates.updateValue(operation, forKey: OperationID(operation)) else {
+                continue
+            }
+            guard try existing.canonicalData() == operation.canonicalData() else {
+                throw ReplicaError.operationFork(origin: operation.originDeviceID, sequence: operation.originSequence)
+            }
+        }
+        for retained in archive.operations {
+            guard let candidate = candidates[OperationID(retained)] else {
+                continue
+            }
+            guard try retained.canonicalData() == candidate.canonicalData() else {
+                throw ReplicaError.operationFork(origin: retained.originDeviceID, sequence: retained.originSequence)
+            }
+        }
+    }
+
+    private static func deduplicated(_ deferred: [TaskOperation]) -> [TaskOperation] {
+        var seen: Set<OperationID> = []
+        return deferred
+            .filter { (try? validateOperation($0)) != nil && seen.insert(OperationID($0)).inserted }
+            .sorted(by: ReplicaOrdering.operations)
+    }
+
     func operations(missingFrom peer: ReplicaVersionVector) -> [TaskOperation] {
         archive.operations
             .filter { $0.originSequence > peer[$0.originDeviceID] }
             .sorted(by: ReplicaOrdering.operations)
+    }
+
+    /// Returns the first of `operations` whose ID is retained, or appears
+    /// earlier in `operations`, with different content.
+    func forkedOperation(in operations: [TaskOperation]) throws -> TaskOperation? {
+        var seen: [OperationID: TaskOperation] = [:]
+        var retained: [OperationID: TaskOperation]?
+        for operation in operations {
+            let id = OperationID(operation)
+            if let earlier = seen[id] {
+                if !earlier.isIdentical(to: operation) {
+                    return operation
+                }
+                continue
+            }
+            seen[id] = operation
+            guard operation.originSequence <= archive.versionVector[operation.originDeviceID] else {
+                continue
+            }
+            if retained == nil {
+                retained = Dictionary(
+                    archive.operations.map { (OperationID($0), $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+            }
+            guard let existing = retained?[id] else {
+                throw ReplicaError.retainedOperationMissing(
+                    origin: operation.originDeviceID,
+                    sequence: operation.originSequence
+                )
+            }
+            if !existing.isIdentical(to: operation) {
+                return operation
+            }
+        }
+        return nil
     }
 
     func atomicArchiveData() throws -> Data {
@@ -168,7 +338,7 @@ struct TaskReplica: Sendable {
         }
 
         let operation = TaskOperation(
-            originDeviceID: archive.deviceID,
+            originDeviceID: archive.localOrigin,
             originSequence: archive.nextLocalOriginSequence,
             lamport: archive.lamport + 1,
             taskID: taskID,
@@ -228,7 +398,7 @@ struct TaskReplica: Sendable {
         guard archive.operations.count < ReplicaLimits.maxOperations else {
             throw ReplicaError.tooManyOperations(archive.operations.count + 1)
         }
-        if operation.originDeviceID == archive.deviceID,
+        if operation.originDeviceID == archive.localOrigin,
            operation.originSequence == UInt64.max {
             throw ReplicaError.originSequenceExhausted
         }
@@ -239,7 +409,7 @@ struct TaskReplica: Sendable {
             operation.originSequence,
             for: operation.originDeviceID
         )
-        if operation.originDeviceID == archive.deviceID {
+        if operation.originDeviceID == archive.localOrigin {
             archive.nextLocalOriginSequence = operation.originSequence + 1
         }
         archive.lamport = max(archive.lamport, operation.lamport)
@@ -435,7 +605,14 @@ struct TaskReplica: Sendable {
     }
 
     private static func validateArchive(_ archive: ReplicaArchive) throws {
-        guard archive.formatVersion == ReplicaLimits.archiveFormatVersion else {
+        switch (archive.formatVersion, archive.originDeviceID) {
+        case (ReplicaLimits.legacyArchiveFormatVersion, nil),
+             (ReplicaLimits.archiveFormatVersion, .some):
+            break
+        case (ReplicaLimits.legacyArchiveFormatVersion, .some),
+             (ReplicaLimits.archiveFormatVersion, nil):
+            throw ReplicaError.corruptArchive("The origin does not match the archive version.")
+        default:
             throw ReplicaError.unsupportedArchiveVersion(archive.formatVersion)
         }
         guard archive.taskRecords.count <= ReplicaLimits.maxTasks else {
@@ -481,7 +658,7 @@ struct TaskReplica: Sendable {
             throw ReplicaError.corruptArchive("The Lamport clock does not match the log.")
         }
         guard archive.nextLocalOriginSequence
-            == archive.versionVector[archive.deviceID] + 1
+            == archive.versionVector[archive.localOrigin] + 1
         else {
             throw ReplicaError.corruptArchive("The next local sequence is inconsistent.")
         }
@@ -559,7 +736,7 @@ struct TaskReplica: Sendable {
         return Array(records.values)
     }
 
-    private struct OperationID: Hashable {
+    struct OperationID: Hashable {
         let origin: ReplicaDeviceID
         let sequence: UInt64
 
@@ -568,6 +745,14 @@ struct TaskReplica: Sendable {
             sequence = operation.originSequence
         }
     }
+}
+
+struct RemoteIntake: Equatable, Sendable {
+    var accepted = 0
+    /// Operations waiting on an earlier sequence from their origin.
+    var waiting: [TaskOperation] = []
+    /// Valid operations that this replica cannot hold within its limits.
+    var deferred: [TaskOperation] = []
 }
 
 private func replace<Value>(

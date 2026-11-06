@@ -33,8 +33,7 @@ enum ProductSyncPolicy {
         pairingWindowTimeToLive
     }
 
-    /// Cap aligned with `ReplicaLimits.maxOrigins` (Group Sync v2).
-    static let maxDevices = ReplicaLimits.maxOrigins
+    static let maxDevices = SyncEngine.maximumGroupSize
 
     /// BGTaskScheduler identifier for deferred mailbox upload.
     static let backgroundMailboxTaskIdentifier =

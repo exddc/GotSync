@@ -129,6 +129,12 @@ operating system grants and retries on the next launch. See
 [push and background receive](docs/PUSH-AND-BACKGROUND-RECEIVE.md) for the
 planned design.
 
+A group holds at most eight devices at a time. Its task history holds edits
+from at most 128 devices over its lifetime, including removed devices, so
+devices can be replaced long after the group first fills. Once the history
+has no free slot, no further device can be linked to it; see
+[replica capacity](docs/PROTOCOL.md#replica-capacity).
+
 All linked devices share access to the group's tasks. A live invitation is an
 admission capability. The safety code protects against accidental pairing and
 key substitution, but does not recover the secrecy of a stolen invitation.
@@ -139,6 +145,13 @@ point and the engine reports `SyncError.syncHistoryBlocked`. Local tasks stay
 editable; unlink and pair again to keep syncing. A device that stays offline
 longer than the relay keeps its unread updates reports
 `SyncError.syncHistoryExpired` and recovers the same way.
+
+A replica holds at most 1,000 tasks including deleted ones, 10,000 retained
+changes, and changes from 128 origins over its lifetime. When valid changes
+from linked devices would exceed a limit, the engine keeps them on the device
+without showing them and reports `SyncError.replicaCapacityReached` instead of
+a completed sync. Pairing devices whose combined tasks exceed a limit links
+them and reports the same error.
 
 Removing a device stops it from reading later changes, but it keeps the tasks
 it already has and cannot be wiped remotely. Any member can remove any other

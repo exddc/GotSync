@@ -43,6 +43,16 @@ public struct MLSInboxMessage: Codable, Equatable, Sendable {
     public let plaintext: Data
 }
 
+/// A tracked application message of this member as it landed in the log.
+/// The log never returns a member's own messages to its inbox, so this is
+/// how the member learns where they landed.
+public struct MLSSentMessage: Codable, Equatable, Sendable {
+    public static let retained = 64
+
+    public let cursor: UInt64
+    public let digest: Data
+}
+
 public struct MLSMember: Equatable, Sendable {
     public let deviceID: Data
     public let fingerprint: Data
@@ -65,6 +75,8 @@ struct ClientRecord: Codable {
     var inbox: [MLSInboxMessage] = []
     var removed = false
     var departures: [Data]?
+    var pendingTracked: Bool?
+    var sent: [MLSSentMessage]?
 }
 
 struct IdentityRecord: Codable {
@@ -120,6 +132,9 @@ public actor MLSClient {
     public func rejectedCommit() throws -> MLSDelivery? { try store.read().rejectedCommit }
     public func departures() throws -> [Data] { try store.read().departures ?? [] }
     public func rejectedApplicationCursors() throws -> [UInt64] { try store.read().rejectedApplicationCursors }
+    /// The last `MLSSentMessage.retained` tracked messages that landed,
+    /// oldest first, each with the SHA-256 digest of its plaintext.
+    public func sentMessages() throws -> [MLSSentMessage] { try store.read().sent ?? [] }
 
     public func createGroup(id: Data) throws {
         try mutate { record in
@@ -162,10 +177,26 @@ public actor MLSClient {
         }
     }
 
-    public func prepareMessage(_ plaintext: Data) throws -> MLSDelivery {
+    public func prepareMessage(_ plaintext: Data, tracked: Bool = false) throws -> MLSDelivery {
         try mutate { record in
             guard record.pending == nil else { throw MLSClientError.invalidState }
+            record.pendingTracked = tracked ? true : nil
             return try Self.seal(plaintext, in: &record)
+        }
+    }
+
+    /// Clears a pending application message after the relay accepted it at
+    /// `cursor`, when the inbox is too full to process the log up to that
+    /// message. A tracked message is listed in `sentMessages()` as if it had
+    /// been processed. The log copy is later recorded as a rejected cursor,
+    /// like any message this member cannot decrypt.
+    public func confirmAcceptedApplication(_ delivery: MLSDelivery, cursor: UInt64) throws {
+        try mutate { record in
+            guard delivery.kind == .application else { throw MLSClientError.invalidState }
+            guard record.pending == delivery else { return }
+            Self.recordTrackedDelivery(at: cursor, in: &record)
+            record.pending = nil
+            record.pendingPlaintext = nil
         }
     }
 
@@ -190,6 +221,8 @@ public actor MLSClient {
                 if pending.kind == .commit {
                     Self.apply(try acceptCommit(state: record.state, acceptedCommit: delivery.payload), to: &record)
                     try Self.pruneDepartures(in: &record)
+                } else if pending.kind == .application {
+                    Self.recordTrackedDelivery(at: cursor, in: &record)
                 }
                 record.pending = nil
                 record.pendingPlaintext = nil
@@ -284,6 +317,12 @@ public actor MLSClient {
         record.pending = delivery
         record.pendingPlaintext = plaintext
         return delivery
+    }
+
+    private static func recordTrackedDelivery(at cursor: UInt64, in record: inout ClientRecord) {
+        guard record.pendingTracked == true, let plaintext = record.pendingPlaintext else { return }
+        let sent = MLSSentMessage(cursor: cursor, digest: Data(SHA256.hash(data: plaintext)))
+        record.sent = Array(((record.sent ?? []) + [sent]).suffix(MLSSentMessage.retained))
     }
 
     private static func pruneDepartures(in record: inout ClientRecord) throws {

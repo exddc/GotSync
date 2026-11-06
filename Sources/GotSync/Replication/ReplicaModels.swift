@@ -5,10 +5,14 @@ public enum ReplicaLimits {
     public static let maxTitleUTF8Bytes = 512
     public static let maxTasks = 1_000
     public static let maxOperations = 10_000
-    public static let maxOrigins = 8
+    /// Distinct devices whose operations one replica retains over its
+    /// lifetime, including devices that have since left or been removed.
+    /// This is separate from the eight-member limit of an MLS group.
+    public static let maxOrigins = 128
     public static let maxBatchOperations = 256
     public static let maxBatchEncodedBytes = 256 * 1_024
-    public static let archiveFormatVersion = 1
+    public static let archiveFormatVersion = 2
+    static let legacyArchiveFormatVersion = 1
 }
 
 enum ReplicaError: Error, Equatable, Sendable {
@@ -36,6 +40,22 @@ enum ReplicaError: Error, Equatable, Sendable {
     case nonCanonicalArchive
     case archiveDeviceMismatch(expected: ReplicaDeviceID, actual: ReplicaDeviceID)
     case corruptArchive(String)
+}
+
+extension ReplicaError {
+    /// The operation is valid, but applying it would exceed a replica limit.
+    var isCapacityLimit: Bool {
+        switch self {
+        case .tooManyTasks, .tooManyOperations, .tooManyOrigins:
+            true
+        default:
+            false
+        }
+    }
+
+    var isFork: Bool {
+        if case .operationFork = self { true } else { false }
+    }
 }
 
 extension ReplicaError: LocalizedError {
@@ -287,6 +307,30 @@ struct TaskOperation: Codable, Equatable, Sendable {
         ReplicaStamp(lamport: lamport, originDeviceID: originDeviceID)
     }
 
+    /// Byte-for-byte equality of the canonical encoding. `==` compares titles
+    /// by Unicode canonical equivalence instead.
+    func isIdentical(to other: TaskOperation) -> Bool {
+        guard originDeviceID == other.originDeviceID,
+              originSequence == other.originSequence,
+              lamport == other.lamport,
+              taskID == other.taskID
+        else {
+            return false
+        }
+        switch (mutation, other.mutation) {
+        case let (.create(lhsTitle, lhsCompleted), .create(rhsTitle, rhsCompleted)):
+            return lhsTitle.utf8.elementsEqual(rhsTitle.utf8) && lhsCompleted == rhsCompleted
+        case let (.setTitle(lhs), .setTitle(rhs)):
+            return lhs.utf8.elementsEqual(rhs.utf8)
+        case let (.setCompleted(lhs), .setCompleted(rhs)):
+            return lhs == rhs
+        case (.delete, .delete):
+            return true
+        default:
+            return false
+        }
+    }
+
     func canonicalData() throws -> Data {
         try ReplicaCanonicalJSON.encode(self)
     }
@@ -395,11 +439,18 @@ struct ReplicaVersionVector: Codable, Equatable, Sendable {
 struct ReplicaArchive: Codable, Equatable, Sendable {
     let formatVersion: Int
     let deviceID: ReplicaDeviceID
+    /// Origin of this archive's local operations. Version 1 archives omit it
+    /// and use `deviceID`.
+    var originDeviceID: ReplicaDeviceID? = nil
     var nextLocalOriginSequence: UInt64
     var lamport: UInt64
     var versionVector: ReplicaVersionVector
     var taskRecords: [ReplicatedTask]
     var operations: [TaskOperation]
+
+    var localOrigin: ReplicaDeviceID {
+        originDeviceID ?? deviceID
+    }
 
     func canonicalData() throws -> Data {
         try ReplicaCanonicalJSON.encode(normalized())
