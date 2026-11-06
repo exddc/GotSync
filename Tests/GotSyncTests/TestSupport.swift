@@ -200,7 +200,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var acknowledgementCount = 0
 
     private var heldApplicationWriters: Set<Data>?
-    private var writerLimit: Int?
+    private var writerLimit: (count: Int, journaled: Bool)?
+    private var rejections: [Data: UInt64] = [:]
+    private var deferNextAdd = false
+    private var deferredAdd: (delivery: MLSDelivery, authorization: Data)?
     private(set) var rateLimitedAdds = 0
     private var rateLimitedFetches = 0
     private var rateLimitedWriter: Data?
@@ -245,7 +248,28 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     /// Refuses an Add once the group has `count` active writers, as a relay
     /// with a smaller writer directory does.
-    func limitWriters(to count: Int?) { writerLimit = count }
+    /// With `journaled`, as current relays do, an Add beyond `count` writers
+    /// is refused as `keyPackageUnavailable` and every later copy with it.
+    /// Without it, as earlier relays do, the Add receives HTTP 429.
+    func limitWriters(to count: Int?, journaled: Bool = true) {
+        writerLimit = count.map { ($0, journaled) }
+    }
+
+    /// Removes every published KeyPackage, as the relay does 15 minutes after
+    /// publication.
+    func expireKeyPackages() { packages = [:] }
+
+    /// Holds the next Add before the delivery store and reports a lost
+    /// connection; `releaseDeferredAdd()` delivers the held request later.
+    func deferNextAddBeforeStore() { deferNextAdd = true }
+
+    var holdsDeferredAdd: Bool { deferredAdd != nil }
+
+    func releaseDeferredAdd() throws {
+        guard let held = deferredAdd else { return }
+        deferredAdd = nil
+        _ = try appendNow(held.delivery, authorization: held.authorization)
+    }
 
     func activeWriterCount(group: Data) -> Int {
         groups[group]?.writers.values.filter { $0.removal == nil }.count ?? 0
@@ -352,6 +376,11 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     private func appendNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        if deferNextAdd, delivery.welcome != nil {
+            deferNextAdd = false
+            deferredAdd = (delivery, authorization)
+            throw URLError(.networkConnectionLost)
+        }
         if rateLimitedAdds > 0, delivery.welcome != nil, isRateLimited(authorization) {
             rateLimitedAdds -= 1
             throw MLSRelayError.rateLimited
@@ -370,6 +399,8 @@ actor FakeMLSRelay: MLSRelayTransport {
         if let duplicate = entries.first(where: { $0.delivery.group == delivery.group && $0.delivery.payload == delivery.payload }) {
             return try respond(.accepted(cursor: duplicate.cursor))
         }
+        let digest = Self.digest(delivery.group + delivery.payload)
+        if let epoch = rejections[digest] { return .keyPackageUnavailable(epoch: epoch) }
         guard delivery.epoch == groups[delivery.group]?.epoch else { throw MLSRelayError.epochConflict }
         if let unacknowledgedLimit, let group = groups[delivery.group] {
             let floor = group.writers.values.filter { $0.removal == nil }.map(\.ack).min() ?? 0
@@ -378,10 +409,13 @@ actor FakeMLSRelay: MLSRelayTransport {
         }
         if let reference = delivery.keyPackageReference {
             guard let package = packages[reference], package.writer == delivery.addWriter else {
+                rejections[digest] = delivery.epoch
                 return .keyPackageUnavailable(epoch: delivery.epoch)
             }
-            if let writerLimit, activeWriterCount(group: delivery.group) >= writerLimit {
-                throw MLSRelayError.capacityReached
+            if let writerLimit, activeWriterCount(group: delivery.group) >= writerLimit.count {
+                guard writerLimit.journaled else { throw MLSRelayError.capacityReached }
+                rejections[digest] = delivery.epoch
+                return .keyPackageUnavailable(epoch: delivery.epoch)
             }
             packages[reference] = nil
         }

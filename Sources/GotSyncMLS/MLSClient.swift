@@ -79,6 +79,7 @@ struct ClientRecord: Codable {
     var departures: [Data]?
     var pendingTracked: Bool?
     var sent: [MLSSentMessage]?
+    var withdrawnWriter: Data?
 }
 
 struct IdentityRecord: Codable {
@@ -305,6 +306,24 @@ public actor MLSClient {
             }
             record.cursor = cursor
         }
+    }
+
+    /// Marks the pending Add as withdrawn: if it lands, its member is to be
+    /// removed. The mark is kept until `clearWithdrawnAdd()`.
+    public func withdrawPendingAdd() throws {
+        try mutate { record in
+            guard let pending = record.pending, pending.kind == .commit, pending.welcome != nil,
+                  let writer = pending.addWriter
+            else { return }
+            record.withdrawnWriter = writer
+        }
+    }
+
+    /// The writer hash of a withdrawn Add, if one is marked.
+    public func withdrawnAddWriter() throws -> Data? { try store.read().withdrawnWriter }
+
+    public func clearWithdrawnAdd() throws {
+        try mutate { record in record.withdrawnWriter = nil }
     }
 
     public func rejectAddForUnavailableKeyPackage(commit: Data, rejectedEpoch: UInt64) throws {

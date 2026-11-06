@@ -161,16 +161,36 @@ def active_writers(store):
     return store._db.execute("SELECT COUNT(*) FROM mls_writers WHERE removal IS NULL").fetchone()[0]
 
 
-def test_writer_capacity_does_not_consume_package(tmp_path):
+def test_writer_ceiling_refusal_is_journaled_and_does_not_consume_package(tmp_path):
     store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
-    add_writers(store, MAX_WRITERS - 1)
+    tokens = add_writers(store, MAX_WRITERS - 1)
     assert active_writers(store) == MAX_WRITERS == 10
     package = request(store, "key-package/publish", payload=encode_base64url(b"eleventh package"))["reference"]
-    with pytest.raises(DeliveryCapacity):
-        append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome"))
+    refused = append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome"))
+    assert refused == {"version": 2, "error": "keyPackageUnavailable", "epoch": MAX_WRITERS - 1}
+    assert append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome")) == refused
     assert request(store, "key-package/fetch", reference=package)["payload"] is not None
     assert active_writers(store) == MAX_WRITERS
     assert len(request(store, "fetch", group=encode_base64url(b"g" * 32), after=0, limit=32)["entries"]) == MAX_WRITERS - 1
+    leaving = encode_base64url(tokens[4])
+    request(store, "append", group=encode_base64url(b"g" * 32), epoch=MAX_WRITERS - 1, kind="proposal",
+            payload=encode_base64url(b"leave"), authorization=leaving)
+    assert active_writers(store) == MAX_WRITERS - 1
+    assert append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome")) == refused
+    assert active_writers(store) == MAX_WRITERS - 1
+    store.close()
+
+
+def test_accepted_add_stays_a_duplicate_after_the_ceiling_is_reached(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    add_writers(store, MAX_WRITERS - 2)
+    token = b"z" * 32
+    package = request(store, "key-package/publish", payload=encode_base64url(token), authorization=encode_base64url(token))["reference"]
+    values = dict(payload=token, epoch=MAX_WRITERS - 2, reference=package, welcome=encode_base64url(b"welcome"),
+                  addWriter=encode_base64url(hashlib.sha256(token).digest()))
+    accepted = append(store, **values)
+    assert "entry" in accepted and active_writers(store) == MAX_WRITERS
+    assert append(store, **values) == accepted
     store.close()
 
 

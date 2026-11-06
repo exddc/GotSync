@@ -140,13 +140,16 @@ discarded and replaced instead.
 
 ### Relay ceiling
 
-The relay admits ten active writers per group; earlier relays admit eight.
-Against an eight-writer relay, the Add of a ninth device in a profiled group
-receives HTTP 429. The inviter discards the Add and reports
-`privateSyncUnreachable`; the joiner reports `pairingDeclined`. The eight
-current members keep syncing and the relay keeps eight writers. Ten-device
-groups therefore need the ten-writer relay. The current production relay
-release accepts eight.
+The relay admits ten active writers per group and refuses an Add beyond that
+with a journaled `keyPackageUnavailable`; the inviter then discards the Add at
+once. Earlier relays admit eight and answer HTTP 429, which is not final. A
+profiled inviter adding a ninth device through such a relay keeps the Add
+pending and reports `privateSyncUnreachable`; the joiner reports
+`pairingDeclined`. The inviter keeps receiving, but its own changes wait until
+the KeyPackage expires, at most 15 minutes. The relay then refuses the Add for
+good and the inviter discards it and catches up. The eight current members keep
+syncing, and the relay keeps eight writers. Ten-device groups therefore need
+the ten-writer relay. The current production relay release accepts eight.
 
 ### Rollback
 

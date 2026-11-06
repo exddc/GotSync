@@ -352,25 +352,45 @@ An append whose epoch differs from the group's current epoch fails with
 that adds a member carries its Welcome, the KeyPackage reference, and the new
 writer's hash; the relay admits that writer only if the reference belongs to a
 KeyPackage published by it, and otherwise answers `keyPackageUnavailable`. It
-admits at most ten active writers per group and answers an Add beyond that
-with HTTP 429 `deliveryCapacity`, without consuming the KeyPackage. The relay
-does not read group profiles. A
+admits at most ten active writers per group. An Add beyond that is refused
+like an unavailable KeyPackage: the relay records the payload digest in its
+rejection journal, answers `keyPackageUnavailable`, and does not consume the
+KeyPackage. Earlier relays admit eight writers and answer HTTP 429
+`deliveryCapacity` instead, without a journal entry. The relay does not read
+group profiles. A
 commit can name `removeWriter`, and a proposal revokes its own sender. Naming
 a writer the relay no longer holds has no effect. The relay does not parse
 MLS: it trusts these fields and treats payloads as opaque.
 
-A client sends each Add once. If the answer is lost, or the relay answers
-HTTP 429, the client keeps the Add pending and does not send it again: it reads
-the log to its head instead. An Add found there is applied, a competing commit
-discards it, and an Add still missing after the log is read never landed and
-is discarded, because the log keeps every entry its writer has not
-acknowledged. While the log cannot be read, the Add stays pending. HTTP 429
-`deliveryCapacity` comes from the delivery store after it looked for a
-duplicate; any other HTTP 429, such as the admission rate limit or a proxy,
-means the request never reached the store. The inviter repeats this check a few
-times during pairing. If the Add is still pending when pairing ends, the joiner
-is recorded as provisional, so a later read that finds the Add removes a joiner
-that never sends a message.
+A pending entry, including an Add, leaves the client only on an answer that
+ends it for good:
+
+- the relay accepts it, or reports it as a duplicate of an earlier copy;
+- the relay refuses it with `keyPackageUnavailable`. The relay checks its
+  journal before the epoch and membership, so every later copy is refused too,
+  and once the KeyPackage expires every copy of the Add is refused;
+- another commit lands at its epoch, so no copy can land later.
+
+A lost answer, any HTTP 429, a failed read of the log, cancellation, or a
+restart leaves the entry pending. The client sends the same bytes again later,
+and the relay deduplicates them, so an earlier copy still in transit that
+arrives before or after the retry is applied once. Reading the log does not end
+an entry, because an earlier request can still be on its way. HTTP 429
+`deliveryCapacity` comes from the delivery store. Any other HTTP 429, such as
+the admission rate limit or a proxy, means that request never reached the
+store. On an earlier relay a refused Add therefore stays pending until its
+KeyPackage expires, at most 15 minutes. Meanwhile the inviter keeps receiving
+but sends nothing else.
+
+Before a linked inviter sends an Add, it records the joiner as provisional. The
+record stays while any Add is pending and restarts its window when the device
+first appears as a member. If the Add lands after the pairing ended and the
+device never sends a message, the next sync cycle that has read the log to its
+head removes it. While messages wait unread behind a full inbox, no member is
+removed for silence. An inviter that unlinks takes these records into its
+departure journal. Before proposing its own removal, it delivers a pending Add
+and removes the member it added, together with every provisional member that
+has not sent a message.
 
 A revoked writer cannot append. It can read entries up to its removal cursor
 until it acknowledges that cursor or 24 hours pass. The relay deletes entries

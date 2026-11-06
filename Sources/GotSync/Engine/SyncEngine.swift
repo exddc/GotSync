@@ -227,6 +227,9 @@ public final class SyncEngine {
         pairingConflictBackupFilename,
     ]
     static let departuresDirectoryName = "mls-v2-departing"
+    /// Members a departing device added that never spoke, removed before it
+    /// leaves.
+    static let withdrawnMembersFilename = "withdrawn-members.json"
     @available(*, deprecated, message: "Use the engine's memberLimit, which follows its group profile")
     public nonisolated static let maximumGroupSize = SyncGroupProfile.legacyMemberLimit
     private static let maximumAddAttempts = 3
@@ -1740,7 +1743,7 @@ public final class SyncEngine {
             phase = .provisioning
             if linked {
                 try await session.synchronize()
-                try await processRemovals(session: session)
+                try await processRemovals(session: session, removesSilentMembers: !isInboxBackpressured)
                 try await requireAdmission(
                     of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true,
                     before: nil, connection: connection, invitation: invitation
@@ -1761,6 +1764,9 @@ public final class SyncEngine {
                     await releaseReservation(claim, session: session)
                     throw error
                 }
+            }
+            if linked {
+                try markProvisional(joinerFingerprint)
             }
             var added = false
             for _ in 0..<Self.maximumAddAttempts where !added {
@@ -1807,6 +1813,7 @@ public final class SyncEngine {
             if declined || overflowed {
                 current.pendingRemovals.append(joinerFingerprint)
             } else {
+                current.provisionalMembers.removeAll { $0.fingerprint == joinerFingerprint }
                 current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
                     fingerprint: joinerFingerprint, deadline: Date().addingTimeInterval(provisionalMemberWindow)
                 ))
@@ -1841,11 +1848,11 @@ public final class SyncEngine {
         }
     }
 
-    /// Settles an Add whose delivery failed by reconciling it with the log a
-    /// few times. Returns `true` once the joiner is a member and rethrows
-    /// `failure` once the Add is gone without it. An Add still pending makes
-    /// the joiner provisional, so a later reconciliation that finds the Add
-    /// removes a joiner that never speaks.
+    /// Settles an Add whose delivery failed by sending it again a few times;
+    /// the relay deduplicates the copies. Returns `true` once the joiner is a
+    /// member and rethrows `failure` otherwise. An Add still pending stays
+    /// pending, and the provisional record made before it was sent removes
+    /// the device if it is admitted later and never sends a message.
     private func resolveAdd(
         of joiner: Data,
         reference: Data,
@@ -1864,14 +1871,17 @@ public final class SyncEngine {
             delayNanoseconds = min(delayNanoseconds * 2, 4_000_000_000)
             _ = try? await session.flush()
         }
-        if try await session.pendingDelivery()?.keyPackageReference == reference,
-           var current = checkpoint, !current.provisionalMembers.contains(where: { $0.fingerprint == joiner }) {
-            current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
-                fingerprint: joiner, deadline: Date().addingTimeInterval(provisionalMemberWindow)
-            ))
-            try saveCheckpoint(current)
-        }
         throw failure
+    }
+
+    /// Records `member` as provisional, with a fresh deadline.
+    private func markProvisional(_ member: Data) throws {
+        guard var current = checkpoint else { return }
+        current.provisionalMembers.removeAll { $0.fingerprint == member }
+        current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
+            fingerprint: member, deadline: Date().addingTimeInterval(provisionalMemberWindow)
+        ))
+        try saveCheckpoint(current)
     }
 
     private struct JoinerResponse {
@@ -2558,7 +2568,7 @@ public final class SyncEngine {
         var flushed = true
         do {
             _ = try await session.flush()
-        } catch MLSClientError.capacityReached {
+        } catch MLSClientError.capacityReached, MLSRelayError.capacityReached, MLSRelayError.rateLimited {
             flushed = false
         }
         if flushed {
@@ -2585,7 +2595,7 @@ public final class SyncEngine {
             try await resolveReservationAttempts(session: session)
         }
         try await sendReplies(session: session)
-        try await processRemovals(session: session)
+        try await processRemovals(session: session, removesSilentMembers: synchronized && !isInboxBackpressured)
         try await releaseAbandonedReservations(session: session)
         try await requestReservationsIfStillWaiting(session: session)
         if checkpoint?.joinPending == true {
@@ -2938,10 +2948,23 @@ public final class SyncEngine {
             return roster
         }
         let previous = current
+        let addPending = try await session.pendingDelivery()?.welcome != nil
+        try requireCurrent(session)
         current.members = roster.map(ReplicationCheckpoint.Member.init)
         current.pendingRemovals.removeAll { !fingerprints.contains($0) }
         let now = Date()
-        current.provisionalMembers.removeAll { !fingerprints.contains($0.fingerprint) && $0.deadline <= now }
+        let known = Set(previous.members.map(\.fingerprint))
+        // A device not yet a member keeps its record while an Add for it may
+        // still land, and its window starts again when it first appears.
+        current.provisionalMembers = current.provisionalMembers.compactMap { entry in
+            guard fingerprints.contains(entry.fingerprint) else {
+                return addPending || entry.deadline > now ? entry : nil
+            }
+            guard !known.contains(entry.fingerprint) else { return entry }
+            return ReplicationCheckpoint.ProvisionalMember(
+                fingerprint: entry.fingerprint, deadline: max(entry.deadline, now.addingTimeInterval(provisionalMemberWindow))
+            )
+        }
         current.membersWithUnknownHistory = current.membersWithUnknownHistory.flatMap {
             Self.membersWithUnknownHistory(roster: $0.filter(fingerprints.contains), known: [])
         }
@@ -2953,14 +2976,17 @@ public final class SyncEngine {
 
     /// Commits removals requested with `removeDevice`, members whose leave
     /// proposal this device received, and added members that never joined.
-    private func processRemovals(session: MLSSession) async throws {
+    /// The last only with `removesSilentMembers`, after the log was read to
+    /// its head, so a member whose messages wait unread is not removed.
+    private func processRemovals(session: MLSSession, removesSilentMembers: Bool) async throws {
         for _ in 0..<Self.maximumRemovalAttempts {
             let roster = try await refreshMembers(session: session)
             guard let current = checkpoint else { return }
             let now = Date()
+            let silent = removesSilentMembers ? current.provisionalMembers.filter { $0.deadline <= now } : []
             let candidates = current.pendingRemovals
                 + (try await session.departures())
-                + current.provisionalMembers.filter { $0.deadline <= now }.map(\.fingerprint)
+                + silent.map(\.fingerprint)
             guard let target = candidates.first(where: { candidate in
                 roster.contains { $0.fingerprint == candidate && $0.deviceID != deviceID.bytes }
             }) else {
@@ -3000,7 +3026,8 @@ public final class SyncEngine {
         }
     }
 
-    /// Moves the MLS state and its key into a new departure slot.
+    /// Moves the MLS state and its key into a new departure slot, with the
+    /// provisional members the departing device must remove before leaving.
     private func stageDeparture() throws {
         guard FileManager.default.fileExists(atPath: mlsDirectory.path) else { return }
         guard let key = try secretStore.read(account: SecretStoreMLSStateKey.account) else {
@@ -3019,6 +3046,12 @@ public final class SyncEngine {
             attributes: ProtectedStorage.directoryAttributes
         )
         try secretStore.write(key, account: Self.departureKeyAccount(name), accessibility: .afterFirstUnlockThisDeviceOnly)
+        if let provisional = checkpoint?.provisionalMembers.map(\.fingerprint), !provisional.isEmpty {
+            try ProtectedStorage.write(
+                ReplicaCanonicalJSON.encode(provisional),
+                to: mlsDirectory.appendingPathComponent(Self.withdrawnMembersFilename)
+            )
+        }
         try FileManager.default.moveItem(at: mlsDirectory, to: departuresDirectory.appendingPathComponent(name, isDirectory: true))
         mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
         try secretStore.delete(account: SecretStoreMLSStateKey.account)
@@ -3048,7 +3081,10 @@ public final class SyncEngine {
                 let departing = try MLSSession(
                     directory: slot, deviceID: deviceID.bytes, secretStore: secretStore, keyAccount: account, transport: mlsTransport
                 )
-                try await departing.leave()
+                let withdrawn = try? ReplicaCanonicalJSON.decode(
+                    [Data].self, from: Data(contentsOf: slot.appendingPathComponent(Self.withdrawnMembersFilename))
+                )
+                try await departing.leave(withdrawing: withdrawn ?? [])
             } catch is CancellationError {
                 return false
             } catch let error where !Self.isSettledDeparture(error) {
@@ -3406,6 +3442,11 @@ extension SyncEngine {
     var awaitsReservationsForTesting: Bool { checkpoint?.reservationsVisible == false }
     var reservationsForTesting: [OriginReservation] { checkpoint?.originReservations ?? [] }
     var provisionalMembersForTesting: [Data] { checkpoint?.provisionalMembers.map(\.fingerprint) ?? [] }
+    func markProvisionalForTesting(_ member: Data, deadline: Date) throws {
+        guard var current = checkpoint else { return }
+        current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(fingerprint: member, deadline: deadline))
+        try saveCheckpoint(current)
+    }
     var reservationsProviderForTesting: Data? { checkpoint?.reservationsProvider }
     var membersWithUnknownHistoryForTesting: [Data]? { checkpoint?.membersWithUnknownHistory }
     var reservationAttemptsForTesting: [OriginReservation.Attempt] { checkpoint?.reservationAttempts ?? [] }

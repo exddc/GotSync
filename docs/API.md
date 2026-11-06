@@ -206,7 +206,10 @@ for mixed builds, relays, and rollback.
 
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this
-device in the background; another member commits it. The journal is erased
+device in the background; another member commits it. Before that, the journal
+removes devices this device added that have not sent a message yet, including
+one whose Add was still being delivered, because no other member knows they
+never joined. The journal is erased
 once the relay accepts the proposal. Both calls switch to a new MLS identity
 and fingerprint at once, so the same install can be invited again.
 `eraseLocalData()` also gives the new empty replica a new operation origin, so

@@ -345,8 +345,10 @@ class MLSDeliveryStore:
         if package and (not joining or joining[0] != added_writer):
             return False
         if joining and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=? AND removal IS NULL", (route, added_writer)).fetchone():
+            # Refused like an unavailable KeyPackage, so the journal fences
+            # every later copy of this Add and the client can discard it.
             if self._db.execute("SELECT COUNT(*) FROM mls_writers WHERE route=? AND removal IS NULL", (route,)).fetchone()[0] >= MAX_WRITERS:
-                raise DeliveryCapacity("writer directory full")
+                return False
         return True
 
     def _accept_entry(self, route: bytes, entry: tuple, writer: bytes) -> dict:

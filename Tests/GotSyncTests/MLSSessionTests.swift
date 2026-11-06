@@ -281,6 +281,10 @@ final class MLSSessionTests: XCTestCase {
         }
     }
 
+    private func addEntries(of reference: Data, relay: FakeMLSRelay, group: Data) async -> Int {
+        await relay.log(group: group).filter { $0.delivery.keyPackageReference == reference }.count
+    }
+
     func testLostAddResponseThenRateLimitedRetryRecoversTheAcceptedAddAcrossRestart() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)
@@ -295,70 +299,132 @@ final class MLSSessionTests: XCTestCase {
             group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
         )
         XCTAssertTrue(joined)
-        await relay.rateLimitNext(adds: 1, fetches: 1)
+        await relay.rateLimitNext(adds: 1)
         do {
             _ = try await alice.flush()
-            XCTFail("Reading the log should be rate limited")
+            XCTFail("The retry should be rate limited before deduplication")
         } catch MLSRelayError.rateLimited {}
         let retained = try await alice.pendingDelivery()
         XCTAssertEqual(retained?.keyPackageReference, published.reference, "an Add with an unknown outcome was discarded")
 
         let restarted = try session("alice", transport: relay)
         guard case .accepted = try await restarted.flush() else { return XCTFail("The accepted Add was not applied") }
-        let unusedLimit = await relay.rateLimitedAdds
-        XCTAssertEqual(unusedLimit, 1, "the Add was sent again instead of being found in the log")
-        await relay.rateLimitNext()
         let cleared = try await restarted.pendingDelivery()
         XCTAssertNil(cleared)
+        let copies = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(copies, 1)
         try await assertConverged([restarted, bob, charlie], relay: relay, group: group)
     }
 
-    func testRateLimitedAddThatNeverLandedIsDiscardedAndNeverAdmitted() async throws {
+    /// The first request for an Add is held before the delivery store while
+    /// the inviter sees a lost connection. Reading an empty log must not end
+    /// it: the held request can still arrive, before or after the retry.
+    private func assertDelayedAddIsDelivered(originalFirst: Bool, restart: Bool) async throws {
         let relay = FakeMLSRelay()
-        let (alice, bob, group) = try await pair(relay)
+        var (alice, bob, group) = try await pair(relay)
         let charlie = try session("charlie", transport: relay)
         let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
-        let epoch = try await alice.epoch()
-        await relay.rateLimitNext(adds: 1)
+        await relay.deferNextAddBeforeStore()
         do {
             _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
-            XCTFail("The Add should be rate limited")
-        } catch MLSRelayError.rateLimited {}
-        let pending = try await alice.pendingDelivery()
-        XCTAssertNil(pending)
-        let after = try await alice.epoch()
-        XCTAssertEqual(after, epoch)
-        let flushed = try await alice.flush()
-        XCTAssertNil(flushed)
+            XCTFail("The ambiguous request should fail")
+        } catch is URLError {}
+        try await bob.synchronize()
+        let empty = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(empty, 0)
+        if restart {
+            alice = try session("alice", transport: relay)
+        }
+        if originalFirst {
+            try await relay.releaseDeferredAdd()
+        }
+        guard case .accepted = try await alice.flush() else { return XCTFail("The Add was not delivered") }
+        if !originalFirst {
+            try await relay.releaseDeferredAdd()
+        }
+        let copies = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(copies, 1, "the held request and the retry were both admitted")
         let joined = try await charlie.join(
             group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
         )
-        XCTAssertFalse(joined)
-        let log = await relay.log(group: group)
-        XCTAssertFalse(log.contains { $0.delivery.keyPackageReference == published.reference }, "the refused Add reached the log")
-        try await assertConverged([alice, bob], relay: relay, group: group)
+        XCTAssertTrue(joined)
+        try await assertConverged([alice, bob, charlie], relay: relay, group: group)
     }
 
-    func testAddKeptWhileTheLogCannotBeReadIsDiscardedOnceItIsRead() async throws {
+    func testDelayedUnknownAddCannotBeAbandonedFromAnEmptyLog() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: false, restart: false)
+    }
+
+    func testDelayedUnknownAddArrivingBeforeTheRetryIsDeduplicated() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: true, restart: false)
+    }
+
+    func testDelayedUnknownAddSurvivesRestartBeforeTheRetry() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: false, restart: true)
+    }
+
+    func testDelayedUnknownAddArrivingDuringRestartIsDeduplicated() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: true, restart: true)
+    }
+
+    func testRateLimitedAddIsKeptAndDeliveredOnRetry() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)
         let charlie = try session("charlie", transport: relay)
         let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
-        await relay.rateLimitNext(adds: 1, fetches: 1)
+        await relay.rateLimitNext(adds: 1)
         do {
             _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
             XCTFail("The Add should be rate limited")
         } catch MLSRelayError.rateLimited {}
         let kept = try await alice.pendingDelivery()
         XCTAssertEqual(kept?.keyPackageReference, published.reference)
-        let restarted = try session("alice", transport: relay)
-        let flushed = try await restarted.flush()
+        guard case .accepted = try await alice.flush() else { return XCTFail("The retry was not accepted") }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        try await assertConverged([alice, bob, charlie], relay: relay, group: group)
+    }
+
+    /// Only the store's journaled refusal ends an Add whose first request is
+    /// still held: once the KeyPackage expires, the retry is refused, and so
+    /// is the held request when it finally arrives.
+    func testUnknownAddEndsOnlyWithTheStoresJournaledRefusal() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        let epoch = try await alice.epoch()
+        await relay.deferNextAddBeforeStore()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The ambiguous request should fail")
+        } catch is URLError {}
+        await relay.rateLimitNext(adds: 3)
+        for _ in 0..<3 {
+            do {
+                _ = try await alice.flush()
+                XCTFail("The retry should be rate limited")
+            } catch MLSRelayError.rateLimited {}
+        }
+        let kept = try await alice.pendingDelivery()
+        XCTAssertEqual(kept?.keyPackageReference, published.reference, "rate limits and timeouts are not terminal")
+        await relay.expireKeyPackages()
+        let flushed = try await alice.flush()
         XCTAssertEqual(flushed, .superseded)
-        let discarded = try await restarted.pendingDelivery()
+        let discarded = try await alice.pendingDelivery()
         XCTAssertNil(discarded)
-        let log = await relay.log(group: group)
-        XCTAssertFalse(log.contains { $0.delivery.keyPackageReference == published.reference }, "the refused Add reached the log")
-        try await assertConverged([restarted, bob], relay: relay, group: group)
+        try await relay.releaseDeferredAdd()
+        let copies = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(copies, 0, "a held copy landed after the refusal")
+        let after = try await alice.epoch()
+        XCTAssertEqual(after, epoch)
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertFalse(joined)
+        try await assertConverged([alice, bob], relay: relay, group: group)
     }
 
     func testLostAddBehindAFullInboxStaysPendingUntilTheInboxDrains() async throws {

@@ -227,13 +227,11 @@ final class TenDeviceAcceptanceTests: XCTestCase {
             group: group, epoch: try await session.epoch(), kind: .commit, payload: try Data.secureRandom(count: 64),
             welcome: try Data.secureRandom(count: 64), keyPackageReference: second.reference, addWriter: outsiderWriter
         )
-        let rateLimited = try await counters()["rate_limit_rejections", default: 0]
-        do {
-            _ = try await transport().append(forged, authorization: try await authorization(inviter))
-            XCTFail("The relay admitted an eleventh writer")
-        } catch MLSRelayError.capacityReached {}
-        let rateLimitedAfter = try await counters()["rate_limit_rejections", default: 0]
-        XCTAssertEqual(rateLimitedAfter, rateLimited, "the append was rate limited instead of refused for capacity")
+        let inviterAuthorization = try await authorization(inviter)
+        let refused = try await transport().append(forged, authorization: inviterAuthorization)
+        XCTAssertEqual(refused, .keyPackageUnavailable(epoch: forged.epoch), "the relay admitted an eleventh writer")
+        let repeated = try await transport().append(forged, authorization: inviterAuthorization)
+        XCTAssertEqual(repeated, refused, "the refusal is not journaled")
         XCTAssertTrue(try relayStillHoldsPackage(second.reference))
         try await assertRelayWritersMatchRoster(group: group, engines: engines, count: 10)
     }
