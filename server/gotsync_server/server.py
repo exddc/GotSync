@@ -960,7 +960,12 @@ class RelayServer:
                 await write_http_response(
                     writer,
                     200,
-                    {"status": "ok", "version": PROTOCOL_VERSION, "supportedVersions": SUPPORTED_VERSIONS},
+                    {
+                        "status": "ok", "version": PROTOCOL_VERSION,
+                        "supportedVersions": SUPPORTED_VERSIONS,
+                        "build": {"version": os.getenv("GOTSYNC_VERSION", "dev"),
+                                  "revision": os.getenv("GOTSYNC_REVISION", "unknown")},
+                    },
                 )
             elif method == "GET" and target == "/readyz":
                 try:

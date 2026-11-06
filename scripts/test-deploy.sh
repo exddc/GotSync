@@ -9,12 +9,14 @@ traefik_image=traefik:v3.7
 setup_image=python:3.12-slim
 work="$(mktemp -d)"
 export GOTSYNC_RELAY_HOST=relay.example.test
+export GOTSYNC_RELAY_IMAGE=gotsync-relay-local
 
 printf '%s\n' "services:" "  relay:" "    volumes:" \
     "      - $work/host/data:/data" "      - $work/host/certs:/certs:ro" > "$work/host-dir.yaml"
 
 compose() {
-    docker compose -p "$project" -f "$compose_file" -f "$work/host-dir.yaml" "$@"
+    docker compose -p "$project" -f "$compose_file" \
+        -f server/deploy/traefik/compose.build.yaml -f "$work/host-dir.yaml" "$@"
 }
 
 cleanup() {
@@ -85,7 +87,7 @@ docker network connect "${project}_default" "$project-traefik"
 docker run -d --name "$project-client" --network "$project-a" --ip 198.51.100.10 \
     -e GOTSYNC_RELAY_HOST \
     -v "$PWD/scripts/deploy-check.py:/check/deploy-check.py:ro" -v "$work/check/ca.crt:/check/ca.crt:ro" \
-    --entrypoint sleep "$project-relay" infinity >/dev/null
+    --entrypoint sleep gotsync-relay-local infinity >/dev/null
 docker network connect --ip 192.0.2.10 "$project-b" "$project-client"
 
 delivery_reachable() {

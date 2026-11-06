@@ -1,0 +1,91 @@
+name: Release relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New relay version, such as 0.1.0
+        required: true
+        type: string
+      force:
+        description: Build a new version for unchanged inputs to refresh base images
+        type: boolean
+        default: false
+      deploy:
+        description: Deploy this version to Coolify after publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-releases
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: relay-stable
+    timeout-minutes: 35
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test release automation
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_relay_*.py'
+      - name: Select changed relay inputs
+        id: plan
+        env:
+          VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=()
+          if [ "$FORCE" = true ]; then args+=(--force); fi
+          python3 scripts/relay-release.py plan --version "$VERSION" \
+            --output "$RUNNER_TEMP/relay-release.json" "${args[@]}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+        if: steps.plan.outputs.build == 'true'
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        if: steps.plan.outputs.publish == 'true'
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        if: steps.plan.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push the versioned image
+        if: steps.plan.outputs.build == 'true'
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          REVISION: ${{ steps.plan.outputs.revision }}
+        run: |
+          docker buildx build server --platform linux/amd64,linux/arm64 --pull --push \
+            --tag "$IMAGE:$VERSION" \
+            --build-arg "GOTSYNC_VERSION=$VERSION" \
+            --build-arg "GOTSYNC_REVISION=$REVISION" \
+            --metadata-file "$RUNNER_TEMP/relay-image.json"
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/relay-image.json")"
+          python3 scripts/relay-release.py record --version "$VERSION" --digest "$digest" \
+            --output "$RUNNER_TEMP/relay-release.json"
+      - name: Publish the version tag and release
+        if: steps.plan.outputs.publish == 'true'
+        run: python3 scripts/relay-release.py publish "$RUNNER_TEMP/relay-release.json"
+      - name: Deploy this release to Coolify
+        if: steps.plan.outputs.publish == 'true' && inputs.deploy
+        env:
+          COOLIFY_URL: ${{ vars.COOLIFY_URL }}
+          COOLIFY_APPLICATION_UUID: ${{ vars.COOLIFY_APPLICATION_UUID }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: python3 scripts/relay-deploy.py "$RUNNER_TEMP/relay-release.json"
+      - name: Report unchanged relay
+        if: steps.plan.outputs.publish != 'true'
+        run: echo 'Relay inputs match the latest release. No new version or image was published.' >> "$GITHUB_STEP_SUMMARY"

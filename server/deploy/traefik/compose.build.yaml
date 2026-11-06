@@ -1,0 +1,6 @@
+services:
+  relay:
+    image: gotsync-relay-local
+    build:
+      context: ../..
+      dockerfile: Dockerfile

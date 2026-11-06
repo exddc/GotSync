@@ -8,6 +8,14 @@ RUN groupadd --gid 10001 gotsync && useradd --uid 10001 --gid gotsync --no-creat
 COPY pyproject.toml uv.lock LICENSE ./
 COPY gotsync_server ./gotsync_server
 RUN uv sync --locked --no-dev --no-editable --no-cache && mkdir /data && chown gotsync:gotsync /data
+ARG GOTSYNC_VERSION=dev
+ARG GOTSYNC_REVISION=unknown
+ENV GOTSYNC_VERSION=$GOTSYNC_VERSION GOTSYNC_REVISION=$GOTSYNC_REVISION
+LABEL org.opencontainers.image.source="https://github.com/exddc/GotSync" \
+    org.opencontainers.image.title="GotSync relay" \
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.version=$GOTSYNC_VERSION \
+    org.opencontainers.image.revision=$GOTSYNC_REVISION
 ENV PATH="/opt/gotsync/python/bin:$PATH"
 USER gotsync:gotsync
 VOLUME ["/data"]

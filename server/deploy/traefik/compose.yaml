@@ -2,9 +2,7 @@ name: gotsync-relay
 
 services:
   relay:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: ${GOTSYNC_RELAY_IMAGE:?set a versioned relay image or digest}
     command:
       - --host=0.0.0.0
       - --delivery-host=0.0.0.0
