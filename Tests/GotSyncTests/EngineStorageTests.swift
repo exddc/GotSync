@@ -219,6 +219,24 @@ final class EngineStorageTests: XCTestCase {
         XCTAssertNotNil(model.errorMessage)
     }
 
+    func testUploadWatermarkCountsOnlyItsOrigin() {
+        let deviceID = ReplicaDeviceID(uuid: UUID())
+        let origin = ReplicaDeviceID(uuid: UUID())
+        var checkpoint = ReplicationCheckpoint(
+            group: Data(repeating: 1, count: 32),
+            members: [],
+            joinPending: false,
+            provider: nil
+        )
+        checkpoint.uploadedThrough = 5
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: deviceID, deviceID: deviceID), 5)
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: origin, deviceID: deviceID), 0)
+
+        checkpoint.setUploadedThrough(3, origin: origin)
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: origin, deviceID: deviceID), 3)
+        XCTAssertEqual(checkpoint.uploadedThrough(origin: deviceID, deviceID: deviceID), 0)
+    }
+
     @MainActor
     func testLegacyPendingJoinIsDiscardedAndArchivePreserved() throws {
         let service = "com.gotdone.relay.tests.\(UUID().uuidString)"
@@ -319,13 +337,13 @@ final class EngineStorageTests: XCTestCase {
                 FileManager.default.fileExists(atPath: markerURL.path),
                 "\(boundary)"
             )
-            XCTAssertTrue(
-                try TaskReplica(
-                    deviceID: localDeviceID,
-                    persistenceURL: persistenceURL
-                ).isEmpty,
-                "\(boundary)"
+            let reloaded = try TaskReplica(
+                deviceID: localDeviceID,
+                persistenceURL: persistenceURL
             )
+            XCTAssertTrue(reloaded.isEmpty, "\(boundary)")
+            XCTAssertNotEqual(reloaded.localOrigin, staleReplica.localOrigin, "\(boundary)")
+            XCTAssertEqual(recovered.replicaForTesting.localOrigin, reloaded.localOrigin, "\(boundary)")
 
             try? keychain.delete(account: InstallIdentity.account)
             try? FileManager.default.removeItem(at: baseDirectory)
@@ -368,8 +386,14 @@ final class EngineStorageTests: XCTestCase {
         )
         try Data("unrelated".utf8).write(to: unrelatedURL)
 
+        let originBeforeErase = model.replicaForTesting.localOrigin
+        XCTAssertNotEqual(originBeforeErase.bytes, identity.deviceID)
+
         model.eraseLocalData()
 
+        let originAfterErase = model.replicaForTesting.localOrigin
+        XCTAssertNotEqual(originAfterErase, originBeforeErase)
+        XCTAssertNotEqual(originAfterErase.bytes, identity.deviceID)
         let markerURL = baseDirectory.appendingPathComponent(
             SyncEngine.eraseMarkerFilename
         )
@@ -391,6 +415,16 @@ final class EngineStorageTests: XCTestCase {
                 persistenceURL: persistenceURL
             ).isEmpty
         )
+
+        let restarted = SyncEngine(
+            keychain: keychain,
+            baseDirectory: baseDirectory
+        )
+        XCTAssertEqual(restarted.replicaForTesting.localOrigin, originAfterErase)
+        XCTAssertTrue(restarted.addTask(title: "After erase"))
+        let created = try XCTUnwrap(restarted.replicaForTesting.retainedOperations.first)
+        XCTAssertEqual(created.originDeviceID, originAfterErase)
+        XCTAssertEqual(created.originSequence, 1)
     }
 
     @MainActor
@@ -494,5 +528,37 @@ final class EngineStorageTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         try ReplyObligation.save(obligation, to: url)
         XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+    }
+
+    func testReplyObligationKeepsBoundedSnapshotRecipientsUntilEachIsSent() throws {
+        let members = (0..<(SyncEngine.maximumGroupSize + 2)).map { Data(repeating: UInt8($0), count: 32) }
+        var obligation = ReplyObligation()
+        obligation.merge(ReplicaVersionVector(), provider: true)
+        for member in members + members.suffix(3) {
+            obligation.addRecipient(member)
+        }
+        XCTAssertEqual(obligation.recipients, Array(members.suffix(SyncEngine.maximumGroupSize)))
+
+        obligation.completeHistory()
+        XCTAssertNil(obligation.provided)
+        XCTAssertFalse(obligation.isEmpty)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+
+        for member in members.suffix(SyncEngine.maximumGroupSize - 1) {
+            obligation.removeRecipient(member)
+        }
+        XCTAssertFalse(obligation.isEmpty)
+        obligation.removeRecipient(members[2])
+        XCTAssertTrue(obligation.isEmpty)
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        var oversized = ReplyObligation()
+        oversized.recipients = members
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(oversized), to: url)
+        XCTAssertThrowsError(try ReplyObligation.load(from: url))
     }
 }

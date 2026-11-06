@@ -166,6 +166,70 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(inbox.map(\.plaintext), [Data("once".utf8)])
     }
 
+    func testTrackedMessageCursorOutlivesLaterMessages() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, _, _) = try await pair(relay)
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.send(Data("claim".utf8), tracked: true)
+            XCTFail("Dropped response succeeded")
+        } catch {}
+        let reopened = try session("alice", transport: relay)
+        guard case .accepted(let cursor) = try await reopened.flush() else { return XCTFail("Retry not accepted") }
+        for index in 0..<(MLSSentMessage.retained + 6) {
+            _ = try await reopened.send(Data("edit \(index)".utf8))
+        }
+        let claim = try await reopened.sentCursors(of: Data("claim".utf8))
+        XCTAssertEqual(claim, [cursor])
+        let edit = try await reopened.sentCursors(of: Data("edit 0".utf8))
+        XCTAssertEqual(edit, [])
+    }
+
+    func testTrackedMessageAcceptedBehindFullInboxKeepsItsCursor() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, _) = try await pair(relay)
+        for index in 0...1_000 {
+            _ = try await bob.send(Data("edit \(index)".utf8))
+        }
+        do {
+            _ = try await alice.synchronize()
+            XCTFail("A full inbox accepted more messages")
+        } catch MLSClientError.capacityReached {}
+        let held = try await alice.inbox()
+        XCTAssertEqual(held.count, 1_000)
+
+        let claim = try ReplicationMessage.reservation(member: Data(repeating: 7, count: 32), origins: [], epoch: 1).encoded()
+        let before = try await alice.cursor()
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.send(claim, tracked: true)
+            XCTFail("Dropped response succeeded")
+        } catch {}
+        var reopened = try session("alice", transport: relay)
+        guard case .accepted(let cursor) = try await reopened.flush() else { return XCTFail("Retry not accepted") }
+        let cleared = try await reopened.pendingDelivery()
+        XCTAssertNil(cleared)
+
+        reopened = try session("alice", transport: relay)
+        for index in 0..<(MLSSentMessage.retained + 6) {
+            guard case .accepted = try await reopened.send(Data("untracked \(index)".utf8)) else {
+                return XCTFail("Untracked message not accepted")
+            }
+        }
+        let landed = try await reopened.sentCursors(of: claim)
+        XCTAssertEqual(landed, [cursor])
+        XCTAssertTrue(landed.contains { $0 > before })
+        let unchanged = try await reopened.inbox()
+        XCTAssertEqual(unchanged, held)
+
+        try await reopened.acknowledgeInbox(through: try XCTUnwrap(held.last).cursor)
+        _ = try await reopened.synchronize()
+        let rest = try await reopened.inbox()
+        XCTAssertEqual(rest.map(\.plaintext), [Data("edit 1000".utf8)])
+        let afterDrain = try await reopened.sentCursors(of: claim)
+        XCTAssertEqual(afterDrain, [cursor])
+    }
+
     func testStaleSenderResolvesEpochConflicts() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)

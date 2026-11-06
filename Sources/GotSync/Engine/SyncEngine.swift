@@ -34,10 +34,14 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case privateSyncUnreachable
     case localStorageUnavailable
     case groupAtCapacity
+    case taskHistoryAtCapacity
     case unsupportedProtocolVersion
     case relinkRequired
     case syncHistoryBlocked
     case syncHistoryExpired
+    /// Another device sent an operation whose ID this device already holds
+    /// with different content.
+    case syncHistoryConflict
     case removedFromGroup
     case approvalExpired
     /// Linked devices sent valid changes that would exceed this device's task,
@@ -64,6 +68,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "Local storage is unavailable. Restart the app after fixing storage."
         case .groupAtCapacity:
             "The group is at its device limit."
+        case .taskHistoryAtCapacity:
+            "This task history has no room for another device. It keeps changes from up to \(ReplicaLimits.maxOrigins) devices, counting removed devices, and keeps one slot for each linked device. Devices already linked keep syncing."
         case .unsupportedProtocolVersion:
             "The sync service uses an unsupported protocol version."
         case .relinkRequired:
@@ -72,6 +78,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "Sync stopped at an update this iPhone could not verify. Your tasks are safe. Unlink and create a new link to keep syncing."
         case .syncHistoryExpired:
             "This iPhone was offline longer than the sync service keeps updates. Your tasks are safe. Unlink and create a new link to keep syncing."
+        case .syncHistoryConflict:
+            "A linked device sent task changes that conflict with this iPhone's copy, so sync stopped. Your tasks are safe. This can happen when a device was erased with an earlier app version: unlink this iPhone, erase that device again, then link them again."
         case .removedFromGroup:
             "This iPhone was removed from the sync group. Your tasks are safe on this iPhone."
         case .approvalExpired:
@@ -136,10 +144,11 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         switch sync {
         case .privateSyncUnreachable, .relay:
             return true
-        case .invitationExpired, .pairingDeclined, .groupAtCapacity,
+        case .invitationExpired, .pairingDeclined, .groupAtCapacity, .taskHistoryAtCapacity,
              .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
              .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
-             .syncHistoryExpired, .removedFromGroup, .approvalExpired, .replicaCapacityReached:
+             .syncHistoryExpired, .syncHistoryConflict, .removedFromGroup, .approvalExpired,
+             .replicaCapacityReached:
             return false
         }
     }
@@ -206,7 +215,7 @@ public final class SyncEngine {
         pairingConflictBackupFilename,
     ]
     static let departuresDirectoryName = "mls-v2-departing"
-    private static let maximumGroupSize = 8
+    public nonisolated static let maximumGroupSize = 8
     private static let maximumAddAttempts = 3
     private static let maximumRemovalAttempts = 8
     private static let maximumDepartures = 8
@@ -280,6 +289,16 @@ public final class SyncEngine {
     private var activeInvitation: Invitation?
     private var approvalContinuation: CheckedContinuation<ApprovalOutcome, Never>?
     private var peerDecision: Bool?
+    private var peerRefusedForTaskHistory = false
+    private(set) var lastPairingFailure: SyncError?
+    private var reservationsInFlight: [OriginReservation.Attempt] = []
+    private var lastKnownEpoch: UInt64 = 0
+    private var reservationRequestCycles = 0
+    private static let reservationRequestInterval = 5
+    var reservationHookForTesting: (@MainActor () async -> Void)?
+    var reservationSendHookForTesting: (@MainActor () async -> Void)?
+    var afterAddHookForTesting: (@MainActor () throws -> Void)?
+    var beforeReservationRequestHookForTesting: (@MainActor () throws -> Void)?
     private var reconcileTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var syncCycleTask: Task<Void, Never>?
@@ -288,6 +307,7 @@ public final class SyncEngine {
     private var syncCycleID: UUID?
     var inboxReadHookForTesting: (@MainActor () async -> Void)?
     var replyBatchHookForTesting: (@MainActor () async -> Void)?
+    var snapshotSendHookForTesting: (@MainActor () throws -> Void)?
     private var syncCycleRequested = false
     private var syncFailureCount = 0
     private var nextSyncAttemptAt = Date.distantPast
@@ -393,16 +413,20 @@ public final class SyncEngine {
                         markerURL: markerURL
                     )
                 } else {
-                    replica = try TaskReplica(deviceID: deviceID, persistenceURL: persistenceURL)
+                    replica = try TaskReplica(
+                        deviceID: deviceID,
+                        persistenceURL: persistenceURL,
+                        newOrigin: Self.newReplicaOrigin()
+                    )
                 }
                 hasDurableStorage = true
             } catch {
                 bootError = bootError ?? error
-                replica = try! TaskReplica(deviceID: deviceID)
+                replica = try! TaskReplica(deviceID: deviceID, newOrigin: Self.newReplicaOrigin())
                 hasDurableStorage = false
             }
         } else {
-            replica = try! TaskReplica(deviceID: deviceID)
+            replica = try! TaskReplica(deviceID: deviceID, newOrigin: Self.newReplicaOrigin())
             hasDurableStorage = false
         }
 
@@ -488,6 +512,630 @@ public final class SyncEngine {
 
     public var isGroupAtCapacity: Bool {
         linkedMemberCount >= Self.maximumGroupSize
+    }
+
+    /// Whether linking one more device could leave the replica unable to
+    /// accept a new origin from that device or a current member. Every
+    /// retained origin holds a slot, and every current member, including this
+    /// device, reserves one more whether or not it has edited yet.
+    public var isTaskHistoryAtCapacity: Bool {
+        guard checkpoint?.reservationsOverflowed != true else {
+            return true
+        }
+        let roster = Set(checkpoint?.members.map(\.fingerprint) ?? [])
+        let claims = (checkpoint?.originReservations ?? []).filter { $0.isActive(roster: roster, epoch: lastKnownEpoch) }
+        guard claims.count < OriginReservation.maximumActive else {
+            return true
+        }
+        return originSlotsInUse(
+            memberCount: roster.union(claims.map(\.member)).count,
+            pending: Set(claims.flatMap(\.origins))
+        ) >= ReplicaLimits.maxOrigins
+    }
+
+    private func originSlotsInUse(memberCount: Int, pending: Set<ReplicaDeviceID> = []) -> Int {
+        Self.originSlots(retained: heldOrigins, pending: pending, memberCount: memberCount)
+    }
+
+    /// Origins of applied operations and of saved operations that exceed a
+    /// replica limit.
+    private var heldOrigins: [ReplicaDeviceID] {
+        Set(replica.versionVector.origins).union(deferredOperations.map(\.originDeviceID)).sorted()
+    }
+
+    static func originSlots(
+        retained: [ReplicaDeviceID],
+        pending: Set<ReplicaDeviceID>,
+        memberCount: Int
+    ) -> Int {
+        Set(retained).union(pending).count + max(memberCount, 1)
+    }
+
+    private struct AdmissionView {
+        var pending: Set<ReplicaDeviceID> = []
+        var reservations: [OriginReservation] = []
+    }
+
+    /// Origins the group has already committed to but this replica has not
+    /// retained: operations and hello vectors delivered but not applied yet,
+    /// plus every reservation known from the inbox or the checkpoint. The
+    /// inbox is read before the checkpoint because a drain saves reservations
+    /// before it acknowledges the inbox. Any received operation the engine
+    /// holds without applying must add its origin to `pending` here too.
+    private func admissionView(session: MLSSession) async throws -> AdmissionView {
+        var view = AdmissionView()
+        var updates: [ReservationUpdate] = []
+        for message in try await session.inbox() {
+            guard let decoded = try? ReplicationMessage.decode(message.plaintext) else {
+                continue
+            }
+            view.pending.formUnion(decoded.operations?.map(\.originDeviceID) ?? [])
+            view.pending.formUnion(decoded.vector?.origins ?? [])
+            if ReservationUpdate.kinds.contains(decoded.kind) {
+                updates.append(ReservationUpdate(cursor: message.cursor, sender: message.sender, message: decoded))
+            }
+        }
+        view.reservations = Self.merge(updates, into: checkpoint?.originReservations ?? [], snapshotsFor: nil)
+        return view
+    }
+
+    private enum Admission {
+        case fits
+        case taskHistoryFull
+        case groupFull
+    }
+
+    /// Counts the joiner against every origin and member slot the group has
+    /// committed to. With `before`, only claims earlier in the relay log
+    /// count, so of two claims the later one always counts the earlier.
+    private func admission(
+        of joiner: Data,
+        origins joinerOrigins: Set<ReplicaDeviceID>,
+        session: MLSSession,
+        linked: Bool,
+        before cursor: UInt64?
+    ) async throws -> Admission {
+        guard checkpoint?.reservationsOverflowed != true else {
+            return .taskHistoryFull
+        }
+        var roster: Set<Data> = [try await session.fingerprint()]
+        var view = AdmissionView()
+        var epoch: UInt64 = 0
+        if linked {
+            epoch = try await session.epoch()
+            view = try await admissionView(session: session)
+            roster = Set(try await session.members().map(\.fingerprint))
+            lastKnownEpoch = max(lastKnownEpoch, epoch)
+        }
+        guard roster.isDisjoint(with: checkpoint?.membersWithUnknownHistory ?? []) else {
+            return .taskHistoryFull
+        }
+        let claims = view.reservations.filter { claim in
+            claim.isActive(roster: roster, epoch: epoch) && cursor.map { claim.cursor < $0 } ?? true
+        }
+        guard claims.count < OriginReservation.maximumActive else {
+            return .taskHistoryFull
+        }
+        let members = roster.union(claims.map(\.member)).union([joiner])
+        guard members.count <= Self.maximumGroupSize else {
+            return .groupFull
+        }
+        let pending = view.pending.union(claims.flatMap(\.origins)).union(joinerOrigins)
+        return originSlotsInUse(memberCount: members.count, pending: pending) <= ReplicaLimits.maxOrigins
+            ? .fits : .taskHistoryFull
+    }
+
+    private func requireAdmission(
+        of joiner: Data,
+        origins: Set<ReplicaDeviceID>,
+        session: MLSSession,
+        linked: Bool,
+        before cursor: UInt64?,
+        connection: any PairingConnection,
+        invitation: Invitation
+    ) async throws {
+        switch try await admission(of: joiner, origins: origins, session: session, linked: linked, before: cursor) {
+        case .fits:
+            return
+        case .taskHistoryFull:
+            try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
+        case .groupFull:
+            throw SyncError.groupAtCapacity
+        }
+    }
+
+    /// Publishes a claim for `joiner` and returns it as recorded at its log
+    /// position. A linked inviter saves the attempt before sending it, so a
+    /// claim whose send fails can still be found in the log and released.
+    private func reserve(
+        _ joiner: Data,
+        origins: Set<ReplicaDeviceID>,
+        session: MLSSession
+    ) async throws -> OriginReservation {
+        try await prepareToReserve(session: session)
+        let epoch = try await session.epoch()
+        let message = ReplicationMessage.reservation(member: joiner, origins: Array(origins), epoch: epoch)
+        let attempt = OriginReservation.Attempt(
+            member: joiner, origins: message.origins ?? [], epoch: epoch, after: try await session.cursor()
+        )
+        try Task.checkCancellation()
+        if var current = checkpoint {
+            current.reservationAttempts = (current.reservationAttempts ?? []) + [attempt]
+            try saveCheckpoint(current)
+            reservationsInFlight.append(attempt)
+        }
+        await reservationSendHookForTesting?()
+        let cursor: UInt64
+        do {
+            guard case .accepted(let accepted) = try await session.send(message.encoded(), tracked: true) else {
+                throw SyncCycleError.notDelivered
+            }
+            cursor = accepted
+            reservationsInFlight.removeAll { $0 == attempt }
+        } catch {
+            reservationsInFlight.removeAll { $0 == attempt }
+            try? await resolveReservationAttempts(session: session)
+            throw error
+        }
+        let claim = OriginReservation(
+            member: joiner, owner: try await session.fingerprint(), origins: attempt.origins,
+            epoch: epoch, cursor: cursor
+        )
+        if var current = checkpoint {
+            current.originReservations = Self.upserting(claim, into: current.originReservations ?? [])
+            current.reservationAttempts?.removeAll { $0 == attempt }
+            try saveCheckpoint(current)
+        } else {
+            guard let founding = try loadFoundingClaims() else {
+                throw SyncError.localStorageUnavailable
+            }
+            try saveFoundingClaims(Self.upserting(claim, into: founding))
+        }
+        return claim
+    }
+
+    /// A linked inviter starts no claim while an earlier attempt is
+    /// unresolved. A founding inviter refuses a claims file that no longer
+    /// decodes.
+    private func prepareToReserve(session: MLSSession) async throws {
+        guard checkpoint != nil else {
+            guard try loadFoundingClaims() != nil else {
+                throw SyncError.localStorageUnavailable
+            }
+            return
+        }
+        for _ in 0..<2 where !(checkpoint?.reservationAttempts ?? []).isEmpty {
+            try await resolveReservationAttempts(session: session)
+        }
+        guard checkpoint?.reservationAttempts?.isEmpty ?? true else {
+            throw SyncError.privateSyncUnreachable
+        }
+    }
+
+    /// Turns each saved attempt into a claim at the cursor where it landed,
+    /// or drops it once nothing is left to deliver and it never landed.
+    /// Attempts whose send is still running wait for a later call.
+    private func resolveReservationAttempts(session: MLSSession) async throws {
+        guard let group = checkpoint?.group else {
+            return
+        }
+        let attempts = (checkpoint?.reservationAttempts ?? []).filter { !reservationsInFlight.contains($0) }
+        guard !attempts.isEmpty else {
+            return
+        }
+        if try await session.pendingDelivery() != nil {
+            _ = try await session.flush()
+        }
+        guard try await session.pendingDelivery() == nil else {
+            return
+        }
+        let owner = try await session.fingerprint()
+        var known = Set((checkpoint?.originReservations ?? []).map(\.cursor))
+        var outcomes: [(attempt: OriginReservation.Attempt, claim: OriginReservation?)] = []
+        for attempt in attempts {
+            let landed = try await session.sentCursors(of: attempt.message.encoded())
+            let cursor = landed.first { $0 > attempt.after && !known.contains($0) }
+            if let cursor {
+                known.insert(cursor)
+            }
+            outcomes.append((attempt, cursor.map {
+                OriginReservation(
+                    member: attempt.member, owner: owner, origins: attempt.origins, epoch: attempt.epoch, cursor: $0
+                )
+            }))
+        }
+        guard var current = checkpoint, current.group == group else {
+            return
+        }
+        let saved = current.reservationAttempts ?? []
+        let resolved = outcomes.filter { saved.contains($0.attempt) }
+        current.originReservations = resolved.compactMap(\.claim).reduce(current.originReservations ?? []) {
+            Self.upserting($1, into: $0)
+        }
+        current.reservationAttempts?.removeAll { attempt in resolved.contains { $0.attempt == attempt } }
+        try saveCheckpoint(current)
+    }
+
+    /// Withdraws a claim. A device never receives its own messages, so the
+    /// claim is also marked released here.
+    private func releaseReservation(_ claim: OriginReservation, session: MLSSession) async {
+        let message = ReplicationMessage.release(member: claim.member, reservation: claim.cursor)
+        guard (try? await session.send(message.encoded())).map({ if case .accepted = $0 { true } else { false } }) == true else {
+            return
+        }
+        var released = claim
+        released.released = true
+        if var current = checkpoint {
+            current.originReservations = Self.upserting(released, into: current.originReservations ?? [], replacing: true)
+            try? saveCheckpoint(current)
+        } else {
+            if let founding = try? loadFoundingClaims() {
+                try? saveFoundingClaims(Self.upserting(released, into: founding, replacing: true))
+            }
+        }
+    }
+
+    /// Releases this device's own claims that no pairing will use: their
+    /// device never joined, the lease still runs, and no Add is waiting to be
+    /// sent.
+    private func releaseAbandonedReservations(session: MLSSession) async throws {
+        guard pairingTask == nil, !(checkpoint?.originReservations ?? []).isEmpty else {
+            return
+        }
+        let own = try await session.fingerprint()
+        let epoch = try await session.epoch()
+        let roster = Set(try await session.members().map(\.fingerprint))
+        guard try await session.pendingDelivery() == nil, pairingTask == nil else {
+            return
+        }
+        let abandoned = (checkpoint?.originReservations ?? []).filter {
+            $0.owner == own && !$0.released && !$0.admitted && !roster.contains($0.member) && $0.allowsAdd(atEpoch: epoch)
+        }
+        for claim in abandoned {
+            await releaseReservation(claim, session: session)
+        }
+    }
+
+    /// A new member still waiting for reservations asks again every few sync
+    /// cycles, moving to the next member each time. Only members that have
+    /// their own reservations answer, so any snapshot addressed to this member
+    /// is complete. Repeating the request also recovers one that was never
+    /// sent, for example after a restart.
+    private func requestReservationsIfStillWaiting(session: MLSSession) async throws {
+        guard let current = checkpoint, current.reservationsVisible == false, !current.joinPending else {
+            reservationRequestCycles = 0
+            return
+        }
+        let own = try await session.fingerprint()
+        let roster = try await session.members().map(\.fingerprint)
+            .filter { $0 != own }
+            .sorted { $0.lexicographicallyPrecedes($1) }
+        let providerLeft = current.reservationsProvider.map { !roster.contains($0) } ?? true
+        reservationRequestCycles += 1
+        guard !roster.isEmpty, providerLeft || reservationRequestCycles >= Self.reservationRequestInterval else {
+            return
+        }
+        reservationRequestCycles = 0
+        let next = current.reservationsProvider
+            .flatMap { provider in roster.first { !$0.lexicographicallyPrecedes(provider) && $0 != provider } }
+            ?? roster[0]
+        guard var latest = checkpoint, latest.group == current.group, latest.reservationsVisible == false else {
+            return
+        }
+        latest.reservationsProvider = next
+        try saveCheckpoint(latest)
+        try beforeReservationRequestHookForTesting?()
+        try await send(.hello(vector: replica.versionVector, provider: next), session: session)
+    }
+
+    private var foundingClaimsURL: URL {
+        checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename)
+    }
+
+    private var unreadableFoundingClaimsURL: URL {
+        checkpointURL.deletingLastPathComponent()
+            .appendingPathComponent(ReplicationCheckpoint.unreadableFoundingClaimsFilename)
+    }
+
+    /// `nil` when the file exists but does not decode. A file that cannot be
+    /// opened throws, so a locked device retries instead of losing claims.
+    private func loadFoundingClaims() throws -> [OriginReservation]? {
+        guard FileManager.default.fileExists(atPath: foundingClaimsURL.path) else {
+            return []
+        }
+        let data = try Data(contentsOf: foundingClaimsURL)
+        return try? ReplicaCanonicalJSON.decode([OriginReservation].self, from: data)
+    }
+
+    private static func membersWithUnknownHistory(roster: [Data], known: Set<Data>) -> [Data]? {
+        let unknown = roster.filter { !known.contains($0) }
+        return unknown.isEmpty ? nil : unknown
+    }
+
+    /// Whether an unpaired device that created a group added someone to it.
+    /// A member besides this device proves it; concluding it is alone needs
+    /// a settled log, so an Add whose answer was lost cannot be missed.
+    private func adoptFoundingGroupIfJoined(session: MLSSession) async throws -> Bool {
+        guard let group = try await session.group() else {
+            try requireCurrent(session)
+            try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            return false
+        }
+        if (try? ReplicationCheckpoint.load(from: joinIntentURL))?.group == group {
+            scheduleReconcile()
+            throw SyncError.privateSyncUnreachable
+        }
+        let settled = await settle(group, session: session)
+        if case .failure(let error) = settled, let ended = Self.endedGroupError(error) {
+            try requireCurrent(session)
+            try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            try resetSession()
+            throw ended
+        }
+        let roster = try await session.members()
+        let own = try await session.fingerprint()
+        try requireCurrent(session)
+        guard roster.count > 1 else {
+            try settled.get()
+            guard try await session.pendingDelivery() == nil else {
+                throw SyncError.privateSyncUnreachable
+            }
+            try requireCurrent(session)
+            try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            return false
+        }
+        if checkpoint?.group != group {
+            try rebuildCheckpoint(group: group, roster: roster, own: own)
+        }
+        isPaired = true
+        startSyncLoop()
+        if let refusal = linkedInviteRefusal {
+            throw refusal
+        }
+        return true
+    }
+
+    /// Catches up with the log and delivers anything pending, registering the
+    /// group again if the relay never saw it.
+    private func settle(_ group: Data, session: MLSSession) async -> Result<Void, Error> {
+        do {
+            do {
+                try await session.synchronize()
+            } catch MLSRelayError.unauthorized {
+                try await session.createGroup(group)
+                try await session.synchronize()
+            }
+            if try await session.isRemoved() {
+                throw MLSSessionError.removed
+            }
+            _ = try await session.flush()
+            try await session.synchronize()
+            return .success(())
+        } catch is CancellationError {
+            return .failure(CancellationError())
+        } catch {
+            return .failure(Self.endedGroupError(error) ?? SyncError.privateSyncUnreachable)
+        }
+    }
+
+    private static func endedGroupError(_ error: Error) -> SyncError? {
+        switch error {
+        case MLSSessionError.removed, SyncError.removedFromGroup: .removedFromGroup
+        case MLSRelayError.historyExpired, SyncError.syncHistoryExpired: .syncHistoryExpired
+        default: nil
+        }
+    }
+
+    private func scheduleReconcile() {
+        guard session != nil, reconcileTask == nil else {
+            return
+        }
+        reconcileTask = Task { [weak self] in
+            await self?.reconcileSession()
+        }
+    }
+
+    /// Why a linked device cannot invite right now, if it cannot.
+    private var linkedInviteRefusal: SyncError? {
+        if isGroupAtCapacity {
+            return .groupAtCapacity
+        }
+        if checkpoint?.reservationsVisible == false || checkpoint?.membersWithUnknownHistory != nil {
+            return .privateSyncUnreachable
+        }
+        return isTaskHistoryAtCapacity ? .taskHistoryAtCapacity : nil
+    }
+
+    /// Builds the checkpoint for a group this device is in but has no
+    /// checkpoint for.
+    private func rebuildCheckpoint(group: Data, roster: [MLSMember], own: Data) throws {
+        let intent = (try? ReplicationCheckpoint.load(from: joinIntentURL)).flatMap { $0.group == group ? $0 : nil }
+        var rebuilt = ReplicationCheckpoint(
+            group: group,
+            members: roster.map(ReplicationCheckpoint.Member.init),
+            joinPending: true,
+            provider: intent?.provider
+        )
+        rebuilt.reservationsVisible = intent?.reservationsVisible
+        rebuilt.reservationsProvider = intent?.reservationsProvider
+        let readable = try adoptFoundingClaims(into: &rebuilt, roster: roster.map(\.fingerprint), known: [own])
+        try saveCheckpoint(rebuilt)
+        try ReplicationCheckpoint.remove(at: joinIntentURL)
+        try retireFoundingClaims(readable: readable)
+    }
+
+    /// Adds the founding claims to `checkpoint` and returns `true`. When the
+    /// file does not decode, returns `false` and counts the history of every
+    /// member outside `known` as unknown. Members added by this founding
+    /// device, or of unknown history, are provisional, so they are removed if
+    /// they never send a message.
+    private func adoptFoundingClaims(
+        into checkpoint: inout ReplicationCheckpoint,
+        roster: [Data],
+        known: Set<Data>
+    ) throws -> Bool {
+        guard let founding = try loadFoundingClaims() else {
+            let unknown = Self.membersWithUnknownHistory(roster: roster, known: known)
+            checkpoint.membersWithUnknownHistory = unknown
+            let deadline = Date().addingTimeInterval(provisionalMemberWindow)
+            for member in unknown ?? [] where !checkpoint.provisionalMembers.contains(where: { $0.fingerprint == member }) {
+                checkpoint.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(fingerprint: member, deadline: deadline))
+            }
+            return false
+        }
+        if !founding.isEmpty {
+            checkpoint.originReservations = founding.reduce(checkpoint.originReservations ?? []) { Self.upserting($1, into: $0) }
+        }
+        let added = Set(founding.filter { !$0.released }.map(\.member)).intersection(roster).subtracting(known)
+        let deadline = Date().addingTimeInterval(provisionalMemberWindow)
+        for member in added where !checkpoint.provisionalMembers.contains(where: { $0.fingerprint == member }) {
+            checkpoint.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(fingerprint: member, deadline: deadline))
+        }
+        return true
+    }
+
+    /// Removes the founding claims file once a saved checkpoint holds its
+    /// claims, keeping the bytes of a file that did not decode.
+    private func retireFoundingClaims(readable: Bool) throws {
+        if readable {
+            try ReplicationCheckpoint.remove(at: foundingClaimsURL)
+        } else {
+            try setAsideFoundingClaims()
+        }
+    }
+
+    /// Removes a claims file left from before this device was linked, keeping
+    /// the bytes if it does not decode and leaving it if it cannot be read.
+    private func retireStaleFoundingClaims() {
+        let decoded: [OriginReservation]?
+        do {
+            decoded = try loadFoundingClaims()
+        } catch {
+            return
+        }
+        try? retireFoundingClaims(readable: decoded != nil)
+    }
+
+    /// Keeps the bytes of a founding claims file that does not decode where
+    /// nothing reads them again.
+    private func setAsideFoundingClaims() throws {
+        try ReplicationCheckpoint.remove(at: unreadableFoundingClaimsURL)
+        try FileManager.default.moveItem(at: foundingClaimsURL, to: unreadableFoundingClaimsURL)
+    }
+
+    private func saveFoundingClaims(_ claims: [OriginReservation]) throws {
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(claims), to: foundingClaimsURL)
+    }
+
+    static func upserting(
+        _ claim: OriginReservation,
+        into entries: [OriginReservation],
+        replacing: Bool = false
+    ) -> [OriginReservation] {
+        if let index = entries.firstIndex(where: { $0.cursor == claim.cursor }) {
+            guard replacing else {
+                return entries
+            }
+            var result = entries
+            result[index] = claim
+            return result
+        }
+        return (entries + [claim]).sorted { $0.cursor < $1.cursor }
+    }
+
+    struct ReservationUpdate {
+        static let kinds: Set<ReplicationMessage.Kind> = [.reservation, .release, .reservations]
+
+        let cursor: UInt64
+        let sender: Data
+        let message: ReplicationMessage
+    }
+
+    /// Adds claims by their original log position. A claim already known keeps
+    /// its local state, so a late or repeated snapshot cannot undo a release
+    /// or an admission. Only a claim's owner can release it, and a release
+    /// for a claim not yet known is kept so a later snapshot cannot revive
+    /// it. Snapshots apply only to the member named by `snapshotsFor`.
+    static func merge(
+        _ updates: [ReservationUpdate],
+        into stored: [OriginReservation],
+        snapshotsFor member: Data?
+    ) -> [OriginReservation] {
+        var entries: [OriginReservation] = []
+        func insert(_ entry: OriginReservation) {
+            if !entries.contains(where: { $0.cursor == entry.cursor }) {
+                entries.append(entry)
+            }
+        }
+        stored.forEach(insert)
+        for update in updates.sorted(by: { $0.cursor < $1.cursor }) {
+            let message = update.message
+            switch message.kind {
+            case .reservation:
+                if let member = message.member, let origins = message.origins, let epoch = message.epoch {
+                    insert(OriginReservation(
+                        member: member, owner: update.sender, origins: origins, epoch: epoch, cursor: update.cursor
+                    ))
+                }
+            case .release:
+                guard let releasedMember = message.member, let cursor = message.reservation, cursor < update.cursor else {
+                    break
+                }
+                if let index = entries.firstIndex(where: { $0.cursor == cursor }) {
+                    if entries[index].member == releasedMember && entries[index].owner == update.sender {
+                        entries[index].released = true
+                    }
+                } else {
+                    insert(OriginReservation(
+                        member: releasedMember, owner: update.sender, origins: [], epoch: 0, cursor: cursor, released: true
+                    ))
+                }
+            case .reservations:
+                guard let member, message.member == member else {
+                    break
+                }
+                (message.reservations ?? []).filter { $0.cursor < update.cursor }.forEach(insert)
+            case .operations, .hello:
+                break
+            }
+        }
+        return entries.sorted { $0.cursor < $1.cursor }
+    }
+
+    /// Drops a claim once it can no longer matter: its device left after
+    /// joining, its retained history covers it, it was released, or its Add
+    /// can no longer happen. A member still waiting for its snapshot keeps
+    /// releases. `overflowed` reports claims beyond what a checkpoint stores.
+    static func prune(
+        _ entries: [OriginReservation],
+        roster: Set<Data>,
+        epoch: UInt64,
+        retained: Set<ReplicaDeviceID>,
+        keepReleases: Bool
+    ) -> (kept: [OriginReservation], overflowed: Bool) {
+        let kept = entries.compactMap { entry -> OriginReservation? in
+            var entry = entry
+            if roster.contains(entry.member) {
+                entry.admitted = true
+                return Set(entry.origins).isSubset(of: retained) ? nil : entry
+            }
+            if entry.released {
+                return keepReleases ? entry : nil
+            }
+            return entry.isActive(roster: roster, epoch: epoch) ? entry : nil
+        }
+        return (Array(kept.prefix(OriginReservation.maximumStored)), kept.count > OriginReservation.maximumStored)
+    }
+
+    private func refuseJoinerForTaskHistory(
+        on connection: any PairingConnection,
+        invitation: Invitation
+    ) async throws -> Never {
+        if let frame = try? PairingFrame.historyFull.seal(for: invitation, from: .fromInviter) {
+            try? await connection.send(frame)
+        }
+        await connection.cancel()
+        throw SyncError.taskHistoryAtCapacity
     }
 
     public var linkedDevices: [LinkedDevice] {
@@ -576,8 +1224,8 @@ public final class SyncEngine {
         guard hasDurableIdentity, hasDurableStorage, isPaired, pairingTask == nil else {
             return
         }
-        if isGroupAtCapacity {
-            fail(SyncError.groupAtCapacity)
+        if let refusal = linkedInviteRefusal {
+            fail(refusal)
             return
         }
         beginInvitation(linked: true)
@@ -650,6 +1298,8 @@ public final class SyncEngine {
         endPairingAttempt()
         if wasJoining && !isPaired {
             try? resetSession()
+        } else if !isPaired {
+            scheduleReconcile()
         }
         errorMessage = nil
         restorePhaseAfterPairing()
@@ -738,6 +1388,7 @@ public final class SyncEngine {
             replyObligation = nil
             isHeldSyncStateUnreadable = false
             isInboxBackpressured = false
+            answeredHeldHelloCursors = []
             mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
             session = try openSession()
             hasDurableStorage = true
@@ -890,6 +1541,10 @@ public final class SyncEngine {
             fail(SyncError.localStorageUnavailable)
             return
         }
+        if isTaskHistoryAtCapacity {
+            fail(SyncError.taskHistoryAtCapacity)
+            return
+        }
         let deadline = Date().addingTimeInterval(SyncTiming.invitationTimeToLive)
         safetyCode = nil
         errorMessage = nil
@@ -916,6 +1571,10 @@ public final class SyncEngine {
             fail(SyncError.localStorageUnavailable)
             return
         }
+        if isTaskHistoryAtCapacity {
+            fail(SyncError.taskHistoryAtCapacity)
+            return
+        }
         invitationPhrase = nil
         invitationURL = nil
         invitationExpiresAt = nil
@@ -936,11 +1595,18 @@ public final class SyncEngine {
         pairingAttemptID = attemptID
         pairingDeadline = deadline
         peerDecision = nil
+        peerRefusedForTaskHistory = false
+        lastPairingFailure = nil
         return attemptID
     }
 
     private func runInviterPairing(session: MLSSession, linked: Bool, attemptID: UUID) async {
+        var linked = linked
         do {
+            if !linked, try await adoptFoundingGroupIfJoined(session: session) {
+                try requireCurrentPairingAttempt(attemptID)
+                linked = true
+            }
             let fingerprint = try await session.fingerprint()
             let groupID: Data
             if linked {
@@ -963,6 +1629,11 @@ public final class SyncEngine {
             let connection = response.connection
             let reference = response.keyPackageReference
             let joinerFingerprint = response.joinerFingerprint
+            let joinerOrigins = Set(response.origins)
+            try await requireAdmission(
+                of: joinerFingerprint, origins: joinerOrigins, session: session, linked: linked,
+                before: nil, connection: connection, invitation: invitation
+            )
             pairingExpiryTask?.cancel()
             pairingExpiryTask = nil
             guard
@@ -1009,19 +1680,42 @@ public final class SyncEngine {
             if linked {
                 try await session.synchronize()
                 try await processRemovals(session: session)
+                try await requireAdmission(
+                    of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true,
+                    before: nil, connection: connection, invitation: invitation
+                )
             } else {
                 try await session.createGroup(groupID)
+            }
+            let claim = try await reserve(joinerFingerprint, origins: joinerOrigins, session: session)
+            await reservationHookForTesting?()
+            try requireCurrentPairingAttempt(attemptID)
+            if linked {
+                do {
+                    try await requireAdmission(
+                        of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true,
+                        before: claim.cursor, connection: connection, invitation: invitation
+                    )
+                } catch {
+                    await releaseReservation(claim, session: session)
+                    throw error
+                }
             }
             var added = false
             for _ in 0..<Self.maximumAddAttempts where !added {
                 try requireCurrentPairingAttempt(attemptID)
                 if case .accepted = try await session.add(
-                    keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference
+                    keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference,
+                    beforeEpoch: claim.epoch &+ OriginReservation.leaseEpochs
                 ) {
                     added = true
                 }
             }
-            guard added else { throw SyncError.invalidPairMessage }
+            guard added else {
+                await releaseReservation(claim, session: session)
+                throw SyncError.invalidPairMessage
+            }
+            try afterAddHookForTesting?()
             pairingReaderTask?.cancel()
             pairingReaderTask = nil
             let declined = peerDecision == false
@@ -1031,10 +1725,19 @@ public final class SyncEngine {
                 throw SyncError.pairingDeclined
             }
             let roster = try await session.members().map(ReplicationCheckpoint.Member.init)
+            let overflow = try await admission(
+                of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true, before: claim.cursor
+            )
+            let overflowed = overflow != .fits
+            let founding = checkpoint?.group != groupID
             var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
                 ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
             current.members = roster
-            if declined {
+            let readable = try !founding || adoptFoundingClaims(
+                into: &current, roster: roster.map(\.fingerprint), known: [fingerprint, joinerFingerprint]
+            )
+            current.originReservations = Self.upserting(claim, into: current.originReservations ?? [])
+            if declined || overflowed {
                 current.pendingRemovals.append(joinerFingerprint)
             } else {
                 current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
@@ -1042,9 +1745,24 @@ public final class SyncEngine {
                 ))
             }
             try saveCheckpoint(current)
+            if founding {
+                try retireFoundingClaims(readable: readable)
+            } else {
+                retireStaleFoundingClaims()
+            }
             if declined {
                 await connection.cancel()
                 throw SyncError.pairingDeclined
+            }
+            if overflow == .taskHistoryFull {
+                try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
+            }
+            if overflow == .groupFull {
+                if let frame = try? PairingFrame.decision(approved: false).seal(for: invitation, from: .fromInviter) {
+                    try? await connection.send(frame)
+                }
+                await connection.cancel()
+                throw SyncError.groupAtCapacity
             }
             if let frame = try? PairingFrame.decision(approved: true).seal(for: invitation, from: .fromInviter) {
                 try? await connection.send(frame)
@@ -1062,6 +1780,7 @@ public final class SyncEngine {
         let joinerFingerprint: Data
         let inviterNonce: Data
         let joinerNonce: Data
+        let origins: [ReplicaDeviceID]
     }
 
     /// Accepts exactly one joiner commitment per invitation and answers it
@@ -1096,7 +1815,7 @@ public final class SyncEngine {
                             let nonce = try bound?.nonce ?? Data.secureRandom(count: 32)
                             bound = (commitment, nonce)
                             try await connection.send(PairingFrame.nonce(nonce).seal(for: invitation, from: .fromInviter))
-                        case .response(let reference, let fingerprint, let joinerNonce):
+                        case .response(let reference, let fingerprint, let joinerNonce, let origins):
                             guard let bound, PairingSafetyCode.commitment(
                                 groupID: groupID,
                                 inviterFingerprint: inviterFingerprint,
@@ -1111,11 +1830,12 @@ public final class SyncEngine {
                                 keyPackageReference: reference,
                                 joinerFingerprint: fingerprint,
                                 inviterNonce: bound.nonce,
-                                joinerNonce: joinerNonce
+                                joinerNonce: joinerNonce,
+                                origins: origins
                             )
                         case .decision:
                             throw SyncError.pairingDeclined
-                        case .offer, .nonce:
+                        case .offer, .nonce, .historyFull:
                             throw SyncError.invalidPairMessage
                         }
                     case .error(let code):
@@ -1162,7 +1882,8 @@ public final class SyncEngine {
                 PairingFrame.response(
                     keyPackageReference: published.reference,
                     joinerFingerprint: published.fingerprint,
-                    joinerNonce: joinerNonce
+                    joinerNonce: joinerNonce,
+                    origins: heldOrigins
                 ).seal(for: invitation, from: .fromJoiner)
             )
             safetyCode = PairingSafetyCode.code(
@@ -1172,9 +1893,11 @@ public final class SyncEngine {
                 inviterNonce: inviterNonce,
                 joinerNonce: joinerNonce
             )
-            let joinIntent = ReplicationCheckpoint(
+            var joinIntent = ReplicationCheckpoint(
                 group: groupID, members: [], joinPending: true, provider: inviterFingerprint
             )
+            joinIntent.reservationsVisible = false
+            joinIntent.reservationsProvider = inviterFingerprint
             try joinIntent.save(to: joinIntentURL)
             phase = .verifying
             listenForInviterDecision(on: connection, invitation: invitation, attemptID: attemptID)
@@ -1185,7 +1908,7 @@ public final class SyncEngine {
                     throw SyncError.invitationExpired
                 }
                 if peerDecision == false {
-                    throw SyncError.pairingDeclined
+                    throw peerRefusedForTaskHistory ? SyncError.taskHistoryAtCapacity : SyncError.pairingDeclined
                 }
                 do {
                     if try await session.join(
@@ -1236,6 +1959,8 @@ public final class SyncEngine {
                     continue
                 case .decision:
                     throw SyncError.pairingDeclined
+                case .historyFull:
+                    throw SyncError.taskHistoryAtCapacity
                 case .commitment, .response:
                     throw SyncError.invalidPairMessage
                 }
@@ -1265,6 +1990,8 @@ public final class SyncEngine {
                             return (connection, group, fingerprint)
                         case .decision:
                             throw SyncError.pairingDeclined
+                        case .historyFull:
+                            throw SyncError.taskHistoryAtCapacity
                         case .commitment, .nonce, .response:
                             throw SyncError.invalidPairMessage
                         }
@@ -1337,13 +2064,19 @@ public final class SyncEngine {
         pairingReaderTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let event = try? await connection.receive() else { return }
-                guard
-                    case .binary(let frame) = event,
-                    case .decision(let approved)? = try? PairingFrame.open(frame, for: invitation, from: .fromInviter)
-                else {
+                guard case .binary(let frame) = event else { continue }
+                let approved: Bool
+                let historyFull: Bool
+                switch try? PairingFrame.open(frame, for: invitation, from: .fromInviter) {
+                case .decision(let decision)?:
+                    (approved, historyFull) = (decision, false)
+                case .historyFull?:
+                    (approved, historyFull) = (false, true)
+                default:
                     continue
                 }
                 guard let self, self.pairingAttemptID == attemptID else { return }
+                if historyFull { self.peerRefusedForTaskHistory = true }
                 self.peerDecision = approved
                 if approved { return }
             }
@@ -1424,6 +2157,7 @@ public final class SyncEngine {
         pairingConnection = nil
         activeInvitation = nil
         peerDecision = nil
+        peerRefusedForTaskHistory = false
         invitationPhrase = nil
         invitationURL = nil
         invitationExpiresAt = nil
@@ -1460,7 +2194,11 @@ public final class SyncEngine {
         if wasJoining && !isPaired && !admitted {
             try? resetSession()
         }
+        if !wasJoining && !isPaired {
+            scheduleReconcile()
+        }
         let mapped = SyncError.fromTransport(error)
+        lastPairingFailure = mapped as? SyncError ?? .invalidPairMessage
         errorMessage = Self.displayMessage(for: mapped is SyncError ? mapped : SyncError.invalidPairMessage)
         if isPaired {
             restorePhaseAfterPairing()
@@ -1508,7 +2246,19 @@ public final class SyncEngine {
                 return
             }
             let group = try await session.group()
+            guard self.session === session, pairingTask == nil || isPaired else {
+                return
+            }
+            let intent = try? ReplicationCheckpoint.load(from: joinIntentURL)
+            if let group, checkpoint?.group != group, intent?.group != group {
+                _ = await settle(group, session: session)
+                try requireCurrent(session)
+                if try await session.isRemoved() {
+                    return
+                }
+            }
             let roster = group == nil ? [] : try await session.members()
+            let own = try await session.fingerprint()
             guard self.session === session, pairingTask == nil || isPaired else {
                 return
             }
@@ -1517,14 +2267,7 @@ public final class SyncEngine {
                     current.members = roster.map(ReplicationCheckpoint.Member.init)
                     try saveCheckpoint(current)
                 } else {
-                    let intent = try? ReplicationCheckpoint.load(from: joinIntentURL)
-                    try saveCheckpoint(ReplicationCheckpoint(
-                        group: group,
-                        members: roster.map(ReplicationCheckpoint.Member.init),
-                        joinPending: true,
-                        provider: intent?.group == group ? intent?.provider : nil
-                    ))
-                    try ReplicationCheckpoint.remove(at: joinIntentURL)
+                    try rebuildCheckpoint(group: group, roster: roster, own: own)
                 }
                 if !isPaired {
                     isPaired = true
@@ -1695,6 +2438,9 @@ public final class SyncEngine {
         } catch MLSClientError.capacityReached {
             flushed = false
         }
+        if flushed {
+            try await resolveReservationAttempts(session: session)
+        }
         try await drainInbox(session: session, retriesDeferred: false)
         var synchronized = false
         for _ in 0..<4 where !synchronized {
@@ -1713,9 +2459,12 @@ public final class SyncEngine {
         try await drainInbox(session: session)
         if !flushed {
             _ = try await session.flush()
+            try await resolveReservationAttempts(session: session)
         }
         try await sendReplies(session: session)
         try await processRemovals(session: session)
+        try await releaseAbandonedReservations(session: session)
+        try await requestReservationsIfStillWaiting(session: session)
         if checkpoint?.joinPending == true {
             try await announceJoin(session: session)
         }
@@ -1745,21 +2494,72 @@ public final class SyncEngine {
             try saveCheckpoint(current)
         }
         var arrivals: [[TaskOperation]] = []
-        var hellos: [(index: Int, message: ReplicationMessage)] = []
+        var hellos: [(index: Int, cursor: UInt64, sender: Data, message: ReplicationMessage)] = []
+        var updates: [ReservationUpdate] = []
         for (index, message) in messages.enumerated() {
             var operations: [TaskOperation] = []
-            if message.sender != fingerprint, let decoded = try? ReplicationMessage.decode(message.plaintext) {
+            if let decoded = try? ReplicationMessage.decode(message.plaintext) {
                 switch decoded.kind {
-                case .operations:
+                case .operations where message.sender != fingerprint:
                     operations = decoded.operations ?? []
-                case .hello:
-                    hellos.append((index, decoded))
+                case .hello where message.sender != fingerprint:
+                    hellos.append((index, message.cursor, message.sender, decoded))
+                case .reservation, .release, .reservations:
+                    updates.append(ReservationUpdate(cursor: message.cursor, sender: message.sender, message: decoded))
+                case .operations, .hello:
+                    break
                 }
             }
             arrivals.append(operations)
         }
         var pool = arrivals.flatMap { $0 }
+        if let forked = try replica.forkedOperation(in: pool) {
+            throw ReplicaError.operationFork(origin: forked.originDeviceID, sequence: forked.originSequence)
+        }
         let application = try applyRemoteOperations(&pool, arrivals: arrivals)
+        let epoch = try await session.epoch()
+        let roster = Set(try await session.members().map(\.fingerprint))
+        lastKnownEpoch = max(lastKnownEpoch, epoch)
+        try requireCurrent(session)
+        if var current = checkpoint,
+           !updates.isEmpty || !(current.originReservations ?? []).isEmpty || current.membersWithUnknownHistory != nil {
+            let waiting = current.reservationsVisible == false
+            let snapshot = waiting ? updates.first {
+                $0.message.kind == .reservations && $0.message.member == fingerprint
+            } : nil
+            var merged = Self.merge(
+                updates.filter { $0.message.kind != .reservations || $0.cursor == snapshot?.cursor },
+                into: current.originReservations ?? [],
+                snapshotsFor: waiting ? fingerprint : nil
+            )
+            if let unknown = current.membersWithUnknownHistory {
+                let heard = hellos.filter { unknown.contains($0.sender) && $0.message.vector != nil }
+                for hello in heard {
+                    merged = Self.upserting(OriginReservation(
+                        member: hello.sender, owner: fingerprint, origins: hello.message.vector?.origins.sorted() ?? [],
+                        epoch: epoch, cursor: hello.cursor, admitted: true
+                    ), into: merged)
+                }
+                current.membersWithUnknownHistory = Self.membersWithUnknownHistory(
+                    roster: unknown.filter(roster.contains), known: Set(heard.map(\.sender))
+                )
+            }
+            let pruned = Self.prune(
+                merged, roster: roster, epoch: epoch,
+                retained: Set(replica.versionVector.origins), keepReleases: waiting && snapshot == nil
+            )
+            current.originReservations = pruned.kept
+            if pruned.overflowed || snapshot?.message.overflowed == true {
+                current.reservationsOverflowed = true
+            }
+            if snapshot != nil {
+                current.reservationsVisible = true
+                current.reservationsProvider = nil
+            }
+            if current != checkpoint {
+                try saveCheckpoint(current)
+            }
+        }
         if application.accepted > 0 {
             publishReplica()
             lastSyncedAt = Date()
@@ -1768,23 +2568,28 @@ public final class SyncEngine {
         let held = application.heldArrivals
         isInboxBackpressured = held < messages.count
         var obligation = replyObligation ?? ReplyObligation()
+        var answeredHeld: [UInt64] = []
         for hello in hellos {
-            let cursor = messages[hello.index].cursor
-            guard hello.index < held || !answeredHeldHelloCursors.contains(cursor),
+            guard hello.index < held || !answeredHeldHelloCursors.contains(hello.cursor),
                   let vector = hello.message.vector
             else {
                 continue
             }
-            obligation.merge(vector, provider: hello.message.provider == fingerprint)
+            let isProvider = hello.message.provider == fingerprint
+            obligation.merge(vector, provider: isProvider)
+            if isProvider, roster.contains(hello.sender) {
+                obligation.addRecipient(hello.sender)
+            }
             obligation.retain(origins: replica.versionVector.origins)
             if hello.index >= held {
-                answeredHeldHelloCursors.insert(cursor)
+                answeredHeld.append(hello.cursor)
             }
         }
         if obligation != (replyObligation ?? ReplyObligation()) {
             try ReplyObligation.save(obligation, to: replyObligationURL)
             replyObligation = obligation
         }
+        answeredHeldHelloCursors.formUnion(answeredHeld)
         if held > 0 {
             let acknowledged = messages[held - 1].cursor
             try await session.acknowledgeInbox(through: acknowledged)
@@ -1862,38 +2667,67 @@ public final class SyncEngine {
     }
 
     /// Sends what saved hellos asked for: this device's uploaded operations,
-    /// and every origin for a hello that named this device as provider.
+    /// and every origin for a hello that named this device as provider. Each
+    /// provider requester then gets a reservations snapshot, sent only after
+    /// the whole history, while this device knows every claim and holds no
+    /// operation it has not applied.
     private func sendReplies(session: MLSSession) async throws {
-        while let obligation = replyObligation {
-            guard let uploadedThrough = checkpoint?.uploadedThrough else {
-                return
-            }
-            var answer: [TaskReplica.OperationID: TaskOperation] = [:]
-            if let own = obligation.own {
-                for operation in replica.operations(missingFrom: own)
-                where operation.originDeviceID == deviceID && operation.originSequence <= uploadedThrough {
-                    answer[TaskReplica.OperationID(operation)] = operation
+        while var obligation = replyObligation, let current = checkpoint {
+            if obligation.own != nil || obligation.provided != nil {
+                let batch = try OperationBatcher.batches(replyOperations(for: obligation, checkpoint: current)).first
+                if let batch {
+                    await replyBatchHookForTesting?()
+                    try await send(.operations(batch), session: session)
+                    try requireCurrent(session)
+                    obligation.advance(past: batch)
+                    obligation.retain(origins: replica.versionVector.origins)
+                } else {
+                    obligation.completeHistory()
                 }
-            }
-            if let provided = obligation.provided {
-                for operation in replica.operations(missingFrom: provided)
-                where operation.originDeviceID != deviceID || operation.originSequence <= uploadedThrough {
-                    answer[TaskReplica.OperationID(operation)] = operation
-                }
-            }
-            let batch = try OperationBatcher.batches(answer.values.sorted(by: ReplicaOrdering.operations)).first
-            if let batch {
-                await replyBatchHookForTesting?()
-                try await send(.operations(batch), session: session)
+            } else if let recipient = obligation.recipients?.first {
+                let roster = Set(try await session.members().map(\.fingerprint))
                 try requireCurrent(session)
+                if roster.contains(recipient) {
+                    guard let latest = checkpoint, latest.reservationsVisible != false,
+                          latest.membersWithUnknownHistory == nil, !isReplicaCapacityBlocked
+                    else {
+                        return
+                    }
+                    try snapshotSendHookForTesting?()
+                    try await send(
+                        .reservations(
+                            latest.originReservations ?? [],
+                            overflowed: latest.reservationsOverflowed == true,
+                            for: recipient
+                        ),
+                        session: session
+                    )
+                    try requireCurrent(session)
+                }
+                obligation.removeRecipient(recipient)
             }
-            var remaining = obligation
-            remaining.advance(past: batch ?? [])
-            remaining.retain(origins: replica.versionVector.origins)
-            let next: ReplyObligation? = batch == nil ? nil : remaining
+            let next: ReplyObligation? = obligation.isEmpty ? nil : obligation
             try ReplyObligation.save(next, to: replyObligationURL)
             replyObligation = next
         }
+    }
+
+    private func replyOperations(for obligation: ReplyObligation, checkpoint: ReplicationCheckpoint) -> [TaskOperation] {
+        let uploadedThrough = uploadedLocalSequence(in: checkpoint)
+        var answer: [TaskReplica.OperationID: TaskOperation] = [:]
+        if let own = obligation.own {
+            for operation in replica.operations(missingFrom: own)
+            where operation.originDeviceID == replica.localOrigin && operation.originSequence <= uploadedThrough {
+                answer[TaskReplica.OperationID(operation)] = operation
+            }
+        }
+        if let provided = obligation.provided {
+            for operation in replica.operations(missingFrom: provided)
+            where operation.originDeviceID != replica.localOrigin || operation.originSequence <= uploadedThrough {
+                answer[TaskReplica.OperationID(operation)] = operation
+            }
+        }
+        return answer.values.sorted(by: ReplicaOrdering.operations)
     }
 
     private func announceJoin(session: MLSSession) async throws {
@@ -1910,7 +2744,10 @@ public final class SyncEngine {
         }
         current.joinPending = false
         current.provider = nil
-        current.uploadedThrough = max(current.uploadedThrough, vector[deviceID])
+        current.setUploadedThrough(
+            max(uploadedLocalSequence(in: current), vector[replica.localOrigin]),
+            origin: replica.localOrigin
+        )
         try saveCheckpoint(current)
         lastMailboxStoredAt = Date()
         refreshPendingMailboxCount()
@@ -1918,24 +2755,26 @@ public final class SyncEngine {
 
     private func uploadLocalOperations(session: MLSSession) async throws {
         while var current = checkpoint {
-            let localSequence = replica.versionVector[deviceID]
-            if current.uploadedThrough > localSequence {
-                current.uploadedThrough = localSequence
+            let localSequence = replica.versionVector[replica.localOrigin]
+            var uploadedThrough = uploadedLocalSequence(in: current)
+            if uploadedThrough > localSequence {
+                uploadedThrough = localSequence
+                current.setUploadedThrough(localSequence, origin: replica.localOrigin)
                 try saveCheckpoint(current)
             }
-            guard current.uploadedThrough < localSequence else {
+            guard uploadedThrough < localSequence else {
                 break
             }
             let pending = replica.retainedOperations.filter {
-                $0.originDeviceID == deviceID && $0.originSequence > current.uploadedThrough
+                $0.originDeviceID == replica.localOrigin && $0.originSequence > uploadedThrough
             }
-            guard pending.first?.originSequence == current.uploadedThrough + 1,
+            guard pending.first?.originSequence == uploadedThrough + 1,
                   let batch = try OperationBatcher.batches(pending).first,
                   let last = batch.last
             else {
                 throw ReplicaError.sequenceGap(
-                    origin: deviceID,
-                    expected: current.uploadedThrough + 1,
+                    origin: replica.localOrigin,
+                    expected: uploadedThrough + 1,
                     received: pending.first?.originSequence ?? 0
                 )
             }
@@ -1944,7 +2783,10 @@ public final class SyncEngine {
             guard var latest = checkpoint, latest.group == current.group else {
                 throw CancellationError()
             }
-            latest.uploadedThrough = max(latest.uploadedThrough, last.originSequence)
+            latest.setUploadedThrough(
+                max(uploadedLocalSequence(in: latest), last.originSequence),
+                origin: replica.localOrigin
+            )
             try saveCheckpoint(latest)
             lastMailboxStoredAt = Date()
             refreshPendingMailboxCount()
@@ -1976,6 +2818,9 @@ public final class SyncEngine {
         current.members = roster.map(ReplicationCheckpoint.Member.init)
         current.pendingRemovals.removeAll { !fingerprints.contains($0) }
         current.provisionalMembers.removeAll { !fingerprints.contains($0.fingerprint) }
+        current.membersWithUnknownHistory = current.membersWithUnknownHistory.flatMap {
+            Self.membersWithUnknownHistory(roster: $0.filter(fingerprints.contains), known: [])
+        }
         if current != previous {
             try saveCheckpoint(current)
         }
@@ -2142,6 +2987,7 @@ public final class SyncEngine {
     /// that is still open can then never create journal files next to the
     /// database of the session that replaced it.
     private func eraseCurrentMLSState() throws {
+        try ReplicationCheckpoint.remove(at: foundingClaimsURL)
         try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
         mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
     }
@@ -2163,6 +3009,10 @@ public final class SyncEngine {
             return lhs < rhs
         }
         return newest ?? freshMLSDirectory(in: root)
+    }
+
+    private func uploadedLocalSequence(in checkpoint: ReplicationCheckpoint) -> UInt64 {
+        checkpoint.uploadedThrough(origin: replica.localOrigin, deviceID: deviceID)
     }
 
     private func saveCheckpoint(_ value: ReplicationCheckpoint) throws {
@@ -2222,8 +3072,8 @@ public final class SyncEngine {
     }
 
     private func refreshPendingMailboxCount() {
-        let localSequence = replica.versionVector[deviceID]
-        let uploaded = checkpoint?.uploadedThrough ?? 0
+        let localSequence = replica.versionVector[replica.localOrigin]
+        let uploaded = checkpoint.map(uploadedLocalSequence) ?? 0
         let pending = localSequence > uploaded ? Int(localSequence - uploaded) : 0
         if pending == 0 {
             if pendingMailboxOperationCount != 0 { pendingMailboxOperationCount = 0 }
@@ -2289,7 +3139,7 @@ public final class SyncEngine {
         case MLSRelayError.historyExpired:
             return .blocked(.syncHistoryExpired)
         case ReplicaError.operationFork:
-            return .blocked(.syncHistoryBlocked)
+            return .blocked(.syncHistoryConflict)
         case MLSSessionError.unresolvedConflict, is SyncCycleError:
             return .transient
         case MLSClientError.storageUnavailable, MLSClientError.capacityReached, is MLSStoreError:
@@ -2313,6 +3163,11 @@ public final class SyncEngine {
         if case MLSStoreError.unreadable = error { return true }
         if case MLSClientError.invalidState = error { return true }
         return false
+    }
+
+    /// A new archive never reuses an origin whose operations peers may hold.
+    private static func newReplicaOrigin() -> ReplicaDeviceID {
+        ReplicaDeviceID(uuid: UUID())
     }
 
     private static func persistEraseMarker(at markerURL: URL) throws {
@@ -2339,6 +3194,9 @@ public final class SyncEngine {
         try ReplicationCheckpoint.remove(
             at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
         )
+        for filename in [ReplicationCheckpoint.foundingClaimsFilename, ReplicationCheckpoint.unreadableFoundingClaimsFilename] {
+            try ReplicationCheckpoint.remove(at: checkpointURL.deletingLastPathComponent().appendingPathComponent(filename))
+        }
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
         try DeferredOperationStore.remove(
             at: persistenceURL.deletingLastPathComponent().appendingPathComponent(DeferredOperationStore.filename)
@@ -2349,7 +3207,11 @@ public final class SyncEngine {
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
         }
-        let clearedReplica = try TaskReplica(deviceID: deviceID, persistenceURL: persistenceURL)
+        let clearedReplica = try TaskReplica(
+            deviceID: deviceID,
+            persistenceURL: persistenceURL,
+            newOrigin: newReplicaOrigin()
+        )
         if FileManager.default.fileExists(atPath: markerURL.path) {
             try FileManager.default.removeItem(at: markerURL)
         }
@@ -2413,5 +3275,12 @@ extension ReplicationCheckpoint.Member {
 
 extension SyncEngine {
     var mlsSessionForTesting: MLSSession? { session }
+    var awaitsReservationsForTesting: Bool { checkpoint?.reservationsVisible == false }
+    var reservationsForTesting: [OriginReservation] { checkpoint?.originReservations ?? [] }
+    var provisionalMembersForTesting: [Data] { checkpoint?.provisionalMembers.map(\.fingerprint) ?? [] }
+    var reservationsProviderForTesting: Data? { checkpoint?.reservationsProvider }
+    var membersWithUnknownHistoryForTesting: [Data]? { checkpoint?.membersWithUnknownHistory }
+    var reservationAttemptsForTesting: [OriginReservation.Attempt] { checkpoint?.reservationAttempts ?? [] }
     var mlsDirectoryForTesting: URL { mlsDirectory }
+    var replicaForTesting: TaskReplica { replica }
 }

@@ -185,6 +185,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var dropAppendResponse = false
     private var droppedWriterAppend: (writer: Data, accepted: Int)?
     private var appendsUnavailable = false
+    private var unavailableAfterDrop = false
+    private var holdsDroppedResponse = false
+    private var offlineWriters: Set<Data> = []
+    private var droppedResponse: CheckedContinuation<Void, Never>?
     private(set) var rejectedAppends = 0
     private var failWelcomeAcknowledgement = false
     private var failingAcknowledgers: Set<Data> = []
@@ -192,14 +196,50 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var lastPublishedReference: Data?
     private(set) var acknowledgementCount = 0
 
-    func dropNextAppendResponse() { dropAppendResponse = true }
+    private var heldApplicationWriters: Set<Data>?
+
+    /// Accepts the next append without answering. With `thenUnavailable`,
+    /// every later append fails until `setAppendsUnavailable(false)`. With
+    /// `held`, the failure reaches the client only after
+    /// `releaseDroppedResponse()`.
+    func dropNextAppendResponse(thenUnavailable: Bool = false, held: Bool = false) {
+        dropAppendResponse = true
+        unavailableAfterDrop = thenUnavailable
+        holdsDroppedResponse = held
+    }
+
+    func releaseDroppedResponse() {
+        holdsDroppedResponse = false
+        droppedResponse?.resume()
+        droppedResponse = nil
+    }
+    /// Rejects application messages from every writer except `authorizations`
+    /// until called with `nil`.
+    func holdApplications(except authorizations: [Data]?) {
+        heldApplicationWriters = authorizations.map { Set($0.map(Self.digest)) }
+    }
+
+    func activeWriterCount(group: Data) -> Int {
+        groups[group]?.writers.values.filter { $0.removal == nil }.count ?? 0
+    }
+
     /// Drops the response to `authorization`'s next new application entry
     /// after `accepted` more, then makes appends unavailable.
     func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int) {
         droppedWriterAppend = (Self.digest(authorization), accepted)
     }
     var isWriterAppendDropPending: Bool { droppedWriterAppend != nil }
+
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
+    /// Fails every request from the writer `authorization` as if it had no
+    /// network.
+    func setOffline(_ authorization: Data, _ offline: Bool) {
+        if offline {
+            offlineWriters.insert(Self.digest(authorization))
+        } else {
+            offlineWriters.remove(Self.digest(authorization))
+        }
+    }
     func expireHistory(group: Data) { expiredGroups.insert(group) }
 
     func removalCursor(of authorization: Data, group: Data) -> UInt64? {
@@ -253,6 +293,7 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     func createGroup(_ group: Data, authorization: Data) throws {
         let writer = Self.digest(authorization)
+        if offlineWriters.contains(writer) { throw URLError(.notConnectedToInternet) }
         if let existing = groups[group] {
             guard existing.writers[writer]?.removal == nil, existing.writers[writer] != nil else { throw MLSRelayError.epochConflict }
             return
@@ -260,12 +301,27 @@ actor FakeMLSRelay: MLSRelayTransport {
         groups[group] = Group(writers: [writer: (0, nil)])
     }
 
-    func append(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
-        if appendsUnavailable {
+    func append(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        let dropping = dropAppendResponse
+        do {
+            return try appendNow(delivery, authorization: authorization)
+        } catch {
+            if dropping, !dropAppendResponse, holdsDroppedResponse {
+                await withCheckedContinuation { droppedResponse = $0 }
+            }
+            throw error
+        }
+    }
+
+    private func appendNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        if appendsUnavailable || offlineWriters.contains(Self.digest(authorization)) {
             rejectedAppends += 1
             throw URLError(.notConnectedToInternet)
         }
         if expiredGroups.contains(delivery.group) { throw MLSRelayError.historyExpired }
+        if let allowed = heldApplicationWriters, delivery.kind == .application, !allowed.contains(Self.digest(authorization)) {
+            throw URLError(.notConnectedToInternet)
+        }
         guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
             throw MLSRelayError.unauthorized
         }
@@ -300,6 +356,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func fetch(group: Data, after cursor: UInt64, limit: Int, authorization: Data) throws -> [MLSRelayEntry] {
+        if offlineWriters.contains(Self.digest(authorization)) { throw URLError(.notConnectedToInternet) }
         let writer = try authorize(group: group, authorization: authorization)
         return Array(entries.filter {
             $0.delivery.group == group && $0.cursor > cursor && $0.cursor <= (writer.removal ?? .max)
@@ -329,12 +386,19 @@ actor FakeMLSRelay: MLSRelayTransport {
     private func respond(_ result: MLSAppendResult) throws -> MLSAppendResult {
         if dropAppendResponse {
             dropAppendResponse = false
+            appendsUnavailable = unavailableAfterDrop
             throw URLError(.networkConnectionLost)
         }
         return result
     }
 
     private static func digest(_ data: Data) -> Data { Data(SHA256.hash(data: data)) }
+}
+
+extension TaskReplica {
+    init(deviceID: ReplicaDeviceID, persistenceURL: URL? = nil) throws {
+        try self.init(deviceID: deviceID, persistenceURL: persistenceURL, newOrigin: nil)
+    }
 }
 
 /// Builds a valid replica archive directly, so tests can reach replica limits
@@ -404,6 +468,7 @@ enum ReplicaFixture {
         return try ReplicaArchive(
             formatVersion: ReplicaLimits.archiveFormatVersion,
             deviceID: deviceID,
+            originDeviceID: deviceID,
             nextLocalOriginSequence: vector[deviceID]! + 1,
             lamport: lamport,
             versionVector: ReplicaVersionVector(vector),

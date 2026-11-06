@@ -89,6 +89,13 @@ actor MLSSession {
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
     func inbox() async throws -> [MLSInboxMessage] { try await client.inbox() }
     func rejectedApplicationCursors() async throws -> [UInt64] { try await client.rejectedApplicationCursors() }
+
+    /// Log cursors where this member's recent tracked messages with
+    /// `plaintext` landed.
+    func sentCursors(of plaintext: Data) async throws -> [UInt64] {
+        let digest = Data(SHA256.hash(data: plaintext))
+        return try await client.sentMessages().filter { $0.digest == digest }.map(\.cursor)
+    }
     func departures() async throws -> [Data] { try await client.departures() }
 
     func acknowledgeInbox(through cursor: UInt64) async throws {
@@ -124,10 +131,25 @@ actor MLSSession {
         }
     }
 
-    func add(keyPackage: Data, verifiedFingerprint: Data, reference: Data) async throws -> MLSSubmission {
+    /// With `beforeEpoch`, the Add is prepared only while the group epoch is
+    /// below it; otherwise the result is `.superseded`. The check runs in the
+    /// same serialized step that prepares the commit.
+    func add(
+        keyPackage: Data,
+        verifiedFingerprint: Data,
+        reference: Data,
+        beforeEpoch: UInt64? = nil
+    ) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit {
-                try await $0.prepareAdd(keyPackage: keyPackage, verifiedFingerprint: verifiedFingerprint, reference: reference)
+            try await session.submit { client in
+                if let beforeEpoch {
+                    guard try await client.epoch() < beforeEpoch else {
+                        return nil
+                    }
+                }
+                return try await client.prepareAdd(
+                    keyPackage: keyPackage, verifiedFingerprint: verifiedFingerprint, reference: reference
+                )
             }
         }
     }
@@ -143,10 +165,11 @@ actor MLSSession {
         }
     }
 
-    func send(_ plaintext: Data) async throws -> MLSSubmission {
+    /// A `tracked` message is listed by `sentCursors(of:)` once it lands.
+    func send(_ plaintext: Data, tracked: Bool = false) async throws -> MLSSubmission {
         try await exclusive { session in
             try await session.commitDepartures()
-            return try await session.submit { try await $0.prepareMessage(plaintext) }
+            return try await session.submit { try await $0.prepareMessage(plaintext, tracked: tracked) }
         }
     }
 
@@ -264,7 +287,7 @@ actor MLSSession {
                 do {
                     _ = try await catchUp()
                 } catch MLSClientError.capacityReached where pending.kind == .application {
-                    try await client.confirmAcceptedApplication(pending)
+                    try await client.confirmAcceptedApplication(pending, cursor: cursor)
                 }
                 return .accepted(cursor: cursor)
             case .keyPackageUnavailable(let epoch):

@@ -28,8 +28,11 @@ enum PairingFrame: Equatable, Sendable {
     case offer(groupID: Data, inviterFingerprint: Data)
     case commitment(Data)
     case nonce(Data)
-    case response(keyPackageReference: Data, joinerFingerprint: Data, joinerNonce: Data)
+    /// `origins` lists every origin in the joiner's replica, so the inviter
+    /// can check the merged task history before it admits the joiner.
+    case response(keyPackageReference: Data, joinerFingerprint: Data, joinerNonce: Data, origins: [ReplicaDeviceID])
     case decision(approved: Bool)
+    case historyFull
 
     enum Direction {
         case fromInviter
@@ -50,13 +53,13 @@ enum PairingFrame: Equatable, Sendable {
         case .commitment: .commitment
         case .nonce: .nonce
         case .response: .response
-        case .decision: .decision
+        case .decision, .historyFull: .decision
         }
     }
 
     private var direction: Direction? {
         switch self {
-        case .offer, .nonce: .fromInviter
+        case .offer, .nonce, .historyFull: .fromInviter
         case .commitment, .response: .fromJoiner
         case .decision: nil
         }
@@ -66,13 +69,23 @@ enum PairingFrame: Equatable, Sendable {
         switch self {
         case .offer(let group, let fingerprint): group + fingerprint
         case .commitment(let value), .nonce(let value): value
-        case .response(let reference, let fingerprint, let nonce): reference + fingerprint + nonce
+        case .response(let reference, let fingerprint, let nonce, let origins):
+            origins.sorted().reduce(reference + fingerprint + nonce + Data([UInt8(origins.count)])) { $0 + $1.bytes }
         case .decision(let approved): Data([approved ? 1 : 0])
+        case .historyFull: Data([2])
         }
     }
 
+    private static let responseFixedBytes = 97
+    private static let maximumFrameBytes = 1 + 12 + 16 + responseFixedBytes + 16 * ReplicaLimits.maxOrigins
+
     func seal(for invitation: Invitation, from direction: Direction) throws -> Data {
         guard self.direction == nil || self.direction == direction else { throw SyncError.invalidPairMessage }
+        if case .response(_, _, _, let origins) = self {
+            guard origins.count <= ReplicaLimits.maxOrigins, Set(origins).count == origins.count else {
+                throw SyncError.invalidPairMessage
+            }
+        }
         let sealed = try ChaChaPoly.seal(
             body,
             using: Self.key(for: invitation, direction: direction),
@@ -82,7 +95,7 @@ enum PairingFrame: Equatable, Sendable {
     }
 
     static func open(_ frame: Data, for invitation: Invitation, from direction: Direction) throws -> PairingFrame {
-        guard frame.count <= 512, let first = frame.first, let kind = Kind(rawValue: first) else {
+        guard frame.count <= maximumFrameBytes, let first = frame.first, let kind = Kind(rawValue: first) else {
             throw SyncError.invalidPairMessage
         }
         let body: Data
@@ -104,16 +117,29 @@ enum PairingFrame: Equatable, Sendable {
             guard body.count == 32 else { throw SyncError.invalidPairMessage }
             decoded = .nonce(Data(body))
         case .response:
-            guard body.count == 96 else { throw SyncError.invalidPairMessage }
             let bytes = Data(body)
+            guard bytes.count >= responseFixedBytes else { throw SyncError.invalidPairMessage }
+            let count = Int(bytes[responseFixedBytes - 1])
+            guard count <= ReplicaLimits.maxOrigins, bytes.count == responseFixedBytes + 16 * count else {
+                throw SyncError.invalidPairMessage
+            }
+            let origins = try (0..<count).map { index in
+                let start = responseFixedBytes + 16 * index
+                guard let origin = try? ReplicaDeviceID(bytes: bytes.subdata(in: start..<start + 16)) else {
+                    throw SyncError.invalidPairMessage
+                }
+                return origin
+            }
+            guard zip(origins, origins.dropFirst()).allSatisfy({ $0 < $1 }) else { throw SyncError.invalidPairMessage }
             decoded = .response(
-                keyPackageReference: bytes.prefix(32),
-                joinerFingerprint: bytes.dropFirst(32).prefix(32),
-                joinerNonce: bytes.suffix(32)
+                keyPackageReference: bytes.subdata(in: 0..<32),
+                joinerFingerprint: bytes.subdata(in: 32..<64),
+                joinerNonce: bytes.subdata(in: 64..<96),
+                origins: origins
             )
         case .decision:
-            guard body.count == 1, body[body.startIndex] <= 1 else { throw SyncError.invalidPairMessage }
-            decoded = .decision(approved: body[body.startIndex] == 1)
+            guard body.count == 1, body[body.startIndex] <= 2 else { throw SyncError.invalidPairMessage }
+            decoded = body[body.startIndex] == 2 ? .historyFull : .decision(approved: body[body.startIndex] == 1)
         }
         guard decoded.direction == nil || decoded.direction == direction else { throw SyncError.invalidPairMessage }
         return decoded
