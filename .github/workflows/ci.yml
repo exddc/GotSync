@@ -72,5 +72,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Test relay release automation
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_relay_*.py'
       - name: Test the example deployment behind Traefik
         run: scripts/test-deploy.sh

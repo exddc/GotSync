@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -466,9 +467,13 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
             == 1
         )
 
-        health_status, health, _ = await self.http_request("GET", "/healthz")
+        with patch.dict(os.environ, {"GOTSYNC_VERSION": "0.1.0", "GOTSYNC_REVISION": "a" * 40}):
+            health_status, health, _ = await self.http_request("GET", "/healthz")
         self.assertEqual(health_status, 200)
-        self.assertEqual(health, {"status": "ok", "version": 2, "supportedVersions": [2]})
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["version"], 2)
+        self.assertEqual(health["supportedVersions"], [2])
+        self.assertEqual(health["build"], {"version": "0.1.0", "revision": "a" * 40})
 
         ready_status, ready, _ = await self.http_request("GET", "/readyz")
         self.assertEqual(ready_status, 200)

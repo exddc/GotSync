@@ -341,20 +341,28 @@ discarded disks, but not from anyone with root on the running server.
 
 ### Run the relay
 
+Use an image from the [relay releases](https://github.com/exddc/GotSync/releases?q=relay-v).
+Each release records its source commit, relay input hash and image digest in
+`relay-release.json`. Relay versions are independent of protocol version 2
+and the `mls-ffi-*` client binary releases.
+
 1. Point the relay's host name at the server with an `A` record. A `CAA`
    record such as `0 issue "letsencrypt.org"` on the same name limits who may
    issue its certificate.
 2. Put `GOTSYNC_RELAY_HOST=relay.example.com` in `server/deploy/traefik/.env`,
-   or export it. If your Traefik names its HTTPS entry point or certificate
+   or export it. Set `GOTSYNC_RELAY_IMAGE` to the release's full
+   `ghcr.io/exddc/gotsync-relay@sha256:...` reference. If your Traefik names its HTTPS entry point or certificate
    resolver something other than `https` and `letsencrypt`, also set
    `TRAEFIK_ENTRYPOINT` and `TRAEFIK_CERT_RESOLVER`.
-3. Run `docker compose up -d --build` in `server/deploy/traefik`, then connect
+3. Run `docker compose pull && docker compose up -d --wait` in `server/deploy/traefik`, then connect
    Traefik to the relay's network with
    `docker network connect gotsync-relay_default <traefik-container>`.
 
 A platform that deploys a compose file from a Git repository can use
-`server/deploy/traefik/compose.yaml` as it is, with the variables set in the
-platform. If the platform escapes `$` in labels, turn that off for this
+`server/deploy/traefik/compose.yaml`, with the variables set in the platform.
+Pin its Git revision to the release's source commit as well: that fixes the
+deployment configuration alongside the image. Disable deployment on Git pushes.
+If the platform escapes `$` in labels, turn that off for this
 application, or Traefik receives the variable names instead of their values.
 Leave the platform's domain setting empty, because the labels already define
 both routes, their middlewares, and the certificate resolver.
@@ -371,6 +379,66 @@ address, unless its entry point sets `forwardedHeaders.insecure` or
 `forwardedHeaders.trustedIPs`. The container runs with a read-only root
 filesystem, no Linux capabilities, `no-new-privileges`, and limits of 512 MB of
 memory and 128 processes.
+
+### Tagged releases
+
+Run **Release relay** from GitHub Actions on `main` and enter a version such
+as `0.1.0`. The workflow requires successful main CI for its source commit,
+creates tag `relay-v0.1.0`, and publishes a GitHub release with the Linux
+amd64 and arm64 image `ghcr.io/exddc/gotsync-relay:0.1.0`. An existing tag
+must point to that same commit. Relay releases do not run on ordinary pushes.
+There is no RC channel.
+
+The workflow compares relay input hashes with the last published version.
+Runtime modules, dependencies, Docker inputs and deployment files count;
+client code, tests and Markdown documentation do not. Unchanged inputs skip
+publication, so a client-only update does not consume a relay version. Run
+with a new version and `force` enabled to refresh unchanged inputs against
+current base images for a security update.
+
+Each release records its source commit, input hash and image digest in
+`relay-release.json`. Versions must increase. Re-running a published version
+reuses its exact image, even with `force` enabled, and can retry its deployment.
+The source tag and successful main CI are checked again. An interrupted draft
+with saved metadata also reuses its image; a draft without metadata resumes
+publication. Image version and source revision appear in OCI labels and the
+loopback-only `/healthz` response, independently of protocol version 2.
+
+### Coolify releases
+
+Keep the existing Compose application, volumes, host name and Traefik labels.
+Configure the GitHub environment `relay-stable`, restricted to `main`, with:
+
+| Setting | Type | Value |
+| --- | --- | --- |
+| `COOLIFY_URL` | Variable | HTTPS Coolify dashboard URL, without `/api/v1` |
+| `COOLIFY_APPLICATION_UUID` | Variable | UUID of the relay Compose application |
+| `COOLIFY_TOKEN` | Secret | Read, write and deploy token scoped to that application |
+
+Enable the Coolify API. For the first release, disable `deploy`, then make
+the `gotsync-relay` container package public in GitHub's package settings, or
+configure registry authentication on the deployment server. New GitHub
+container packages start private even for a public repository. Re-run
+**Release relay** with the same version and `deploy` enabled; it reuses the
+published image. Publishing uses the workflow's `GITHUB_TOKEN`.
+
+With `deploy` enabled, the workflow updates `GOTSYNC_RELAY_IMAGE` to the
+release's digest, pins the Compose source to its commit, disables automatic
+Git deployments and requests a Coolify deployment. Compose waits for container
+health before the workflow reports success. With `deploy` disabled, it only
+publishes the version. Production stays pinned between explicit releases.
+
+For rollback, set `GOTSYNC_RELAY_IMAGE` and the Git revision in Coolify to a
+previous manifest's digest and source commit, then redeploy. Check database
+compatibility before downgrading. Rollback does not alter any release or tag.
+
+For local source builds, add `compose.build.yaml` and supply the local image
+name:
+
+```sh
+GOTSYNC_RELAY_IMAGE=gotsync-relay-local docker compose \
+  -f compose.yaml -f compose.build.yaml up -d --build --wait
+```
 
 ### Logs and backups
 
