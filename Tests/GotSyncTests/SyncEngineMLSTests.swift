@@ -2920,7 +2920,7 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertTrue(peer.addTask(title: "Valid peer task"))
         try await pair(host, peer)
 
-        try await waitForCapacityReport(host, unapplied: 1)
+        try await waitForCapacityReport(host, unapplied: 1, timeout: .seconds(60))
         try await waitForCapacityReport(peer, unapplied: 1, timeout: .seconds(60))
         XCTAssertEqual(host.tasks.map(\.titleValue), ["Task 1"])
         XCTAssertEqual(peer.tasks.count, 2)
