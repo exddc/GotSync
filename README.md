@@ -1,7 +1,8 @@
 # GotSync
 
 GotSync is an accountless, local-first sync engine for Apple platforms. It links
-up to eight devices in one MLS group (RFC 9420, through OpenMLS). The relay
+up to ten devices in one MLS group (RFC 9420, through OpenMLS); groups without
+a profile, such as the demo's, hold up to eight. The relay
 stores and forwards only MLS ciphertext. The current replicated model contains
 task titles, completion state, and deletions. The engine is under development and does not offer a generic
 record schema.
@@ -120,8 +121,8 @@ No public hosted service is provisioned by this repository.
 
 ## Delivery and security limits
 
-Edits save locally before transmission. Every group, from two to eight
-members, sends task changes as MLS application messages through the relay's
+Edits save locally before transmission. Every group, from two members to its
+member limit, sends task changes as MLS application messages through the relay's
 ordered delivery log. While the application is active, the engine polls that
 log every two seconds. There are no inbound push notifications and no live
 socket for task changes. Background upload depends on the execution time the
@@ -129,7 +130,8 @@ operating system grants and retries on the next launch. See
 [push and background receive](docs/PUSH-AND-BACKGROUND-RECEIVE.md) for the
 planned design.
 
-A group holds at most eight devices at a time. Its task history holds edits
+A group holds at most its profile's member limit at a time: ten at most, and
+eight for groups without a profile. Its task history holds edits
 from at most 128 devices over its lifetime, including removed devices, so
 devices can be replaced long after the group first fills. Once the history
 has no free slot, no further device can be linked to it; see

@@ -33,7 +33,7 @@ final class MLSSessionTests: XCTestCase {
         let alice = try session("alice", transport: relay)
         let bob = try session("bob", transport: relay)
         let group = try Data.secureRandom(count: 32)
-        try await alice.createGroup(group)
+        try await alice.createGroup(group, profile: nil)
         try await admit(bob, by: alice, group: group)
         return (alice, bob, group)
     }
@@ -54,13 +54,13 @@ final class MLSSessionTests: XCTestCase {
 
     private func admit(_ joining: MLSSession, by inviter: MLSSession, group: Data) async throws {
         let token = try Data.secureRandom(count: 32)
-        let published = try await joining.publishKeyPackage(pairingToken: token)
+        let published = try await joining.publishKeyPackage(pairingToken: token, profile: nil)
         let keyPackage = try await XCTUnwrapAsync(await inviter.fetchKeyPackage(reference: published.reference, pairingToken: token))
         let added = try await inviter.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
         guard case .accepted = added else { return XCTFail("Add was not accepted: \(added)") }
         let joined = try await joining.join(
             group: group, keyPackageReference: published.reference,
-            verifiedInviterFingerprint: inviter.fingerprint()
+            verifiedInviterFingerprint: inviter.fingerprint(), profile: nil
         )
         XCTAssertTrue(joined)
     }
@@ -140,9 +140,9 @@ final class MLSSessionTests: XCTestCase {
         let alice = try session("alice", transport: relay)
         let bob = try session("bob", transport: relay)
         let group = try Data.secureRandom(count: 32)
-        try await alice.createGroup(group)
-        let published = try await bob.publishKeyPackage(pairingToken: Data(repeating: 3, count: 32))
-        let joined = try await bob.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint())
+        try await alice.createGroup(group, profile: nil)
+        let published = try await bob.publishKeyPackage(pairingToken: Data(repeating: 3, count: 32), profile: nil)
+        let joined = try await bob.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil)
         XCTAssertFalse(joined)
         let bobGroup = try await bob.group()
         XCTAssertNil(bobGroup)
@@ -152,10 +152,10 @@ final class MLSSessionTests: XCTestCase {
         let relay = FakeMLSRelay()
         let alice = try session("alice", transport: relay)
         let group = Data(repeating: 4, count: 32)
-        try await alice.createGroup(group)
-        try await alice.createGroup(group)
+        try await alice.createGroup(group, profile: nil)
+        try await alice.createGroup(group, profile: nil)
         do {
-            try await alice.createGroup(Data(repeating: 5, count: 32))
+            try await alice.createGroup(Data(repeating: 5, count: 32), profile: nil)
             XCTFail("Second group accepted")
         } catch { XCTAssertEqual(error as? MLSSessionError, .groupMismatch) }
     }
@@ -252,7 +252,7 @@ final class MLSSessionTests: XCTestCase {
 
         let dave = try session("dave", transport: relay)
         let token = Data(repeating: 6, count: 32)
-        let published = try await dave.publishKeyPackage(pairingToken: token)
+        let published = try await dave.publishKeyPackage(pairingToken: token, profile: nil)
         let keyPackage = try await XCTUnwrapAsync(await bob.fetchKeyPackage(reference: published.reference, pairingToken: token))
         let staleSend = try await bob.send(Data("after conflict".utf8))
         guard case .accepted = staleSend else { return XCTFail("Stale message not resealed") }
@@ -274,7 +274,7 @@ final class MLSSessionTests: XCTestCase {
     func testUnavailableKeyPackageUnblocksInviter() async throws {
         let relay = FakeMLSRelay()
         let alice = try session("alice", transport: relay)
-        try await alice.createGroup(Data(repeating: 8, count: 32))
+        try await alice.createGroup(Data(repeating: 8, count: 32), profile: nil)
         let bob = try session("bob", transport: relay)
         let identity = try await bob.joiningIdentityForTesting()
         let result = try await alice.add(
@@ -444,7 +444,7 @@ final class MLSSessionTests: XCTestCase {
         let bob = try session("bob", transport: relay)
         let bobAuthorization = try await bob.transportAuthorizationForTesting()
         let group = try Data.secureRandom(count: 32)
-        try await alice.createGroup(group)
+        try await alice.createGroup(group, profile: nil)
         await relay.failAcknowledgements(by: bobAuthorization, true)
         do {
             try await admit(bob, by: alice, group: group)
@@ -551,7 +551,7 @@ final class MLSSessionTests: XCTestCase {
         let (alice, bob, group) = try await pair(relay)
         let token = try Data.secureRandom(count: 32)
         let charlie = try session("charlie", transport: relay)
-        let published = try await charlie.publishKeyPackage(pairingToken: token)
+        let published = try await charlie.publishKeyPackage(pairingToken: token, profile: nil)
         let wrongToken = try Data.secureRandom(count: 32)
         do {
             _ = try await alice.fetchKeyPackage(reference: published.reference, pairingToken: wrongToken)
@@ -562,7 +562,7 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertNil(consumed)
         let added = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
         guard case .accepted = added else { return XCTFail("Add not accepted") }
-        let joined = try await charlie.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint())
+        let joined = try await charlie.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil)
         XCTAssertTrue(joined)
 
         _ = try await bob.send(Data("from Bob".utf8))

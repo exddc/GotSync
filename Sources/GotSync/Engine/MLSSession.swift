@@ -34,6 +34,7 @@ enum MLSSessionError: Error, Equatable {
     case groupMismatch
     case removed
     case unresolvedConflict
+    case profileMismatch
 }
 
 actor MLSSession {
@@ -85,6 +86,7 @@ actor MLSSession {
     func epoch() async throws -> UInt64 { try await client.epoch() }
     func cursor() async throws -> UInt64 { try await client.cursor() }
     func members() async throws -> [MLSMember] { try await client.members() }
+    func groupProfile() async throws -> Data? { try await client.groupProfile() }
     func isRemoved() async throws -> Bool { try await client.isRemoved() }
     func pendingDelivery() async throws -> MLSDelivery? { try await client.pendingDelivery() }
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
@@ -103,10 +105,10 @@ actor MLSSession {
         try await client.acknowledgeInbox(through: cursor)
     }
 
-    func publishKeyPackage(pairingToken: Data) async throws -> MLSPublishedKeyPackage {
+    func publishKeyPackage(pairingToken: Data, profile: Data?) async throws -> MLSPublishedKeyPackage {
         guard pairingToken.count == 32 else { throw MLSRelayError.invalidRequest }
         return try await exclusive { session in
-            let identity = try await session.client.joiningIdentity()
+            let identity = try await session.client.joiningIdentity(profile: profile)
             let reference = try await session.transport.publishKeyPackage(
                 identity.keyPackage,
                 authorization: session.client.transportAuthorization(),
@@ -120,14 +122,17 @@ actor MLSSession {
         try await transport.fetchKeyPackage(reference: reference, pairingToken: pairingToken)
     }
 
-    func createGroup(_ id: Data) async throws {
+    /// Creates the group with `profile`, or registers it again with the
+    /// relay when this member already holds it with the same profile.
+    func createGroup(_ id: Data, profile: Data?) async throws {
         guard id.count == 32 else { throw MLSRelayError.invalidRequest }
         try await exclusive { session in
             switch try await session.client.group() {
-            case nil: try await session.client.createGroup(id: id)
+            case nil: try await session.client.createGroup(id: id, profile: profile)
             case id?: break
             default: throw MLSSessionError.groupMismatch
             }
+            guard try await session.client.groupProfile() == profile else { throw MLSSessionError.profileMismatch }
             try await session.transport.createGroup(id, authorization: session.client.transportAuthorization())
         }
     }
@@ -231,7 +236,7 @@ actor MLSSession {
         try await exclusive { session in try await session.catchUp() }
     }
 
-    func join(group: Data, keyPackageReference: Data, verifiedInviterFingerprint: Data) async throws -> Bool {
+    func join(group: Data, keyPackageReference: Data, verifiedInviterFingerprint: Data, profile: Data?) async throws -> Bool {
         try await exclusive { session in
             guard try await session.client.group() == nil else { throw MLSSessionError.groupMismatch }
             let authorization = try await session.client.transportAuthorization()
@@ -254,7 +259,8 @@ actor MLSSession {
                         welcome: welcome,
                         group: group,
                         verifiedInviterFingerprint: verifiedInviterFingerprint,
-                        cursor: entry.cursor
+                        cursor: entry.cursor,
+                        expectedProfile: profile
                     )
                     _ = try await session.catchUp()
                     return true
@@ -294,6 +300,12 @@ actor MLSSession {
                 _ = try await catchUp()
                 if try await client.isRemoved() { throw MLSSessionError.removed }
                 continue
+            } catch MLSRelayError.capacityReached where pending.kind == .commit && pending.welcome != nil {
+                // The relay refused the Add without appending it, for example
+                // because its writer directory is smaller than the group's
+                // member limit. A queued Add would block every later send.
+                try await client.rejectAddForUnavailableKeyPackage(commit: pending.payload, rejectedEpoch: pending.epoch)
+                throw MLSRelayError.capacityReached
             }
             switch result {
             case .accepted(let cursor):

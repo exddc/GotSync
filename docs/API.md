@@ -6,7 +6,8 @@ archives are implementation details rather than a supported consumer API.
 
 | Surface | Purpose |
 | --- | --- |
-| `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, and consumer invitation URL scheme. `relayURL` ends in `/v2/pairing` and `mailboxURL` in `/v2/mls` |
+| `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, consumer invitation URL scheme, and group profile. `relayURL` ends in `/v2/pairing` and `mailboxURL` in `/v2/mls` |
+| `SyncGroupProfile`, `SyncPayloadSchema`, `SyncGroupProfileError` | The application, payload schema, and member limit every group of an engine carries |
 | `SyncEngine` | MLS pairing, replication, local task mutations, and transport lifecycle |
 | `SyncState`, `SyncPhase`, `MailboxSyncState` | Immutable snapshots and connection state |
 | `LinkedDevice` | A group member as listed in `SyncState.linkedDevices` and passed to `removeDevice(_:)` |
@@ -161,7 +162,47 @@ Removing a device frees a group slot but not its slot in the task history.
 `isTaskHistoryAtCapacity` is `true` when linking one more device would leave
 no room for a new origin from that device or a current member. It is separate
 from `isGroupAtCapacity`, which counts current members only against
-`SyncEngine.maximumGroupSize` (8).
+`memberLimit`.
+
+### Group profiles and member limits
+
+`SyncConfiguration` takes a `groupProfile`, `SyncGroupProfile.legacyTaskDemo`
+by default. The legacy profile creates groups that earlier builds can pair
+with and admits eight devices. A profiled configuration names the application
+and member limit:
+
+```swift
+let profile = try SyncGroupProfile(
+    application: "com.example.tasks",
+    schema: .taskReplica,
+    memberLimit: SyncGroupProfile.supportedMemberCeiling
+)
+```
+
+The application is 1 to 64 bytes of lowercase ASCII letters, digits, `.` and
+`-`, starting with a letter or digit; otherwise the initializer throws
+`SyncGroupProfileError.invalidApplication`. `memberLimit` must be between 2 and
+`SyncGroupProfile.supportedMemberCeiling` (10), otherwise it throws
+`invalidMemberLimit`. `SyncPayloadSchema.taskReplica`, the task model this
+engine replicates, is the only schema consumers can select; it does not
+describe any other application data.
+
+`SyncEngine.groupProfile` returns the configured profile, and
+`SyncEngine.memberLimit` and `SyncState.memberLimit` its member limit. Read the
+limit from there instead of hardcoding a count. `isGroupAtCapacity` compares
+`linkedMemberCount` with it. `SyncGroupProfile.legacyMemberLimit` (8) is the
+limit of legacy groups. `SyncEngine.maximumGroupSize` is deprecated and still
+returns 8.
+
+`SyncError.incompatibleGroupProfile` reports that the other device or the
+stored group uses another application, schema, schema version, or member
+limit. Pairing fails with it on both devices before a KeyPackage is published
+or a safety code is shown. When the stored group's profile differs from the
+configuration, sync stops with it in `mailboxError`, `mailboxRequiresRepair`
+is `true`, and `inviteToGroup()` fails with it; the MLS state and tasks are
+kept. Configure the stored profile again, or unlink. Exhaustive switches over
+`SyncError` need a case for it. See [COMPATIBILITY.md](COMPATIBILITY.md#group-profiles-and-ten-members)
+for mixed builds, relays, and rollback.
 
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this

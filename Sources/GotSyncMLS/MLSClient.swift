@@ -7,6 +7,8 @@ public enum MLSClientError: Error {
     case invalidDelivery
     case storageUnavailable
     case capacityReached
+    /// The group's profile differs from the expected one or is malformed.
+    case unsupportedGroupProfile
 }
 
 public struct MLSJoiningIdentity: Sendable {
@@ -84,6 +86,9 @@ struct IdentityRecord: Codable {
 }
 
 public actor MLSClient {
+    /// The most members a group can have, whatever its profile allows.
+    public static let memberCeiling = Int(supportedMemberCeiling())
+
     private let store: MLSStore
 
     public init(directory: URL, deviceID: Data, stateKey: MLSStateKeyProvider) throws {
@@ -102,10 +107,12 @@ public actor MLSClient {
         }
     }
 
-    public func joiningIdentity() throws -> MLSJoiningIdentity {
+    /// A KeyPackage for joining a group with `profile`, or a legacy group
+    /// when `profile` is `nil`.
+    public func joiningIdentity(profile: Data? = nil) throws -> MLSJoiningIdentity {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
-            let transition = try publishKeyPackage(state: record.state)
+            let transition = try publishKeyPackage(state: record.state, profile: profile)
             record.state = Data(transition.state)
             return MLSJoiningIdentity(keyPackage: Data(transition.output), fingerprint: record.identity.fingerprint)
         }
@@ -136,10 +143,21 @@ public actor MLSClient {
     /// oldest first, each with the SHA-256 digest of its plaintext.
     public func sentMessages() throws -> [MLSSentMessage] { try store.read().sent ?? [] }
 
-    public func createGroup(id: Data) throws {
+    /// The group's profile descriptor, or `nil` for a legacy group.
+    public func groupProfile() throws -> Data? {
+        let record = try store.read()
+        guard record.group != nil, !record.removed else { throw MLSClientError.invalidState }
+        do {
+            return try GotSyncMLSBindings.groupProfile(state: record.state)
+        } catch MlsError.InvalidInput {
+            throw MLSClientError.unsupportedGroupProfile
+        }
+    }
+
+    public func createGroup(id: Data, profile: Data? = nil) throws {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
-            let transition = try GotSyncMLSBindings.createGroup(state: record.state, groupId: id)
+            let transition = try GotSyncMLSBindings.createGroup(state: record.state, groupId: id, profile: profile)
             Self.apply(transition, to: &record)
         }
     }
@@ -200,10 +218,19 @@ public actor MLSClient {
         }
     }
 
-    public func join(welcome: Data, group: Data, verifiedInviterFingerprint: Data, cursor: UInt64) throws {
+    /// Joins only a group whose profile equals `expectedProfile`.
+    public func join(welcome: Data, group: Data, verifiedInviterFingerprint: Data, cursor: UInt64, expectedProfile: Data? = nil) throws {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
-            let transition = try joinGroup(state: record.state, welcome: welcome, expectedGroupId: group, inviterFingerprint: verifiedInviterFingerprint)
+            let transition: MlsTransition
+            do {
+                transition = try joinGroup(
+                    state: record.state, welcome: welcome, expectedGroupId: group,
+                    inviterFingerprint: verifiedInviterFingerprint, expectedProfile: expectedProfile
+                )
+            } catch MlsError.ProfileMismatch {
+                throw MLSClientError.unsupportedGroupProfile
+            }
             Self.apply(transition, to: &record)
             record.cursor = cursor
         }
@@ -253,7 +280,7 @@ public actor MLSClient {
                 else { throw MLSClientError.invalidDelivery }
                 Self.apply(transition, to: &record)
                 if let departed = transition.departed, !(record.departures ?? []).contains(departed) {
-                    record.departures = Array(((record.departures ?? []) + [departed]).suffix(8))
+                    record.departures = Array(((record.departures ?? []) + [departed]).suffix(Self.memberCeiling))
                 }
                 if let sender = transition.sender {
                     guard record.inbox.count < 1000 else { throw MLSClientError.capacityReached }

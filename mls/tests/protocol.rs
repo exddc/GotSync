@@ -7,7 +7,7 @@ struct Identity {
 }
 fn identity(id: u8) -> Identity {
     let identity = create_identity(vec![id; 16]).unwrap();
-    let published = publish_key_package(identity.state).unwrap();
+    let published = publish_key_package(identity.state, None).unwrap();
     Identity {
         state: published.state,
         key_package: published.output,
@@ -15,7 +15,7 @@ fn identity(id: u8) -> Identity {
     }
 }
 fn group(id: &Identity) -> MlsTransition {
-    create_group(id.state.clone(), vec![7; 32]).unwrap()
+    create_group(id.state.clone(), vec![7; 32], None).unwrap()
 }
 fn add(host: Vec<u8>, joiner: &Identity, inviter: &Identity) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let pending =
@@ -25,6 +25,7 @@ fn add(host: Vec<u8>, joiner: &Identity, inviter: &Identity) -> (Vec<u8>, Vec<u8
         pending.welcome.unwrap(),
         vec![7; 32],
         inviter.fingerprint.clone(),
+        None,
     )
     .unwrap();
     let accepted = accept_commit(pending.state, pending.output.clone()).unwrap();
@@ -73,7 +74,13 @@ fn fingerprints_and_group_id_are_verified_in_both_directions() {
     let pending = prepare_add(a, bob.key_package, bob.fingerprint).unwrap();
     let welcome = pending.welcome.unwrap();
     assert!(matches!(
-        join_group(bob.state.clone(), welcome.clone(), vec![7; 32], vec![0; 32]),
+        join_group(
+            bob.state.clone(),
+            welcome.clone(),
+            vec![7; 32],
+            vec![0; 32],
+            None
+        ),
         Err(MlsError::FingerprintMismatch)
     ));
     assert!(
@@ -81,11 +88,12 @@ fn fingerprints_and_group_id_are_verified_in_both_directions() {
             bob.state.clone(),
             welcome.clone(),
             vec![8; 32],
-            alice.fingerprint.clone()
+            alice.fingerprint.clone(),
+            None
         )
         .is_err()
     );
-    assert!(join_group(bob.state, welcome, vec![7; 32], alice.fingerprint).is_ok());
+    assert!(join_group(bob.state, welcome, vec![7; 32], alice.fingerprint, None).is_ok());
 }
 
 #[test]
@@ -121,7 +129,7 @@ fn replay_tampering_and_unknown_member_are_rejected() {
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
     assert!(receive_message(b.clone(), tampered).is_err());
-    let other_group = create_group(outsider.state, vec![7; 32]).unwrap();
+    let other_group = create_group(outsider.state, vec![7; 32], None).unwrap();
     let forged = seal_message(other_group.state, b"unknown sender".to_vec()).unwrap();
     assert!(receive_message(b, forged.output).is_err());
 }
@@ -145,7 +153,8 @@ fn welcome_must_be_signed_by_pinned_inviter_not_just_contain_them() {
             joiner.state,
             pending.welcome.unwrap(),
             vec![7; 32],
-            inviter.fingerprint
+            inviter.fingerprint,
+            None
         ),
         Err(MlsError::FingerprintMismatch)
     ));
@@ -158,10 +167,10 @@ fn snapshot_version_and_reload_preserve_group_identity() {
     let mut old = identity.state.clone();
     old[0] = 3;
     assert!(matches!(
-        create_group(old, vec![7; 32]),
+        create_group(old, vec![7; 32], None),
         Err(MlsError::InvalidInput)
     ));
-    let saved = create_group(identity.state, vec![7; 32]).unwrap();
+    let saved = create_group(identity.state, vec![7; 32], None).unwrap();
     let roster = members(saved.state.clone()).unwrap();
     assert_eq!(roster[0].device_id, vec![1; 16]);
     assert_eq!(roster[0].fingerprint, identity.fingerprint);
@@ -176,7 +185,7 @@ fn snapshot_version_and_reload_preserve_group_identity() {
 fn any_unexpired_published_package_can_join() {
     let alice = identity(1);
     let bob = identity(2);
-    let fresh = publish_key_package(bob.state.clone()).unwrap();
+    let fresh = publish_key_package(bob.state.clone(), None).unwrap();
     let old = prepare_add(
         group(&alice).state,
         bob.key_package,
@@ -188,7 +197,8 @@ fn any_unexpired_published_package_can_join() {
             fresh.state.clone(),
             old.welcome.unwrap(),
             vec![7; 32],
-            alice.fingerprint.clone()
+            alice.fingerprint.clone(),
+            None
         )
         .is_ok()
     );
@@ -198,7 +208,8 @@ fn any_unexpired_published_package_can_join() {
             fresh.state,
             pending.welcome.unwrap(),
             vec![7; 32],
-            alice.fingerprint
+            alice.fingerprint,
+            None
         )
         .is_ok()
     );
@@ -323,6 +334,7 @@ fn departing_install_can_rejoin_in_the_commit_that_removes_it() {
         pending.welcome.unwrap(),
         vec![7; 32],
         alice.fingerprint.clone(),
+        None,
     )
     .unwrap();
     let a = accept_commit(pending.state, pending.output).unwrap().state;

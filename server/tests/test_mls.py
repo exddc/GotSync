@@ -5,7 +5,7 @@ import hashlib
 
 import pytest
 
-from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
+from gotsync_server.mls import MAX_WRITERS, MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
 from gotsync_server.server import _argument_parser
 from gotsync_server.http import RequestError, UnsupportedVersion, encode_base64url
 
@@ -146,17 +146,45 @@ def test_key_package_writer_mismatch_is_terminal(tmp_path):
     store.close()
 
 
+def add_writers(store, count, first_epoch=0):
+    tokens = []
+    for index in range(count):
+        token = bytes([index + 2 + first_epoch]) * 32
+        package = request(store, "key-package/publish", payload=encode_base64url(token), authorization=encode_base64url(token))["reference"]
+        append(store, payload=token, epoch=first_epoch + index, reference=package, welcome=encode_base64url(b"welcome"),
+               addWriter=encode_base64url(hashlib.sha256(token).digest()))
+        tokens.append(token)
+    return tokens
+
+
+def active_writers(store):
+    return store._db.execute("SELECT COUNT(*) FROM mls_writers WHERE removal IS NULL").fetchone()[0]
+
+
 def test_writer_capacity_does_not_consume_package(tmp_path):
     store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
-    for index in range(7):
-        token = bytes([index + 2]) * 32
-        package = request(store, "key-package/publish", payload=encode_base64url(token), authorization=encode_base64url(token))["reference"]
-        append(store, payload=token, epoch=index, reference=package, welcome=encode_base64url(b"welcome"),
-               addWriter=encode_base64url(hashlib.sha256(token).digest()))
-    package = request(store, "key-package/publish", payload=encode_base64url(b"ninth package"))["reference"]
+    add_writers(store, MAX_WRITERS - 1)
+    assert active_writers(store) == MAX_WRITERS == 10
+    package = request(store, "key-package/publish", payload=encode_base64url(b"eleventh package"))["reference"]
     with pytest.raises(DeliveryCapacity):
-        append(store, payload=b"ninth", epoch=7, reference=package, welcome=encode_base64url(b"welcome"))
+        append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome"))
     assert request(store, "key-package/fetch", reference=package)["payload"] is not None
+    assert active_writers(store) == MAX_WRITERS
+    assert len(request(store, "fetch", group=encode_base64url(b"g" * 32), after=0, limit=32)["entries"]) == MAX_WRITERS - 1
+    store.close()
+
+
+def test_removed_writer_frees_a_slot_for_its_replacement(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    tokens = add_writers(store, MAX_WRITERS - 1)
+    removed = encode_base64url(hashlib.sha256(tokens[3]).digest())
+    append(store, payload=b"remove fifth", epoch=MAX_WRITERS - 1, removeWriter=removed)
+    assert active_writers(store) == MAX_WRITERS - 1
+    add_writers(store, 1, first_epoch=MAX_WRITERS)
+    assert active_writers(store) == MAX_WRITERS
+    with pytest.raises(DeliveryUnauthorized):
+        request(store, "append", group=encode_base64url(b"g" * 32), epoch=MAX_WRITERS + 1, kind="application",
+                payload=encode_base64url(b"from removed"), authorization=encode_base64url(tokens[3]))
     store.close()
 
 

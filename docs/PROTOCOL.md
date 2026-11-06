@@ -10,7 +10,8 @@ from version 1, and [THREAT-MODEL.md](THREAT-MODEL.md) for security limits.
 ## Groups and identities
 
 Each linked set of devices is one MLS group (RFC 9420, ciphersuite
-`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) of up to eight members. The
+`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) of up to ten members; its
+[group profile](#group-profiles) sets the limit. The
 OpenMLS state, signing key, and epoch secrets are managed by
 the `GotSyncMLS` module and stored encrypted on the device.
 A member's fingerprint is the SHA-256 of its MLS signature public key. The
@@ -20,7 +21,65 @@ per-group log of commits and application messages.
 Any member can invite another device. Pairing always runs between two
 devices: the inviting member and the joining device. After the joiner is
 added, every member reads the same group log, so groups of any size up to
-eight deliver operations the same way.
+their member limit deliver operations the same way.
+
+### Group profiles
+
+A group profile names the application, the payload schema of its application
+messages, and the most members the group admits at once.
+`SyncConfiguration.groupProfile` selects it, and an engine creates and joins
+only groups with exactly that profile. The only schema a consumer can select
+is `gotsync.task-replica` version 2, the task operations described under
+[Replication](#replication). A future application-record schema gets a
+different identifier, so groups that carry it never match a task-replica
+profile.
+
+A legacy group has no profile. Earlier builds create only legacy groups, and
+`SyncGroupProfile.legacyTaskDemo` keeps creating them. A legacy group admits
+eight members and pairs with the frames and labels of earlier builds.
+
+A profiled group stores its canonical descriptor in a GroupContext extension
+of private-use type `0xF0D5`:
+
+| Field | Encoding |
+| --- | --- |
+| Format | one byte, 1 |
+| Application | one length byte (1–64), then that many bytes of `[a-z0-9.-]`, starting with a letter or digit |
+| Schema | the same encoding as the application |
+| Schema version | two bytes, big-endian, nonzero |
+| Member limit | one byte, 2 to 10 |
+
+A descriptor is at most 134 bytes. Any other byte sequence, including trailing
+bytes, is malformed. The descriptor of application `com.example.tasks`,
+schema `gotsync.task-replica` version 2, and limit 10 is
+`0111636f6d2e6578616d706c652e7461736b7314676f7473796e632e7461736b2d7265706c69636100020a`.
+
+The creator's leaf and every KeyPackage made for a profiled group list
+`0xF0D5` in their capabilities, so OpenMLS refuses to add a KeyPackage from a
+legacy build or a legacy-mode engine. The MLS layer accepts a group context
+that holds no extensions or exactly this one, rejects every proposal other
+than Add, Remove, and Update, and checks after each commit that the profile is
+unchanged, so a profile cannot change after creation. It enforces the member
+limit of the profile, or eight without one, when it prepares an Add and when
+it validates any roster. Ten is the supported ceiling in the MLS library and
+the relay.
+
+The engine reads the profile from the MLS group context, never from a local
+file, and compares it byte for byte with its configured descriptor:
+
+- a joiner verifies the profile of the Welcome before it stores anything;
+- a founding inviter that reuses its own group, and a linked inviter, verify
+  it before they issue an invitation;
+- every sync cycle verifies it before sending or applying anything, including
+  after a restart and after a founding device adopts a group whose Add answer
+  was lost;
+- a settled founding group with no other member and another profile is
+  discarded and replaced.
+
+A mismatch stops sync with `SyncError.incompatibleGroupProfile` in
+`mailboxError`. The MLS state, checkpoint, and tasks stay as they are, and the
+engine never treats the group as legacy. Configuring the original profile
+again resumes sync; unlinking leaves the group.
 
 ### Invitation
 
@@ -56,12 +115,24 @@ ciphertext, tag). The associated data is
 | 4 commitment | joiner to inviter | 32-byte commitment `C` |
 | 5 nonce | inviter to joiner | 32-byte inviter nonce `Ni` |
 | 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` ‖ origin count `n` (one byte, at most 128) ‖ `n` 16-byte origin IDs |
-| 3 decision | either | one byte: 1 added, 0 declined or cancelled, 2 refused because the task history is full (inviter only) |
+| 3 decision | either | one byte: 1 added, 0 declined or cancelled, 2 refused because the task history is full (inviter only), 3 refused because the group profiles differ |
+| 6 profiled offer | inviter to joiner | group ID ‖ inviter fingerprint ‖ the inviter's profile descriptor |
+| 7 profiled response | joiner to inviter | the response body ‖ the joiner's profile descriptor |
+
+A legacy engine sends kinds 1 and 2. A profiled engine sends kinds 6 and 7
+instead, which earlier builds reject as unknown kinds, so the two never reach
+a safety code. Each side compares the peer's descriptor with its own before it
+acts: the joiner checks the offer before it publishes a KeyPackage, and the
+inviter checks the response before it fetches the KeyPackage. On any
+difference, including legacy against profiled, the device sends decision 3,
+both devices report `SyncError.incompatibleGroupProfile`, and nothing is
+published, approved, added, or stored. Earlier builds treat decision 3 as an
+invalid frame and abort.
 
 The response lists every origin in the joiner's replica, including origins of
 saved operations that exceed a replica limit, in strictly ascending byte order. A receiver rejects a response with more than 128 origins, a body
 length other than `97 + 16n` bytes, or origins that are unsorted or repeated.
-A frame is at most 2,174 bytes.
+A frame is at most 2,308 bytes.
 
 The exchange runs in this order:
 
@@ -97,6 +168,13 @@ the joiner fixes its KeyPackage, fingerprint, and `Nj` before `Ni` exists, and
 the inviter fixes `Ni` before `Nj` is revealed. Each attempt to match another
 device's code therefore succeeds with probability 10⁻⁶ and costs one online
 pairing attempt, which the inviter's user sees.
+
+In a profiled pairing the commitment and the safety code use the labels
+`com.gotdone.sync/mls-pairing-commitment/profiled/v2` and
+`com.gotdone.sync/mls-safety-code/profiled/v2`, followed by one length byte
+and the descriptor, then the same fields as above. Rewriting the descriptor in
+a frame therefore breaks the commitment check or changes the code. Legacy
+pairings keep the labels and inputs above unchanged.
 
 The inviter waits at most 10 minutes for approval. The relay discards an
 unused KeyPackage 15 minutes after publication, so an approved KeyPackage can
@@ -273,7 +351,11 @@ An append whose epoch differs from the group's current epoch fails with
 `epochConflict`; the client fetches the winning commit and retries. A commit
 that adds a member carries its Welcome, the KeyPackage reference, and the new
 writer's hash; the relay admits that writer only if the reference belongs to a
-KeyPackage published by it, and otherwise answers `keyPackageUnavailable`. A
+KeyPackage published by it, and otherwise answers `keyPackageUnavailable`. It
+admits at most ten active writers per group and answers an Add beyond that
+with HTTP 429 `deliveryCapacity`, without consuming the KeyPackage. The relay
+does not read group profiles. A client that receives HTTP 429 for an Add
+discards that Add instead of retrying it. A
 commit can name `removeWriter`, and a proposal revokes its own sender. Naming
 a writer the relay no longer holds has no effect. The relay does not parse
 MLS: it trusts these fields and treats payloads as opaque.
@@ -352,7 +434,7 @@ and 128 origins. An origin is a device whose operations the replica retains.
 Removing or unlinking a device keeps its origin, because later joiners need
 its operations to rebuild the same tasks. The origin limit therefore counts
 every device that has edited the task history, while the MLS group separately
-limits how many devices are members at once to eight. A `hello` that carries
+limits how many devices are members at once to its member limit. A `hello` that carries
 all 128 vector entries stays under 10 KiB, and every origin holds at least one
 of the 10,000 retained operations.
 
@@ -361,8 +443,8 @@ in saved operations that exceed a replica limit, plus one slot for each current
 member, including this device, whether or not that
 member has edited. It does not match members to origins, because a replica's
 origin need not equal its member's device ID. A member that has already edited
-therefore counts twice, which can refuse a device up to eight slots early; a
-full group of eight still has room for at least 120 origins over its lifetime.
+therefore counts twice, which can refuse a device up to ten slots early; a
+full group of ten still has room for at least 118 origins over its lifetime.
 Linking needs one free slot for the other device.
 
 Each device checks its own history before pairing starts, so
@@ -379,7 +461,7 @@ has already committed to. The count covers:
 - every active reservation (described below);
 - every origin in the joiner's response;
 - one slot for each current member, each reserved device, and the joiner,
-  which must also stay within eight.
+  which must also stay within the group's member limit.
 
 Each origin counts once, however many of these sources name it. Any received
 operation that the engine keeps without applying must add its origin to the
@@ -491,7 +573,7 @@ member it asked has left. This state survives restarts, including recovery
 after an interrupted join or a request that was never sent.
 
 Admission refuses while 16 or more claims are active. In normal use a group
-of eight has far fewer. A checkpoint never drops an active claim below 64
+of ten has far fewer. A checkpoint never drops an active claim below 64
 stored claims. Past 64, it keeps 64, marks the checkpoint overflowed, passes
 that flag on in snapshots, and refuses every further admission on that link.
 

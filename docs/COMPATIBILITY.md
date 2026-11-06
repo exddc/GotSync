@@ -33,6 +33,7 @@ that tells the user to pair every device again. The pairing WebSocket closes a
 | Invitation URL | Consumer-specific scheme and `pair` host with `v=2` | Parser requires `secret`, `group`, and `fingerprint`; `v=1` fails with `unsupportedVersion` |
 | Invitation phrase | 17 words: 16-byte secret and a checksum word | Unknown words and a wrong checksum are rejected; the phrase carries no version |
 | MLS pairing frames | Version 2 domains over the `/v2/pairing` WebSocket room | Frames that fail authentication or carry an unknown kind abort pairing; a response that does not open the commitment, or lacks a canonical origin list, aborts pairing |
+| Group profile | GroupContext extension `0xF0D5`, descriptor format 1; profiled pairing frames 6 and 7, decision 3 | Any difference in descriptor bytes refuses pairing before a KeyPackage is published, refuses a Welcome, and stops sync of a stored group with `incompatibleGroupProfile`; a group without the extension is legacy |
 | MLS delivery service | `/v2/mls`, `version: 2` | Client rejects any other response version; server answers other request versions with HTTP 400 `unsupportedVersion` |
 | MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
@@ -111,6 +112,63 @@ replication messages. Earlier builds skip them, so an earlier build neither
 publishes nor counts reservations, and a device it invites never receives a
 snapshot and cannot invite while that inviter stays in the group. Update
 every device before inviting.
+
+## Group profiles and ten members
+
+Builds with group profiles add a descriptor to every group they create unless
+the consumer keeps `SyncGroupProfile.legacyTaskDemo`, the default. Legacy
+groups, the demo app, and pairing between legacy-mode engines behave as before:
+eight members, the same frames, and the same commitment and safety-code
+inputs. A profiled group admits up to its own limit, at most ten.
+
+| Inviter | Joiner | Result |
+| --- | --- | --- |
+| Earlier build, or legacy mode | Earlier build, or legacy mode | Pairs as before; legacy group of eight |
+| Profiled | Same descriptor | Pairs; the group stores the descriptor |
+| Profiled | Earlier build | The joiner cannot read offer kind 6 and aborts; the inviter reports `pairingDeclined` or `invalidPairMessage` |
+| Earlier build | Profiled | The joiner refuses offer kind 1 and sends decision 3; the earlier inviter reads decision 3 as an invalid frame and aborts |
+| Profiled or legacy mode | The other mode | Both report `incompatibleGroupProfile` before any KeyPackage, approval, Add, or stored state |
+| Profiled | Other application, schema, schema version, or member limit | Both report `incompatibleGroupProfile`, by URL and by phrase |
+| Profiled | Descriptor rewritten in transit by a holder of the invitation | The commitment check fails with `invalidPairMessage` before approval, or the codes differ |
+
+Existing members of a legacy group keep syncing after they update. An engine
+whose configured profile differs from the profile of its stored group, in
+either direction, stops sync with `incompatibleGroupProfile`, keeps the MLS
+state, checkpoint, and tasks, and refuses to invite. Configuring the stored
+profile again resumes sync. A settled founding group without other members is
+discarded and replaced instead.
+
+### Relay ceiling
+
+The relay admits ten active writers per group; earlier relays admit eight.
+Against an eight-writer relay, the Add of a ninth device in a profiled group
+receives HTTP 429. The inviter discards the Add and reports
+`privateSyncUnreachable`; the joiner reports `pairingDeclined`. The eight
+current members keep syncing and the relay keeps eight writers. Ten-device
+groups therefore need the ten-writer relay. The current production relay
+release accepts eight.
+
+### Rollback
+
+A group with more than eight members cannot move back to an eight-member
+relay or to an earlier build:
+
+- an earlier build validates every roster against eight members, so it stops
+  with `syncHistoryBlocked` at the commit that adds a ninth member, and on
+  every sync of state that already holds more than eight;
+- an earlier build cannot join a profiled group or admit anyone to it, because
+  its KeyPackages lack the profile capability and its pairing frames are
+  legacy. It does not read profiles, so a downgraded member of a profiled
+  group with at most eight members keeps exchanging messages;
+- an earlier build refuses a saved reply file with more than eight recipients
+  and stops sync with `localStorageUnavailable` without changing the file;
+- an eight-writer relay refuses every Add while it holds eight or more active
+  writers, so a group that already has nine or ten writers on a newer relay
+  keeps them but can add no one.
+
+No build truncates or evicts members to fit a smaller limit. To move a large
+group back, remove members until eight remain, then downgrade, or unlink every
+device and pair again under the earlier build.
 
 ## Future changes
 

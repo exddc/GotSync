@@ -27,6 +27,7 @@ from .protocol import PROTOCOL_VERSION as VERSION
 MAX_PAYLOAD = 448 * 1024
 MAX_ENTRIES = 10_000
 MAX_BYTES = 16 * 1024 * 1024
+MAX_WRITERS = 10
 DEFAULT_MAX_PACKAGES = 4096
 DEFAULT_MAX_GROUPS = 4096
 DEFAULT_RETENTION_SECONDS = 90 * 86400
@@ -344,7 +345,7 @@ class MLSDeliveryStore:
         if package and (not joining or joining[0] != added_writer):
             return False
         if joining and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=? AND removal IS NULL", (route, added_writer)).fetchone():
-            if self._db.execute("SELECT COUNT(*) FROM mls_writers WHERE route=? AND removal IS NULL", (route,)).fetchone()[0] >= 8:
+            if self._db.execute("SELECT COUNT(*) FROM mls_writers WHERE route=? AND removal IS NULL", (route,)).fetchone()[0] >= MAX_WRITERS:
                 raise DeliveryCapacity("writer directory full")
         return True
 

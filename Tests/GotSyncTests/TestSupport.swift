@@ -200,6 +200,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var acknowledgementCount = 0
 
     private var heldApplicationWriters: Set<Data>?
+    private var writerLimit: Int?
 
     /// Accepts the next append without answering. With `thenUnavailable`,
     /// every later append fails until `setAppendsUnavailable(false)`. With
@@ -221,6 +222,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     func holdApplications(except authorizations: [Data]?) {
         heldApplicationWriters = authorizations.map { Set($0.map(Self.digest)) }
     }
+
+    /// Refuses an Add once the group has `count` active writers, as a relay
+    /// with a smaller writer directory does.
+    func limitWriters(to count: Int?) { writerLimit = count }
 
     func activeWriterCount(group: Data) -> Int {
         groups[group]?.writers.values.filter { $0.removal == nil }.count ?? 0
@@ -350,6 +355,9 @@ actor FakeMLSRelay: MLSRelayTransport {
         if let reference = delivery.keyPackageReference {
             guard let package = packages[reference], package.writer == delivery.addWriter else {
                 return .keyPackageUnavailable(epoch: delivery.epoch)
+            }
+            if let writerLimit, activeWriterCount(group: delivery.group) >= writerLimit {
+                throw MLSRelayError.capacityReached
             }
             packages[reference] = nil
         }

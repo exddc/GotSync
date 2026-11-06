@@ -48,6 +48,9 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     /// change-history, or device-history limit. They are kept on this device,
     /// unapplied, until they fit or the link ends.
     case replicaCapacityReached
+    /// The other device or the group uses a different application, data
+    /// format, or device limit. Nothing was linked or changed.
+    case incompatibleGroupProfile
 
     public var errorDescription: String? {
         switch self {
@@ -86,6 +89,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "The safety code was not confirmed in time. Nothing was linked. Create a new invitation and try again."
         case .replicaCapacityReached:
             "This iPhone reached its limit for tasks or sync history. Changes from your other devices are saved here but cannot be shown. Your tasks are safe."
+        case .incompatibleGroupProfile:
+            "This sync uses a different app, data format, or device limit. Your tasks are safe. Update both apps, then try again."
         }
     }
 
@@ -120,6 +125,12 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         if error is URLError {
             return SyncError.privateSyncUnreachable
         }
+        if case MLSClientError.unsupportedGroupProfile = error {
+            return SyncError.incompatibleGroupProfile
+        }
+        if case MLSSessionError.profileMismatch = error {
+            return SyncError.incompatibleGroupProfile
+        }
         if let mls = error as? MLSRelayError {
             switch mls {
             case .unsupportedVersion:
@@ -148,7 +159,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
              .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
              .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
              .syncHistoryExpired, .syncHistoryConflict, .removedFromGroup, .approvalExpired,
-             .replicaCapacityReached:
+             .replicaCapacityReached, .incompatibleGroupProfile:
             return false
         }
     }
@@ -185,6 +196,7 @@ public final class SyncEngine {
             showsSavingNotice: showsSavingNotice,
             linkEndedReason: linkEndedReason,
             linkedMemberCount: linkedMemberCount,
+            memberLimit: memberLimit,
             linkedDevices: linkedDevices
         )
     }
@@ -215,7 +227,8 @@ public final class SyncEngine {
         pairingConflictBackupFilename,
     ]
     static let departuresDirectoryName = "mls-v2-departing"
-    public nonisolated static let maximumGroupSize = 8
+    @available(*, deprecated, message: "Use the engine's memberLimit, which follows its group profile")
+    public nonisolated static let maximumGroupSize = SyncGroupProfile.legacyMemberLimit
     private static let maximumAddAttempts = 3
     private static let maximumRemovalAttempts = 8
     private static let maximumDepartures = 8
@@ -253,6 +266,8 @@ public final class SyncEngine {
 
     public let relayURL: URL
     public let mailboxURL: URL
+    /// The profile every group of this engine must carry.
+    public let groupProfile: SyncGroupProfile
 
     private let secretStore: any SecretStore
     private let mlsTransport: any MLSRelayTransport
@@ -289,7 +304,8 @@ public final class SyncEngine {
     private var activeInvitation: Invitation?
     private var approvalContinuation: CheckedContinuation<ApprovalOutcome, Never>?
     private var peerDecision: Bool?
-    private var peerRefusedForTaskHistory = false
+    /// Why the inviter refused this joiner, when it said.
+    private var peerRefusal: SyncError?
     private(set) var lastPairingFailure: SyncError?
     private var reservationsInFlight: [OriginReservation.Attempt] = []
     private var lastKnownEpoch: UInt64 = 0
@@ -360,6 +376,7 @@ public final class SyncEngine {
         relayURL = configuration.endpoints.relayURL
         mailboxURL = configuration.endpoints.mailboxURL
         invitationURLScheme = configuration.invitationURLScheme
+        groupProfile = configuration.groupProfile
         self.secretStore = secretStore
         self.mlsTransport = mlsTransport
             ?? HTTPMLSRelayTransport(baseURL: configuration.endpoints.mailboxURL, policy: configuration.endpointPolicy)
@@ -510,8 +527,11 @@ public final class SyncEngine {
         isPaired ? linkedDeviceIDs.count : 0
     }
 
+    /// How many devices a group of this engine admits, from its profile.
+    public var memberLimit: Int { groupProfile.memberLimit }
+
     public var isGroupAtCapacity: Bool {
-        linkedMemberCount >= Self.maximumGroupSize
+        linkedMemberCount >= memberLimit
     }
 
     /// Whether linking one more device could leave the replica unable to
@@ -617,7 +637,7 @@ public final class SyncEngine {
             return .taskHistoryFull
         }
         let members = roster.union(claims.map(\.member)).union([joiner])
-        guard members.count <= Self.maximumGroupSize else {
+        guard members.count <= memberLimit else {
             return .groupFull
         }
         let pending = view.pending.union(claims.flatMap(\.origins)).union(joinerOrigins)
@@ -880,8 +900,12 @@ public final class SyncEngine {
             guard try await session.pendingDelivery() == nil else {
                 throw SyncError.privateSyncUnreachable
             }
+            let profile = try await session.groupProfile()
             try requireCurrent(session)
             try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            if profile != groupProfile.descriptor {
+                try resetSession()
+            }
             return false
         }
         if checkpoint?.group != group {
@@ -902,7 +926,7 @@ public final class SyncEngine {
             do {
                 try await session.synchronize()
             } catch MLSRelayError.unauthorized {
-                try await session.createGroup(group)
+                try await session.createGroup(group, profile: session.groupProfile())
                 try await session.synchronize()
             }
             if try await session.isRemoved() {
@@ -915,6 +939,15 @@ public final class SyncEngine {
             return .failure(CancellationError())
         } catch {
             return .failure(Self.endedGroupError(error) ?? SyncError.privateSyncUnreachable)
+        }
+    }
+
+    /// Fails unless the group this session holds carries `groupProfile`.
+    /// The profile is read from the authenticated MLS group context, never
+    /// from local files.
+    private func requireGroupProfile(session: MLSSession) async throws {
+        guard try await session.groupProfile() == groupProfile.descriptor else {
+            throw SyncError.incompatibleGroupProfile
         }
     }
 
@@ -1136,6 +1169,20 @@ public final class SyncEngine {
         }
         await connection.cancel()
         throw SyncError.taskHistoryAtCapacity
+    }
+
+    /// Tells the peer that the profiles differ and stops before anything is
+    /// published, added, or shown for approval.
+    private func refuseMismatchedProfile(
+        on connection: any PairingConnection,
+        invitation: Invitation,
+        from direction: PairingFrame.Direction
+    ) async throws -> Never {
+        if let frame = try? PairingFrame.profileMismatch.seal(for: invitation, from: direction) {
+            try? await connection.send(frame)
+        }
+        await connection.cancel()
+        throw SyncError.incompatibleGroupProfile
     }
 
     public var linkedDevices: [LinkedDevice] {
@@ -1595,18 +1642,30 @@ public final class SyncEngine {
         pairingAttemptID = attemptID
         pairingDeadline = deadline
         peerDecision = nil
-        peerRefusedForTaskHistory = false
+        peerRefusal = nil
         lastPairingFailure = nil
         return attemptID
     }
 
     private func runInviterPairing(session: MLSSession, linked: Bool, attemptID: UUID) async {
         var linked = linked
+        var session = session
         do {
-            if !linked, try await adoptFoundingGroupIfJoined(session: session) {
-                try requireCurrentPairingAttempt(attemptID)
-                linked = true
+            if !linked {
+                if try await adoptFoundingGroupIfJoined(session: session) {
+                    try requireCurrentPairingAttempt(attemptID)
+                    linked = true
+                } else {
+                    try requireCurrentPairingAttempt(attemptID)
+                    guard let current = self.session else { throw SyncError.localStorageUnavailable }
+                    session = current
+                }
             }
+            let existingGroup = try await session.group()
+            if linked || existingGroup != nil {
+                try await requireGroupProfile(session: session)
+            }
+            let profile = groupProfile.descriptor
             let fingerprint = try await session.fingerprint()
             let groupID: Data
             if linked {
@@ -1621,7 +1680,7 @@ public final class SyncEngine {
             invitationPhrase = invitation.phrase
             invitationURL = try invitation.url(scheme: invitationURLScheme)
 
-            let offer = try PairingFrame.offer(groupID: groupID, inviterFingerprint: fingerprint)
+            let offer = try PairingFrame.offer(groupID: groupID, inviterFingerprint: fingerprint, profile: profile)
                 .seal(for: invitation, from: .fromInviter)
             let response = try await awaitJoinerResponse(
                 invitation: invitation, groupID: groupID, inviterFingerprint: fingerprint, offer: offer, attemptID: attemptID
@@ -1651,7 +1710,8 @@ public final class SyncEngine {
                 inviterFingerprint: fingerprint,
                 joinerFingerprint: joinerFingerprint,
                 inviterNonce: response.inviterNonce,
-                joinerNonce: response.joinerNonce
+                joinerNonce: response.joinerNonce,
+                profile: profile
             )
             isHostApprovalPending = true
             phase = .verifying
@@ -1685,7 +1745,7 @@ public final class SyncEngine {
                     before: nil, connection: connection, invitation: invitation
                 )
             } else {
-                try await session.createGroup(groupID)
+                try await session.createGroup(groupID, profile: profile)
             }
             let claim = try await reserve(joinerFingerprint, origins: joinerOrigins, session: session)
             await reservationHookForTesting?()
@@ -1815,13 +1875,17 @@ public final class SyncEngine {
                             let nonce = try bound?.nonce ?? Data.secureRandom(count: 32)
                             bound = (commitment, nonce)
                             try await connection.send(PairingFrame.nonce(nonce).seal(for: invitation, from: .fromInviter))
-                        case .response(let reference, let fingerprint, let joinerNonce, let origins):
+                        case .response(let reference, let fingerprint, let joinerNonce, let origins, let profile):
+                            guard profile == groupProfile.descriptor else {
+                                try await refuseMismatchedProfile(on: connection, invitation: invitation, from: .fromInviter)
+                            }
                             guard let bound, PairingSafetyCode.commitment(
                                 groupID: groupID,
                                 inviterFingerprint: inviterFingerprint,
                                 keyPackageReference: reference,
                                 joinerFingerprint: fingerprint,
-                                joinerNonce: joinerNonce
+                                joinerNonce: joinerNonce,
+                                profile: profile
                             ) == bound.commitment else {
                                 throw SyncError.invalidPairMessage
                             }
@@ -1835,6 +1899,8 @@ public final class SyncEngine {
                             )
                         case .decision:
                             throw SyncError.pairingDeclined
+                        case .profileMismatch:
+                            throw SyncError.incompatibleGroupProfile
                         case .offer, .nonce, .historyFull:
                             throw SyncError.invalidPairMessage
                         }
@@ -1855,7 +1921,7 @@ public final class SyncEngine {
         do {
             try resetSession()
             guard let session = self.session else { throw SyncError.localStorageUnavailable }
-            let (connection, groupID, inviterFingerprint) = try await awaitInviterOffer(
+            let (connection, groupID, inviterFingerprint, offeredProfile) = try await awaitInviterOffer(
                 invitation: invitation, attemptID: attemptID
             )
             if let expectedGroup = invitation.groupID, let expectedFingerprint = invitation.inviterFingerprint {
@@ -1864,7 +1930,11 @@ public final class SyncEngine {
                     throw SyncError.invalidPairMessage
                 }
             }
-            let published = try await session.publishKeyPackage(pairingToken: invitation.pairingToken)
+            let profile = groupProfile.descriptor
+            guard offeredProfile == profile else {
+                try await refuseMismatchedProfile(on: connection, invitation: invitation, from: .fromJoiner)
+            }
+            let published = try await session.publishKeyPackage(pairingToken: invitation.pairingToken, profile: profile)
             try requireCurrentPairingAttempt(attemptID)
             let joinerNonce = try Data.secureRandom(count: 32)
             let commitment = try PairingFrame.commitment(PairingSafetyCode.commitment(
@@ -1872,7 +1942,8 @@ public final class SyncEngine {
                 inviterFingerprint: inviterFingerprint,
                 keyPackageReference: published.reference,
                 joinerFingerprint: published.fingerprint,
-                joinerNonce: joinerNonce
+                joinerNonce: joinerNonce,
+                profile: profile
             )).seal(for: invitation, from: .fromJoiner)
             try await connection.send(commitment)
             let inviterNonce = try await awaitInviterNonce(
@@ -1883,7 +1954,8 @@ public final class SyncEngine {
                     keyPackageReference: published.reference,
                     joinerFingerprint: published.fingerprint,
                     joinerNonce: joinerNonce,
-                    origins: heldOrigins
+                    origins: heldOrigins,
+                    profile: profile
                 ).seal(for: invitation, from: .fromJoiner)
             )
             safetyCode = PairingSafetyCode.code(
@@ -1891,7 +1963,8 @@ public final class SyncEngine {
                 inviterFingerprint: inviterFingerprint,
                 joinerFingerprint: published.fingerprint,
                 inviterNonce: inviterNonce,
-                joinerNonce: joinerNonce
+                joinerNonce: joinerNonce,
+                profile: profile
             )
             var joinIntent = ReplicationCheckpoint(
                 group: groupID, members: [], joinPending: true, provider: inviterFingerprint
@@ -1908,13 +1981,14 @@ public final class SyncEngine {
                     throw SyncError.invitationExpired
                 }
                 if peerDecision == false {
-                    throw peerRefusedForTaskHistory ? SyncError.taskHistoryAtCapacity : SyncError.pairingDeclined
+                    throw peerRefusal ?? SyncError.pairingDeclined
                 }
                 do {
                     if try await session.join(
                         group: groupID,
                         keyPackageReference: published.reference,
-                        verifiedInviterFingerprint: inviterFingerprint
+                        verifiedInviterFingerprint: inviterFingerprint,
+                        profile: profile
                     ) {
                         break
                     }
@@ -1961,6 +2035,8 @@ public final class SyncEngine {
                     throw SyncError.pairingDeclined
                 case .historyFull:
                     throw SyncError.taskHistoryAtCapacity
+                case .profileMismatch:
+                    throw SyncError.incompatibleGroupProfile
                 case .commitment, .response:
                     throw SyncError.invalidPairMessage
                 }
@@ -1973,7 +2049,7 @@ public final class SyncEngine {
     private func awaitInviterOffer(
         invitation: Invitation,
         attemptID: UUID
-    ) async throws -> (any PairingConnection, Data, Data) {
+    ) async throws -> (any PairingConnection, Data, Data, Data?) {
         var delayNanoseconds: UInt64 = 500_000_000
         while true {
             let connection = try await connectPairing(route: invitation.route, attemptID: attemptID)
@@ -1986,12 +2062,14 @@ public final class SyncEngine {
                         continue
                     case .binary(let frame):
                         switch try PairingFrame.open(frame, for: invitation, from: .fromInviter) {
-                        case .offer(let group, let fingerprint):
-                            return (connection, group, fingerprint)
+                        case .offer(let group, let fingerprint, let profile):
+                            return (connection, group, fingerprint, profile)
                         case .decision:
                             throw SyncError.pairingDeclined
                         case .historyFull:
                             throw SyncError.taskHistoryAtCapacity
+                        case .profileMismatch:
+                            throw SyncError.incompatibleGroupProfile
                         case .commitment, .nonce, .response:
                             throw SyncError.invalidPairMessage
                         }
@@ -2066,17 +2144,19 @@ public final class SyncEngine {
                 guard let event = try? await connection.receive() else { return }
                 guard case .binary(let frame) = event else { continue }
                 let approved: Bool
-                let historyFull: Bool
+                var refusal: SyncError?
                 switch try? PairingFrame.open(frame, for: invitation, from: .fromInviter) {
                 case .decision(let decision)?:
-                    (approved, historyFull) = (decision, false)
+                    approved = decision
                 case .historyFull?:
-                    (approved, historyFull) = (false, true)
+                    (approved, refusal) = (false, .taskHistoryAtCapacity)
+                case .profileMismatch?:
+                    (approved, refusal) = (false, .incompatibleGroupProfile)
                 default:
                     continue
                 }
                 guard let self, self.pairingAttemptID == attemptID else { return }
-                if historyFull { self.peerRefusedForTaskHistory = true }
+                if let refusal { self.peerRefusal = refusal }
                 self.peerDecision = approved
                 if approved { return }
             }
@@ -2157,7 +2237,7 @@ public final class SyncEngine {
         pairingConnection = nil
         activeInvitation = nil
         peerDecision = nil
-        peerRefusedForTaskHistory = false
+        peerRefusal = nil
         invitationPhrase = nil
         invitationURL = nil
         invitationExpiresAt = nil
@@ -2431,6 +2511,9 @@ public final class SyncEngine {
     private func performSyncCycle(session: MLSSession) async throws {
         guard hasDurableStorage else {
             throw SyncError.localStorageUnavailable
+        }
+        if try await !session.isRemoved() {
+            try await requireGroupProfile(session: session)
         }
         var flushed = true
         do {
@@ -3138,6 +3221,8 @@ public final class SyncEngine {
             return .cancelled
         case MLSSessionError.removed:
             return .removed
+        case SyncError.incompatibleGroupProfile, MLSClientError.unsupportedGroupProfile:
+            return .blocked(.incompatibleGroupProfile)
         case MLSRelayError.historyExpired:
             return .blocked(.syncHistoryExpired)
         case ReplicaError.operationFork:
