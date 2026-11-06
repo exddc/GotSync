@@ -11,10 +11,11 @@ import ssl
 import subprocess
 import tempfile
 import unittest
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.asyncio.messages import MAX_FRAGMENTS
 from websockets.exceptions import ConnectionClosed, InvalidMessage
 
 from gotsync_server.server import (
@@ -515,6 +516,39 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionClosed) as closed:
             await first.recv()
         self.assertEqual(closed.exception.rcvd.code, 1009)
+
+    async def test_fragmented_binary_message_is_forwarded_whole(self) -> None:
+        first, second = await self.registered_pair(route_text(173))
+        await first.send([b"frag", b"mented", b"-message"])
+        self.assertEqual(await asyncio.wait_for(second.recv(), 1), b"fragmented-message")
+
+        # send() appends an empty final frame.
+        fragments = [bytes([index % 256]) for index in range(MAX_FRAGMENTS - 1)]
+        await first.send(fragments)
+        self.assertEqual(await asyncio.wait_for(second.recv(), 2), b"".join(fragments))
+
+    async def test_unfinished_message_with_too_many_fragments_is_closed(self) -> None:
+        first, second = await self.registered_pair(route_text(179))
+
+        async def empty_fragments() -> AsyncIterator[bytes]:
+            for _ in range(MAX_FRAGMENTS + 1):
+                yield b""
+            await asyncio.Event().wait()
+
+        sending = asyncio.create_task(first.send(empty_fragments()))
+        try:
+            with self.assertRaises(ConnectionClosed) as closed:
+                await asyncio.wait_for(first.recv(), 2)
+            self.assertEqual(closed.exception.rcvd.code, 1009)
+            self.assertEqual(closed.exception.rcvd.reason, "too many fragments")
+        finally:
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
+
+        peer_left = json.loads(await asyncio.wait_for(second.recv(), 1))
+        self.assertEqual(peer_left, {"type": "peerLeft", "version": 2})
+        counters = self.relay.service.metrics.snapshot()["counters"]
+        self.assertEqual(counters["binary_frames_forwarded"], 0)
 
     async def test_graceful_shutdown_closes_sockets_and_cleans_rooms(self) -> None:
         first, second = await self.registered_pair(route_text(201))
