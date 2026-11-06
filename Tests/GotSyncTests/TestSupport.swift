@@ -192,6 +192,9 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var rejectedAppends = 0
     private var failWelcomeAcknowledgement = false
     private var failingAcknowledgers: Set<Data> = []
+    private var fetchBudgets: [Data: Int] = [:]
+    private var unacknowledgedLimit: Int?
+    private(set) var interruptedFetches = 0
     private var expiredGroups: Set<Data> = []
     private(set) var lastPublishedReference: Data?
     private(set) var acknowledgementCount = 0
@@ -250,6 +253,16 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     func failAcknowledgements(by authorization: Data, _ fail: Bool) {
         if fail { failingAcknowledgers.insert(Self.digest(authorization)) } else { failingAcknowledgers.remove(Self.digest(authorization)) }
+    }
+
+    /// Refuses appends while a group holds `count` entries that some active
+    /// writer has not acknowledged, as the relay does before it can prune.
+    func limitUnacknowledgedEntries(to count: Int?) { unacknowledgedLimit = count }
+
+    /// Serves `count` more fetches to this writer, then fails its fetches
+    /// until called again with `nil`.
+    func limitFetches(by authorization: Data, to count: Int?) {
+        fetchBudgets[Self.digest(authorization)] = count
     }
 
     func acknowledged(by authorization: Data) -> UInt64? {
@@ -329,6 +342,11 @@ actor FakeMLSRelay: MLSRelayTransport {
             return try respond(.accepted(cursor: duplicate.cursor))
         }
         guard delivery.epoch == groups[delivery.group]?.epoch else { throw MLSRelayError.epochConflict }
+        if let unacknowledgedLimit, let group = groups[delivery.group] {
+            let floor = group.writers.values.filter { $0.removal == nil }.map(\.ack).min() ?? 0
+            let unacknowledged = entries.filter { $0.delivery.group == delivery.group && $0.cursor > floor }
+            if unacknowledged.count >= unacknowledgedLimit { throw MLSRelayError.capacityReached }
+        }
         if let reference = delivery.keyPackageReference {
             guard let package = packages[reference], package.writer == delivery.addWriter else {
                 return .keyPackageUnavailable(epoch: delivery.epoch)
@@ -357,6 +375,13 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     func fetch(group: Data, after cursor: UInt64, limit: Int, authorization: Data) throws -> [MLSRelayEntry] {
         if offlineWriters.contains(Self.digest(authorization)) { throw URLError(.notConnectedToInternet) }
+        if let budget = fetchBudgets[Self.digest(authorization)] {
+            guard budget > 0 else {
+                interruptedFetches += 1
+                throw URLError(.networkConnectionLost)
+            }
+            fetchBudgets[Self.digest(authorization)] = budget - 1
+        }
         let writer = try authorize(group: group, authorization: authorization)
         return Array(entries.filter {
             $0.delivery.group == group && $0.cursor > cursor && $0.cursor <= (writer.removal ?? .max)
