@@ -58,8 +58,8 @@ ciphertext, tag). The associated data is
 | 2 response | joiner to inviter | KeyPackage reference ‖ joiner fingerprint ‖ 32-byte joiner nonce `Nj` ‖ origin count `n` (one byte, at most 128) ‖ `n` 16-byte origin IDs |
 | 3 decision | either | one byte: 1 added, 0 declined or cancelled, 2 refused because the task history is full (inviter only) |
 
-The response lists every origin in the joiner's replica in strictly ascending
-byte order. A receiver rejects a response with more than 128 origins, a body
+The response lists every origin in the joiner's replica, including origins of
+saved operations that exceed a replica limit, in strictly ascending byte order. A receiver rejects a response with more than 128 origins, a body
 length other than `97 + 16n` bytes, or origins that are unsorted or repeated.
 A frame is at most 2,174 bytes.
 
@@ -144,8 +144,9 @@ as `provider` also sends every other missing origin.
 
 After joining, a device sends a `hello` that names its inviter as provider and
 then all retained operations. Each device then uploads its own operations in
-sequence. The engine applies received operations and persists the replica
-before it answers hellos and acknowledges the MLS inbox. A replay after a
+sequence. Before it acknowledges the MLS inbox, the engine applies received
+operations, persists the replica, and saves what each `hello` asks for. It
+answers saved requests afterwards, one batch at a time. A replay after a
 crash is idempotent.
 
 `sync-v2.json` in the storage directory records the group ID, each member's
@@ -347,8 +348,9 @@ limits how many devices are members at once to eight. A `hello` that carries
 all 128 vector entries stays under 10 KiB, and every origin holds at least one
 of the 10,000 retained operations.
 
-The engine counts the slots in use: every origin its replica retains, plus one
-slot for each current member, including this device, whether or not that
+The engine counts the slots in use: every origin its replica retains or holds
+in saved operations that exceed a replica limit, plus one slot for each current
+member, including this device, whether or not that
 member has edited. It does not match members to origins, because a replica's
 origin need not equal its member's device ID. A member that has already edited
 therefore counts twice, which can refuse a device up to eight slots early; a
@@ -363,7 +365,8 @@ nothing is linked.
 The inviter then checks the union of both histories with everything the group
 has already committed to. The count covers:
 
-- its own retained origins;
+- its own retained origins and the origins of operations it saved without
+  applying because they exceed a replica limit;
 - the origins named by operations and hellos it has received but not applied;
 - every active reservation (described below);
 - every origin in the joiner's response;
@@ -462,7 +465,12 @@ invitations.
 
 A new member cannot read reservations published before it joined. When the
 inviter answers the new member's join `hello`, it sends a `reservations`
-message for that member with every claim it holds. Only a member that has
+message for that member with every claim it holds. The member named as
+provider saves each such request before it acknowledges the inbox, sends the
+whole missing history first, and sends the snapshot afterwards. It holds the
+snapshot back while it keeps operations it has not applied, because its
+history is then incomplete, and the requester moves on to the next member. It
+forgets a request only after the snapshot is sent or the requester has left. Only a member that has
 its own snapshot answers, so a snapshot addressed to the new member is
 complete as of the `hello` it answers. The new member merges claims by their
 original log cursor. A known claim keeps its local state, and a release that

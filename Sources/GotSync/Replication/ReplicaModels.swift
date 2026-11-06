@@ -42,6 +42,22 @@ enum ReplicaError: Error, Equatable, Sendable {
     case corruptArchive(String)
 }
 
+extension ReplicaError {
+    /// The operation is valid, but applying it would exceed a replica limit.
+    var isCapacityLimit: Bool {
+        switch self {
+        case .tooManyTasks, .tooManyOperations, .tooManyOrigins:
+            true
+        default:
+            false
+        }
+    }
+
+    var isFork: Bool {
+        if case .operationFork = self { true } else { false }
+    }
+}
+
 extension ReplicaError: LocalizedError {
     var errorDescription: String? {
         switch self {

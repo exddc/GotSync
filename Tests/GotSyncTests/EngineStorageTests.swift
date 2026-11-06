@@ -426,4 +426,139 @@ final class EngineStorageTests: XCTestCase {
         XCTAssertEqual(created.originDeviceID, originAfterErase)
         XCTAssertEqual(created.originSequence, 1)
     }
+
+    @MainActor
+    func testDeferredOperationsAreLoadedAtLaunchAndErased() throws {
+        let keychain = MemorySecretStore(service: "com.gotdone.relay.tests.\(UUID().uuidString)")
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+        try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        let deferredURL = baseDirectory.appendingPathComponent(DeferredOperationStore.filename)
+        let operations = (1...3).map {
+            TaskOperation(
+                originDeviceID: ReplicaDeviceID(uuid: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!),
+                originSequence: UInt64($0),
+                lamport: UInt64($0),
+                taskID: UUID(),
+                mutation: .create(title: "Deferred \($0)", completed: false)
+            )
+        }
+
+        try DeferredOperationStore.save(operations, to: deferredURL)
+        XCTAssertEqual(try DeferredOperationStore.load(from: deferredURL), operations)
+
+        let model = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        XCTAssertEqual(model.unappliedRemoteOperationCount, 3)
+        XCTAssertEqual(model.state.unappliedRemoteOperationCount, 3)
+        model.eraseLocalData()
+        XCTAssertEqual(model.unappliedRemoteOperationCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
+
+        let unreadable = Data("not deferred operations".utf8)
+        try unreadable.write(to: deferredURL)
+        for _ in 0..<2 {
+            let relaunched = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+            XCTAssertEqual(relaunched.phase, .failed)
+            XCTAssertEqual(relaunched.errorMessage, SyncError.localStorageUnavailable.errorDescription)
+            XCTAssertFalse(relaunched.isPaired)
+            relaunched.createPrivateSync()
+            XCTAssertNil(relaunched.invitationURL)
+            XCTAssertEqual(relaunched.phase, .failed)
+            XCTAssertEqual(try Data(contentsOf: deferredURL), unreadable)
+        }
+        let repaired = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        repaired.eraseLocalData()
+        XCTAssertEqual(repaired.phase, .unpaired)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
+    }
+
+    @MainActor
+    func testReplyObligationKeepsLowestRequestAndFailsClosedWhenUnreadable() throws {
+        let a = ReplicaDeviceID(uuid: UUID())
+        let b = ReplicaDeviceID(uuid: UUID())
+        var obligation = ReplyObligation()
+        obligation.merge(try ReplicaVersionVector([a: 5, b: 2]), provider: true)
+        obligation.merge(try ReplicaVersionVector([a: 3]), provider: true)
+        XCTAssertEqual(obligation.provided, try ReplicaVersionVector([a: 3]))
+        XCTAssertNil(obligation.own)
+        obligation.advance(past: (4...6).map {
+            TaskOperation(originDeviceID: a, originSequence: $0, lamport: $0, taskID: UUID(), mutation: .setCompleted(true))
+        })
+        XCTAssertEqual(obligation.provided, try ReplicaVersionVector([a: 6]))
+
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+        try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        let url = baseDirectory.appendingPathComponent(ReplyObligation.filename)
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+        try ReplyObligation.save(nil, to: url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        let unreadable = Data("not a reply obligation".utf8)
+        try unreadable.write(to: url)
+        let keychain = MemorySecretStore(service: "com.gotdone.relay.tests.\(UUID().uuidString)")
+        let engine = SyncEngine(keychain: keychain, baseDirectory: baseDirectory)
+        XCTAssertEqual(engine.phase, .failed)
+        XCTAssertEqual(engine.errorMessage, SyncError.localStorageUnavailable.errorDescription)
+        XCTAssertEqual(try Data(contentsOf: url), unreadable)
+        engine.eraseLocalData()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testReplyObligationStaysWithinOriginLimitAcrossRestart() throws {
+        let requested = (0..<ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let held = (0..<ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let request = try ReplicaVersionVector(Dictionary(uniqueKeysWithValues: requested.map { ($0, 1) }))
+        var obligation = ReplyObligation()
+        obligation.merge(request, provider: true)
+        obligation.merge(request, provider: false)
+        obligation.advance(past: held.map {
+            TaskOperation(originDeviceID: $0, originSequence: 1, lamport: 1, taskID: UUID(), mutation: .setCompleted(true))
+        })
+        obligation.retain(origins: held)
+        let own = try XCTUnwrap(obligation.own)
+        let provided = try XCTUnwrap(obligation.provided)
+        XCTAssertEqual(Set(own.origins), Set(held))
+        XCTAssertEqual(Set(provided.origins), Set(held))
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+    }
+
+    func testReplyObligationKeepsBoundedSnapshotRecipientsUntilEachIsSent() throws {
+        let members = (0..<(SyncEngine.maximumGroupSize + 2)).map { Data(repeating: UInt8($0), count: 32) }
+        var obligation = ReplyObligation()
+        obligation.merge(ReplicaVersionVector(), provider: true)
+        for member in members + members.suffix(3) {
+            obligation.addRecipient(member)
+        }
+        XCTAssertEqual(obligation.recipients, Array(members.suffix(SyncEngine.maximumGroupSize)))
+
+        obligation.completeHistory()
+        XCTAssertNil(obligation.provided)
+        XCTAssertFalse(obligation.isEmpty)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
+
+        for member in members.suffix(SyncEngine.maximumGroupSize - 1) {
+            obligation.removeRecipient(member)
+        }
+        XCTAssertFalse(obligation.isEmpty)
+        obligation.removeRecipient(members[2])
+        XCTAssertTrue(obligation.isEmpty)
+        try ReplyObligation.save(obligation, to: url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        var oversized = ReplyObligation()
+        oversized.recipients = members
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(oversized), to: url)
+        XCTAssertThrowsError(try ReplyObligation.load(from: url))
+    }
 }

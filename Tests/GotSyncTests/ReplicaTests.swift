@@ -746,6 +746,183 @@ final class ReplicaTests: XCTestCase {
         }
     }
 
+    func testIntakeDefersCapacityBlockedOriginsAndDropsInvalidOperations() throws {
+        var replica = try seededReplica(taskCount: ReplicaLimits.maxTasks)
+        let localTask = try XCTUnwrap(replica.tasks.first).id
+        let blocked = operation(
+            origin: 1, sequence: 1, lamport: 2_000, taskID: task(500),
+            mutation: .create(title: "Blocked", completed: false)
+        )
+        let rename = operation(
+            origin: 1, sequence: 2, lamport: 2_001, taskID: task(500), mutation: .setTitle("Renamed")
+        )
+        let oversized = operation(
+            origin: 1, sequence: 3, lamport: 2_002, taskID: task(500),
+            mutation: .setTitle(String(repeating: "a", count: 201))
+        )
+        let toggle = operation(
+            origin: 2, sequence: 1, lamport: 2_003, taskID: localTask, mutation: .setCompleted(true)
+        )
+        let malformed = operation(
+            origin: 3, sequence: 1, lamport: 0, taskID: task(501),
+            mutation: .create(title: "Malformed", completed: false)
+        )
+        let gapped = operation(
+            origin: 4, sequence: 2, lamport: 2_004, taskID: localTask, mutation: .setCompleted(false)
+        )
+
+        let intake = try replica.applyAvailable([gapped, malformed, rename, toggle, oversized, blocked])
+
+        XCTAssertEqual(intake.accepted, 1)
+        XCTAssertEqual(intake.deferred, [blocked, rename])
+        XCTAssertEqual(intake.waiting, [gapped])
+        XCTAssertEqual(replica.task(id: localTask)?.isCompleted, true)
+        XCTAssertEqual(replica.versionVector[device(1)], 0)
+        XCTAssertEqual(replica.versionVector[device(3)], 0)
+        XCTAssertNil(replica.task(id: task(500)))
+        XCTAssertEqual(replica.taskRecords.count, ReplicaLimits.maxTasks)
+    }
+
+    func testIntakeRetriesDeferredOperationsWithoutDuplicating() throws {
+        let blocked = operation(
+            origin: 1, sequence: 1, lamport: 2_000, taskID: task(500),
+            mutation: .create(title: "Blocked", completed: false)
+        )
+        let rename = operation(
+            origin: 1, sequence: 2, lamport: 2_001, taskID: task(500), mutation: .setTitle("Renamed")
+        )
+        let complete = operation(
+            origin: 1, sequence: 3, lamport: 2_002, taskID: task(500), mutation: .setCompleted(true)
+        )
+
+        var full = try seededReplica(taskCount: ReplicaLimits.maxTasks)
+        let stillBlocked = try full.applyAvailable([complete, blocked], previouslyDeferred: [blocked, rename])
+        XCTAssertEqual(stillBlocked.accepted, 0)
+        XCTAssertEqual(stillBlocked.deferred, [blocked, rename, complete])
+        XCTAssertTrue(stillBlocked.waiting.isEmpty)
+
+        let conflicting = operation(
+            origin: 1, sequence: 2, lamport: 2_001, taskID: task(500), mutation: .setTitle("Different")
+        )
+        XCTAssertThrowsError(try full.applyAvailable([conflicting], previouslyDeferred: stillBlocked.deferred)) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 2))
+        }
+
+        var roomy = try TaskReplica(deviceID: device(9))
+        let retried = try roomy.applyAvailable([], previouslyDeferred: stillBlocked.deferred)
+        XCTAssertEqual(retried.accepted, 3)
+        XCTAssertTrue(retried.deferred.isEmpty)
+        XCTAssertEqual(roomy.tasks.map(\.titleValue), ["Renamed"])
+        XCTAssertEqual(roomy.tasks.first?.isCompleted, true)
+    }
+
+    func testIntakeDefersEveryBlockedOperationWithoutTruncating() throws {
+        var replica = try seededReplica(taskCount: ReplicaLimits.maxTasks)
+        var operations: [TaskOperation] = []
+        for origin: UInt8 in [1, 2] {
+            for sequence: UInt64 in 1...5_001 {
+                let mutation: TaskMutation = sequence == 1
+                    ? .create(title: "Blocked", completed: false)
+                    : .setCompleted(sequence % 2 == 0)
+                operations.append(operation(
+                    origin: origin, sequence: sequence, lamport: 20_000 + sequence,
+                    taskID: task(UInt16(origin)), mutation: mutation
+                ))
+            }
+        }
+
+        let intake = try replica.applyAvailable(operations)
+
+        XCTAssertEqual(intake.accepted, 0)
+        XCTAssertTrue(intake.waiting.isEmpty)
+        XCTAssertEqual(intake.deferred.count, operations.count)
+    }
+
+    func testIntakeRejectsConflictingCopiesBeforeApplyingAnything() throws {
+        let saved = operation(
+            origin: 1, sequence: 1, lamport: 1, taskID: task(500), mutation: .create(title: "Saved", completed: false)
+        )
+        let conflicting = operation(
+            origin: 1, sequence: 1, lamport: 1, taskID: task(500),
+            mutation: .create(title: "Conflicting", completed: false)
+        )
+        var roomy = try TaskReplica(deviceID: device(9))
+        XCTAssertThrowsError(try roomy.applyAvailable([conflicting], previouslyDeferred: [saved])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+        XCTAssertEqual(roomy.versionVector[device(1)], 0)
+        XCTAssertTrue(roomy.taskRecords.isEmpty)
+
+        try roomy.applyRemote([saved])
+        XCTAssertThrowsError(try roomy.applyAvailable([conflicting])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+        var fresh = try TaskReplica(deviceID: device(9))
+        XCTAssertThrowsError(try fresh.applyAvailable([saved, conflicting])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+    }
+
+    func testIntakeRejectsByteDifferentUnicodeCopyOfBlockedOperation() throws {
+        let composed = operation(
+            origin: 1, sequence: 1, lamport: 2_000, taskID: task(500), mutation: .create(title: "Caf\u{E9}", completed: false)
+        )
+        let decomposed = operation(
+            origin: 1, sequence: 1, lamport: 2_000, taskID: task(500), mutation: .create(title: "Cafe\u{301}", completed: false)
+        )
+        XCTAssertEqual(composed, decomposed)
+        XCTAssertNotEqual(try composed.canonicalData(), try decomposed.canonicalData())
+
+        var full = try seededReplica(taskCount: ReplicaLimits.maxTasks)
+        let archive = try full.atomicArchiveData()
+        XCTAssertThrowsError(try full.applyAvailable([decomposed], previouslyDeferred: [composed])) {
+            XCTAssertEqual($0 as? ReplicaError, .operationFork(origin: device(1), sequence: 1))
+        }
+        XCTAssertEqual(try full.atomicArchiveData(), archive)
+    }
+
+    func testIntakeDefersOperationsOverOperationAndOriginLimits() throws {
+        var fullLog = try seededReplica(taskCount: 1, toggleCount: ReplicaLimits.maxOperations - 1)
+        let localTask = try XCTUnwrap(fullLog.tasks.first).id
+        let toggle = operation(
+            origin: 1, sequence: 1, lamport: 20_000, taskID: localTask, mutation: .setCompleted(true)
+        )
+        XCTAssertThrowsError(try fullLog.applyRemote([toggle])) {
+            XCTAssertEqual($0 as? ReplicaError, .tooManyOperations(ReplicaLimits.maxOperations + 1))
+            XCTAssertEqual(($0 as? ReplicaError)?.isCapacityLimit, true)
+        }
+        let logIntake = try fullLog.applyAvailable([toggle])
+        XCTAssertEqual(logIntake.accepted, 0)
+        XCTAssertEqual(logIntake.deferred, [toggle])
+
+        let foreign = (1...UInt8.max).filter { $0 != 9 && $0 != 99 }.prefix(ReplicaLimits.maxOrigins - 1).map(device)
+        var fullOrigins = try seededReplica(taskCount: 1, foreignOrigins: foreign)
+        let originTask = try XCTUnwrap(fullOrigins.tasks.first).id
+        let newOrigin = operation(
+            origin: 99, sequence: 1, lamport: 100, taskID: originTask, mutation: .setCompleted(true)
+        )
+        let knownOrigin = operation(
+            origin: 1, sequence: 2, lamport: 101, taskID: originTask, mutation: .setCompleted(false)
+        )
+        let originIntake = try fullOrigins.applyAvailable([newOrigin, knownOrigin])
+        XCTAssertEqual(originIntake.accepted, 1)
+        XCTAssertEqual(originIntake.deferred, [newOrigin])
+        XCTAssertEqual(fullOrigins.versionVector[device(1)], 2)
+    }
+
+    private func seededReplica(
+        taskCount: Int,
+        toggleCount: Int = 0,
+        foreignOrigins: [ReplicaDeviceID] = []
+    ) throws -> TaskReplica {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        try ReplicaFixture.archive(
+            deviceID: device(9), taskCount: taskCount, toggleCount: toggleCount, foreignOrigins: foreignOrigins
+        ).write(to: url)
+        return try TaskReplica(deviceID: device(9), persistenceURL: url)
+    }
+
     private func device(_ byte: UInt8) -> ReplicaDeviceID {
         try! ReplicaDeviceID(bytes: Data(repeating: byte, count: 16))
     }

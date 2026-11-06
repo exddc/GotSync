@@ -29,7 +29,8 @@ final class SyncEngineMLSTests: XCTestCase {
         _ name: String,
         approvalTimeoutNanoseconds: UInt64 = SyncTiming.approvalTimeoutNanoseconds,
         provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
-        departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000
+        departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000,
+        deferredOperationLimit: Int = DeferredOperationStore.maximumCount
     ) -> SyncEngine {
         let store = stores[name] ?? MemorySecretStore()
         stores[name] = store
@@ -49,7 +50,8 @@ final class SyncEngineMLSTests: XCTestCase {
             syncIntervalNanoseconds: 50_000_000,
             approvalTimeoutNanoseconds: approvalTimeoutNanoseconds,
             provisionalMemberWindow: provisionalMemberWindow,
-            departureRetryDelayNanoseconds: departureRetryDelayNanoseconds
+            departureRetryDelayNanoseconds: departureRetryDelayNanoseconds,
+            deferredOperationLimit: deferredOperationLimit
         )
         engines.append(engine)
         return engine
@@ -2257,6 +2259,649 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertEqual(host.linkedDevices.map(\.isCurrentDevice), [true])
         let reopened = engine("host")
         try await wait("lone member stays linked") { reopened.isPaired && reopened.phase == .synced }
+    }
+
+    private func seededEngine(
+        _ name: String,
+        taskCount: Int,
+        toggleCount: Int = 0,
+        foreignOrigins: [ReplicaDeviceID] = [],
+        deferredOperationLimit: Int = DeferredOperationStore.maximumCount
+    ) async throws -> SyncEngine {
+        let initial = engine(name)
+        let deviceID = try ReplicaDeviceID(bytes: initial.localDeviceID)
+        await restartable(initial)
+        try ProtectedStorage.write(
+            ReplicaFixture.archive(
+                deviceID: deviceID, taskCount: taskCount, toggleCount: toggleCount, foreignOrigins: foreignOrigins
+            ),
+            to: root.appendingPathComponent("\(name)/replica-v1.json")
+        )
+        return engine(name, deferredOperationLimit: deferredOperationLimit)
+    }
+
+    private func send(_ operations: [TaskOperation], from engine: SyncEngine) async throws {
+        let session = try XCTUnwrap(engine.mlsSessionForTesting)
+        guard case .accepted = try await session.send(ReplicationMessage.operations(operations).encoded()) else {
+            throw SyncTestError.timeout
+        }
+    }
+
+    private func inboxOperations(_ engine: SyncEngine) async throws -> [TaskOperation] {
+        let inbox = try await engine.mlsSessionForTesting?.inbox() ?? []
+        return inbox.flatMap { (try? ReplicationMessage.decode($0.plaintext))?.operations ?? [] }
+    }
+
+    private func deferredOperations(_ name: String) throws -> [TaskOperation] {
+        try DeferredOperationStore.load(from: root.appendingPathComponent("\(name)/\(DeferredOperationStore.filename)"))
+    }
+
+    private func create(_ origin: ReplicaDeviceID, _ sequence: UInt64, task: UUID = UUID(), title: String) -> TaskOperation {
+        TaskOperation(
+            originDeviceID: origin, originSequence: sequence, lamport: 5_000 + sequence, taskID: task,
+            mutation: .create(title: title, completed: false)
+        )
+    }
+
+    private func toggle(_ origin: ReplicaDeviceID, _ sequence: UInt64, task: UUID) -> TaskOperation {
+        TaskOperation(
+            originDeviceID: origin, originSequence: sequence, lamport: 5_000 + sequence, taskID: task,
+            mutation: .setCompleted(sequence % 2 == 0)
+        )
+    }
+
+    func testDeferredLimitLeavesLaterMessagesUnacknowledged() async throws {
+        var host = try await seededEngine("bound-host", taskCount: ReplicaLimits.maxTasks, deferredOperationLimit: 3)
+        let peer = engine("bound-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks && host.phase == .synced && peer.phase == .synced
+        }
+
+        let first = ReplicaDeviceID(uuid: UUID())
+        let second = ReplicaDeviceID(uuid: UUID())
+        let third = ReplicaDeviceID(uuid: UUID())
+        let firstTask = UUID()
+        let held = [create(first, 1, task: firstTask, title: "First"), toggle(first, 2, task: firstTask)]
+        let heldSecond = [create(second, 1, title: "Second")]
+        let overflow = [create(third, 1, title: "Third")]
+        let afterOverflow = [toggle(first, 3, task: firstTask)]
+        let applicable = [TaskOperation(
+            originDeviceID: ReplicaDeviceID(uuid: UUID()), originSequence: 1, lamport: 6_000,
+            taskID: ReplicaFixture.taskID(1), mutation: .setCompleted(true)
+        )]
+        for operations in [held, heldSecond, overflow, afterOverflow, applicable] {
+            try await send(operations, from: peer)
+        }
+
+        let sent = held + heldSecond + overflow + afterOverflow + applicable
+        for restart in 0..<2 {
+            if restart == 1 {
+                await restartable(host)
+                host = engine("bound-host", deferredOperationLimit: 3)
+                XCTAssertEqual(host.unappliedRemoteOperationCount, 3)
+            }
+            try await waitForCapacityReport(host, unapplied: 3)
+            try await wait("overflowing messages stay in the inbox") {
+                try await self.inboxOperations(host) == overflow + afterOverflow + applicable
+                    && host.tasks.first { $0.id == ReplicaFixture.taskID(1) }?.isCompleted == true
+            }
+            XCTAssertEqual(try deferredOperations("bound-host"), (held + heldSecond).sorted(by: ReplicaOrdering.operations))
+            let kept = try deferredOperations("bound-host") + (try await inboxOperations(host))
+            XCTAssertEqual(Set(kept.map(TaskReplica.OperationID.init)), Set(sent.map(TaskReplica.OperationID.init)))
+            XCTAssertEqual(host.tasks.count, ReplicaLimits.maxTasks)
+        }
+    }
+
+    func testFullDeferredStoreKeepsNewBlockedOperationsInInboxAcrossRestart() async throws {
+        var host = try await seededEngine("full-host", taskCount: ReplicaLimits.maxTasks)
+        let peer = engine("full-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks && host.phase == .synced && peer.phase == .synced
+        }
+        await restartable(host)
+        let origin = ReplicaDeviceID(uuid: UUID())
+        let task = UUID()
+        let saved = [create(origin, 1, task: task, title: "Saved")]
+            + (2...UInt64(DeferredOperationStore.maximumCount)).map { toggle(origin, $0, task: task) }
+        let storeURL = root.appendingPathComponent("full-host/\(DeferredOperationStore.filename)")
+        try DeferredOperationStore.save(saved, to: storeURL)
+        let storedBytes = try Data(contentsOf: storeURL)
+
+        let incoming = [create(ReplicaDeviceID(uuid: UUID()), 1, title: "Incoming")]
+        try await send(incoming, from: peer)
+        for _ in 0..<2 {
+            host = engine("full-host")
+            XCTAssertEqual(host.unappliedRemoteOperationCount, DeferredOperationStore.maximumCount)
+            try await waitForCapacityReport(host, unapplied: DeferredOperationStore.maximumCount, timeout: .seconds(60))
+            try await wait("blocked message stays in the inbox", timeout: .seconds(30)) {
+                try await self.inboxOperations(host) == incoming
+            }
+            XCTAssertEqual(try Data(contentsOf: storeURL), storedBytes)
+            await restartable(host)
+        }
+    }
+
+    func testRetryKeepsSavedOperationsThatNowWaitOnAGap() async throws {
+        var host = try await seededEngine("gap-host", taskCount: ReplicaLimits.maxTasks)
+        let peer = engine("gap-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks && host.phase == .synced && peer.phase == .synced
+        }
+        let origin = ReplicaDeviceID(uuid: UUID())
+        let task = UUID()
+        let head = create(origin, 1, task: task, title: "Head")
+        let afterGap = toggle(origin, 3, task: task)
+        try await send([head, afterGap], from: peer)
+        try await waitForCapacityReport(host, unapplied: 2)
+
+        await restartable(host)
+        let hostID = try ReplicaDeviceID(bytes: host.localDeviceID)
+        try ProtectedStorage.write(
+            ReplicaFixture.archive(deviceID: hostID, taskCount: ReplicaLimits.maxTasks - 1),
+            to: root.appendingPathComponent("gap-host/replica-v1.json")
+        )
+        host = engine("gap-host")
+        try await wait("head applied") {
+            host.tasks.contains { $0.titleValue == "Head" } && host.unappliedRemoteOperationCount == 1
+        }
+        XCTAssertEqual(try deferredOperations("gap-host"), [afterGap])
+        XCTAssertNotEqual(host.phase, .synced)
+    }
+
+    func testUnreadableDeferredStoreKeepsLinkAndBlocksSyncUntilUnlink() async throws {
+        var host = engine("unreadable-host")
+        let peer = engine("unreadable-peer")
+        XCTAssertTrue(host.addTask(title: "Kept"))
+        try await pair(host, peer)
+        try await wait("synced") { host.phase == .synced && peer.tasks.count == 1 }
+        await restartable(host)
+        let storeURL = root.appendingPathComponent("unreadable-host/\(DeferredOperationStore.filename)")
+        let unreadable = Data("unreadable".utf8)
+        try unreadable.write(to: storeURL)
+        XCTAssertTrue(peer.addTask(title: "Not received"))
+
+        host = engine("unreadable-host")
+        XCTAssertTrue(host.isPaired)
+        XCTAssertEqual(host.phase, .failed)
+        XCTAssertEqual(host.mailboxError, .localStorageUnavailable)
+        XCTAssertTrue(host.mailboxRequiresRepair)
+        host.applicationDidBecomeActive()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(host.phase, .failed)
+        XCTAssertEqual(host.tasks.map(\.titleValue), ["Kept"])
+        XCTAssertEqual(try Data(contentsOf: storeURL), unreadable)
+
+        host.unlinkAndKeepTasks()
+        XCTAssertEqual(host.phase, .unpaired)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeURL.path))
+        XCTAssertEqual(host.tasks.map(\.titleValue), ["Kept"])
+    }
+
+    private func replaceArchive(_ name: String, dropping origins: [ReplicaDeviceID]) throws {
+        let url = root.appendingPathComponent("\(name)/replica-v1.json")
+        let archive = try ReplicaArchive.decodeCanonical(from: Data(contentsOf: url))
+        let kept = archive.operations
+            .filter { !origins.contains($0.originDeviceID) }
+            .sorted(by: ReplicaOrdering.operations)
+        try FileManager.default.removeItem(at: url)
+        var replica = try TaskReplica(
+            deviceID: archive.deviceID, persistenceURL: url, newOrigin: archive.originDeviceID
+        )
+        for batch in try OperationBatcher.batches(kept) {
+            try replica.applyRemote(batch)
+        }
+    }
+
+    func testUploadsProgressWhileHeldInboxIsFullAndEverythingAppliesOnceItFits() async throws {
+        var foreign = (1..<(ReplicaLimits.maxOrigins - 3)).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        var host = try await seededEngine(
+            "held-host", taskCount: 1, foreignOrigins: foreign, deferredOperationLimit: 1
+        )
+        let peer = engine("held-peer")
+        let third = engine("held-third")
+        try await pair(host, peer)
+        try await pair(host, third)
+        try await wait("linked") {
+            [host, peer, third].allSatisfy { $0.linkedMemberCount == 3 && $0.phase == .synced }
+        }
+        let filling = (0..<3).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        try await send(filling.map { create($0, 1, title: "Filling") }, from: peer)
+        foreign += filling
+        try await wait("origins full") {
+            host.replicaForTesting.versionVector.origins.count == ReplicaLimits.maxOrigins && host.phase == .synced
+        }
+
+        try await send([create(ReplicaDeviceID(uuid: UUID()), 1, title: "Saved")], from: peer)
+        try await waitForCapacityReport(host, unapplied: 1)
+        let blockedOrigin = ReplicaDeviceID(uuid: UUID())
+        let blockedTask = UUID()
+        try await send([create(blockedOrigin, 1, task: blockedTask, title: "Blocked")], from: peer)
+        for sequence: UInt64 in 2...1_001 {
+            try await send([toggle(blockedOrigin, sequence, task: blockedTask)], from: peer)
+        }
+        try await wait("held inbox full", timeout: .seconds(60)) {
+            try await host.mlsSessionForTesting?.inbox().count == 1_000
+        }
+        let storeURL = root.appendingPathComponent("held-host/\(DeferredOperationStore.filename)")
+        let storedBytes = try Data(contentsOf: storeURL)
+
+        XCTAssertTrue(host.addTask(title: "Outbound 1"))
+        try await wait("first upload", timeout: .seconds(30)) {
+            peer.tasks.contains { $0.titleValue == "Outbound 1" } && host.pendingMailboxOperationCount == 0
+        }
+        try await waitForCapacityReport(host, unapplied: 1)
+
+        await restartable(host)
+        host = engine("held-host", deferredOperationLimit: 1)
+        try await waitForCapacityReport(host, unapplied: 1)
+        await relay.dropNextAppendResponse()
+        XCTAssertTrue(host.addTask(title: "Outbound 2"))
+        try await wait("upload after restart and lost response", timeout: .seconds(30)) {
+            peer.tasks.contains { $0.titleValue == "Outbound 2" } && host.pendingMailboxOperationCount == 0
+        }
+        try await waitForCapacityReport(host, unapplied: 1)
+        let held = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertEqual(held.count, 1_000)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storedBytes)
+        XCTAssertEqual(peer.tasks.filter { $0.titleValue?.hasPrefix("Outbound") == true }.count, 2)
+
+        let thirdFingerprint = try await fingerprint(third)
+        XCTAssertTrue(peer.removeDevice(fingerprint: thirdFingerprint))
+        try await wait("commit behind the held inbox") { peer.linkedMemberCount == 2 }
+        try await send([TaskOperation(
+            originDeviceID: blockedOrigin, originSequence: 1_002, lamport: 7_000, taskID: blockedTask,
+            mutation: .setTitle("Final")
+        )], from: peer)
+
+        await restartable(host)
+        try replaceArchive("held-host", dropping: Array(foreign.prefix(2)))
+        host = engine("held-host")
+        try await wait("everything applied", timeout: .seconds(60)) {
+            host.unappliedRemoteOperationCount == 0 && host.phase == .synced && host.linkedMemberCount == 2
+                && host.tasks.first { $0.id == blockedTask }?.titleValue == "Final"
+        }
+        let drained = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertTrue(drained.isEmpty)
+        XCTAssertNil(host.mailboxError)
+        XCTAssertTrue(host.tasks.contains { $0.titleValue == "Saved" })
+        XCTAssertEqual(host.tasks.filter { $0.titleValue?.hasPrefix("Outbound") == true }.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeURL.path))
+
+        XCTAssertTrue(host.addTask(title: "Outbound 3"))
+        try await wait("upload after recovery") { peer.tasks.contains { $0.titleValue == "Outbound 3" } }
+    }
+
+    func testHeldHelloIsAnsweredAfterCommitBehindFullInbox() async throws {
+        var host = engine("hh-host")
+        XCTAssertTrue(host.addTask(title: "Host task"))
+        let peer = engine("hh-peer")
+        let third = engine("hh-third")
+        try await pair(host, peer)
+        try await pair(host, third)
+        try await wait("linked") {
+            [host, peer, third].allSatisfy {
+                $0.linkedMemberCount == 3 && $0.phase == .synced && $0.pendingMailboxOperationCount == 0
+            } && peer.tasks.contains { $0.titleValue == "Host task" }
+        }
+        let thirdFingerprint = try await fingerprint(third)
+
+        await relay.setAppendsUnavailable(true)
+        XCTAssertTrue(host.addTask(title: "Pending"))
+        try await wait("pending delivery left behind") {
+            try await host.mlsSessionForTesting?.pendingDelivery() != nil && host.mailboxState == .unavailable
+        }
+        await restartable(host)
+        await restartable(third)
+        await relay.setAppendsUnavailable(false)
+
+        let session = try XCTUnwrap(peer.mlsSessionForTesting)
+        guard case .accepted = try await session.send(
+            ReplicationMessage.hello(vector: ReplicaVersionVector(), provider: nil).encoded()
+        ) else {
+            return XCTFail("The hello was not delivered.")
+        }
+        let origin = ReplicaDeviceID(uuid: UUID())
+        let task = UUID()
+        try await send([create(origin, 1, task: task, title: "Busy")], from: peer)
+        for sequence: UInt64 in 2...1_050 {
+            try await send([toggle(origin, sequence, task: task)], from: peer)
+        }
+        XCTAssertTrue(peer.removeDevice(fingerprint: thirdFingerprint))
+        try await wait("commit behind the full inbox", timeout: .seconds(60)) { peer.linkedMemberCount == 2 }
+
+        host = engine("hh-host")
+        try await wait("recovered", timeout: .seconds(60)) {
+            host.phase == .synced && host.linkedMemberCount == 2
+                && host.tasks.first { $0.id == task }?.isCompleted == true
+                && peer.tasks.contains { $0.titleValue == "Pending" }
+        }
+        let inbox = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.inbox())
+        XCTAssertTrue(inbox.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("hh-host/\(ReplyObligation.filename)").path
+        ))
+    }
+
+    func testProviderHistoryThenSnapshotSurviveLostSendsAndRestarts() async throws {
+        var host = try await seededEngine("reply-host", taskCount: 600)
+        let first = engine("reply-first")
+        try await pair(host, first)
+        let obligationURL = root.appendingPathComponent("reply-host/\(ReplyObligation.filename)")
+        try await wait("first copy", timeout: .seconds(30)) {
+            first.tasks.count == 600 && host.pendingMailboxOperationCount == 0 && host.phase == .synced
+                && !FileManager.default.fileExists(atPath: obligationURL.path)
+        }
+        let authorization = try await XCTUnwrapAsync(await host.mlsSessionForTesting?.client.transportAuthorization())
+        var replyBatches = 0
+        host.replyBatchHookForTesting = { [relay] in
+            replyBatches += 1
+            if replyBatches == 2 {
+                await relay?.dropAppendResponse(of: authorization, afterAccepting: 0)
+            }
+        }
+
+        let joiner = engine("reply-joiner")
+        joiner.beforeReservationRequestHookForTesting = { throw CancellationError() }
+        try await pair(host, joiner)
+        try await wait("second reply batch lost", timeout: .seconds(30)) {
+            await !self.relay.isWriterAppendDropPending && host.mailboxState == .unavailable
+        }
+        try await wait("accepted reply batches received") {
+            joiner.tasks.count == 2 * ReplicaLimits.maxBatchOperations
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: obligationURL.path))
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+
+        await restartable(host)
+        await relay.setAppendsUnavailable(false)
+        host = engine("reply-host")
+        var pendingAtSnapshot: [ReplyObligation?] = []
+        host.snapshotSendHookForTesting = {
+            pendingAtSnapshot.append(try ReplyObligation.load(from: obligationURL))
+            throw CancellationError()
+        }
+        try await wait("history delivered before the interrupted snapshot", timeout: .seconds(30)) {
+            !pendingAtSnapshot.isEmpty && joiner.tasks.count == 600
+        }
+        let joinerFingerprint = try await fingerprint(joiner)
+        for pending in pendingAtSnapshot {
+            XCTAssertNil(pending?.provided)
+            XCTAssertEqual(pending?.recipients, [joinerFingerprint])
+        }
+        XCTAssertEqual(Set(joiner.tasks.map(\.id)), Set(first.tasks.map(\.id)))
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: obligationURL.path))
+
+        await restartable(host)
+        host = engine("reply-host")
+        try await wait("snapshot delivered after restart", timeout: .seconds(30)) {
+            !joiner.awaitsReservationsForTesting && host.phase == .synced
+                && !FileManager.default.fileExists(atPath: obligationURL.path)
+        }
+    }
+
+    func testProviderHoldingSavedOperationsLeavesTheSnapshotToAnotherMember() async throws {
+        let host = try await seededEngine("holding-host", taskCount: ReplicaLimits.maxTasks)
+        let peer = engine("holding-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks && !peer.awaitsReservationsForTesting
+                && host.phase == .synced && peer.phase == .synced
+        }
+        try await send([create(ReplicaDeviceID(uuid: UUID()), 1, title: "Saved")], from: peer)
+        try await waitForCapacityReport(host, unapplied: 1)
+
+        host.snapshotSendHookForTesting = { XCTFail("A provider holding saved operations sent a snapshot.") }
+        let joiner = engine("holding-joiner")
+        joiner.beforeReservationRequestHookForTesting = { throw CancellationError() }
+        try await pair(host, joiner)
+        let joinerFingerprint = try await fingerprint(joiner)
+        let obligationURL = root.appendingPathComponent("holding-host/\(ReplyObligation.filename)")
+        try await wait("history sent, snapshot held", timeout: .seconds(30)) {
+            let pending = try ReplyObligation.load(from: obligationURL)
+            return joiner.tasks.count == ReplicaLimits.maxTasks && pending?.provided == nil
+                && pending?.recipients == [joinerFingerprint]
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+
+        joiner.beforeReservationRequestHookForTesting = nil
+        try await wait("snapshot from the other member", timeout: .seconds(30)) {
+            !joiner.awaitsReservationsForTesting
+        }
+        XCTAssertEqual(try ReplyObligation.load(from: obligationURL)?.recipients, [joinerFingerprint])
+    }
+
+    func testConflictingCopyOfDeferredHeadIsRejectedOnceItFits() async throws {
+        var host = try await seededEngine("fork-host", taskCount: ReplicaLimits.maxTasks)
+        let peer = engine("fork-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks && host.phase == .synced && peer.phase == .synced
+        }
+        let origin = ReplicaDeviceID(uuid: UUID())
+        let task = UUID()
+        try await send([create(origin, 1, task: task, title: "Saved")], from: peer)
+        try await waitForCapacityReport(host, unapplied: 1)
+        try await wait("saved message acknowledged") { try await self.inboxOperations(host).isEmpty }
+
+        await restartable(host)
+        let conflicting = [create(origin, 1, task: task, title: "Conflicting")]
+        try await send(conflicting, from: peer)
+        let archiveURL = root.appendingPathComponent("fork-host/replica-v1.json")
+        let storeURL = root.appendingPathComponent("fork-host/\(DeferredOperationStore.filename)")
+        let hostID = try ReplicaDeviceID(bytes: host.localDeviceID)
+        try ProtectedStorage.write(
+            ReplicaFixture.archive(deviceID: hostID, taskCount: ReplicaLimits.maxTasks - 1),
+            to: archiveURL
+        )
+        let archiveBytes = try Data(contentsOf: archiveURL)
+        let storedBytes = try Data(contentsOf: storeURL)
+
+        host = engine("fork-host")
+        try await wait("conflict blocks sync") {
+            host.mailboxError == .syncHistoryConflict && host.phase == .failed
+        }
+        XCTAssertEqual(host.unappliedRemoteOperationCount, 1)
+        XCTAssertEqual(try Data(contentsOf: archiveURL), archiveBytes)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storedBytes)
+        XCTAssertFalse(host.tasks.contains { $0.titleValue == "Saved" || $0.titleValue == "Conflicting" })
+        let retained = try await inboxOperations(host)
+        XCTAssertEqual(retained.map { try? $0.canonicalData() }, conflicting.map { try? $0.canonicalData() })
+        XCTAssertNil(host.localEditErrorMessage)
+    }
+
+    private func restartable(_ engine: SyncEngine) async {
+        await engine.stop()
+        engines.removeAll { $0 === engine }
+    }
+
+    private func waitForCapacityReport(_ engine: SyncEngine, unapplied: Int, timeout: Duration = .seconds(30)) async throws {
+        try await wait("capacity reported", timeout: timeout) {
+            engine.unappliedRemoteOperationCount == unapplied && engine.phase == .failed
+                && engine.mailboxError == .replicaCapacityReached
+        }
+        XCTAssertEqual(engine.errorMessage, SyncError.replicaCapacityReached.errorDescription)
+        XCTAssertEqual(engine.state.unappliedRemoteOperationCount, unapplied)
+        XCTAssertFalse(engine.mailboxRequiresRepair)
+    }
+
+    func testValidOperationsOverTaskCapacityAreKeptAcrossRestartAndAppliedOnceTheyFit() async throws {
+        var host = try await seededEngine("capacity-host", taskCount: ReplicaLimits.maxTasks)
+        let peer = engine("capacity-peer")
+        XCTAssertTrue(peer.addTask(title: "Valid peer task"))
+        try await pair(host, peer)
+
+        try await waitForCapacityReport(host, unapplied: 1)
+        try await waitForCapacityReport(peer, unapplied: 1)
+        try await wait("inbox acknowledged") { try await host.mlsSessionForTesting?.inbox().isEmpty == true }
+        XCTAssertEqual(host.tasks.count, ReplicaLimits.maxTasks)
+        XCTAssertFalse(host.tasks.contains { $0.titleValue == "Valid peer task" })
+        XCTAssertNotEqual(host.phase, .synced)
+        let deferredURL = root.appendingPathComponent("capacity-host/\(DeferredOperationStore.filename)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: deferredURL.path))
+
+        await restartable(host)
+        host = engine("capacity-host")
+        XCTAssertEqual(host.unappliedRemoteOperationCount, 1)
+        try await waitForCapacityReport(host, unapplied: 1)
+
+        await restartable(host)
+        let hostID = try ReplicaDeviceID(bytes: host.localDeviceID)
+        try ProtectedStorage.write(
+            ReplicaFixture.archive(deviceID: hostID, taskCount: ReplicaLimits.maxTasks - 1),
+            to: root.appendingPathComponent("capacity-host/replica-v1.json")
+        )
+        host = engine("capacity-host")
+        try await wait("deferred task applied") {
+            host.tasks.contains { $0.titleValue == "Valid peer task" }
+                && host.unappliedRemoteOperationCount == 0 && host.phase == .synced
+        }
+        XCTAssertNil(host.mailboxError)
+        XCTAssertNil(host.errorMessage)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deferredURL.path))
+    }
+
+    func testSavedOperationsFromNewOriginsCountTowardTaskHistoryCapacity() async throws {
+        let retired = (1...(ReplicaLimits.maxOrigins - 8)).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let host = try await seededEngine("inventory-host", taskCount: ReplicaLimits.maxTasks, foreignOrigins: retired)
+        let peer = engine("inventory-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks && host.phase == .synced && peer.phase == .synced
+        }
+        XCTAssertFalse(host.isTaskHistoryAtCapacity)
+
+        let unseen = (1...5).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        try await send(unseen.map { create($0, 1, title: "Unseen") }, from: peer)
+        try await waitForCapacityReport(host, unapplied: unseen.count)
+        try await wait("saved message acknowledged") { try await self.inboxOperations(host).isEmpty }
+
+        XCTAssertTrue(host.isTaskHistoryAtCapacity)
+        host.createPrivateSync()
+        XCTAssertNil(host.invitationURL)
+        XCTAssertEqual(host.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription)
+    }
+
+    func testValidOperationsOverRetainedOperationLimitAreKept() async throws {
+        let host = try await seededEngine(
+            "operations-host", taskCount: 1, toggleCount: ReplicaLimits.maxOperations - 1
+        )
+        let peer = engine("operations-peer")
+        XCTAssertTrue(peer.addTask(title: "Valid peer task"))
+        try await pair(host, peer)
+
+        try await waitForCapacityReport(host, unapplied: 1)
+        try await waitForCapacityReport(peer, unapplied: 1, timeout: .seconds(60))
+        XCTAssertEqual(host.tasks.map(\.titleValue), ["Task 1"])
+        XCTAssertEqual(peer.tasks.count, 2)
+    }
+
+    func testValidOperationsFromOriginOverLimitAreKept() async throws {
+        let foreign = (1..<(ReplicaLimits.maxOrigins - 3)).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let host = try await seededEngine("origins-host", taskCount: 1, foreignOrigins: foreign)
+        let peer = engine("origins-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.replicaForTesting.versionVector == host.replicaForTesting.versionVector
+                && host.phase == .synced && peer.phase == .synced
+        }
+
+        let free = ReplicaLimits.maxOrigins - foreign.count - 1
+        let overflow = (0...free).map { create(ReplicaDeviceID(uuid: UUID()), 1, title: "Origin \($0)") }
+        try await send(overflow, from: peer)
+        try await send(overflow, from: host)
+
+        try await waitForCapacityReport(host, unapplied: 1)
+        try await waitForCapacityReport(peer, unapplied: 1)
+        XCTAssertEqual(host.tasks.count, 1 + free)
+        XCTAssertEqual(peer.tasks.count, 1 + free)
+    }
+
+    func testMixedMessagesKeepBlockedOperationsAndSkipInvalidTraffic() async throws {
+        var host = try await seededEngine("mixed-host", taskCount: ReplicaLimits.maxTasks - 1)
+        let peer = engine("mixed-peer")
+        try await pair(host, peer)
+        try await wait("peer copy") {
+            peer.tasks.count == ReplicaLimits.maxTasks - 1 && host.phase == .synced && peer.phase == .synced
+        }
+
+        let blockedOrigin = ReplicaDeviceID(uuid: UUID())
+        let invalidOrigin = ReplicaDeviceID(uuid: UUID())
+        let validOrigin = ReplicaDeviceID(uuid: UUID())
+        let overflowTask = UUID()
+        let operations = ReplicationMessage.operations([
+            TaskOperation(
+                originDeviceID: blockedOrigin, originSequence: 1, lamport: 5_000, taskID: UUID(),
+                mutation: .create(title: "Fits", completed: false)
+            ),
+            TaskOperation(
+                originDeviceID: blockedOrigin, originSequence: 2, lamport: 5_001, taskID: overflowTask,
+                mutation: .create(title: "Caf\u{E9}", completed: false)
+            ),
+            TaskOperation(
+                originDeviceID: blockedOrigin, originSequence: 3, lamport: 5_002, taskID: overflowTask,
+                mutation: .setCompleted(true)
+            ),
+        ])
+        let mixed = ReplicationMessage.operations([
+            TaskOperation(
+                originDeviceID: invalidOrigin, originSequence: 1, lamport: 0, taskID: UUID(),
+                mutation: .create(title: "Malformed", completed: false)
+            ),
+            TaskOperation(
+                originDeviceID: validOrigin, originSequence: 1, lamport: 5_003, taskID: ReplicaFixture.taskID(1),
+                mutation: .setCompleted(true)
+            ),
+        ])
+        let session = try XCTUnwrap(peer.mlsSessionForTesting)
+        for plaintext in [try operations.encoded(), Data("not a replication message".utf8), try mixed.encoded()] {
+            guard case .accepted = try await session.send(plaintext) else {
+                return XCTFail("The message was not delivered.")
+            }
+        }
+
+        try await waitForCapacityReport(host, unapplied: 2)
+        try await wait("mixed messages consumed") {
+            try await host.mlsSessionForTesting?.inbox().isEmpty == true
+                && host.tasks.first { $0.id == ReplicaFixture.taskID(1) }?.isCompleted == true
+        }
+        XCTAssertTrue(host.tasks.contains { $0.titleValue == "Fits" })
+        XCTAssertFalse(host.tasks.contains { $0.titleValue == "Caf\u{E9}" || $0.titleValue == "Malformed" })
+
+        await restartable(host)
+        host = engine("mixed-host")
+        XCTAssertEqual(host.unappliedRemoteOperationCount, 2)
+        try await waitForCapacityReport(host, unapplied: 2)
+
+        let decomposed = TaskOperation(
+            originDeviceID: blockedOrigin, originSequence: 2, lamport: 5_001, taskID: overflowTask,
+            mutation: .create(title: "Cafe\u{301}", completed: false)
+        )
+        let archiveURL = root.appendingPathComponent("mixed-host/replica-v1.json")
+        let storeURL = root.appendingPathComponent("mixed-host/\(DeferredOperationStore.filename)")
+        let archiveBytes = try Data(contentsOf: archiveURL)
+        let storedBytes = try Data(contentsOf: storeURL)
+        try await send([decomposed], from: peer)
+        try await wait("conflict blocks sync") {
+            host.mailboxError == .syncHistoryConflict && host.mailboxRequiresRepair && host.phase == .failed
+        }
+        XCTAssertNil(host.localEditErrorMessage)
+        XCTAssertEqual(host.unappliedRemoteOperationCount, 2)
+        XCTAssertEqual(try Data(contentsOf: archiveURL), archiveBytes)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storedBytes)
+        let retained = try await inboxOperations(host)
+        XCTAssertEqual(retained.map { try? $0.canonicalData() }, [try decomposed.canonicalData()])
+
+        host.unlinkAndKeepTasks()
+        XCTAssertEqual(host.unappliedRemoteOperationCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("mixed-host/\(DeferredOperationStore.filename)").path
+        ))
+        XCTAssertTrue(host.tasks.contains { $0.titleValue == "Fits" })
     }
 
     func testSyncFilesAreExcludedFromBackup() async throws {

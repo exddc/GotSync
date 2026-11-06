@@ -185,6 +185,21 @@ public actor MLSClient {
         }
     }
 
+    /// Clears a pending application message after the relay accepted it at
+    /// `cursor`, when the inbox is too full to process the log up to that
+    /// message. A tracked message is listed in `sentMessages()` as if it had
+    /// been processed. The log copy is later recorded as a rejected cursor,
+    /// like any message this member cannot decrypt.
+    public func confirmAcceptedApplication(_ delivery: MLSDelivery, cursor: UInt64) throws {
+        try mutate { record in
+            guard delivery.kind == .application else { throw MLSClientError.invalidState }
+            guard record.pending == delivery else { return }
+            Self.recordTrackedDelivery(at: cursor, in: &record)
+            record.pending = nil
+            record.pendingPlaintext = nil
+        }
+    }
+
     public func join(welcome: Data, group: Data, verifiedInviterFingerprint: Data, cursor: UInt64) throws {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
@@ -206,10 +221,8 @@ public actor MLSClient {
                 if pending.kind == .commit {
                     Self.apply(try acceptCommit(state: record.state, acceptedCommit: delivery.payload), to: &record)
                     try Self.pruneDepartures(in: &record)
-                } else if pending.kind == .application, record.pendingTracked == true,
-                          let plaintext = record.pendingPlaintext {
-                    let sent = MLSSentMessage(cursor: cursor, digest: Data(SHA256.hash(data: plaintext)))
-                    record.sent = Array(((record.sent ?? []) + [sent]).suffix(MLSSentMessage.retained))
+                } else if pending.kind == .application {
+                    Self.recordTrackedDelivery(at: cursor, in: &record)
                 }
                 record.pending = nil
                 record.pendingPlaintext = nil
@@ -304,6 +317,12 @@ public actor MLSClient {
         record.pending = delivery
         record.pendingPlaintext = plaintext
         return delivery
+    }
+
+    private static func recordTrackedDelivery(at cursor: UInt64, in record: inout ClientRecord) {
+        guard record.pendingTracked == true, let plaintext = record.pendingPlaintext else { return }
+        let sent = MLSSentMessage(cursor: cursor, digest: Data(SHA256.hash(data: plaintext)))
+        record.sent = Array(((record.sent ?? []) + [sent]).suffix(MLSSentMessage.retained))
     }
 
     private static func pruneDepartures(in record: inout ClientRecord) throws {

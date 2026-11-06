@@ -57,13 +57,46 @@ New `SyncError` cases:
 - `approvalExpired`: the inviter did not approve the safety code within 10
   minutes. Nothing was linked.
 - `taskHistoryAtCapacity`: the task history has no room for another device.
-  It counts retained origins, including those of removed devices, plus one
-  slot for each current member and this device, up to
+  It counts retained origins, including those of removed devices, origins of
+  changes saved under `replicaCapacityReached`, plus one slot for each current
+  member and this device, up to
   `ReplicaLimits.maxOrigins` (128). Creating, inviting,
   or joining fails before anything is linked. The inviter counts the joiner's
   history and every device another member is adding at the same time, and
   both devices report this error when the merged history would not fit.
   Current members keep syncing.
+- `replicaCapacityReached`: linked devices sent valid changes that would
+  exceed this device's limit of 1,000 tasks including deleted ones, 10,000
+  retained changes, or 128 origins over the history's lifetime. The engine
+  saves those changes before it acknowledges the messages that carried them,
+  and counts them in
+  `unappliedRemoteOperationCount`. It saves at most 10,000. When the next
+  message does not fit, that message and every later one stay unacknowledged
+  in the delivery inbox; nothing saved is replaced. Saved changes are retried
+  after launch and whenever new messages arrive. While any remain,
+  `mailboxError` and `errorMessage` carry this case and `phase` is `.failed`,
+  but sync keeps running. `mailboxRequiresRepair` stays `false`, because
+  pairing again does not free capacity. Unlinking, removal, and
+  `eraseLocalData()` discard the saved changes; the group's other members
+  still hold them. A full store blocks inbox progress until the device unlinks
+  or erases. Local uploads continue while the delivery inbox is full, until a
+  commit from another member waits behind the held messages; MLS must process
+  that commit before this device can send again. Requests from other members for
+  missing changes are saved before their messages are acknowledged and
+  answered after catching up, one batch at a time, resuming after a failed
+  send or restart. A member that asked this device for the whole history then
+  gets the reservations snapshot, once this device knows every pending
+  reservation itself and holds no saved changes. While it holds some, that
+  member asks another member. If the saved changes or saved requests cannot be read
+  at launch, the files are kept, the engine reports `localStorageUnavailable` in `mailboxError` and
+  `errorMessage` with `phase` `.failed`, sets `mailboxRequiresRepair` while
+  linked, and neither syncs nor pairs. `unlinkAndKeepTasks()` or
+  `eraseLocalData()` clears it.
+
+  Before applying anything, the engine compares each received change with
+  every retained, saved, and received change that has the same origin and
+  sequence, byte for byte. A mismatch stops sync with `syncHistoryConflict` and
+  leaves the message unacknowledged.
 
 A device that has just joined cannot invite until its inviter has sent it the
 group's pending reservations, usually within one sync cycle. Until then,

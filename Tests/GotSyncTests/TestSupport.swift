@@ -183,6 +183,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var groups: [Data: Group] = [:]
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
+    private var droppedWriterAppend: (writer: Data, accepted: Int)?
     private var appendsUnavailable = false
     private var unavailableAfterDrop = false
     private var holdsDroppedResponse = false
@@ -221,6 +222,13 @@ actor FakeMLSRelay: MLSRelayTransport {
     func activeWriterCount(group: Data) -> Int {
         groups[group]?.writers.values.filter { $0.removal == nil }.count ?? 0
     }
+
+    /// Drops the response to `authorization`'s next new application entry
+    /// after `accepted` more, then makes appends unavailable.
+    func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int) {
+        droppedWriterAppend = (Self.digest(authorization), accepted)
+    }
+    var isWriterAppendDropPending: Bool { droppedWriterAppend != nil }
 
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
     /// Fails every request from the writer `authorization` as if it had no
@@ -336,6 +344,14 @@ actor FakeMLSRelay: MLSRelayTransport {
         where groups[delivery.group]?.writers[removed]?.removal == nil {
             groups[delivery.group]?.writers[removed]?.removal = cursor
         }
+        if let drop = droppedWriterAppend, drop.writer == sender, delivery.kind == .application {
+            guard drop.accepted > 0 else {
+                droppedWriterAppend = nil
+                appendsUnavailable = true
+                throw URLError(.networkConnectionLost)
+            }
+            droppedWriterAppend = (drop.writer, drop.accepted - 1)
+        }
         return try respond(.accepted(cursor: cursor))
     }
 
@@ -382,5 +398,82 @@ actor FakeMLSRelay: MLSRelayTransport {
 extension TaskReplica {
     init(deviceID: ReplicaDeviceID, persistenceURL: URL? = nil) throws {
         try self.init(deviceID: deviceID, persistenceURL: persistenceURL, newOrigin: nil)
+    }
+}
+
+/// Builds a valid replica archive directly, so tests can reach replica limits
+/// without applying thousands of operations one at a time.
+enum ReplicaFixture {
+    static func taskID(_ index: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-4000-8000-%012X", index))!
+    }
+
+    static func archive(
+        deviceID: ReplicaDeviceID,
+        taskCount: Int,
+        toggleCount: Int = 0,
+        foreignOrigins: [ReplicaDeviceID] = []
+    ) throws -> Data {
+        precondition(taskCount > 0)
+        var lamport: UInt64 = 0
+        var operations: [TaskOperation] = []
+        var records: [ReplicatedTask] = []
+        for index in 1...taskCount {
+            lamport += 1
+            let operation = TaskOperation(
+                originDeviceID: deviceID,
+                originSequence: lamport,
+                lamport: lamport,
+                taskID: taskID(index),
+                mutation: .create(title: "Task \(index)", completed: false)
+            )
+            operations.append(operation)
+            records.append(ReplicatedTask(
+                id: operation.taskID,
+                title: LWWRegister(value: "Task \(index)", stamp: operation.stamp),
+                completed: LWWRegister(value: false, stamp: operation.stamp),
+                deletion: nil
+            ))
+        }
+        let toggled = records[0].id
+        var completed = records[0].completed!
+        var vector = [deviceID: UInt64(taskCount)]
+        for _ in 0..<toggleCount {
+            lamport += 1
+            let operation = TaskOperation(
+                originDeviceID: deviceID,
+                originSequence: lamport,
+                lamport: lamport,
+                taskID: toggled,
+                mutation: .setCompleted(!completed.value)
+            )
+            operations.append(operation)
+            completed = LWWRegister(value: !completed.value, stamp: operation.stamp)
+            vector[deviceID] = lamport
+        }
+        for origin in foreignOrigins {
+            lamport += 1
+            let operation = TaskOperation(
+                originDeviceID: origin,
+                originSequence: 1,
+                lamport: lamport,
+                taskID: toggled,
+                mutation: .setCompleted(!completed.value)
+            )
+            operations.append(operation)
+            completed = LWWRegister(value: !completed.value, stamp: operation.stamp)
+            vector[origin] = 1
+        }
+        records[0].completed = completed
+        return try ReplicaArchive(
+            formatVersion: ReplicaLimits.archiveFormatVersion,
+            deviceID: deviceID,
+            originDeviceID: deviceID,
+            nextLocalOriginSequence: vector[deviceID]! + 1,
+            lamport: lamport,
+            versionVector: ReplicaVersionVector(vector),
+            taskRecords: records,
+            operations: operations
+        ).canonicalData()
     }
 }

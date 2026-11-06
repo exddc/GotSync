@@ -267,3 +267,154 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
         }
     }
 }
+
+/// Remote operations that are valid but exceed a replica limit. They are saved
+/// before the inbox messages that carried them are acknowledged.
+enum DeferredOperationStore {
+    static let filename = "replica-v1.deferred.json"
+    static let version = 1
+    static let maximumCount = ReplicaLimits.maxOperations
+
+    private struct Stored: Codable {
+        let version: Int
+        let operations: [TaskOperation]
+    }
+
+    static func load(from url: URL) throws -> [TaskOperation] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let stored = try ReplicaCanonicalJSON.decode(Stored.self, from: Data(contentsOf: url))
+        guard stored.version == version else {
+            throw ReplicaError.corruptArchive("The deferred operations are unreadable.")
+        }
+        return stored.operations
+    }
+
+    static func save(_ operations: [TaskOperation], to url: URL) throws {
+        guard !operations.isEmpty else {
+            try remove(at: url)
+            return
+        }
+        try ProtectedStorage.write(
+            ReplicaCanonicalJSON.encode(Stored(version: version, operations: operations)),
+            to: url
+        )
+    }
+
+    static func remove(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+}
+
+/// Hellos this device acknowledged before answering them in full. Answers are
+/// sent from here after the log is caught up, one batch at a time, and resume
+/// after a failed send or a restart.
+struct ReplyObligation: Codable, Equatable, Sendable {
+    static let filename = "sync-v2-replies.json"
+    static let version = 1
+
+    var version = Self.version
+    /// Lowest vector among hellos that ask for this device's own operations.
+    var own: ReplicaVersionVector?
+    /// Lowest vector among hellos that name this device as provider, which
+    /// asks for every origin.
+    var provided: ReplicaVersionVector?
+    /// Members whose hello named this device as provider and that still wait
+    /// for a reservations snapshot, in the order they asked.
+    var recipients: [Data]?
+
+    var isEmpty: Bool { own == nil && provided == nil && (recipients ?? []).isEmpty }
+
+    mutating func addRecipient(_ member: Data) {
+        var members = recipients ?? []
+        if !members.contains(member) {
+            members.append(member)
+        }
+        recipients = Array(members.suffix(SyncEngine.maximumGroupSize))
+    }
+
+    mutating func removeRecipient(_ member: Data) {
+        recipients?.removeAll { $0 == member }
+        if recipients?.isEmpty == true {
+            recipients = nil
+        }
+    }
+
+    mutating func completeHistory() {
+        own = nil
+        provided = nil
+    }
+
+    mutating func merge(_ vector: ReplicaVersionVector, provider: Bool) {
+        if provider {
+            provided = Self.lower(provided, vector)
+        } else {
+            own = Self.lower(own, vector)
+        }
+    }
+
+    /// Records that `operations`, a prefix of the answer in replica order,
+    /// was delivered.
+    mutating func advance(past operations: [TaskOperation]) {
+        for operation in operations {
+            own?.raise(operation)
+            provided?.raise(operation)
+        }
+    }
+
+    /// Drops entries for origins this device holds no operations from. They
+    /// never select an operation to send, and keeping them could exceed the
+    /// origin limit that loading enforces.
+    mutating func retain(origins: [ReplicaDeviceID]) {
+        let kept = Set(origins)
+        own = own.map { $0.retaining(kept) }
+        provided = provided.map { $0.retaining(kept) }
+    }
+
+    private static func lower(_ current: ReplicaVersionVector?, _ vector: ReplicaVersionVector) -> ReplicaVersionVector {
+        guard let current else { return vector }
+        var result = ReplicaVersionVector()
+        for origin in current.origins {
+            result.setSequence(min(current[origin], vector[origin]), for: origin)
+        }
+        return result
+    }
+
+    static func load(from url: URL) throws -> ReplyObligation? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let stored = try ReplicaCanonicalJSON.decode(ReplyObligation.self, from: Data(contentsOf: url))
+        guard stored.version == version, (stored.recipients ?? []).count <= SyncEngine.maximumGroupSize else {
+            throw ReplicaError.corruptArchive("The reply obligation is unreadable.")
+        }
+        return stored.isEmpty ? nil : stored
+    }
+
+    static func save(_ obligation: ReplyObligation?, to url: URL) throws {
+        guard let obligation, !obligation.isEmpty else {
+            try remove(at: url)
+            return
+        }
+        try ProtectedStorage.write(ReplicaCanonicalJSON.encode(obligation), to: url)
+    }
+
+    static func remove(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+}
+
+private extension ReplicaVersionVector {
+    mutating func raise(_ operation: TaskOperation) {
+        setSequence(max(self[operation.originDeviceID], operation.originSequence), for: operation.originDeviceID)
+    }
+
+    func retaining(_ kept: Set<ReplicaDeviceID>) -> ReplicaVersionVector {
+        var result = ReplicaVersionVector()
+        for origin in origins where kept.contains(origin) {
+            result.setSequence(self[origin], for: origin)
+        }
+        return result
+    }
+}

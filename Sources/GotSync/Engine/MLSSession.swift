@@ -284,7 +284,11 @@ actor MLSSession {
             }
             switch result {
             case .accepted(let cursor):
-                _ = try await catchUp()
+                do {
+                    _ = try await catchUp()
+                } catch MLSClientError.capacityReached where pending.kind == .application {
+                    try await client.confirmAcceptedApplication(pending, cursor: cursor)
+                }
                 return .accepted(cursor: cursor)
             case .keyPackageUnavailable(let epoch):
                 try await client.rejectAddForUnavailableKeyPackage(commit: pending.payload, rejectedEpoch: epoch)
