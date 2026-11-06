@@ -632,15 +632,12 @@ public final class SyncEngine {
     }
 
     /// A linked inviter starts no claim while an earlier attempt is
-    /// unresolved. A founding inviter sets aside an unreadable claims file
-    /// while it has added nobody yet.
+    /// unresolved. A founding inviter refuses a claims file that no longer
+    /// decodes.
     private func prepareToReserve(session: MLSSession) async throws {
         guard checkpoint != nil else {
-            if try loadFoundingClaims() == nil {
-                guard try await session.members().count == 1 else {
-                    throw SyncError.localStorageUnavailable
-                }
-                try setAsideFoundingClaims()
+            guard try loadFoundingClaims() != nil else {
+                throw SyncError.localStorageUnavailable
             }
             return
         }
@@ -792,10 +789,123 @@ public final class SyncEngine {
         return unknown.isEmpty ? nil : unknown
     }
 
+    /// Whether an unpaired device that created a group added someone to it.
+    /// A member besides this device proves it; concluding it is alone needs
+    /// a settled log, so an Add whose answer was lost cannot be missed.
+    private func adoptFoundingGroupIfJoined(session: MLSSession) async throws -> Bool {
+        guard let group = try await session.group() else {
+            try requireCurrent(session)
+            try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            return false
+        }
+        if (try? ReplicationCheckpoint.load(from: joinIntentURL))?.group == group {
+            scheduleReconcile()
+            throw SyncError.privateSyncUnreachable
+        }
+        let settled = await settle(group, session: session)
+        if case .failure(let error) = settled, let ended = Self.endedGroupError(error) {
+            try requireCurrent(session)
+            try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            try resetSession()
+            throw ended
+        }
+        let roster = try await session.members()
+        let own = try await session.fingerprint()
+        try requireCurrent(session)
+        guard roster.count > 1 else {
+            try settled.get()
+            guard try await session.pendingDelivery() == nil else {
+                throw SyncError.privateSyncUnreachable
+            }
+            try requireCurrent(session)
+            try retireFoundingClaims(readable: try loadFoundingClaims() != nil)
+            return false
+        }
+        if checkpoint?.group != group {
+            try rebuildCheckpoint(group: group, roster: roster, own: own)
+        }
+        isPaired = true
+        startSyncLoop()
+        if let refusal = linkedInviteRefusal {
+            throw refusal
+        }
+        return true
+    }
+
+    /// Catches up with the log and delivers anything pending, registering the
+    /// group again if the relay never saw it.
+    private func settle(_ group: Data, session: MLSSession) async -> Result<Void, Error> {
+        do {
+            do {
+                try await session.synchronize()
+            } catch MLSRelayError.unauthorized {
+                try await session.createGroup(group)
+                try await session.synchronize()
+            }
+            if try await session.isRemoved() {
+                throw MLSSessionError.removed
+            }
+            _ = try await session.flush()
+            try await session.synchronize()
+            return .success(())
+        } catch is CancellationError {
+            return .failure(CancellationError())
+        } catch {
+            return .failure(Self.endedGroupError(error) ?? SyncError.privateSyncUnreachable)
+        }
+    }
+
+    private static func endedGroupError(_ error: Error) -> SyncError? {
+        switch error {
+        case MLSSessionError.removed, SyncError.removedFromGroup: .removedFromGroup
+        case MLSRelayError.historyExpired, SyncError.syncHistoryExpired: .syncHistoryExpired
+        default: nil
+        }
+    }
+
+    private func scheduleReconcile() {
+        guard session != nil, reconcileTask == nil else {
+            return
+        }
+        reconcileTask = Task { [weak self] in
+            await self?.reconcileSession()
+        }
+    }
+
+    /// Why a linked device cannot invite right now, if it cannot.
+    private var linkedInviteRefusal: SyncError? {
+        if isGroupAtCapacity {
+            return .groupAtCapacity
+        }
+        if checkpoint?.reservationsVisible == false || checkpoint?.membersWithUnknownHistory != nil {
+            return .privateSyncUnreachable
+        }
+        return isTaskHistoryAtCapacity ? .taskHistoryAtCapacity : nil
+    }
+
+    /// Builds the checkpoint for a group this device is in but has no
+    /// checkpoint for.
+    private func rebuildCheckpoint(group: Data, roster: [MLSMember], own: Data) throws {
+        let intent = (try? ReplicationCheckpoint.load(from: joinIntentURL)).flatMap { $0.group == group ? $0 : nil }
+        var rebuilt = ReplicationCheckpoint(
+            group: group,
+            members: roster.map(ReplicationCheckpoint.Member.init),
+            joinPending: true,
+            provider: intent?.provider
+        )
+        rebuilt.reservationsVisible = intent?.reservationsVisible
+        rebuilt.reservationsProvider = intent?.reservationsProvider
+        let readable = try adoptFoundingClaims(into: &rebuilt, roster: roster.map(\.fingerprint), known: [own])
+        try saveCheckpoint(rebuilt)
+        try ReplicationCheckpoint.remove(at: joinIntentURL)
+        try retireFoundingClaims(readable: readable)
+    }
+
     /// Adds the founding claims to `checkpoint` and returns `true`. When the
     /// file does not decode, returns `false` and counts the history of every
-    /// member outside `known` as unknown. Such a member is also provisional,
-    /// so it is removed if it never sends a message.
+    /// member outside `known` as unknown. Members added by this founding
+    /// device, or of unknown history, are provisional, so they are removed if
+    /// they never send a message.
     private func adoptFoundingClaims(
         into checkpoint: inout ReplicationCheckpoint,
         roster: [Data],
@@ -813,6 +923,11 @@ public final class SyncEngine {
         if !founding.isEmpty {
             checkpoint.originReservations = founding.reduce(checkpoint.originReservations ?? []) { Self.upserting($1, into: $0) }
         }
+        let added = Set(founding.filter { !$0.released }.map(\.member)).intersection(roster).subtracting(known)
+        let deadline = Date().addingTimeInterval(provisionalMemberWindow)
+        for member in added where !checkpoint.provisionalMembers.contains(where: { $0.fingerprint == member }) {
+            checkpoint.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(fingerprint: member, deadline: deadline))
+        }
         return true
     }
 
@@ -824,6 +939,18 @@ public final class SyncEngine {
         } else {
             try setAsideFoundingClaims()
         }
+    }
+
+    /// Removes a claims file left from before this device was linked, keeping
+    /// the bytes if it does not decode and leaving it if it cannot be read.
+    private func retireStaleFoundingClaims() {
+        let decoded: [OriginReservation]?
+        do {
+            decoded = try loadFoundingClaims()
+        } catch {
+            return
+        }
+        try? retireFoundingClaims(readable: decoded != nil)
     }
 
     /// Keeps the bytes of a founding claims file that does not decode where
@@ -1034,12 +1161,8 @@ public final class SyncEngine {
         guard hasDurableIdentity, hasDurableStorage, isPaired, pairingTask == nil else {
             return
         }
-        if isGroupAtCapacity {
-            fail(SyncError.groupAtCapacity)
-            return
-        }
-        if checkpoint?.reservationsVisible == false || checkpoint?.membersWithUnknownHistory != nil {
-            fail(SyncError.privateSyncUnreachable)
+        if let refusal = linkedInviteRefusal {
+            fail(refusal)
             return
         }
         beginInvitation(linked: true)
@@ -1112,6 +1235,8 @@ public final class SyncEngine {
         endPairingAttempt()
         if wasJoining && !isPaired {
             try? resetSession()
+        } else if !isPaired {
+            scheduleReconcile()
         }
         errorMessage = nil
         restorePhaseAfterPairing()
@@ -1407,7 +1532,12 @@ public final class SyncEngine {
     }
 
     private func runInviterPairing(session: MLSSession, linked: Bool, attemptID: UUID) async {
+        var linked = linked
         do {
+            if !linked, try await adoptFoundingGroupIfJoined(session: session) {
+                try requireCurrentPairingAttempt(attemptID)
+                linked = true
+            }
             let fingerprint = try await session.fingerprint()
             let groupID: Data
             if linked {
@@ -1546,7 +1676,11 @@ public final class SyncEngine {
                 ))
             }
             try saveCheckpoint(current)
-            try retireFoundingClaims(readable: readable)
+            if founding {
+                try retireFoundingClaims(readable: readable)
+            } else {
+                retireStaleFoundingClaims()
+            }
             if declined {
                 await connection.cancel()
                 throw SyncError.pairingDeclined
@@ -1991,6 +2125,9 @@ public final class SyncEngine {
         if wasJoining && !isPaired && !admitted {
             try? resetSession()
         }
+        if !wasJoining && !isPaired {
+            scheduleReconcile()
+        }
         let mapped = SyncError.fromTransport(error)
         lastPairingFailure = mapped as? SyncError ?? .invalidPairMessage
         errorMessage = Self.displayMessage(for: mapped is SyncError ? mapped : SyncError.invalidPairMessage)
@@ -2040,6 +2177,17 @@ public final class SyncEngine {
                 return
             }
             let group = try await session.group()
+            guard self.session === session, pairingTask == nil || isPaired else {
+                return
+            }
+            let intent = try? ReplicationCheckpoint.load(from: joinIntentURL)
+            if let group, checkpoint?.group != group, intent?.group != group {
+                _ = await settle(group, session: session)
+                try requireCurrent(session)
+                if try await session.isRemoved() {
+                    return
+                }
+            }
             let roster = group == nil ? [] : try await session.members()
             let own = try await session.fingerprint()
             guard self.session === session, pairingTask == nil || isPaired else {
@@ -2050,21 +2198,7 @@ public final class SyncEngine {
                     current.members = roster.map(ReplicationCheckpoint.Member.init)
                     try saveCheckpoint(current)
                 } else {
-                    let intent = (try? ReplicationCheckpoint.load(from: joinIntentURL)).flatMap { $0.group == group ? $0 : nil }
-                    var rebuilt = ReplicationCheckpoint(
-                        group: group,
-                        members: roster.map(ReplicationCheckpoint.Member.init),
-                        joinPending: true,
-                        provider: intent?.provider
-                    )
-                    rebuilt.reservationsVisible = intent?.reservationsVisible
-                    rebuilt.reservationsProvider = intent?.reservationsProvider
-                    let readable = try adoptFoundingClaims(
-                        into: &rebuilt, roster: roster.map(\.fingerprint), known: [own]
-                    )
-                    try saveCheckpoint(rebuilt)
-                    try ReplicationCheckpoint.remove(at: joinIntentURL)
-                    try retireFoundingClaims(readable: readable)
+                    try rebuildCheckpoint(group: group, roster: roster, own: own)
                 }
                 if !isPaired {
                     isPaired = true

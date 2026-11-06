@@ -185,6 +185,9 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var dropAppendResponse = false
     private var appendsUnavailable = false
     private var unavailableAfterDrop = false
+    private var holdsDroppedResponse = false
+    private var offlineWriters: Set<Data> = []
+    private var droppedResponse: CheckedContinuation<Void, Never>?
     private(set) var rejectedAppends = 0
     private var failWelcomeAcknowledgement = false
     private var failingAcknowledgers: Set<Data> = []
@@ -195,10 +198,19 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var heldApplicationWriters: Set<Data>?
 
     /// Accepts the next append without answering. With `thenUnavailable`,
-    /// every later append fails until `setAppendsUnavailable(false)`.
-    func dropNextAppendResponse(thenUnavailable: Bool = false) {
+    /// every later append fails until `setAppendsUnavailable(false)`. With
+    /// `held`, the failure reaches the client only after
+    /// `releaseDroppedResponse()`.
+    func dropNextAppendResponse(thenUnavailable: Bool = false, held: Bool = false) {
         dropAppendResponse = true
         unavailableAfterDrop = thenUnavailable
+        holdsDroppedResponse = held
+    }
+
+    func releaseDroppedResponse() {
+        holdsDroppedResponse = false
+        droppedResponse?.resume()
+        droppedResponse = nil
     }
     /// Rejects application messages from every writer except `authorizations`
     /// until called with `nil`.
@@ -211,6 +223,15 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func setAppendsUnavailable(_ unavailable: Bool) { appendsUnavailable = unavailable }
+    /// Fails every request from the writer `authorization` as if it had no
+    /// network.
+    func setOffline(_ authorization: Data, _ offline: Bool) {
+        if offline {
+            offlineWriters.insert(Self.digest(authorization))
+        } else {
+            offlineWriters.remove(Self.digest(authorization))
+        }
+    }
     func expireHistory(group: Data) { expiredGroups.insert(group) }
 
     func removalCursor(of authorization: Data, group: Data) -> UInt64? {
@@ -264,6 +285,7 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     func createGroup(_ group: Data, authorization: Data) throws {
         let writer = Self.digest(authorization)
+        if offlineWriters.contains(writer) { throw URLError(.notConnectedToInternet) }
         if let existing = groups[group] {
             guard existing.writers[writer]?.removal == nil, existing.writers[writer] != nil else { throw MLSRelayError.epochConflict }
             return
@@ -271,8 +293,20 @@ actor FakeMLSRelay: MLSRelayTransport {
         groups[group] = Group(writers: [writer: (0, nil)])
     }
 
-    func append(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
-        if appendsUnavailable {
+    func append(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        let dropping = dropAppendResponse
+        do {
+            return try appendNow(delivery, authorization: authorization)
+        } catch {
+            if dropping, !dropAppendResponse, holdsDroppedResponse {
+                await withCheckedContinuation { droppedResponse = $0 }
+            }
+            throw error
+        }
+    }
+
+    private func appendNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        if appendsUnavailable || offlineWriters.contains(Self.digest(authorization)) {
             rejectedAppends += 1
             throw URLError(.notConnectedToInternet)
         }
@@ -306,6 +340,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     func fetch(group: Data, after cursor: UInt64, limit: Int, authorization: Data) throws -> [MLSRelayEntry] {
+        if offlineWriters.contains(Self.digest(authorization)) { throw URLError(.notConnectedToInternet) }
         let writer = try authorize(group: group, authorization: authorization)
         return Array(entries.filter {
             $0.delivery.group == group && $0.cursor > cursor && $0.cursor <= (writer.removal ?? .max)

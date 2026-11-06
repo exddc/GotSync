@@ -744,6 +744,203 @@ final class SyncEngineMLSTests: XCTestCase {
         XCTAssertTrue(other.isPaired)
     }
 
+    /// The host's Add lands and its first joiner joins, but the answer
+    /// reaches the host only after it gave up on the pairing.
+    private func foundingHostWithLostAdd(
+        _ prefix: String,
+        offline: Bool
+    ) async throws -> (host: SyncEngine, first: SyncEngine, other: SyncEngine, local: [Set<UUID>]) {
+        let host = engine("\(prefix)-host")
+        let first = try await engineWithRetiredOrigins("\(prefix)-j1", count: 70)
+        let other = try await engineWithRetiredOrigins("\(prefix)-j2", count: 70)
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        await relay.holdApplications(except: [try await authorization(host)])
+        var armed = true
+        host.reservationHookForTesting = { [relay] in
+            guard armed else { return }
+            armed = false
+            await relay?.dropNextAppendResponse(held: true)
+        }
+        first.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && first.safetyCode != nil }
+        host.approveSafetyCode()
+        do {
+            try await wait("first joined") { first.isPaired }
+        } catch {
+            await relay.releaseDroppedResponse()
+            throw error
+        }
+        if offline {
+            await relay.setOffline(try await authorization(host), true)
+        }
+        await relay.releaseDroppedResponse()
+        try await wait("host gave up") { !host.canCancelPairing }
+        return (host, first, other, local)
+    }
+
+    private func assertSecondDisjointJoinerRefused(
+        host: SyncEngine,
+        first: SyncEngine,
+        other: SyncEngine,
+        local: [Set<UUID>],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        other.joinPrivateSync(url: try await invite(host))
+        try await wait("other refused") { other.phase == .failed && !host.canCancelPairing }
+        XCTAssertEqual(other.errorMessage, SyncError.taskHistoryAtCapacity.errorDescription, file: file, line: line)
+        await relay.holdApplications(except: nil)
+        for engine in [host, first, other] { engine.applicationDidBecomeActive() }
+        try await settle([host, first, other])
+        XCTAssertLessThanOrEqual(Set(host.tasks.map(\.id)).count, ReplicaLimits.maxOrigins, file: file, line: line)
+        let group = try await groupID(host)
+        try await assertAtMostOneJoinerLinked(
+            [first, other], localTasks: local, members: [host], group: group, file: file, line: line
+        )
+        XCTAssertTrue(first.isPaired, file: file, line: line)
+    }
+
+    func testFoundingAddWhoseAnswerWasLostCountsBeforeTheNextJoiner() async throws {
+        let (host, first, other, local) = try await foundingHostWithLostAdd("lostadd", offline: false)
+        try await wait("host adopted the group") { host.isPaired && host.linkedMemberCount == 2 }
+        let firstFingerprint = try await fingerprint(first)
+        XCTAssertTrue(host.reservationsForTesting.contains { $0.member == firstFingerprint })
+        try await assertSecondDisjointJoinerRefused(host: host, first: first, other: other, local: local)
+    }
+
+    func testFoundingInviterFailsClosedWhileItsLastAddIsUnsettled() async throws {
+        let (host, first, other, local) = try await foundingHostWithLostAdd("lostadd-offline", offline: true)
+        let journal = root.appendingPathComponent("lostadd-offline-host/\(ReplicationCheckpoint.foundingClaimsFilename)")
+        XCTAssertFalse(host.isPaired)
+        host.createPrivateSync()
+        try await wait("invitation refused") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        XCTAssertEqual(host.lastPairingFailure, .privateSyncUnreachable)
+        XCTAssertNil(host.invitationURL)
+        XCTAssertFalse(host.isPaired)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journal.path))
+        await relay.setOffline(try await authorization(host), false)
+        try await assertSecondDisjointJoinerRefused(host: host, first: first, other: other, local: local)
+    }
+
+    func testUnpairedHostAdoptsItsGroupAndAdmitsAFittingJoinerInTheSameAttempt() async throws {
+        let (host, first, _, _) = try await foundingHostWithLostAdd("adopt", offline: true)
+        XCTAssertFalse(host.isPaired)
+        await relay.setOffline(try await authorization(host), false)
+        let small = try await engineWithRetiredOrigins("adopt-small", count: 5)
+        let url = try await invite(host)
+        XCTAssertTrue(host.isPaired)
+        small.joinPrivateSync(url: url)
+        try await wait("safety code") { host.isHostApprovalPending && small.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("small joined") { small.isPaired && !host.canCancelPairing }
+        await relay.holdApplications(except: nil)
+        for engine in [host, first, small] { engine.applicationDidBecomeActive() }
+        try await wait("all three linked") { [host, first, small].allSatisfy { $0.linkedMemberCount == 3 } }
+        try await settle([host, first, small])
+        XCTAssertEqual(Set(host.tasks.map(\.id)), Set(first.tasks.map(\.id)).union(small.tasks.map(\.id)))
+    }
+
+    func testUnpairedHostThatAdoptedItsGroupKeepsItWhenTheNextJoinerIsDeclined() async throws {
+        let (host, first, other, _) = try await foundingHostWithLostAdd("adopt-decline", offline: true)
+        await relay.setOffline(try await authorization(host), false)
+        other.joinPrivateSync(url: try await invite(host))
+        try await wait("refused or awaiting approval") {
+            (host.isHostApprovalPending && other.safetyCode != nil) || (other.phase == .failed && !host.canCancelPairing)
+        }
+        if host.isHostApprovalPending {
+            host.cancelPairing()
+        }
+        try await wait("pairing ended") { !host.canCancelPairing }
+        XCTAssertTrue(host.isPaired)
+        XCTAssertFalse(other.isPaired)
+        let firstFingerprint = try await fingerprint(first)
+        try await wait("first still linked") {
+            let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+            return members.contains { $0.fingerprint == firstFingerprint } && host.linkedMemberCount == 2
+        }
+        XCTAssertTrue(first.isPaired)
+    }
+
+    func testJoinerWithoutCheckpointCannotInviteBeforeItsSnapshot() async throws {
+        let host = engine("intent-host")
+        var joiner = engine("intent-joiner")
+        try await pair(host, joiner)
+        await relay.holdApplications(except: [try await authorization(joiner)])
+        await joiner.stop()
+        let directory = root.appendingPathComponent("intent-joiner")
+        let checkpoint = directory.appendingPathComponent(ReplicationCheckpoint.filename)
+        var saved = try XCTUnwrap(ReplicationCheckpoint.load(from: checkpoint))
+        saved.reservationsVisible = false
+        try saved.save(to: directory.appendingPathComponent(ReplicationCheckpoint.joinIntentFilename))
+        try FileManager.default.removeItem(at: checkpoint)
+        joiner = engine("intent-joiner")
+        joiner.createPrivateSync()
+        try await wait("invitation refused") {
+            joiner.invitationURL == nil && !joiner.canCancelPairing && joiner.isPaired
+                && (joiner.lastPairingFailure == .privateSyncUnreachable
+                    || joiner.errorMessage == SyncError.privateSyncUnreachable.errorDescription)
+        }
+        XCTAssertTrue(joiner.awaitsReservationsForTesting)
+        await relay.holdApplications(except: nil)
+    }
+
+    func testFoundingInviterRemovedAfterItsLostAddStartsAFreshGroup() async throws {
+        let (host, first, _, _) = try await foundingHostWithLostAdd("removed", offline: true)
+        await relay.holdApplications(except: nil)
+        let hostFingerprint = try await fingerprint(host)
+        try await wait("first sees host") { first.linkedDevices.count == 2 }
+        XCTAssertTrue(first.removeDevice(fingerprint: hostFingerprint))
+        try await wait("host removed") {
+            let members = try await XCTUnwrapAsync(first.mlsSessionForTesting).members()
+            return members.count == 1
+        }
+        await relay.setOffline(try await authorization(host), false)
+        host.createPrivateSync()
+        try await wait("invitation refused") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        XCTAssertEqual(host.lastPairingFailure, .removedFromGroup)
+        let group = try await host.mlsSessionForTesting?.group()
+        XCTAssertNil(group)
+        let fresh = engine("removed-fresh")
+        try await pair(host, fresh)
+        XCTAssertTrue(fresh.isPaired)
+    }
+
+    func testDamagedClaimsOfALostFoundingAddBlockInvitationsUntilTheMemberReports() async throws {
+        let (host, first, other, local) = try await foundingHostWithLostAdd("lostadd-damaged", offline: true)
+        let directory = root.appendingPathComponent("lostadd-damaged-host")
+        let damaged = Data("{damaged".utf8)
+        try damaged.write(to: directory.appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename))
+        await relay.setOffline(try await authorization(host), false)
+        host.createPrivateSync()
+        try await wait("invitation refused") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        XCTAssertEqual(host.lastPairingFailure, .privateSyncUnreachable)
+        XCTAssertTrue(host.isPaired)
+        let firstFingerprint = try await fingerprint(first)
+        XCTAssertEqual(host.membersWithUnknownHistoryForTesting, [firstFingerprint])
+        let aside = directory.appendingPathComponent(ReplicationCheckpoint.unreadableFoundingClaimsFilename)
+        XCTAssertEqual(try Data(contentsOf: aside), damaged)
+        await relay.holdApplications(except: nil)
+        for engine in [host, first] { engine.applicationDidBecomeActive() }
+        try await wait("first reported its history") { host.membersWithUnknownHistoryForTesting == nil }
+        try await assertSecondDisjointJoinerRefused(host: host, first: first, other: other, local: local)
+    }
+
+    func testDamagedClaimsOfALostFoundingAddAreRecoveredOnRestart() async throws {
+        var (host, first, other, local) = try await foundingHostWithLostAdd("lostadd-restart", offline: true)
+        await host.stop()
+        let directory = root.appendingPathComponent("lostadd-restart-host")
+        try Data("{damaged".utf8).write(to: directory.appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename))
+        await relay.setOffline(try await authorization(host), false)
+        host = engine("lostadd-restart-host")
+        try await wait("host adopted the group") { host.isPaired && host.linkedMemberCount == 2 }
+        let firstFingerprint = try await fingerprint(first)
+        XCTAssertEqual(host.membersWithUnknownHistoryForTesting, [firstFingerprint])
+        await relay.holdApplications(except: nil)
+        for engine in [host, first] { engine.applicationDidBecomeActive() }
+        try await wait("first reported its history") { host.membersWithUnknownHistoryForTesting == nil }
+        try await assertSecondDisjointJoinerRefused(host: host, first: first, other: other, local: local)
+    }
+
     func testUnreadableFoundingClaimsBlockAdmissionUntilMembersReportHistory() async throws {
         var host = engine("unreadable-host")
         let first = try await engineWithRetiredOrigins("unreadable-j1", count: 70)

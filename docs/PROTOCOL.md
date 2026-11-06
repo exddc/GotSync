@@ -420,11 +420,28 @@ that never landed is dropped, but never while its send is still running,
 even after its pairing was cancelled. The owner starts no reservation while
 an earlier attempt is unresolved.
 
+An Add can land although its answer never reaches the founding inviter, so
+an unlinked device with a group never concludes from its local roster that
+it is alone. When the app starts, after a failed or cancelled invitation,
+and before it invites again, it catches up with the log, registering the
+group again if the relay never saw it, and delivers any pending message. If
+the roster then holds another member, the device builds its checkpoint with
+its founding claims, and the members those claims added stay provisional
+until they send a message. It then handles the invitation as a linked
+inviter, with the same refusals. Only a settled log showing the device
+alone, with nothing pending, lets it found the group afresh and discard the
+claims file; otherwise the invitation fails with
+`SyncError.privateSyncUnreachable`. A device that finds it was removed, or
+that the relay no longer keeps the group's history, starts a new MLS
+identity and reports `removedFromGroup` or `syncHistoryExpired`; its next
+invitation founds a new group. A device that joined someone else's group
+never takes this path.
+
 If `sync-v2-claims.json` exists but does not decode, the founding inviter
 never treats it as empty. It keeps the bytes as
-`sync-v2-claims-unreadable.json`. When no member has been added yet, it
-starts a new file. When recovery finds members it added, it counts each of
-their histories as unknown: it refuses to invite or answer snapshot requests
+`sync-v2-claims-unreadable.json`. When the log shows nobody was added, it
+starts a new file. When it finds members it added, it counts each of their
+histories as unknown: it refuses to invite or answer snapshot requests
 until that member's next `hello` arrives, and the `hello`'s vector becomes
 that member's claim. Such a member is also provisional, so one that never
 sends a message is removed, and a member that leaves no longer blocks

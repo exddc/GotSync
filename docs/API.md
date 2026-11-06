@@ -62,7 +62,11 @@ group's pending reservations, usually within one sync cycle. Until then,
 `inviteToGroup()` fails with `SyncError.privateSyncUnreachable`. The same
 applies to a device that created a group, crashed while adding its first
 member, and then could not read its saved reservations: it cannot invite
-until that member's history arrives on its next sync.
+until that member's history arrives on its next sync. An unlinked device that
+already created a group first checks the relay's log, because an earlier
+invitation may have added someone without the device learning it. If the
+relay cannot be reached, `createPrivateSync()` fails with
+`SyncError.privateSyncUnreachable`.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`
