@@ -2781,15 +2781,24 @@ final class SyncEngineMLSTests: XCTestCase {
         try await waitForCapacityReport(host, unapplied: 1)
 
         host.snapshotSendHookForTesting = { XCTFail("A provider holding saved operations sent a snapshot.") }
+        let hostFingerprint = try await fingerprint(host)
+        let peerFingerprint = try await fingerprint(peer)
+        let peerSession = try XCTUnwrap(peer.mlsSessionForTesting)
+        guard case .accepted = try await peerSession.send(ReplicationMessage.hello(
+            vector: peer.replicaForTesting.versionVector, provider: hostFingerprint
+        ).encoded()) else {
+            return XCTFail("The history request was not delivered.")
+        }
         let joiner = engine("holding-joiner")
         joiner.beforeReservationRequestHookForTesting = { throw CancellationError() }
         try await pair(host, joiner)
         let joinerFingerprint = try await fingerprint(joiner)
+        let expectedRecipients: Set<Data> = [peerFingerprint, joinerFingerprint]
         let obligationURL = root.appendingPathComponent("holding-host/\(ReplyObligation.filename)")
         try await wait("history sent, snapshot held", timeout: .seconds(30)) {
             let pending = try ReplyObligation.load(from: obligationURL)
             return joiner.tasks.count == ReplicaLimits.maxTasks && pending?.provided == nil
-                && pending?.recipients == [joinerFingerprint]
+                && Set(pending?.recipients ?? []) == expectedRecipients
         }
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertTrue(joiner.awaitsReservationsForTesting)
@@ -2798,7 +2807,7 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("snapshot from the other member", timeout: .seconds(30)) {
             !joiner.awaitsReservationsForTesting
         }
-        XCTAssertEqual(try ReplyObligation.load(from: obligationURL)?.recipients, [joinerFingerprint])
+        XCTAssertEqual(Set(try ReplyObligation.load(from: obligationURL)?.recipients ?? []), expectedRecipients)
     }
 
     func testConflictingCopyOfDeferredHeadIsRejectedOnceItFits() async throws {
