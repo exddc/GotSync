@@ -201,8 +201,16 @@ changes. The engine opens a fresh MLS identity at once and publishes the leave
 proposal from the slot in the background. It retries with backoff, at launch,
 and when the application becomes active. A slot is erased after the relay
 accepts the proposal, or when the relay or MLS state shows that the device is
-already outside the group. Each MLS identity uses its own directory, so a
-superseded session never shares a path with the session that replaced it.
+already outside the group, when the history the slot must process has
+expired, or when the slot's state can no longer be decrypted. After expired
+history the relay may still list the old writer, so another member must remove
+the device. Any other failure keeps the slot for the next retry. Before the
+proposal, the slot delivers any pending message and processes the log after
+it. The slot's inbox feeds no replica, so when it is full the slot drops its
+unread plaintext. When the relay log is full, the slot catches up and
+acknowledges before it appends again. Neither backlog blocks the proposal.
+Each MLS identity uses its own directory, so a superseded session never shares
+a path with the session that replaced it.
 
 A device that processes a commit removing it erases its MLS state, keeps its
 tasks, and reports `SyncError.removedFromGroup`. A group can shrink to one
