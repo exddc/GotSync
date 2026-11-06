@@ -335,6 +335,73 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(repeated, .superseded)
     }
 
+    func testOnlyLeaveDropsPlaintextFromFullInbox() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        try await bob.synchronize()
+        for index in 0...1000 { _ = try await alice.send(Data("\(index)".utf8)) }
+        _ = try await bob.client.prepareMessage(Data("pending".utf8))
+        do {
+            _ = try await bob.synchronize()
+            XCTFail("full inbox accepted another message")
+        } catch MLSClientError.capacityReached {}
+        let full = try await bob.inbox()
+        XCTAssertEqual(full.count, 1000)
+
+        let bobAuthorization = try await bob.client.transportAuthorization()
+        try await bob.leave()
+        let log = await relay.log(group: group)
+        let proposal = try XCTUnwrap(log.last)
+        XCTAssertEqual(proposal.delivery.kind, .proposal)
+        let removal = await relay.removalCursor(of: bobAuthorization, group: group)
+        XCTAssertEqual(removal, proposal.cursor)
+        let cursor = try await bob.cursor()
+        XCTAssertEqual(cursor, proposal.cursor - 1)
+        let remaining = try await bob.inbox()
+        XCTAssertEqual(remaining.map(\.plaintext), [Data("1000".utf8)])
+    }
+
+    func testLeaveCatchesUpWhenRelayLogIsFull() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        try await bob.synchronize()
+        for index in 0..<6 { _ = try await alice.send(Data("\(index)".utf8)) }
+        await relay.limitUnacknowledgedEntries(to: 6)
+        _ = try await bob.client.prepareMessage(Data("pending".utf8))
+        do {
+            _ = try await bob.flush()
+            XCTFail("full relay log accepted another message")
+        } catch MLSRelayError.capacityReached {}
+
+        let bobAuthorization = try await bob.client.transportAuthorization()
+        try await bob.leave()
+        let log = await relay.log(group: group)
+        XCTAssertEqual(log.suffix(2).map(\.delivery.kind), [.application, .proposal])
+        let removal = await relay.removalCursor(of: bobAuthorization, group: group)
+        XCTAssertEqual(removal, log.last?.cursor)
+    }
+
+    func testLeaveFinishesRemovalAcknowledgement() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, _) = try await pair(relay)
+        let bobAuthorization = try await bob.transportAuthorizationForTesting()
+        guard case .accepted(let removal) = try await alice.remove(fingerprint: bob.fingerprint()) else {
+            return XCTFail("Removal not accepted")
+        }
+        await relay.failAcknowledgements(by: bobAuthorization, true)
+        do {
+            try await bob.synchronize()
+            XCTFail("Failed acknowledgement succeeded")
+        } catch {}
+        await relay.failAcknowledgements(by: bobAuthorization, false)
+        do {
+            try await bob.leave()
+            XCTFail("Removed member left")
+        } catch MLSSessionError.removed {}
+        let acknowledged = await relay.acknowledged(by: bobAuthorization)
+        XCTAssertEqual(acknowledged, removal)
+    }
+
     func testFailedAcknowledgementIsRetriedAfterRestart() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, _) = try await pair(relay)
