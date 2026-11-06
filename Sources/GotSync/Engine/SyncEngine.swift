@@ -270,10 +270,12 @@ public final class SyncEngine {
     private var peerDecision: Bool?
     private var peerRefusedForTaskHistory = false
     private(set) var lastPairingFailure: SyncError?
+    private var reservationsInFlight: [OriginReservation.Attempt] = []
     private var lastKnownEpoch: UInt64 = 0
     private var reservationRequestCycles = 0
     private static let reservationRequestInterval = 5
     var reservationHookForTesting: (@MainActor () async -> Void)?
+    var reservationSendHookForTesting: (@MainActor () async -> Void)?
     var afterAddHookForTesting: (@MainActor () throws -> Void)?
     var beforeReservationRequestHookForTesting: (@MainActor () throws -> Void)?
     private var reconcileTask: Task<Void, Never>?
@@ -542,6 +544,9 @@ public final class SyncEngine {
             roster = Set(try await session.members().map(\.fingerprint))
             lastKnownEpoch = max(lastKnownEpoch, epoch)
         }
+        guard roster.isDisjoint(with: checkpoint?.membersWithUnknownHistory ?? []) else {
+            return .taskHistoryFull
+        }
         let claims = view.reservations.filter { claim in
             claim.isActive(roster: roster, epoch: epoch) && cursor.map { claim.cursor < $0 } ?? true
         }
@@ -577,28 +582,118 @@ public final class SyncEngine {
     }
 
     /// Publishes a claim for `joiner` and returns it as recorded at its log
-    /// position. A linked inviter also saves it before adding anyone.
+    /// position. A linked inviter saves the attempt before sending it, so a
+    /// claim whose send fails can still be found in the log and released.
     private func reserve(
         _ joiner: Data,
         origins: Set<ReplicaDeviceID>,
         session: MLSSession
     ) async throws -> OriginReservation {
+        try await prepareToReserve(session: session)
         let epoch = try await session.epoch()
         let message = ReplicationMessage.reservation(member: joiner, origins: Array(origins), epoch: epoch)
-        guard case .accepted(let cursor) = try await session.send(message.encoded()) else {
-            throw SyncCycleError.notDelivered
+        let attempt = OriginReservation.Attempt(
+            member: joiner, origins: message.origins ?? [], epoch: epoch, after: try await session.cursor()
+        )
+        try Task.checkCancellation()
+        if var current = checkpoint {
+            current.reservationAttempts = (current.reservationAttempts ?? []) + [attempt]
+            try saveCheckpoint(current)
+            reservationsInFlight.append(attempt)
+        }
+        await reservationSendHookForTesting?()
+        let cursor: UInt64
+        do {
+            guard case .accepted(let accepted) = try await session.send(message.encoded(), tracked: true) else {
+                throw SyncCycleError.notDelivered
+            }
+            cursor = accepted
+            reservationsInFlight.removeAll { $0 == attempt }
+        } catch {
+            reservationsInFlight.removeAll { $0 == attempt }
+            try? await resolveReservationAttempts(session: session)
+            throw error
         }
         let claim = OriginReservation(
-            member: joiner, owner: try await session.fingerprint(), origins: message.origins ?? [],
+            member: joiner, owner: try await session.fingerprint(), origins: attempt.origins,
             epoch: epoch, cursor: cursor
         )
         if var current = checkpoint {
             current.originReservations = Self.upserting(claim, into: current.originReservations ?? [])
+            current.reservationAttempts?.removeAll { $0 == attempt }
             try saveCheckpoint(current)
         } else {
-            try saveFoundingClaims(Self.upserting(claim, into: loadFoundingClaims()))
+            guard let founding = try loadFoundingClaims() else {
+                throw SyncError.localStorageUnavailable
+            }
+            try saveFoundingClaims(Self.upserting(claim, into: founding))
         }
         return claim
+    }
+
+    /// A linked inviter starts no claim while an earlier attempt is
+    /// unresolved. A founding inviter sets aside an unreadable claims file
+    /// while it has added nobody yet.
+    private func prepareToReserve(session: MLSSession) async throws {
+        guard checkpoint != nil else {
+            if try loadFoundingClaims() == nil {
+                guard try await session.members().count == 1 else {
+                    throw SyncError.localStorageUnavailable
+                }
+                try setAsideFoundingClaims()
+            }
+            return
+        }
+        for _ in 0..<2 where !(checkpoint?.reservationAttempts ?? []).isEmpty {
+            try await resolveReservationAttempts(session: session)
+        }
+        guard checkpoint?.reservationAttempts?.isEmpty ?? true else {
+            throw SyncError.privateSyncUnreachable
+        }
+    }
+
+    /// Turns each saved attempt into a claim at the cursor where it landed,
+    /// or drops it once nothing is left to deliver and it never landed.
+    /// Attempts whose send is still running wait for a later call.
+    private func resolveReservationAttempts(session: MLSSession) async throws {
+        guard let group = checkpoint?.group else {
+            return
+        }
+        let attempts = (checkpoint?.reservationAttempts ?? []).filter { !reservationsInFlight.contains($0) }
+        guard !attempts.isEmpty else {
+            return
+        }
+        if try await session.pendingDelivery() != nil {
+            _ = try await session.flush()
+        }
+        guard try await session.pendingDelivery() == nil else {
+            return
+        }
+        let owner = try await session.fingerprint()
+        var known = Set((checkpoint?.originReservations ?? []).map(\.cursor))
+        var outcomes: [(attempt: OriginReservation.Attempt, claim: OriginReservation?)] = []
+        for attempt in attempts {
+            let landed = try await session.sentCursors(of: attempt.message.encoded())
+            let cursor = landed.first { $0 > attempt.after && !known.contains($0) }
+            if let cursor {
+                known.insert(cursor)
+            }
+            outcomes.append((attempt, cursor.map {
+                OriginReservation(
+                    member: attempt.member, owner: owner, origins: attempt.origins, epoch: attempt.epoch, cursor: $0
+                )
+            }))
+        }
+        guard var current = checkpoint, current.group == group else {
+            return
+        }
+        let saved = current.reservationAttempts ?? []
+        let resolved = outcomes.filter { saved.contains($0.attempt) }
+        current.originReservations = resolved.compactMap(\.claim).reduce(current.originReservations ?? []) {
+            Self.upserting($1, into: $0)
+        }
+        current.reservationAttempts?.removeAll { attempt in resolved.contains { $0.attempt == attempt } }
+        try saveCheckpoint(current)
     }
 
     /// Withdraws a claim. A device never receives its own messages, so the
@@ -614,7 +709,9 @@ public final class SyncEngine {
             current.originReservations = Self.upserting(released, into: current.originReservations ?? [], replacing: true)
             try? saveCheckpoint(current)
         } else {
-            try? saveFoundingClaims(Self.upserting(released, into: loadFoundingClaims(), replacing: true))
+            if let founding = try? loadFoundingClaims() {
+                try? saveFoundingClaims(Self.upserting(released, into: founding, replacing: true))
+            }
         }
     }
 
@@ -675,11 +772,65 @@ public final class SyncEngine {
         checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename)
     }
 
-    private func loadFoundingClaims() -> [OriginReservation] {
-        guard let data = try? Data(contentsOf: foundingClaimsURL) else {
+    private var unreadableFoundingClaimsURL: URL {
+        checkpointURL.deletingLastPathComponent()
+            .appendingPathComponent(ReplicationCheckpoint.unreadableFoundingClaimsFilename)
+    }
+
+    /// `nil` when the file exists but does not decode. A file that cannot be
+    /// opened throws, so a locked device retries instead of losing claims.
+    private func loadFoundingClaims() throws -> [OriginReservation]? {
+        guard FileManager.default.fileExists(atPath: foundingClaimsURL.path) else {
             return []
         }
-        return (try? ReplicaCanonicalJSON.decode([OriginReservation].self, from: data)) ?? []
+        let data = try Data(contentsOf: foundingClaimsURL)
+        return try? ReplicaCanonicalJSON.decode([OriginReservation].self, from: data)
+    }
+
+    private static func membersWithUnknownHistory(roster: [Data], known: Set<Data>) -> [Data]? {
+        let unknown = roster.filter { !known.contains($0) }
+        return unknown.isEmpty ? nil : unknown
+    }
+
+    /// Adds the founding claims to `checkpoint` and returns `true`. When the
+    /// file does not decode, returns `false` and counts the history of every
+    /// member outside `known` as unknown. Such a member is also provisional,
+    /// so it is removed if it never sends a message.
+    private func adoptFoundingClaims(
+        into checkpoint: inout ReplicationCheckpoint,
+        roster: [Data],
+        known: Set<Data>
+    ) throws -> Bool {
+        guard let founding = try loadFoundingClaims() else {
+            let unknown = Self.membersWithUnknownHistory(roster: roster, known: known)
+            checkpoint.membersWithUnknownHistory = unknown
+            let deadline = Date().addingTimeInterval(provisionalMemberWindow)
+            for member in unknown ?? [] where !checkpoint.provisionalMembers.contains(where: { $0.fingerprint == member }) {
+                checkpoint.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(fingerprint: member, deadline: deadline))
+            }
+            return false
+        }
+        if !founding.isEmpty {
+            checkpoint.originReservations = founding.reduce(checkpoint.originReservations ?? []) { Self.upserting($1, into: $0) }
+        }
+        return true
+    }
+
+    /// Removes the founding claims file once a saved checkpoint holds its
+    /// claims, keeping the bytes of a file that did not decode.
+    private func retireFoundingClaims(readable: Bool) throws {
+        if readable {
+            try ReplicationCheckpoint.remove(at: foundingClaimsURL)
+        } else {
+            try setAsideFoundingClaims()
+        }
+    }
+
+    /// Keeps the bytes of a founding claims file that does not decode where
+    /// nothing reads them again.
+    private func setAsideFoundingClaims() throws {
+        try ReplicationCheckpoint.remove(at: unreadableFoundingClaimsURL)
+        try FileManager.default.moveItem(at: foundingClaimsURL, to: unreadableFoundingClaimsURL)
     }
 
     private func saveFoundingClaims(_ claims: [OriginReservation]) throws {
@@ -887,7 +1038,7 @@ public final class SyncEngine {
             fail(SyncError.groupAtCapacity)
             return
         }
-        if checkpoint?.reservationsVisible == false {
+        if checkpoint?.reservationsVisible == false || checkpoint?.membersWithUnknownHistory != nil {
             fail(SyncError.privateSyncUnreachable)
             return
         }
@@ -1379,12 +1530,14 @@ public final class SyncEngine {
                 of: joinerFingerprint, origins: joinerOrigins, session: session, linked: true, before: claim.cursor
             )
             let overflowed = overflow != .fits
+            let founding = checkpoint?.group != groupID
             var current = checkpoint.flatMap { $0.group == groupID ? $0 : nil }
                 ?? ReplicationCheckpoint(group: groupID, members: roster, joinPending: false, provider: nil)
             current.members = roster
-            current.originReservations = (loadFoundingClaims() + [claim]).reduce(current.originReservations ?? []) {
-                Self.upserting($1, into: $0)
-            }
+            let readable = try !founding || adoptFoundingClaims(
+                into: &current, roster: roster.map(\.fingerprint), known: [fingerprint, joinerFingerprint]
+            )
+            current.originReservations = Self.upserting(claim, into: current.originReservations ?? [])
             if declined || overflowed {
                 current.pendingRemovals.append(joinerFingerprint)
             } else {
@@ -1393,7 +1546,7 @@ public final class SyncEngine {
                 ))
             }
             try saveCheckpoint(current)
-            try ReplicationCheckpoint.remove(at: foundingClaimsURL)
+            try retireFoundingClaims(readable: readable)
             if declined {
                 await connection.cancel()
                 throw SyncError.pairingDeclined
@@ -1888,6 +2041,7 @@ public final class SyncEngine {
             }
             let group = try await session.group()
             let roster = group == nil ? [] : try await session.members()
+            let own = try await session.fingerprint()
             guard self.session === session, pairingTask == nil || isPaired else {
                 return
             }
@@ -1905,13 +2059,12 @@ public final class SyncEngine {
                     )
                     rebuilt.reservationsVisible = intent?.reservationsVisible
                     rebuilt.reservationsProvider = intent?.reservationsProvider
-                    let founding = loadFoundingClaims()
-                    if !founding.isEmpty {
-                        rebuilt.originReservations = founding
-                    }
+                    let readable = try adoptFoundingClaims(
+                        into: &rebuilt, roster: roster.map(\.fingerprint), known: [own]
+                    )
                     try saveCheckpoint(rebuilt)
                     try ReplicationCheckpoint.remove(at: joinIntentURL)
-                    try ReplicationCheckpoint.remove(at: foundingClaimsURL)
+                    try retireFoundingClaims(readable: readable)
                 }
                 if !isPaired {
                     isPaired = true
@@ -2071,6 +2224,7 @@ public final class SyncEngine {
             throw SyncError.localStorageUnavailable
         }
         _ = try await session.flush()
+        try await resolveReservationAttempts(session: session)
         try await drainInbox(session: session)
         var synchronized = false
         for _ in 0..<4 where !synchronized {
@@ -2108,7 +2262,7 @@ public final class SyncEngine {
             try saveCheckpoint(current)
         }
         var pool: [TaskOperation] = []
-        var hellos: [(sender: Data, message: ReplicationMessage)] = []
+        var hellos: [(cursor: UInt64, sender: Data, message: ReplicationMessage)] = []
         var updates: [ReservationUpdate] = []
         for message in messages {
             guard let decoded = try? ReplicationMessage.decode(message.plaintext) else {
@@ -2118,7 +2272,7 @@ public final class SyncEngine {
             case .operations where message.sender != fingerprint:
                 pool.append(contentsOf: decoded.operations ?? [])
             case .hello where message.sender != fingerprint:
-                hellos.append((message.sender, decoded))
+                hellos.append((message.cursor, message.sender, decoded))
             case .reservation, .release, .reservations:
                 updates.append(ReservationUpdate(cursor: message.cursor, sender: message.sender, message: decoded))
             case .operations, .hello:
@@ -2130,16 +2284,29 @@ public final class SyncEngine {
         let roster = Set(try await session.members().map(\.fingerprint))
         lastKnownEpoch = max(lastKnownEpoch, epoch)
         try requireCurrent(session)
-        if var current = checkpoint, !updates.isEmpty || !(current.originReservations ?? []).isEmpty {
+        if var current = checkpoint,
+           !updates.isEmpty || !(current.originReservations ?? []).isEmpty || current.membersWithUnknownHistory != nil {
             let waiting = current.reservationsVisible == false
             let snapshot = waiting ? updates.first {
                 $0.message.kind == .reservations && $0.message.member == fingerprint
             } : nil
-            let merged = Self.merge(
+            var merged = Self.merge(
                 updates.filter { $0.message.kind != .reservations || $0.cursor == snapshot?.cursor },
                 into: current.originReservations ?? [],
                 snapshotsFor: waiting ? fingerprint : nil
             )
+            if let unknown = current.membersWithUnknownHistory {
+                let heard = hellos.filter { unknown.contains($0.sender) && $0.message.vector != nil }
+                for hello in heard {
+                    merged = Self.upserting(OriginReservation(
+                        member: hello.sender, owner: fingerprint, origins: hello.message.vector?.origins.sorted() ?? [],
+                        epoch: epoch, cursor: hello.cursor, admitted: true
+                    ), into: merged)
+                }
+                current.membersWithUnknownHistory = Self.membersWithUnknownHistory(
+                    roster: unknown.filter(roster.contains), known: Set(heard.map(\.sender))
+                )
+            }
             let pruned = Self.prune(
                 merged, roster: roster, epoch: epoch,
                 retained: Set(replica.versionVector.origins), keepReleases: waiting && snapshot == nil
@@ -2235,7 +2402,7 @@ public final class SyncEngine {
             return isProvider
         }
         try await send(operations, session: session)
-        if isProvider, checkpoint?.reservationsVisible != false {
+        if isProvider, checkpoint?.reservationsVisible != false, checkpoint?.membersWithUnknownHistory == nil {
             try await send(
                 .reservations(
                     checkpoint?.originReservations ?? [],
@@ -2327,6 +2494,9 @@ public final class SyncEngine {
         current.members = roster.map(ReplicationCheckpoint.Member.init)
         current.pendingRemovals.removeAll { !fingerprints.contains($0) }
         current.provisionalMembers.removeAll { !fingerprints.contains($0.fingerprint) }
+        current.membersWithUnknownHistory = current.membersWithUnknownHistory.flatMap {
+            Self.membersWithUnknownHistory(roster: $0.filter(fingerprints.contains), known: [])
+        }
         if current != previous {
             try saveCheckpoint(current)
         }
@@ -2689,9 +2859,9 @@ public final class SyncEngine {
         try ReplicationCheckpoint.remove(
             at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.joinIntentFilename)
         )
-        try ReplicationCheckpoint.remove(
-            at: checkpointURL.deletingLastPathComponent().appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename)
-        )
+        for filename in [ReplicationCheckpoint.foundingClaimsFilename, ReplicationCheckpoint.unreadableFoundingClaimsFilename] {
+            try ReplicationCheckpoint.remove(at: checkpointURL.deletingLastPathComponent().appendingPathComponent(filename))
+        }
         try MLSSession.erase(directory: mlsRoot, secretStore: secretStore)
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
@@ -2764,5 +2934,7 @@ extension SyncEngine {
     var reservationsForTesting: [OriginReservation] { checkpoint?.originReservations ?? [] }
     var provisionalMembersForTesting: [Data] { checkpoint?.provisionalMembers.map(\.fingerprint) ?? [] }
     var reservationsProviderForTesting: Data? { checkpoint?.reservationsProvider }
+    var membersWithUnknownHistoryForTesting: [Data]? { checkpoint?.membersWithUnknownHistory }
+    var reservationAttemptsForTesting: [OriginReservation.Attempt] { checkpoint?.reservationAttempts ?? [] }
     var mlsDirectoryForTesting: URL { mlsDirectory }
 }

@@ -374,9 +374,10 @@ and reservations survive restarts. The inviter:
 2. after approval, synchronizes, commits pending removals, and checks again
    against every active reservation;
 3. publishes its reservation and saves it before any Add. A linked inviter
-   saves it in its checkpoint. A founding inviter, which has no checkpoint
-   yet, saves it in `sync-v2-claims.json` right after it creates the group,
-   and recovery after a crash moves it into the rebuilt checkpoint;
+   saves the attempt in its checkpoint before sending it, and the claim once
+   the relay accepts it. A founding inviter, which has no checkpoint yet,
+   saves it in `sync-v2-claims.json` right after it creates the group, and
+   recovery after a crash moves it into the rebuilt checkpoint;
 4. checks again, counting only reservations earlier in the log than its own;
 5. adds the joiner, and checks once more after the Add.
 
@@ -407,6 +408,27 @@ the attempt was cancelled or the app restarted, the joiner never joined, the
 lease still runs, and no Add is waiting to be sent. Only the owner can
 release a claim, and a release never frees slots of a device that is a
 member.
+
+The relay can accept a reservation without its answer reaching the owner.
+The log never returns a member's own messages to its inbox, so the owner's
+MLS client records where each of its last 64 reservations landed, with a
+SHA-256 digest of the plaintext. Other messages are not recorded and cannot
+push a reservation out. Each sync cycle, also after a restart, first
+delivers any message still pending, then turns each saved attempt into a
+claim at the cursor where it landed and releases it as above. An attempt
+that never landed is dropped, but never while its send is still running,
+even after its pairing was cancelled. The owner starts no reservation while
+an earlier attempt is unresolved.
+
+If `sync-v2-claims.json` exists but does not decode, the founding inviter
+never treats it as empty. It keeps the bytes as
+`sync-v2-claims-unreadable.json`. When no member has been added yet, it
+starts a new file. When recovery finds members it added, it counts each of
+their histories as unknown: it refuses to invite or answer snapshot requests
+until that member's next `hello` arrives, and the `hello`'s vector becomes
+that member's claim. Such a member is also provisional, so one that never
+sends a message is removed, and a member that leaves no longer blocks
+invitations.
 
 A new member cannot read reservations published before it joined. When the
 inviter answers the new member's join `hello`, it sends a `reservations`

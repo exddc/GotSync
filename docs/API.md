@@ -59,7 +59,10 @@ New `SyncError` cases:
 
 A device that has just joined cannot invite until its inviter has sent it the
 group's pending reservations, usually within one sync cycle. Until then,
-`inviteToGroup()` fails with `SyncError.privateSyncUnreachable`.
+`inviteToGroup()` fails with `SyncError.privateSyncUnreachable`. The same
+applies to a device that created a group, crashed while adding its first
+member, and then could not read its saved reservations: it cannot invite
+until that member's history arrives on its next sync.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`

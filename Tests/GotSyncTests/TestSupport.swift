@@ -184,6 +184,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
     private var appendsUnavailable = false
+    private var unavailableAfterDrop = false
     private(set) var rejectedAppends = 0
     private var failWelcomeAcknowledgement = false
     private var failingAcknowledgers: Set<Data> = []
@@ -193,7 +194,12 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     private var heldApplicationWriters: Set<Data>?
 
-    func dropNextAppendResponse() { dropAppendResponse = true }
+    /// Accepts the next append without answering. With `thenUnavailable`,
+    /// every later append fails until `setAppendsUnavailable(false)`.
+    func dropNextAppendResponse(thenUnavailable: Bool = false) {
+        dropAppendResponse = true
+        unavailableAfterDrop = thenUnavailable
+    }
     /// Rejects application messages from every writer except `authorizations`
     /// until called with `nil`.
     func holdApplications(except authorizations: [Data]?) {
@@ -329,6 +335,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private func respond(_ result: MLSAppendResult) throws -> MLSAppendResult {
         if dropAppendResponse {
             dropAppendResponse = false
+            appendsUnavailable = unavailableAfterDrop
             throw URLError(.networkConnectionLost)
         }
         return result

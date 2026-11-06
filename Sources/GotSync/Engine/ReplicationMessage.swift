@@ -172,6 +172,17 @@ struct OriginReservation: Codable, Equatable, Sendable {
     func isActive(roster: Set<Data>, epoch current: UInt64) -> Bool {
         roster.contains(member) || (!released && !admitted && allowsAdd(atEpoch: current))
     }
+
+    /// A claim this member sent without learning where it landed. `after` is
+    /// the log cursor this member had reached before sending it.
+    struct Attempt: Codable, Equatable, Sendable {
+        let member: Data
+        let origins: [ReplicaDeviceID]
+        let epoch: UInt64
+        let after: UInt64
+
+        var message: ReplicationMessage { .reservation(member: member, origins: origins, epoch: epoch) }
+    }
 }
 
 /// Engine state for the current MLS group that MLS itself does not hold.
@@ -180,6 +191,7 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     static let joinIntentFilename = "sync-v2-join.json"
     /// Claims a founding inviter makes before its checkpoint exists.
     static let foundingClaimsFilename = "sync-v2-claims.json"
+    static let unreadableFoundingClaimsFilename = "sync-v2-claims-unreadable.json"
     static let version = 2
 
     struct Member: Codable, Equatable, Sendable {
@@ -209,6 +221,10 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     var reservationsVisible: Bool? = nil
     var reservationsProvider: Data? = nil
     var reservationsOverflowed: Bool? = nil
+    var reservationAttempts: [OriginReservation.Attempt]? = nil
+    /// Members added while the founding claims file could not be read. Their
+    /// history counts as unknown until each sends a hello.
+    var membersWithUnknownHistory: [Data]? = nil
 
     var memberDeviceIDs: [Data] { members.map(\.deviceID) }
 

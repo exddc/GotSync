@@ -89,6 +89,13 @@ actor MLSSession {
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
     func inbox() async throws -> [MLSInboxMessage] { try await client.inbox() }
     func rejectedApplicationCursors() async throws -> [UInt64] { try await client.rejectedApplicationCursors() }
+
+    /// Log cursors where this member's recent tracked messages with
+    /// `plaintext` landed.
+    func sentCursors(of plaintext: Data) async throws -> [UInt64] {
+        let digest = Data(SHA256.hash(data: plaintext))
+        return try await client.sentMessages().filter { $0.digest == digest }.map(\.cursor)
+    }
     func departures() async throws -> [Data] { try await client.departures() }
 
     func acknowledgeInbox(through cursor: UInt64) async throws {
@@ -158,10 +165,11 @@ actor MLSSession {
         }
     }
 
-    func send(_ plaintext: Data) async throws -> MLSSubmission {
+    /// A `tracked` message is listed by `sentCursors(of:)` once it lands.
+    func send(_ plaintext: Data, tracked: Bool = false) async throws -> MLSSubmission {
         try await exclusive { session in
             try await session.commitDepartures()
-            return try await session.submit { try await $0.prepareMessage(plaintext) }
+            return try await session.submit { try await $0.prepareMessage(plaintext, tracked: tracked) }
         }
     }
 

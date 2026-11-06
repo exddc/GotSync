@@ -37,6 +37,7 @@ that tells the user to pair every device again. The pairing WebSocket closes a
 | MLS delivery entry kinds | `commit`, `application`, `proposal` | Server rejects other kinds; a `proposal` revokes its sender |
 | Replication message | `version: 2` inside MLS application messages | Receivers skip messages with another version or shape |
 | Replication checkpoint | `sync-v2.json`, version 2 | Engine discards an unreadable checkpoint and rebuilds it from MLS state |
+| Founding reservations | `sync-v2-claims.json` | Engine keeps an unreadable file as `sync-v2-claims-unreadable.json` and refuses to invite until each member it added reports its history |
 | Replica archive | `replica-v1.json`, format 1 | Unchanged by the cutover; replica validation rejects unsupported archives and more than 128 origins |
 
 The relay's `/healthz` reports `supportedVersions: [2]`.
