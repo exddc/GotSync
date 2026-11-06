@@ -373,6 +373,131 @@ final class ReplicaTests: XCTestCase {
         }
     }
 
+    func testForkedOperationReportsRetainedIDsWithDifferentContent() throws {
+        let taskID = task(8)
+        let first = operation(
+            origin: 1,
+            sequence: 1,
+            lamport: 1,
+            taskID: taskID,
+            mutation: .create(title: "Before erase", completed: false)
+        )
+        var replica = try TaskReplica(deviceID: device(9))
+        XCTAssertEqual(try replica.applyRemote([first]), 1)
+
+        let reused = operation(
+            origin: 1,
+            sequence: 1,
+            lamport: 1,
+            taskID: task(9),
+            mutation: .create(title: "After erase", completed: false)
+        )
+        let next = operation(
+            origin: 1,
+            sequence: 2,
+            lamport: 2,
+            taskID: taskID,
+            mutation: .setCompleted(true)
+        )
+        let nextFork = operation(
+            origin: 1,
+            sequence: 2,
+            lamport: 2,
+            taskID: taskID,
+            mutation: .setCompleted(false)
+        )
+        XCTAssertNil(try replica.forkedOperation(in: [first, next, next]))
+        XCTAssertEqual(try replica.forkedOperation(in: [next, reused]), reused)
+        XCTAssertEqual(try replica.forkedOperation(in: [next, nextFork]), nextFork)
+
+        let decomposed = operation(
+            origin: 1,
+            sequence: 1,
+            lamport: 1,
+            taskID: taskID,
+            mutation: .create(title: "Before erase\u{301}", completed: false)
+        )
+        let precomposed = operation(
+            origin: 1,
+            sequence: 1,
+            lamport: 1,
+            taskID: taskID,
+            mutation: .create(title: "Before eras\u{E9}", completed: false)
+        )
+        XCTAssertEqual(decomposed, precomposed)
+        XCTAssertFalse(decomposed.isIdentical(to: precomposed))
+    }
+
+    func testNewOriginIsDurableAndIndependentOfDeviceID() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("replica.json")
+
+        var replica = try TaskReplica(deviceID: device(1), persistenceURL: url, newOrigin: device(2))
+        let created = try replica.createTask(id: task(1), title: "New origin")
+        XCTAssertEqual(created.originDeviceID, device(2))
+        XCTAssertEqual(created.originSequence, 1)
+        XCTAssertEqual(replica.archive.formatVersion, ReplicaLimits.archiveFormatVersion)
+
+        var reloaded = try TaskReplica(deviceID: device(1), persistenceURL: url, newOrigin: device(3))
+        XCTAssertEqual(reloaded.localOrigin, device(2))
+        let updated = try reloaded.setCompleted(taskID: task(1), completed: true)
+        XCTAssertEqual(updated.originDeviceID, device(2))
+        XCTAssertEqual(updated.originSequence, 2)
+        XCTAssertThrowsError(try TaskReplica(deviceID: device(2), persistenceURL: url)) {
+            XCTAssertEqual($0 as? ReplicaError, .archiveDeviceMismatch(expected: device(2), actual: device(1)))
+        }
+    }
+
+    func testVersionOneArchiveKeepsDeviceIDAsOrigin() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("replica.json")
+
+        var legacy = try TaskReplica(deviceID: device(1), persistenceURL: url)
+        try legacy.createTask(id: task(1), title: "Version 1")
+        XCTAssertEqual(legacy.archive.formatVersion, ReplicaLimits.legacyArchiveFormatVersion)
+        XCTAssertNil(try ReplicaArchive.decodeCanonical(from: Data(contentsOf: url)).originDeviceID)
+
+        var reloaded = try TaskReplica(deviceID: device(1), persistenceURL: url, newOrigin: device(2))
+        XCTAssertEqual(reloaded.localOrigin, device(1))
+        let next = try reloaded.setTitle(taskID: task(1), title: "Still version 1")
+        XCTAssertEqual(next.originDeviceID, device(1))
+        XCTAssertEqual(next.originSequence, 2)
+    }
+
+    func testArchiveVersionMustMatchOriginPresence() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let cases: [(Int, ReplicaDeviceID?, ReplicaError)] = [
+            (ReplicaLimits.legacyArchiveFormatVersion, device(2), .corruptArchive("The origin does not match the archive version.")),
+            (ReplicaLimits.archiveFormatVersion, nil, .corruptArchive("The origin does not match the archive version.")),
+            (ReplicaLimits.archiveFormatVersion + 1, device(2), .unsupportedArchiveVersion(ReplicaLimits.archiveFormatVersion + 1)),
+        ]
+        for (version, origin, expected) in cases {
+            let archive = ReplicaArchive(
+                formatVersion: version,
+                deviceID: device(1),
+                originDeviceID: origin,
+                nextLocalOriginSequence: 1,
+                lamport: 0,
+                versionVector: ReplicaVersionVector(),
+                taskRecords: [],
+                operations: []
+            )
+            let url = directory.appendingPathComponent("\(version)-\(origin != nil).json")
+            try archive.canonicalData().write(to: url, options: .atomic)
+            XCTAssertThrowsError(try TaskReplica(deviceID: device(1), persistenceURL: url)) {
+                XCTAssertEqual($0 as? ReplicaError, expected)
+            }
+        }
+    }
+
     func testPersistenceReload() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -510,7 +635,7 @@ final class ReplicaTests: XCTestCase {
 
         let emptyVector = ReplicaVersionVector()
         let excessiveTasks = ReplicaArchive(
-            formatVersion: ReplicaLimits.archiveFormatVersion,
+            formatVersion: ReplicaLimits.legacyArchiveFormatVersion,
             deviceID: device(9),
             nextLocalOriginSequence: 1,
             lamport: 0,
@@ -541,7 +666,7 @@ final class ReplicaTests: XCTestCase {
             mutation: .delete
         )
         let excessiveOperations = ReplicaArchive(
-            formatVersion: ReplicaLimits.archiveFormatVersion,
+            formatVersion: ReplicaLimits.legacyArchiveFormatVersion,
             deviceID: device(9),
             nextLocalOriginSequence: 1,
             lamport: 1,
