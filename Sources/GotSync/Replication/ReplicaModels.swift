@@ -5,7 +5,10 @@ public enum ReplicaLimits {
     public static let maxTitleUTF8Bytes = 512
     public static let maxTasks = 1_000
     public static let maxOperations = 10_000
-    public static let maxOrigins = 8
+    /// Distinct devices whose operations one replica retains over its
+    /// lifetime, including devices that have since left or been removed.
+    /// This is separate from the eight-member limit of an MLS group.
+    public static let maxOrigins = 128
     public static let maxBatchOperations = 256
     public static let maxBatchEncodedBytes = 256 * 1_024
     public static let archiveFormatVersion = 2

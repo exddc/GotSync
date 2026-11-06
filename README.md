@@ -129,6 +129,12 @@ operating system grants and retries on the next launch. See
 [push and background receive](docs/PUSH-AND-BACKGROUND-RECEIVE.md) for the
 planned design.
 
+A group holds at most eight devices at a time. Its task history holds edits
+from at most 128 devices over its lifetime, including removed devices, so
+devices can be replaced long after the group first fills. Once the history
+has no free slot, no further device can be linked to it; see
+[replica capacity](docs/PROTOCOL.md#replica-capacity).
+
 All linked devices share access to the group's tasks. A live invitation is an
 admission capability. The safety code protects against accidental pairing and
 key substitution, but does not recover the secrecy of a stolen invitation.

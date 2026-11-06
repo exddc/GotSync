@@ -56,6 +56,25 @@ New `SyncError` cases:
   its MLS state, unlinks, keeps local tasks, and shows this in `errorMessage`.
 - `approvalExpired`: the inviter did not approve the safety code within 10
   minutes. Nothing was linked.
+- `taskHistoryAtCapacity`: the task history has no room for another device.
+  It counts retained origins, including those of removed devices, plus one
+  slot for each current member and this device, up to
+  `ReplicaLimits.maxOrigins` (128). Creating, inviting,
+  or joining fails before anything is linked. The inviter counts the joiner's
+  history and every device another member is adding at the same time, and
+  both devices report this error when the merged history would not fit.
+  Current members keep syncing.
+
+A device that has just joined cannot invite until its inviter has sent it the
+group's pending reservations, usually within one sync cycle. Until then,
+`inviteToGroup()` fails with `SyncError.privateSyncUnreachable`. The same
+applies to a device that created a group, crashed while adding its first
+member, and then could not read its saved reservations: it cannot invite
+until that member's history arrives on its next sync. An unlinked device that
+already created a group first checks the relay's log, because an earlier
+invitation may have added someone without the device learning it. If the
+relay cannot be reached, `createPrivateSync()` fails with
+`SyncError.privateSyncUnreachable`.
 
 `SyncEngine.linkEndedReason` and `SyncState.linkEndedReason` report why this
 device stopped being linked without the user unlinking it: `.removedFromGroup`
@@ -104,6 +123,12 @@ for a fingerprint outside the group. Sync cycles commit saved removals until
 the device is gone, after restarts and conflicting commits as well. The entry
 disappears from `linkedDevices` once the commit is accepted. A group may
 shrink to this device alone; it stays paired and can invite again.
+
+Removing a device frees a group slot but not its slot in the task history.
+`isTaskHistoryAtCapacity` is `true` when linking one more device would leave
+no room for a new origin from that device or a current member. It is separate
+from `isGroupAtCapacity`, which counts current members only against
+`SyncEngine.maximumGroupSize` (8).
 
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this

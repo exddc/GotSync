@@ -180,6 +180,25 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(inbox.map(\.plaintext), [Data("once".utf8)])
     }
 
+    func testTrackedMessageCursorOutlivesLaterMessages() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, _, _) = try await pair(relay)
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.send(Data("claim".utf8), tracked: true)
+            XCTFail("Dropped response succeeded")
+        } catch {}
+        let reopened = try session("alice", transport: relay)
+        guard case .accepted(let cursor) = try await reopened.flush() else { return XCTFail("Retry not accepted") }
+        for index in 0..<(MLSSentMessage.retained + 6) {
+            _ = try await reopened.send(Data("edit \(index)".utf8))
+        }
+        let claim = try await reopened.sentCursors(of: Data("claim".utf8))
+        XCTAssertEqual(claim, [cursor])
+        let edit = try await reopened.sentCursors(of: Data("edit 0".utf8))
+        XCTAssertEqual(edit, [])
+    }
+
     func testStaleSenderResolvesEpochConflicts() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)
