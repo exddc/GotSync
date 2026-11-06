@@ -39,6 +39,9 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
     case relinkRequired
     case syncHistoryBlocked
     case syncHistoryExpired
+    /// Another device sent an operation whose ID this device already holds
+    /// with different content.
+    case syncHistoryConflict
     case removedFromGroup
     case approvalExpired
 
@@ -71,6 +74,8 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
             "Sync stopped at an update this iPhone could not verify. Your tasks are safe. Unlink and create a new link to keep syncing."
         case .syncHistoryExpired:
             "This iPhone was offline longer than the sync service keeps updates. Your tasks are safe. Unlink and create a new link to keep syncing."
+        case .syncHistoryConflict:
+            "A linked device sent task changes that conflict with this iPhone's copy, so sync stopped. Your tasks are safe. This can happen when a device was erased with an earlier app version: unlink this iPhone, erase that device again, then link them again."
         case .removedFromGroup:
             "This iPhone was removed from the sync group. Your tasks are safe on this iPhone."
         case .approvalExpired:
@@ -136,7 +141,7 @@ public enum SyncError: Error, LocalizedError, Equatable, Sendable {
         case .invitationExpired, .pairingDeclined, .groupAtCapacity, .taskHistoryAtCapacity,
              .invalidPairMessage, .invalidCredentials, .localStorageUnavailable,
              .unsupportedProtocolVersion, .relinkRequired, .syncHistoryBlocked,
-             .syncHistoryExpired, .removedFromGroup, .approvalExpired:
+             .syncHistoryExpired, .syncHistoryConflict, .removedFromGroup, .approvalExpired:
             return false
         }
     }
@@ -377,16 +382,20 @@ public final class SyncEngine {
                         markerURL: markerURL
                     )
                 } else {
-                    replica = try TaskReplica(deviceID: deviceID, persistenceURL: persistenceURL)
+                    replica = try TaskReplica(
+                        deviceID: deviceID,
+                        persistenceURL: persistenceURL,
+                        newOrigin: Self.newReplicaOrigin()
+                    )
                 }
                 hasDurableStorage = true
             } catch {
                 bootError = bootError ?? error
-                replica = try! TaskReplica(deviceID: deviceID)
+                replica = try! TaskReplica(deviceID: deviceID, newOrigin: Self.newReplicaOrigin())
                 hasDurableStorage = false
             }
         } else {
-            replica = try! TaskReplica(deviceID: deviceID)
+            replica = try! TaskReplica(deviceID: deviceID, newOrigin: Self.newReplicaOrigin())
             hasDurableStorage = false
         }
 
@@ -2413,6 +2422,9 @@ public final class SyncEngine {
                 break
             }
         }
+        if let forked = try replica.forkedOperation(in: pool) {
+            throw ReplicaError.operationFork(origin: forked.originDeviceID, sequence: forked.originSequence)
+        }
         let accepted = try applyRemoteOperations(&pool)
         let epoch = try await session.epoch()
         let roster = Set(try await session.members().map(\.fingerprint))
@@ -2525,12 +2537,12 @@ public final class SyncEngine {
         fingerprint: Data,
         session: MLSSession
     ) async throws {
-        guard let vector = hello.vector, let uploadedThrough = checkpoint?.uploadedThrough else {
+        guard let vector = hello.vector, let uploadedThrough = checkpoint.map(uploadedLocalSequence) else {
             return
         }
         let isProvider = hello.provider == fingerprint
         let operations = replica.operations(missingFrom: vector).filter {
-            if $0.originDeviceID == deviceID {
+            if $0.originDeviceID == replica.localOrigin {
                 return $0.originSequence <= uploadedThrough
             }
             return isProvider
@@ -2562,7 +2574,10 @@ public final class SyncEngine {
         }
         current.joinPending = false
         current.provider = nil
-        current.uploadedThrough = max(current.uploadedThrough, vector[deviceID])
+        current.setUploadedThrough(
+            max(uploadedLocalSequence(in: current), vector[replica.localOrigin]),
+            origin: replica.localOrigin
+        )
         try saveCheckpoint(current)
         lastMailboxStoredAt = Date()
         refreshPendingMailboxCount()
@@ -2570,24 +2585,26 @@ public final class SyncEngine {
 
     private func uploadLocalOperations(session: MLSSession) async throws {
         while var current = checkpoint {
-            let localSequence = replica.versionVector[deviceID]
-            if current.uploadedThrough > localSequence {
-                current.uploadedThrough = localSequence
+            let localSequence = replica.versionVector[replica.localOrigin]
+            var uploadedThrough = uploadedLocalSequence(in: current)
+            if uploadedThrough > localSequence {
+                uploadedThrough = localSequence
+                current.setUploadedThrough(localSequence, origin: replica.localOrigin)
                 try saveCheckpoint(current)
             }
-            guard current.uploadedThrough < localSequence else {
+            guard uploadedThrough < localSequence else {
                 break
             }
             let pending = replica.retainedOperations.filter {
-                $0.originDeviceID == deviceID && $0.originSequence > current.uploadedThrough
+                $0.originDeviceID == replica.localOrigin && $0.originSequence > uploadedThrough
             }
-            guard pending.first?.originSequence == current.uploadedThrough + 1,
+            guard pending.first?.originSequence == uploadedThrough + 1,
                   let batch = try OperationBatcher.batches(pending).first,
                   let last = batch.last
             else {
                 throw ReplicaError.sequenceGap(
-                    origin: deviceID,
-                    expected: current.uploadedThrough + 1,
+                    origin: replica.localOrigin,
+                    expected: uploadedThrough + 1,
                     received: pending.first?.originSequence ?? 0
                 )
             }
@@ -2596,7 +2613,10 @@ public final class SyncEngine {
             guard var latest = checkpoint, latest.group == current.group else {
                 throw CancellationError()
             }
-            latest.uploadedThrough = max(latest.uploadedThrough, last.originSequence)
+            latest.setUploadedThrough(
+                max(uploadedLocalSequence(in: latest), last.originSequence),
+                origin: replica.localOrigin
+            )
             try saveCheckpoint(latest)
             lastMailboxStoredAt = Date()
             refreshPendingMailboxCount()
@@ -2821,6 +2841,10 @@ public final class SyncEngine {
         return newest ?? freshMLSDirectory(in: root)
     }
 
+    private func uploadedLocalSequence(in checkpoint: ReplicationCheckpoint) -> UInt64 {
+        checkpoint.uploadedThrough(origin: replica.localOrigin, deviceID: deviceID)
+    }
+
     private func saveCheckpoint(_ value: ReplicationCheckpoint) throws {
         try value.save(to: checkpointURL)
         checkpoint = value
@@ -2878,8 +2902,8 @@ public final class SyncEngine {
     }
 
     private func refreshPendingMailboxCount() {
-        let localSequence = replica.versionVector[deviceID]
-        let uploaded = checkpoint?.uploadedThrough ?? 0
+        let localSequence = replica.versionVector[replica.localOrigin]
+        let uploaded = checkpoint.map(uploadedLocalSequence) ?? 0
         let pending = localSequence > uploaded ? Int(localSequence - uploaded) : 0
         if pending == 0 {
             if pendingMailboxOperationCount != 0 { pendingMailboxOperationCount = 0 }
@@ -2944,6 +2968,8 @@ public final class SyncEngine {
             return .removed
         case MLSRelayError.historyExpired:
             return .blocked(.syncHistoryExpired)
+        case ReplicaError.operationFork:
+            return .blocked(.syncHistoryConflict)
         case MLSSessionError.unresolvedConflict, is SyncCycleError:
             return .transient
         case MLSClientError.storageUnavailable, MLSClientError.capacityReached, is MLSStoreError:
@@ -2967,6 +2993,11 @@ public final class SyncEngine {
         if case MLSStoreError.unreadable = error { return true }
         if case MLSClientError.invalidState = error { return true }
         return false
+    }
+
+    /// A new archive never reuses an origin whose operations peers may hold.
+    private static func newReplicaOrigin() -> ReplicaDeviceID {
+        ReplicaDeviceID(uuid: UUID())
     }
 
     private static func persistEraseMarker(at markerURL: URL) throws {
@@ -3000,7 +3031,11 @@ public final class SyncEngine {
         if FileManager.default.fileExists(atPath: persistenceURL.path) {
             try FileManager.default.removeItem(at: persistenceURL)
         }
-        let clearedReplica = try TaskReplica(deviceID: deviceID, persistenceURL: persistenceURL)
+        let clearedReplica = try TaskReplica(
+            deviceID: deviceID,
+            persistenceURL: persistenceURL,
+            newOrigin: newReplicaOrigin()
+        )
         if FileManager.default.fileExists(atPath: markerURL.path) {
             try FileManager.default.removeItem(at: markerURL)
         }
@@ -3071,4 +3106,5 @@ extension SyncEngine {
     var membersWithUnknownHistoryForTesting: [Data]? { checkpoint?.membersWithUnknownHistory }
     var reservationAttemptsForTesting: [OriginReservation.Attempt] { checkpoint?.reservationAttempts ?? [] }
     var mlsDirectoryForTesting: URL { mlsDirectory }
+    var replicaForTesting: TaskReplica { replica }
 }

@@ -378,3 +378,9 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     private static func digest(_ data: Data) -> Data { Data(SHA256.hash(data: data)) }
 }
+
+extension TaskReplica {
+    init(deviceID: ReplicaDeviceID, persistenceURL: URL? = nil) throws {
+        try self.init(deviceID: deviceID, persistenceURL: persistenceURL, newOrigin: nil)
+    }
+}

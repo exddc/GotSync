@@ -209,6 +209,9 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     var version = Self.version
     let group: Data
     var uploadedThrough: UInt64
+    /// The local origin that `uploadedThrough` counts. Checkpoints written
+    /// before replicas had their own origin omit it and count the device ID.
+    var uploadOrigin: ReplicaDeviceID?
     var members: [Member]
     var joinPending: Bool
     var provider: Data?
@@ -227,6 +230,15 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     var membersWithUnknownHistory: [Data]? = nil
 
     var memberDeviceIDs: [Data] { members.map(\.deviceID) }
+
+    func uploadedThrough(origin: ReplicaDeviceID, deviceID: ReplicaDeviceID) -> UInt64 {
+        (uploadOrigin ?? deviceID) == origin ? uploadedThrough : 0
+    }
+
+    mutating func setUploadedThrough(_ sequence: UInt64, origin: ReplicaDeviceID) {
+        uploadedThrough = sequence
+        uploadOrigin = origin
+    }
 
     init(group: Data, members: [Member], joinPending: Bool, provider: Data?) {
         self.group = group

@@ -149,11 +149,14 @@ before it answers hellos and acknowledges the MLS inbox. A replay after a
 crash is idempotent.
 
 `sync-v2.json` in the storage directory records the group ID, each member's
-device ID and fingerprint, the highest own sequence uploaded, whether the join
-announcement is pending, requested removals, provisional members, the
-reservations it knows, and whether this member still waits for its
-reservations snapshot. The MLS
-state remains the source of truth: on launch, a group with at least two
+device ID and fingerprint, the highest own sequence uploaded and the local
+origin it counts, whether the join announcement is pending, requested
+removals, provisional members, the reservations it knows, and whether this
+member still waits for its reservations snapshot. A sequence recorded for
+another origin counts as nothing uploaded, so a replica recreated under a new
+origin while the link survives uploads all its edits. A checkpoint without an
+origin counts the device ID, as version 1 archives do. The MLS state remains
+the source of truth: on launch, a group with at least two
 members is linked even if the file is missing. Before a joiner waits for
 admission it writes the group ID and inviter fingerprint to
 `sync-v2-join.json`, so a joiner that stops after admission but before
@@ -311,13 +314,23 @@ Each replica persists:
 
 - materialized task records and tombstones;
 - every operation;
-- its next local origin sequence;
+- the origin of its local operations and its next sequence;
 - its Lamport clock;
 - the highest contiguous sequence seen for each origin.
 
 An install-scoped 128-bit replica device ID is generated on first launch,
 before any task or pairing operation, and stored with a `ThisDeviceOnly`
-Keychain class. It is not regenerated when the device leaves a group. Origin sequences
+Keychain class. It is not regenerated when the device leaves a group. The
+archive records this ID and refuses to load under another one.
+
+Local operations use a separate random 128-bit origin that the engine
+generates whenever it creates a replica archive: on first launch, after
+`eraseLocalData()`, and when the archive is missing, as after a reinstall that
+kept the Keychain. The origin is stored in the archive (format version 2), so
+it survives restarts, and an interrupted erase that runs again at launch
+generates another one. Operations created after an erase therefore never
+reuse the IDs of earlier operations that other devices still hold. A version 1
+archive has no stored origin and keeps using the device ID. Origin sequences
 begin at one; zero means that no operation from an origin has been applied.
 If the install identity or persistent replica cannot be opened, the engine
 enters a fatal local error state: it does not open the MLS session, sync,
@@ -480,7 +493,11 @@ complete replica archive.
 
 Operations are idempotent by `(originDeviceID, originSequence)`. A repeated ID
 must have byte-identical canonical content; different content for an existing
-ID is a fork, and the whole batch is rejected.
+ID is a fork, and the whole batch is rejected. Before it applies anything from
+an inbox read, the engine also compares every received operation with its
+retained copy and with other received copies of the same ID. On a fork it
+reports `SyncError.syncHistoryConflict`, applies nothing, and does not
+acknowledge the MLS inbox, so neither copy is silently dropped.
 
 Mutation cases and apply rules:
 
