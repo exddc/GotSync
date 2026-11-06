@@ -230,6 +230,7 @@ public final class SyncEngine {
     @available(*, deprecated, message: "Use the engine's memberLimit, which follows its group profile")
     public nonisolated static let maximumGroupSize = SyncGroupProfile.legacyMemberLimit
     private static let maximumAddAttempts = 3
+    private static let maximumAddResolutionAttempts = 5
     private static let maximumRemovalAttempts = 8
     private static let maximumDepartures = 8
 
@@ -1764,11 +1765,17 @@ public final class SyncEngine {
             var added = false
             for _ in 0..<Self.maximumAddAttempts where !added {
                 try requireCurrentPairingAttempt(attemptID)
-                if case .accepted = try await session.add(
-                    keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference,
-                    beforeEpoch: claim.epoch &+ OriginReservation.leaseEpochs
-                ) {
-                    added = true
+                do {
+                    if case .accepted = try await session.add(
+                        keyPackage: keyPackage, verifiedFingerprint: joinerFingerprint, reference: reference,
+                        beforeEpoch: claim.epoch &+ OriginReservation.leaseEpochs
+                    ) {
+                        added = true
+                    }
+                } catch let error where Self.isTransientTransportFailure(error) || error as? MLSClientError == .capacityReached {
+                    added = try await resolveAdd(
+                        of: joinerFingerprint, reference: reference, session: session, attemptID: attemptID, failure: error
+                    )
                 }
             }
             guard added else {
@@ -1832,6 +1839,39 @@ public final class SyncEngine {
         } catch {
             pairingFailed(error, attemptID: attemptID)
         }
+    }
+
+    /// Settles an Add whose delivery failed by reconciling it with the log a
+    /// few times. Returns `true` once the joiner is a member and rethrows
+    /// `failure` once the Add is gone without it. An Add still pending makes
+    /// the joiner provisional, so a later reconciliation that finds the Add
+    /// removes a joiner that never speaks.
+    private func resolveAdd(
+        of joiner: Data,
+        reference: Data,
+        session: MLSSession,
+        attemptID: UUID,
+        failure: Error
+    ) async throws -> Bool {
+        var delayNanoseconds = pairingRetryDelayNanoseconds
+        for _ in 0..<Self.maximumAddResolutionAttempts {
+            guard try await session.pendingDelivery()?.keyPackageReference == reference else {
+                guard try await session.members().contains(where: { $0.fingerprint == joiner }) else { throw failure }
+                return true
+            }
+            try requireCurrentPairingAttempt(attemptID)
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+            delayNanoseconds = min(delayNanoseconds * 2, 4_000_000_000)
+            _ = try? await session.flush()
+        }
+        if try await session.pendingDelivery()?.keyPackageReference == reference,
+           var current = checkpoint, !current.provisionalMembers.contains(where: { $0.fingerprint == joiner }) {
+            current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(
+                fingerprint: joiner, deadline: Date().addingTimeInterval(provisionalMemberWindow)
+            ))
+            try saveCheckpoint(current)
+        }
+        throw failure
     }
 
     private struct JoinerResponse {
@@ -2900,7 +2940,8 @@ public final class SyncEngine {
         let previous = current
         current.members = roster.map(ReplicationCheckpoint.Member.init)
         current.pendingRemovals.removeAll { !fingerprints.contains($0) }
-        current.provisionalMembers.removeAll { !fingerprints.contains($0.fingerprint) }
+        let now = Date()
+        current.provisionalMembers.removeAll { !fingerprints.contains($0.fingerprint) && $0.deadline <= now }
         current.membersWithUnknownHistory = current.membersWithUnknownHistory.flatMap {
             Self.membersWithUnknownHistory(roster: $0.filter(fingerprints.contains), known: [])
         }

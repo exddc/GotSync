@@ -21,7 +21,12 @@ enum MLSRelayError: Error, Equatable {
     case unsupportedVersion
     case unauthorized
     case epochConflict
+    /// The delivery store refused the request for lack of room.
     case capacityReached
+    /// HTTP 429 from anything other than the delivery store, such as the
+    /// relay's admission rate limit or a proxy. The request never reached the
+    /// store.
+    case rateLimited
     case historyExpired
     case rejected(status: Int, code: String)
 }
@@ -331,7 +336,8 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
             case (409, "epochConflict"): throw MLSRelayError.epochConflict
             case (403, _): throw MLSRelayError.unauthorized
             case (410, "historyExpired"): throw MLSRelayError.historyExpired
-            case (429, _): throw MLSRelayError.capacityReached
+            case (429, "deliveryCapacity"): throw MLSRelayError.capacityReached
+            case (429, _): throw MLSRelayError.rateLimited
             case (_, "unsupportedVersion"): throw MLSRelayError.unsupportedVersion
             case (let status, let code): throw MLSRelayError.rejected(status: status, code: code ?? "http\(status)")
             }

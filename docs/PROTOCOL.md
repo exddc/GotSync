@@ -354,11 +354,23 @@ writer's hash; the relay admits that writer only if the reference belongs to a
 KeyPackage published by it, and otherwise answers `keyPackageUnavailable`. It
 admits at most ten active writers per group and answers an Add beyond that
 with HTTP 429 `deliveryCapacity`, without consuming the KeyPackage. The relay
-does not read group profiles. A client that receives HTTP 429 for an Add
-discards that Add instead of retrying it. A
+does not read group profiles. A
 commit can name `removeWriter`, and a proposal revokes its own sender. Naming
 a writer the relay no longer holds has no effect. The relay does not parse
 MLS: it trusts these fields and treats payloads as opaque.
+
+A client sends each Add once. If the answer is lost, or the relay answers
+HTTP 429, the client keeps the Add pending and does not send it again: it reads
+the log to its head instead. An Add found there is applied, a competing commit
+discards it, and an Add still missing after the log is read never landed and
+is discarded, because the log keeps every entry its writer has not
+acknowledged. While the log cannot be read, the Add stays pending. HTTP 429
+`deliveryCapacity` comes from the delivery store after it looked for a
+duplicate; any other HTTP 429, such as the admission rate limit or a proxy,
+means the request never reached the store. The inviter repeats this check a few
+times during pairing. If the Add is still pending when pairing ends, the joiner
+is recorded as provisional, so a later read that finds the Add removes a joiner
+that never sends a message.
 
 A revoked writer cannot append. It can read entries up to its removal cursor
 until it acknowledges that cursor or 24 hours pass. The relay deletes entries

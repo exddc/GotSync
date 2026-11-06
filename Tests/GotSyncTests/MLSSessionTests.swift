@@ -244,6 +244,154 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(afterDrain, [cursor])
     }
 
+    private func publishedPackage(
+        of joiner: MLSSession, for inviter: MLSSession
+    ) async throws -> (keyPackage: Data, published: MLSPublishedKeyPackage) {
+        let token = try Data.secureRandom(count: 32)
+        let published = try await joiner.publishKeyPackage(pairingToken: token, profile: nil)
+        let keyPackage = try await XCTUnwrapAsync(await inviter.fetchKeyPackage(reference: published.reference, pairingToken: token))
+        return (keyPackage, published)
+    }
+
+    private func assertConverged(
+        _ sessions: [MLSSession], relay: FakeMLSRelay, group: Data, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        for session in sessions { try await session.synchronize() }
+        var epochs: Set<UInt64> = []
+        var rosters: Set<[Data]> = []
+        for session in sessions {
+            epochs.insert(try await session.epoch())
+            let members = try await session.members()
+            XCTAssertEqual(Set(members.map(\.fingerprint)).count, members.count, "duplicate leaf", file: file, line: line)
+            rosters.insert(members.map(\.fingerprint).sorted { $0.lexicographicallyPrecedes($1) })
+        }
+        XCTAssertEqual(epochs.count, 1, "members are in different epochs", file: file, line: line)
+        XCTAssertEqual(rosters.count, 1, "members disagree on the roster", file: file, line: line)
+        XCTAssertEqual(rosters.first?.count, sessions.count, "ghost or missing leaf", file: file, line: line)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, sessions.count, "relay writers differ from the roster", file: file, line: line)
+        for (index, sender) in sessions.enumerated() {
+            let text = Data("after Add from \(index)".utf8)
+            guard case .accepted = try await sender.send(text) else { return XCTFail("send refused", file: file, line: line) }
+            for receiver in sessions where receiver !== sender {
+                try await receiver.synchronize()
+                let inbox = try await receiver.inbox()
+                XCTAssertEqual(inbox.last?.plaintext, text, file: file, line: line)
+            }
+        }
+    }
+
+    func testLostAddResponseThenRateLimitedRetryRecoversTheAcceptedAddAcrossRestart() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The response should be lost")
+        } catch is URLError {}
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        await relay.rateLimitNext(adds: 1, fetches: 1)
+        do {
+            _ = try await alice.flush()
+            XCTFail("Reading the log should be rate limited")
+        } catch MLSRelayError.rateLimited {}
+        let retained = try await alice.pendingDelivery()
+        XCTAssertEqual(retained?.keyPackageReference, published.reference, "an Add with an unknown outcome was discarded")
+
+        let restarted = try session("alice", transport: relay)
+        guard case .accepted = try await restarted.flush() else { return XCTFail("The accepted Add was not applied") }
+        let unusedLimit = await relay.rateLimitedAdds
+        XCTAssertEqual(unusedLimit, 1, "the Add was sent again instead of being found in the log")
+        await relay.rateLimitNext()
+        let cleared = try await restarted.pendingDelivery()
+        XCTAssertNil(cleared)
+        try await assertConverged([restarted, bob, charlie], relay: relay, group: group)
+    }
+
+    func testRateLimitedAddThatNeverLandedIsDiscardedAndNeverAdmitted() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        let epoch = try await alice.epoch()
+        await relay.rateLimitNext(adds: 1)
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The Add should be rate limited")
+        } catch MLSRelayError.rateLimited {}
+        let pending = try await alice.pendingDelivery()
+        XCTAssertNil(pending)
+        let after = try await alice.epoch()
+        XCTAssertEqual(after, epoch)
+        let flushed = try await alice.flush()
+        XCTAssertNil(flushed)
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertFalse(joined)
+        let log = await relay.log(group: group)
+        XCTAssertFalse(log.contains { $0.delivery.keyPackageReference == published.reference }, "the refused Add reached the log")
+        try await assertConverged([alice, bob], relay: relay, group: group)
+    }
+
+    func testAddKeptWhileTheLogCannotBeReadIsDiscardedOnceItIsRead() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.rateLimitNext(adds: 1, fetches: 1)
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The Add should be rate limited")
+        } catch MLSRelayError.rateLimited {}
+        let kept = try await alice.pendingDelivery()
+        XCTAssertEqual(kept?.keyPackageReference, published.reference)
+        let restarted = try session("alice", transport: relay)
+        let flushed = try await restarted.flush()
+        XCTAssertEqual(flushed, .superseded)
+        let discarded = try await restarted.pendingDelivery()
+        XCTAssertNil(discarded)
+        let log = await relay.log(group: group)
+        XCTAssertFalse(log.contains { $0.delivery.keyPackageReference == published.reference }, "the refused Add reached the log")
+        try await assertConverged([restarted, bob], relay: relay, group: group)
+    }
+
+    func testLostAddBehindAFullInboxStaysPendingUntilTheInboxDrains() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        for index in 0...1_000 {
+            _ = try await bob.send(Data("edit \(index)".utf8))
+        }
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The response should be lost")
+        } catch is URLError {}
+        do {
+            _ = try await alice.flush()
+            XCTFail("A full inbox accepted more messages")
+        } catch MLSClientError.capacityReached {}
+        let kept = try await alice.pendingDelivery()
+        XCTAssertEqual(kept?.keyPackageReference, published.reference)
+        let held = try await alice.inbox()
+        try await alice.acknowledgeInbox(through: try XCTUnwrap(held.last).cursor)
+        guard case .accepted = try await alice.flush() else { return XCTFail("The accepted Add was not applied") }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        try await alice.acknowledgeInbox(through: try await alice.cursor())
+        try await bob.acknowledgeInbox(through: try await bob.cursor())
+        try await assertConverged([alice, bob, charlie], relay: relay, group: group)
+    }
+
     func testStaleSenderResolvesEpochConflicts() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)
@@ -528,6 +676,26 @@ final class MLSSessionTests: XCTestCase {
         } catch { XCTAssertEqual(error as? MLSRelayError, .insecureTransport) }
     }
 
+    func testHTTPTransportSeparatesGatewayRateLimitsFromStoreCapacity() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TooManyRequestsProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let cases: [(String, MLSRelayError)] = [
+            ("rate-limited.example", .rateLimited),
+            ("proxy.example", .rateLimited),
+            ("store-full.example", .capacityReached),
+        ]
+        for (host, expected) in cases {
+            let transport = HTTPMLSRelayTransport(baseURL: try XCTUnwrap(URL(string: "https://\(host)/v2/mls")), session: session)
+            do {
+                _ = try await transport.fetch(group: Data(repeating: 1, count: 32), after: 0, limit: 1, authorization: Data(repeating: 2, count: 32))
+                XCTFail("\(host) answered")
+            } catch {
+                XCTAssertEqual(error as? MLSRelayError, expected, host)
+            }
+        }
+    }
+
     func testRealRelayReportsMissingGroupAsExpiredHistory() async throws {
         guard let relay = try realRelay() else { return }
         let group = try Data.secureRandom(count: 32)
@@ -609,4 +777,27 @@ extension MLSSession {
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
     try XCTUnwrap(value, file: file, line: line)
+}
+
+/// Answers every request with HTTP 429 and the body the host names: the
+/// relay's admission limiter, a proxy without a JSON body, or the delivery
+/// store.
+private final class TooManyRequestsProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        let body: Data = switch url.host {
+        case "rate-limited.example": Data(#"{"error":"rateLimited","version":2}"#.utf8)
+        case "store-full.example": Data(#"{"error":"deliveryCapacity","version":2}"#.utf8)
+        default: Data("Too Many Requests".utf8)
+        }
+        let response = HTTPURLResponse(url: url, statusCode: 429, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

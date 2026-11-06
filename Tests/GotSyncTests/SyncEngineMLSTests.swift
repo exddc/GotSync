@@ -3365,6 +3365,99 @@ extension SyncEngineMLSTests {
         XCTAssertFalse(third.isPaired)
     }
 
+    private func linkedPairWithPendingThird(
+        _ prefix: String,
+        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
+        arm: @escaping @MainActor (_ relay: FakeMLSRelay, _ host: Data, _ third: Data) async -> Void
+    ) async throws -> (host: SyncEngine, first: SyncEngine, third: SyncEngine, group: Data) {
+        let host = engine("\(prefix)-host", provisionalMemberWindow: provisionalMemberWindow)
+        let first = engine("\(prefix)-first")
+        try await pair(host, first)
+        let group = try await groupID(host)
+        let hostAuthorization = try await authorization(host)
+        let third = engine("\(prefix)-third")
+        var armed = true
+        var thirdAuthorization = Data()
+        host.reservationHookForTesting = { [relay] in
+            guard armed, let relay else { return }
+            armed = false
+            await arm(relay, hostAuthorization, thirdAuthorization)
+        }
+        third.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && third.safetyCode != nil }
+        thirdAuthorization = try await authorization(third)
+        host.approveSafetyCode()
+        return (host, first, third, group)
+    }
+
+    func testLostAddResponseIsResolvedWithinThePairingDespiteARateLimitedRead() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("lost-add") { relay, host, _ in
+            await relay.dropNextAddResponse()
+            await relay.rateLimitNext(fetches: 1, of: host)
+        }
+        try await wait("third linked") { third.isPaired && !host.canCancelPairing }
+        XCTAssertNil(host.lastPairingFailure)
+        let all = [host, first, third]
+        try await wait("three members") { all.allSatisfy { $0.linkedMemberCount == 3 } }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 3)
+        await host.stop()
+        let restarted = engine("lost-add-host")
+        XCTAssertTrue(third.addTask(title: "From the third device"))
+        XCTAssertTrue(restarted.addTask(title: "From the restarted host"))
+        let converged = [restarted, first, third]
+        try await wait("converged") {
+            converged.allSatisfy { $0.tasks.count == 2 && $0.linkedMemberCount == 3 && $0.pendingMailboxOperationCount == 0 }
+        }
+    }
+
+    func testRateLimitedAddEndsThePairingWithoutAdmittingTheJoinerLater() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("limited-add") { relay, host, _ in
+            await relay.rateLimitNext(adds: 1, of: host)
+        }
+        try await wait("pairing failed") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        XCTAssertEqual(host.lastPairingFailure, .privateSyncUnreachable)
+        let pending = try await XCTUnwrapAsync(host.mlsSessionForTesting).pendingDelivery()
+        XCTAssertNil(pending)
+        let thirdFingerprint = try await XCTUnwrapAsync(third.mlsSessionForTesting).fingerprint()
+        XCTAssertTrue(first.addTask(title: "Group keeps syncing"))
+        try await wait("claim released and group syncing") {
+            host.tasks.count == 1 && !host.reservationsForTesting.contains { $0.member == thirdFingerprint && !$0.released }
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+        XCTAssertEqual(members.count, 2)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        XCTAssertFalse(third.isPaired)
+    }
+
+    func testAddStillUnresolvedWhenThePairingEndsIsProvisional() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird(
+            "unresolved-add", provisionalMemberWindow: 1
+        ) { relay, host, third in
+            await relay.dropNextAddResponse()
+            await relay.rateLimitNext(fetches: 1_000, of: host)
+            await relay.setOffline(third, true)
+        }
+        let thirdFingerprint = try await XCTUnwrapAsync(third.mlsSessionForTesting).fingerprint()
+        try await wait("pairing failed") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(thirdFingerprint))
+        third.cancelPairing()
+        XCTAssertFalse(third.isPaired)
+        await relay.rateLimitNext()
+        try await wait("Add found, then the silent joiner removed") {
+            host.linkedMemberCount == 2 && first.linkedMemberCount == 2 && host.provisionalMembersForTesting.isEmpty
+        }
+        let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+        XCTAssertFalse(members.contains { $0.fingerprint == thirdFingerprint })
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        let log = await relay.log(group: group)
+        let add = try XCTUnwrap(log.last { $0.delivery.welcome != nil }, "the Add never landed")
+        XCTAssertTrue(log.contains { $0.cursor > add.cursor && $0.delivery.removeWriter == add.delivery.addWriter })
+    }
+
     func testLegacyGroupStillRefusesANinthDevice() async throws {
         let linked = try await linkedGroup((1...8).map { "legacy-\($0)" })
         let host = linked[0]

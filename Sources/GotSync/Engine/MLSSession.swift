@@ -25,6 +25,8 @@ struct MLSPublishedKeyPackage: Equatable, Sendable {
 }
 
 enum MLSSubmission: Equatable, Sendable {
+    /// For an Add found while reconciling, `cursor` is the log position read
+    /// to, at or after the commit.
     case accepted(cursor: UInt64)
     case superseded
 }
@@ -147,7 +149,7 @@ actor MLSSession {
         beforeEpoch: UInt64? = nil
     ) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit { client in
+            try await session.submit(sendingAdd: true) { client in
                 if let beforeEpoch {
                     guard try await client.epoch() < beforeEpoch else {
                         return nil
@@ -281,18 +283,27 @@ actor MLSSession {
         throw MLSSessionError.unresolvedConflict
     }
 
-    private func submit(_ prepare: (MLSClient) async throws -> MLSDelivery?) async throws -> MLSSubmission {
+    private func submit(
+        sendingAdd: Bool = false,
+        _ prepare: (MLSClient) async throws -> MLSDelivery?
+    ) async throws -> MLSSubmission {
         if try await client.pendingDelivery() != nil {
             _ = try await deliverPending()
         }
         guard try await prepare(client) != nil else { return .superseded }
-        return try await deliverPending()
+        return try await deliverPending(sendingAdd: sendingAdd)
     }
 
-    private func deliverPending() async throws -> MLSSubmission {
+    /// Only `add` sends an Add, once. Anywhere else a pending Add is
+    /// reconciled with the log and never sent again, so an Add whose pairing
+    /// already ended cannot admit its device later.
+    private func deliverPending(sendingAdd: Bool = false) async throws -> MLSSubmission {
         let authorization = try await client.transportAuthorization()
         for _ in 0..<Self.maximumSubmitAttempts {
             guard let pending = try await client.pendingDelivery() else { return .superseded }
+            if pending.isAdd && !sendingAdd {
+                return try await reconcileAdd(pending)
+            }
             let result: MLSAppendResult
             do {
                 result = try await transport.append(pending, authorization: authorization)
@@ -300,12 +311,13 @@ actor MLSSession {
                 _ = try await catchUp()
                 if try await client.isRemoved() { throw MLSSessionError.removed }
                 continue
-            } catch MLSRelayError.capacityReached where pending.kind == .commit && pending.welcome != nil {
-                // The relay refused the Add without appending it, for example
-                // because its writer directory is smaller than the group's
-                // member limit. A queued Add would block every later send.
-                try await client.rejectAddForUnavailableKeyPackage(commit: pending.payload, rejectedEpoch: pending.epoch)
-                throw MLSRelayError.capacityReached
+            } catch let error as MLSRelayError where pending.isAdd && (error == .capacityReached || error == .rateLimited) {
+                // This attempt appended nothing. A refusal by the delivery
+                // store, such as a full writer directory, would otherwise
+                // keep the Add queued and block every later send.
+                let outcome = try await reconcileAdd(pending)
+                if case .accepted = outcome { return outcome }
+                throw error
             }
             switch result {
             case .accepted(let cursor):
@@ -321,6 +333,22 @@ actor MLSSession {
             }
         }
         throw MLSSessionError.unresolvedConflict
+    }
+
+    /// Reads the log to its head. An Add found there is applied, a competing
+    /// commit discards it, and an Add still pending afterwards never landed:
+    /// the log keeps every entry this member has not acknowledged. If the log
+    /// cannot be read, the Add stays pending.
+    private func reconcileAdd(_ pending: MLSDelivery) async throws -> MLSSubmission {
+        _ = try await catchUp()
+        if try await client.isRemoved() { throw MLSSessionError.removed }
+        guard try await client.pendingDelivery() == pending else {
+            return try await client.rejectedCommit() == pending
+                ? .superseded
+                : .accepted(cursor: try await client.cursor())
+        }
+        try await client.rejectAddForUnavailableKeyPackage(commit: pending.payload, rejectedEpoch: pending.epoch)
+        return .superseded
     }
 
     private func catchUp() async throws -> Int {
@@ -385,4 +413,8 @@ actor MLSSession {
             task.cancel()
         }
     }
+}
+
+private extension MLSDelivery {
+    var isAdd: Bool { kind == .commit && welcome != nil }
 }

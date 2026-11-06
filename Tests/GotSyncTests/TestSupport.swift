@@ -201,6 +201,10 @@ actor FakeMLSRelay: MLSRelayTransport {
 
     private var heldApplicationWriters: Set<Data>?
     private var writerLimit: Int?
+    private(set) var rateLimitedAdds = 0
+    private var rateLimitedFetches = 0
+    private var rateLimitedWriter: Data?
+    private var dropAddResponse = false
 
     /// Accepts the next append without answering. With `thenUnavailable`,
     /// every later append fails until `setAppendsUnavailable(false)`. With
@@ -221,6 +225,22 @@ actor FakeMLSRelay: MLSRelayTransport {
     /// until called with `nil`.
     func holdApplications(except authorizations: [Data]?) {
         heldApplicationWriters = authorizations.map { Set($0.map(Self.digest)) }
+    }
+
+    /// Accepts the next Add without answering.
+    func dropNextAddResponse() { dropAddResponse = true }
+
+    /// Answers the next Adds and fetches, of `authorization` only if given,
+    /// with the relay gateway's HTTP 429 before the delivery store sees them,
+    /// so a retried entry is not deduplicated.
+    func rateLimitNext(adds: Int = 0, fetches: Int = 0, of authorization: Data? = nil) {
+        rateLimitedAdds = adds
+        rateLimitedFetches = fetches
+        rateLimitedWriter = authorization.map(Self.digest)
+    }
+
+    private func isRateLimited(_ authorization: Data) -> Bool {
+        rateLimitedWriter.map { $0 == Self.digest(authorization) } ?? true
     }
 
     /// Refuses an Add once the group has `count` active writers, as a relay
@@ -332,6 +352,10 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     private func appendNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        if rateLimitedAdds > 0, delivery.welcome != nil, isRateLimited(authorization) {
+            rateLimitedAdds -= 1
+            throw MLSRelayError.rateLimited
+        }
         if appendsUnavailable || offlineWriters.contains(Self.digest(authorization)) {
             rejectedAppends += 1
             throw URLError(.notConnectedToInternet)
@@ -378,10 +402,18 @@ actor FakeMLSRelay: MLSRelayTransport {
             }
             droppedWriterAppend = (drop.writer, drop.accepted - 1)
         }
+        if dropAddResponse, delivery.welcome != nil {
+            dropAddResponse = false
+            throw URLError(.networkConnectionLost)
+        }
         return try respond(.accepted(cursor: cursor))
     }
 
     func fetch(group: Data, after cursor: UInt64, limit: Int, authorization: Data) throws -> [MLSRelayEntry] {
+        if rateLimitedFetches > 0, isRateLimited(authorization) {
+            rateLimitedFetches -= 1
+            throw MLSRelayError.rateLimited
+        }
         if offlineWriters.contains(Self.digest(authorization)) { throw URLError(.notConnectedToInternet) }
         if let budget = fetchBudgets[Self.digest(authorization)] {
             guard budget > 0 else {
