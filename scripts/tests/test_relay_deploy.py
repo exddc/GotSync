@@ -64,6 +64,15 @@ class DeploymentTests(unittest.TestCase):
                 self.assertRaises(RuntimeError):
             deploy.deploy(self.manifest)
 
+    def test_user_cancelled_deployment_stops_without_waiting(self):
+        with patch.object(deploy, "api", side_effect=[self.application, [], {}, {},
+                          {"deployments": [{"deployment_uuid": "d"}]}, {"status": "cancelled-by-user"}]), \
+                patch.object(deploy.time, "monotonic", side_effect=[0, 0, 601]), \
+                patch.object(deploy.time, "sleep") as sleep, \
+                self.assertRaisesRegex(RuntimeError, "cancelled-by-user"):
+            deploy.deploy(self.manifest)
+        sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

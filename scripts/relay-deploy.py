@@ -60,7 +60,7 @@ def deploy(manifest):
         if state == "finished":
             print(f"Stable relay {manifest['version']} deployed successfully")
             return
-        if state in {"failed", "cancelled", "canceled"}:
+        if state in {"failed", "cancelled-by-user", "cancelled", "canceled"}:
             raise RuntimeError(f"Coolify deployment {deployment} {state}; inspect its deployment log")
         time.sleep(10)
     raise TimeoutError(f"Coolify deployment {deployment} is still pending; inspect it before retrying")
