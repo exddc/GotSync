@@ -3,9 +3,6 @@ import Foundation
 import XCTest
 @testable import GotSync
 
-/// Byte fixtures recorded from the engine before the task replication
-/// adapter was extracted. Identities are fixed or replaced by placeholders,
-/// so any change in wire or file bytes fails here.
 @MainActor
 final class TaskReplicationGoldenTests: XCTestCase {
     private var root: URL!
@@ -377,7 +374,7 @@ final class TaskReplicationGoldenTests: XCTestCase {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    // MARK: - Recorded at 3f20ffb, before the extraction
+    // MARK: - Fixtures
 
     private static let recordedMessageDigests = [
         "hello": "229adeeb1b0d80c8ed7b667ab00baa34d237d8d2b17d8ea8b3c2ea465b93970f",
