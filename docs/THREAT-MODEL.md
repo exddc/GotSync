@@ -43,7 +43,8 @@ The relay deletes stored records on the schedule in the
 learn whether the relay still holds that group, because requests for a deleted
 group return `historyExpired` instead of `unauthorized`.
 
-A group has up to eight devices. Every member can read and edit all tasks and
+A group has up to ten devices; its group profile sets the limit, and a group
+without one has up to eight. Every member can read and edit all tasks and
 invite additional members. There is no administrator role or privacy boundary
 between members. TLS protects transport between a device and the deployment;
 MLS protects message contents from the relay.
@@ -74,6 +75,18 @@ code matches the real joiner's code. Each attempt matches with probability
 attacker who holds the invitation and wins the race to respond, but then the
 real joiner shows a different value. The inviter's approval wait ends after 10
 minutes, before the relay discards the KeyPackage.
+
+A group profile names the application, payload schema, and member limit of a
+group. It lives in the authenticated MLS group context and cannot change after
+creation. Profiled pairings carry the descriptor in sealed frames and bind it
+into the commitment and the safety code, so devices configured for different
+applications, schemas, or limits refuse each other before anything is
+published or approved, and a holder of the invitation who rewrites the
+descriptor breaks the commitment or the code. A profile is not a secret and
+grants nothing: it stops accidental cross-application pairing and silent
+downgrades, not an attacker who holds a valid invitation for the right
+profile. The relay neither sees nor enforces profiles; it caps every group at
+ten writers.
 
 ## Removal and leave
 

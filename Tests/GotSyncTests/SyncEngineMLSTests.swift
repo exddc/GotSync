@@ -11,6 +11,7 @@ final class SyncEngineMLSTests: XCTestCase {
     private var rendezvous: FakePairingRendezvous!
     private var stores: [String: MemorySecretStore] = [:]
     private var engines: [SyncEngine] = []
+    private var profile = SyncGroupProfile.legacyTaskDemo
 
     override func setUp() async throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -30,7 +31,8 @@ final class SyncEngineMLSTests: XCTestCase {
         approvalTimeoutNanoseconds: UInt64 = SyncTiming.approvalTimeoutNanoseconds,
         provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
         departureRetryDelayNanoseconds: ClosedRange<UInt64> = 1_000_000_000...30_000_000_000,
-        deferredOperationLimit: Int = DeferredOperationStore.maximumCount
+        deferredOperationLimit: Int = DeferredOperationStore.maximumCount,
+        profile: SyncGroupProfile? = nil
     ) -> SyncEngine {
         let store = stores[name] ?? MemorySecretStore()
         stores[name] = store
@@ -40,7 +42,8 @@ final class SyncEngineMLSTests: XCTestCase {
                 mailboxURL: TestEndpoints.mailboxURL,
                 storageDirectory: root.appendingPathComponent(name),
                 invitationURLScheme: "gotsync-tests",
-                endpointPolicy: .localDevelopment
+                endpointPolicy: .localDevelopment,
+                groupProfile: profile ?? self.profile
             ),
             secretStore: store,
             backgroundMailboxScheduler: nil,
@@ -75,7 +78,10 @@ final class SyncEngineMLSTests: XCTestCase {
         }
     }
 
+    /// A host still finishing its previous pairing ignores a new invitation,
+    /// so wait for that attempt to end first.
     private func invite(_ host: SyncEngine) async throws -> URL {
+        try await wait("host ready to invite") { !host.canCancelPairing }
         host.createPrivateSync()
         try await wait("invitation") { host.invitationURL != nil }
         return try XCTUnwrap(host.invitationURL)
@@ -91,7 +97,7 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("safety code") { host.isHostApprovalPending && joiner.safetyCode != nil }
         XCTAssertEqual(host.safetyCode, joiner.safetyCode)
         host.approveSafetyCode()
-        try await wait("paired") { host.isPaired && joiner.isPaired }
+        try await wait("paired") { host.isPaired && joiner.isPaired && !host.canCancelPairing }
     }
 
     private func groupID(_ engine: SyncEngine) async throws -> Data {
@@ -354,14 +360,14 @@ final class SyncEngineMLSTests: XCTestCase {
         let origins = (1...ReplicaLimits.maxOrigins).map { _ in ReplicaDeviceID(uuid: UUID()) }
         let fixed = Data(repeating: 4, count: 32)
         let response = PairingFrame.response(
-            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: origins
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: origins, profile: nil
         )
         let opened = try PairingFrame.open(response.seal(for: invitation, from: .fromJoiner), for: invitation, from: .fromJoiner)
         XCTAssertEqual(opened, .response(
-            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: origins.sorted()
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: origins.sorted(), profile: nil
         ))
         XCTAssertThrowsError(try PairingFrame.response(
-            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: [origins[0], origins[0]]
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: [origins[0], origins[0]], profile: nil
         ).seal(for: invitation, from: .fromJoiner))
         XCTAssertEqual(
             try PairingFrame.open(PairingFrame.historyFull.seal(for: invitation, from: .fromInviter), for: invitation, from: .fromInviter),
@@ -379,7 +385,11 @@ final class SyncEngineMLSTests: XCTestCase {
         for body in invalidBodies {
             XCTAssertThrowsError(try PairingFrame.open(sealed(body, kind: 2, key: invitation.responseKey), for: invitation, from: .fromJoiner))
         }
-        XCTAssertThrowsError(try PairingFrame.open(sealed(Data([3]), kind: 3, key: invitation.offerKey), for: invitation, from: .fromInviter))
+        XCTAssertEqual(
+            try PairingFrame.open(sealed(Data([3]), kind: 3, key: invitation.offerKey), for: invitation, from: .fromInviter),
+            .profileMismatch
+        )
+        XCTAssertThrowsError(try PairingFrame.open(sealed(Data([4]), kind: 3, key: invitation.offerKey), for: invitation, from: .fromInviter))
     }
 
     private func sealed(_ body: Data, kind: UInt8, key: SymmetricKey) throws -> Data {
@@ -1602,17 +1612,18 @@ final class SyncEngineMLSTests: XCTestCase {
             secretStore: MemorySecretStore(),
             transport: relay
         )
-        let published = try await attacker.publishKeyPackage(pairingToken: invitation.pairingToken)
+        let published = try await attacker.publishKeyPackage(pairingToken: invitation.pairingToken, profile: nil)
         let nonce = Data(repeating: 0x42, count: 32)
         let commitment = try PairingFrame.commitment(PairingSafetyCode.commitment(
             groupID: try XCTUnwrap(invitation.groupID),
             inviterFingerprint: try XCTUnwrap(invitation.inviterFingerprint),
             keyPackageReference: published.reference,
             joinerFingerprint: published.fingerprint,
-            joinerNonce: nonce
+            joinerNonce: nonce,
+            profile: nil
         )).seal(for: invitation, from: .fromJoiner)
         let reveal = try PairingFrame.response(
-            keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce, origins: []
+            keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce, origins: [], profile: nil
         ).seal(for: invitation, from: .fromJoiner)
         await rendezvous.setInterceptor { frame in
             switch try? PairingFrame.open(frame, for: invitation, from: .fromJoiner) {
@@ -1646,12 +1657,12 @@ final class SyncEngineMLSTests: XCTestCase {
                 transport: relay
             )
             let connection = try await rendezvous.connect(route: invitation.route)
-            let committed = try await attacker.publishKeyPackage(pairingToken: invitation.pairingToken)
+            let committed = try await attacker.publishKeyPackage(pairingToken: invitation.pairingToken, profile: nil)
             let nonce = Data(repeating: 0x24, count: 32)
             func commitment(_ package: MLSPublishedKeyPackage) throws -> Data {
                 try PairingFrame.commitment(PairingSafetyCode.commitment(
                     groupID: group, inviterFingerprint: inviter, keyPackageReference: package.reference,
-                    joinerFingerprint: package.fingerprint, joinerNonce: nonce
+                    joinerFingerprint: package.fingerprint, joinerNonce: nonce, profile: nil
                 )).seal(for: invitation, from: .fromJoiner)
             }
             var inviterNonce: Data?
@@ -1667,12 +1678,12 @@ final class SyncEngineMLSTests: XCTestCase {
                 default: XCTFail("Unexpected event")
                 }
             }
-            let ground = try await attacker.publishKeyPackage(pairingToken: invitation.pairingToken)
+            let ground = try await attacker.publishKeyPackage(pairingToken: invitation.pairingToken, profile: nil)
             if substituteCommitment {
                 try await connection.send(commitment(ground))
             } else {
                 try await connection.send(PairingFrame.response(
-                    keyPackageReference: ground.reference, joinerFingerprint: ground.fingerprint, joinerNonce: nonce, origins: []
+                    keyPackageReference: ground.reference, joinerFingerprint: ground.fingerprint, joinerNonce: nonce, origins: [], profile: nil
                 ).seal(for: invitation, from: .fromJoiner))
             }
             try await wait("inviter rejects") { host.phase == .failed }
@@ -1690,13 +1701,13 @@ final class SyncEngineMLSTests: XCTestCase {
         let codes = Set((0..<32).map { byte in
             PairingSafetyCode.code(
                 groupID: group, inviterFingerprint: inviter, joinerFingerprint: joiner,
-                inviterNonce: Data(repeating: UInt8(byte), count: 32), joinerNonce: Data(repeating: 9, count: 32)
+                inviterNonce: Data(repeating: UInt8(byte), count: 32), joinerNonce: Data(repeating: 9, count: 32), profile: nil
             )
         })
         XCTAssertGreaterThan(codes.count, 28)
         XCTAssertNotEqual(
-            PairingSafetyCode.code(groupID: group, inviterFingerprint: inviter, joinerFingerprint: joiner, inviterNonce: group, joinerNonce: inviter),
-            PairingSafetyCode.code(groupID: group, inviterFingerprint: inviter, joinerFingerprint: joiner, inviterNonce: group, joinerNonce: joiner)
+            PairingSafetyCode.code(groupID: group, inviterFingerprint: inviter, joinerFingerprint: joiner, inviterNonce: group, joinerNonce: inviter, profile: nil),
+            PairingSafetyCode.code(groupID: group, inviterFingerprint: inviter, joinerFingerprint: joiner, inviterNonce: group, joinerNonce: joiner, profile: nil)
         )
     }
 
@@ -1739,7 +1750,7 @@ final class SyncEngineMLSTests: XCTestCase {
         let joiner = engine("joiner")
         let real = try Invitation.from(url: try await invite(host), scheme: "gotsync-tests")
         let forger = try Invitation(secret: Data(repeating: 0x55, count: 16))
-        let forged = try PairingFrame.offer(groupID: try XCTUnwrap(real.groupID), inviterFingerprint: Data(repeating: 0xEE, count: 32))
+        let forged = try PairingFrame.offer(groupID: try XCTUnwrap(real.groupID), inviterFingerprint: Data(repeating: 0xEE, count: 32), profile: nil)
             .seal(for: forger, from: .fromInviter)
         await rendezvous.setInterceptor { _ in [forged] }
         joiner.joinPrivateSync(phrase: try XCTUnwrap(host.invitationPhrase))
@@ -2353,7 +2364,7 @@ final class SyncEngineMLSTests: XCTestCase {
             transport: relay
         )
         let connection = try await rendezvous.connect(route: invitation.route)
-        let published = try await ghost.publishKeyPackage(pairingToken: invitation.pairingToken)
+        let published = try await ghost.publishKeyPackage(pairingToken: invitation.pairingToken, profile: nil)
         let nonce = Data(repeating: 0x33, count: 32)
         var answered = false
         while !answered {
@@ -2365,11 +2376,12 @@ final class SyncEngineMLSTests: XCTestCase {
                     inviterFingerprint: try XCTUnwrap(invitation.inviterFingerprint),
                     keyPackageReference: published.reference,
                     joinerFingerprint: published.fingerprint,
-                    joinerNonce: nonce
+                    joinerNonce: nonce,
+                    profile: nil
                 )).seal(for: invitation, from: .fromJoiner))
             case .nonce:
                 try await connection.send(PairingFrame.response(
-                    keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce, origins: []
+                    keyPackageReference: published.reference, joinerFingerprint: published.fingerprint, joinerNonce: nonce, origins: [], profile: nil
                 ).seal(for: invitation, from: .fromJoiner))
                 answered = true
             default:
@@ -3074,4 +3086,701 @@ private final class SyncTestGate {
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
     try XCTUnwrap(value, file: file, line: line)
+}
+
+private let tenDeviceProfile = try! SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: 10)
+
+// MARK: - Group profiles
+
+extension SyncEngineMLSTests {
+    func testProfiledDevicesPairByURLAndPhraseAndKeepTheProfileInTheGroup() async throws {
+        profile = tenDeviceProfile
+        let host = engine("profiled-host")
+        let first = engine("profiled-first")
+        let second = engine("profiled-second")
+        XCTAssertTrue(host.addTask(title: "Host"))
+        XCTAssertTrue(second.addTask(title: "Second"))
+        try await pair(host, first)
+        try await pair(host, second, usePhrase: true)
+        let all = [host, first, second]
+        try await wait("converged") { all.allSatisfy { $0.tasks.count == 2 && $0.linkedMemberCount == 3 } }
+        for engine in all {
+            XCTAssertEqual(engine.memberLimit, 10)
+            XCTAssertEqual(engine.state.memberLimit, 10)
+            let stored = try await XCTUnwrapAsync(engine.mlsSessionForTesting).groupProfile()
+            XCTAssertEqual(stored, tenDeviceProfile.descriptor)
+        }
+        await host.stop()
+        let restarted = engine("profiled-host")
+        XCTAssertTrue(restarted.isPaired)
+        XCTAssertTrue(first.addTask(title: "After restart"))
+        try await wait("restarted host syncs") { restarted.tasks.count == 3 && restarted.phase == .synced }
+    }
+
+    private func assertRefusedBeforeApproval(
+        _ name: String,
+        host hostProfile: SyncGroupProfile,
+        joiner joinerProfile: SyncGroupProfile,
+        usePhrase: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let host = engine("\(name)-host", profile: hostProfile)
+        let joiner = engine("\(name)-joiner", profile: joinerProfile)
+        XCTAssertTrue(joiner.addTask(title: "Joiner task"))
+        let published = await relay.lastPublishedReference
+        let url = try await invite(host)
+        if usePhrase {
+            joiner.joinPrivateSync(phrase: try XCTUnwrap(host.invitationPhrase))
+        } else {
+            joiner.joinPrivateSync(url: url)
+        }
+        var approvalShown = false
+        try await wait("refused", file: file, line: line) {
+            approvalShown = approvalShown || host.isHostApprovalPending || host.safetyCode != nil || joiner.safetyCode != nil
+            return host.lastPairingFailure != nil && joiner.lastPairingFailure != nil
+        }
+        XCTAssertFalse(approvalShown, file: file, line: line)
+        XCTAssertEqual(host.lastPairingFailure, .incompatibleGroupProfile, file: file, line: line)
+        XCTAssertEqual(joiner.lastPairingFailure, .incompatibleGroupProfile, file: file, line: line)
+        XCTAssertEqual(joiner.errorMessage, SyncError.incompatibleGroupProfile.errorDescription, file: file, line: line)
+        let publishedAfter = await relay.lastPublishedReference
+        XCTAssertEqual(publishedAfter, published, "the joiner published a KeyPackage", file: file, line: line)
+        XCTAssertFalse(host.isPaired, file: file, line: line)
+        XCTAssertFalse(joiner.isPaired, file: file, line: line)
+        let hostGroup = try await host.mlsSessionForTesting?.group()
+        let joinerGroup = try await joiner.mlsSessionForTesting?.group()
+        XCTAssertNil(hostGroup, file: file, line: line)
+        XCTAssertNil(joinerGroup, file: file, line: line)
+        XCTAssertEqual(joiner.tasks.compactMap(\.titleValue), ["Joiner task"], file: file, line: line)
+    }
+
+    func testMismatchedProfilesAreRefusedBeforeAnyKeyPackageOrApproval() async throws {
+        let otherApplication = try SyncGroupProfile(application: "com.example.other", schema: .taskReplica, memberLimit: 10)
+        let otherSchema = try SyncGroupProfile(
+            application: "com.example.tasks", schema: SyncPayloadSchema(identifier: "com.example.records", version: 1), memberLimit: 10
+        )
+        let otherLimit = try SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: 9)
+        let cases: [(String, SyncGroupProfile, SyncGroupProfile, Bool)] = [
+            ("legacy-host-url", .legacyTaskDemo, tenDeviceProfile, false),
+            ("legacy-host-phrase", .legacyTaskDemo, tenDeviceProfile, true),
+            ("legacy-joiner-url", tenDeviceProfile, .legacyTaskDemo, false),
+            ("legacy-joiner-phrase", tenDeviceProfile, .legacyTaskDemo, true),
+            ("other-application", tenDeviceProfile, otherApplication, true),
+            ("other-schema", tenDeviceProfile, otherSchema, false),
+            ("other-limit", tenDeviceProfile, otherLimit, true),
+        ]
+        for (name, host, joiner, usePhrase) in cases {
+            try await assertRefusedBeforeApproval(name, host: host, joiner: joiner, usePhrase: usePhrase)
+        }
+    }
+
+    func testProfileRewrittenInTransitIsRefusedBeforeApproval() async throws {
+        let other = try SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: 9)
+        let host = engine("rewrite-host", profile: tenDeviceProfile)
+        let joiner = engine("rewrite-joiner", profile: other)
+        let url = try await invite(host)
+        let invitation = try Invitation.from(url: url, scheme: "gotsync-tests")
+        let hostDescriptor = tenDeviceProfile.descriptor
+        let joinerDescriptor = other.descriptor
+        await rendezvous.setInterceptor { frame in
+            if case .offer(let group, let fingerprint, _)? = try? PairingFrame.open(frame, for: invitation, from: .fromInviter) {
+                return [try! PairingFrame.offer(groupID: group, inviterFingerprint: fingerprint, profile: joinerDescriptor)
+                    .seal(for: invitation, from: .fromInviter)]
+            }
+            if case .response(let reference, let fingerprint, let nonce, let origins, _)? =
+                try? PairingFrame.open(frame, for: invitation, from: .fromJoiner) {
+                return [try! PairingFrame.response(
+                    keyPackageReference: reference, joinerFingerprint: fingerprint, joinerNonce: nonce,
+                    origins: origins, profile: hostDescriptor
+                ).seal(for: invitation, from: .fromJoiner)]
+            }
+            return [frame]
+        }
+        joiner.joinPrivateSync(url: url)
+        var approvalShown = false
+        try await wait("refused") {
+            approvalShown = approvalShown || host.isHostApprovalPending || host.safetyCode != nil
+            return host.lastPairingFailure != nil
+        }
+        XCTAssertFalse(approvalShown)
+        XCTAssertEqual(host.lastPairingFailure, .invalidPairMessage)
+        let hostGroup = try await host.mlsSessionForTesting?.group()
+        XCTAssertNil(hostGroup)
+        XCTAssertFalse(joiner.isPaired)
+    }
+
+    func testProfiledFramesUseKindsEarlierBuildsRejectAndBindTheDescriptor() throws {
+        let invitation = try Invitation.generate(
+            groupID: Data(repeating: 1, count: 32), inviterFingerprint: Data(repeating: 2, count: 32)
+        )
+        let descriptor = try XCTUnwrap(tenDeviceProfile.descriptor)
+        let fixed = Data(repeating: 4, count: 32)
+        let legacyOffer = try PairingFrame.offer(groupID: fixed, inviterFingerprint: fixed, profile: nil)
+            .seal(for: invitation, from: .fromInviter)
+        let offer = try PairingFrame.offer(groupID: fixed, inviterFingerprint: fixed, profile: descriptor)
+            .seal(for: invitation, from: .fromInviter)
+        let response = try PairingFrame.response(
+            keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: [], profile: descriptor
+        ).seal(for: invitation, from: .fromJoiner)
+        XCTAssertEqual(legacyOffer.first, 1)
+        XCTAssertEqual(offer.first, 6)
+        XCTAssertEqual(response.first, 7)
+        XCTAssertEqual(
+            try PairingFrame.open(offer, for: invitation, from: .fromInviter),
+            .offer(groupID: fixed, inviterFingerprint: fixed, profile: descriptor)
+        )
+        XCTAssertEqual(
+            try PairingFrame.open(response, for: invitation, from: .fromJoiner),
+            .response(keyPackageReference: fixed, joinerFingerprint: fixed, joinerNonce: fixed, origins: [], profile: descriptor)
+        )
+        for body in [fixed + fixed, fixed + fixed + Data(repeating: 1, count: SyncGroupProfile.maximumDescriptorBytes + 1)] {
+            XCTAssertThrowsError(try PairingFrame.open(sealed(body, kind: 6, key: invitation.offerKey), for: invitation, from: .fromInviter))
+        }
+        XCTAssertThrowsError(try PairingFrame.open(sealed(fixed + fixed + fixed + Data([0]), kind: 7, key: invitation.responseKey), for: invitation, from: .fromJoiner))
+        XCTAssertThrowsError(try PairingFrame.offer(groupID: fixed, inviterFingerprint: fixed, profile: Data()).seal(for: invitation, from: .fromInviter))
+
+        func commitment(_ profile: Data?) -> Data {
+            PairingSafetyCode.commitment(
+                groupID: fixed, inviterFingerprint: fixed, keyPackageReference: fixed,
+                joinerFingerprint: fixed, joinerNonce: fixed, profile: profile
+            )
+        }
+        func code(_ profile: Data?) -> String {
+            PairingSafetyCode.code(
+                groupID: fixed, inviterFingerprint: fixed, joinerFingerprint: fixed,
+                inviterNonce: fixed, joinerNonce: Data(repeating: 5, count: 32), profile: profile
+            )
+        }
+        let legacyInput = Data("com.gotdone.sync/mls-pairing-commitment/v2".utf8) + fixed + fixed + fixed + fixed + fixed
+        XCTAssertEqual(commitment(nil), Data(SHA256.hash(data: legacyInput)))
+        let nine = try XCTUnwrap(SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: 9).descriptor)
+        XCTAssertEqual(Set([commitment(nil), commitment(descriptor), commitment(nine)]).count, 3)
+        XCTAssertNotEqual(code(descriptor), code(nine))
+    }
+
+    func testDescriptorEncodingIsCanonicalAndBounded() throws {
+        let descriptor = try XCTUnwrap(tenDeviceProfile.descriptor)
+        XCTAssertEqual(
+            descriptor.map { String(format: "%02x", $0) }.joined(),
+            "0111636f6d2e6578616d706c652e7461736b7314676f7473796e632e7461736b2d7265706c69636100020a"
+        )
+        XCTAssertEqual(try SyncGroupProfile(descriptor: descriptor), tenDeviceProfile)
+        XCTAssertNil(SyncGroupProfile.legacyTaskDemo.descriptor)
+        XCTAssertEqual(SyncGroupProfile.legacyTaskDemo.memberLimit, 8)
+        XCTAssertEqual(SyncGroupProfile.supportedMemberCeiling, 10)
+        for application in ["", "Com.example", ".example", "com example", String(repeating: "a", count: 65), "café"] {
+            XCTAssertThrowsError(try SyncGroupProfile(application: application, schema: .taskReplica, memberLimit: 10))
+        }
+        for limit in [0, 1, 11] {
+            XCTAssertThrowsError(try SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: limit))
+        }
+        var malformed = [Data(), descriptor + Data([0]), descriptor.dropLast(), Data([2]) + descriptor.dropFirst()]
+        var zeroVersion = descriptor
+        zeroVersion[zeroVersion.count - 3] = 0
+        zeroVersion[zeroVersion.count - 2] = 0
+        malformed.append(zeroVersion)
+        for bytes in malformed {
+            XCTAssertThrowsError(try SyncGroupProfile(descriptor: Data(bytes)))
+        }
+        let longest = try SyncGroupProfile(
+            application: String(repeating: "a", count: 64),
+            schema: SyncPayloadSchema(identifier: String(repeating: "b", count: 64), version: .max),
+            memberLimit: 2
+        )
+        XCTAssertEqual(longest.descriptor?.count, SyncGroupProfile.maximumDescriptorBytes)
+    }
+
+    func testLinkedProfiledGroupRefusesAMismatchedJoinerWithoutChangingMembers() async throws {
+        profile = tenDeviceProfile
+        let host = engine("linked-mismatch-host")
+        let first = engine("linked-mismatch-first")
+        try await pair(host, first)
+        let group = try await groupID(host)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        let legacy = engine("linked-mismatch-legacy", profile: .legacyTaskDemo)
+        legacy.joinPrivateSync(url: try await invite(host))
+        try await wait("refused") { host.lastPairingFailure != nil && legacy.lastPairingFailure != nil }
+        XCTAssertEqual(host.lastPairingFailure, .incompatibleGroupProfile)
+        XCTAssertEqual(legacy.lastPairingFailure, .incompatibleGroupProfile)
+        let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+        XCTAssertEqual(members.count, 2)
+        let writersAfter = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writersAfter, 2)
+        XCTAssertTrue(host.isPaired)
+        XCTAssertTrue(first.addTask(title: "Still syncing"))
+        try await wait("group keeps syncing") { host.tasks.count == 1 }
+    }
+
+    func testProfiledLimitRefusesTheNextDeviceUntilOneIsRemoved() async throws {
+        profile = try SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: 3)
+        let linked = try await linkedGroup(["limit-a", "limit-b", "limit-c"])
+        let host = linked[0]
+        XCTAssertTrue(host.isGroupAtCapacity)
+        let group = try await groupID(host)
+        let fourth = engine("limit-d")
+        host.inviteToGroup()
+        XCTAssertEqual(host.errorMessage, SyncError.groupAtCapacity.errorDescription)
+        XCTAssertFalse(host.canCancelPairing)
+        XCTAssertNil(host.invitationURL)
+        let removed = try await fingerprint(linked[2])
+        XCTAssertTrue(host.removeDevice(fingerprint: removed))
+        try await wait("removed") { host.linkedMemberCount == 2 && !linked[2].isPaired }
+        try await pair(host, fourth)
+        try await wait("replacement linked") { linked[0...1].allSatisfy { $0.linkedMemberCount == 3 } && fourth.linkedMemberCount == 3 }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 3)
+    }
+
+    func testConcurrentInvitersAtTheMemberLimitAdmitAtMostOneJoiner() async throws {
+        profile = try SyncGroupProfile(application: "com.example.tasks", schema: .taskReplica, memberLimit: 3)
+        let (host, second, first, other, group) = try await linkedPairWithDisjointJoiners("cap", own: 2)
+        let local = [Set(first.tasks.map(\.id)), Set(other.tasks.map(\.id))]
+        try await approveConcurrently(host: host, second: second, first: first, other: other)
+        try await settle([host, second, first, other])
+        try await assertAtMostOneJoinerLinked([first, other], localTasks: local, members: [host, second], group: group)
+        let refusals = [host, second].compactMap(\.lastPairingFailure)
+        XCTAssertTrue(refusals.allSatisfy { $0 == .groupAtCapacity }, "\(refusals)")
+    }
+
+    func testRelayWithFewerWritersRefusesTheAddWithoutBlockingTheInviter() async throws {
+        profile = tenDeviceProfile
+        let host = engine("small-relay-host")
+        let first = engine("small-relay-first")
+        try await pair(host, first)
+        let group = try await groupID(host)
+        await relay.limitWriters(to: 2)
+        let third = engine("small-relay-third")
+        third.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && third.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("Add refused") { host.lastPairingFailure != nil }
+        let pending = try await XCTUnwrapAsync(host.mlsSessionForTesting).pendingDelivery()
+        XCTAssertNil(pending)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        XCTAssertTrue(host.addTask(title: "Inviter still syncs"))
+        XCTAssertTrue(first.addTask(title: "Member still syncs"))
+        try await wait("group keeps syncing") {
+            [host, first].allSatisfy { $0.tasks.count == 2 && $0.linkedMemberCount == 2 && $0.pendingMailboxOperationCount == 0 }
+        }
+        XCTAssertFalse(third.isPaired)
+    }
+
+    private func linkedPairWithPendingThird(
+        _ prefix: String,
+        provisionalMemberWindow: TimeInterval = SyncTiming.provisionalMemberWindow,
+        arm: @escaping @MainActor (_ relay: FakeMLSRelay, _ host: Data, _ third: Data) async -> Void
+    ) async throws -> (host: SyncEngine, first: SyncEngine, third: SyncEngine, group: Data) {
+        let host = engine("\(prefix)-host", provisionalMemberWindow: provisionalMemberWindow)
+        let first = engine("\(prefix)-first")
+        try await pair(host, first)
+        let group = try await groupID(host)
+        let hostAuthorization = try await authorization(host)
+        let third = engine("\(prefix)-third")
+        host.reservationHookForTesting = { [relay, weak host, weak third] in
+            host?.reservationHookForTesting = nil
+            guard let relay, let session = third?.mlsSessionForTesting,
+                  let thirdAuthorization = try? await session.client.transportAuthorization()
+            else { return }
+            await arm(relay, hostAuthorization, thirdAuthorization)
+        }
+        third.joinPrivateSync(url: try await invite(host))
+        try await wait("safety code") { host.isHostApprovalPending && third.safetyCode != nil }
+        host.approveSafetyCode()
+        return (host, first, third, group)
+    }
+
+    func testLostAddResponseIsResolvedWithinThePairingDespiteARateLimitedRead() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("lost-add") { relay, host, _ in
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1, of: host)
+        }
+        try await wait("third linked") { third.isPaired && !host.canCancelPairing }
+        XCTAssertNil(host.lastPairingFailure)
+        let all = [host, first, third]
+        try await wait("three members") { all.allSatisfy { $0.linkedMemberCount == 3 } }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 3)
+        await host.stop()
+        let restarted = engine("lost-add-host")
+        XCTAssertTrue(third.addTask(title: "From the third device"))
+        XCTAssertTrue(restarted.addTask(title: "From the restarted host"))
+        let converged = [restarted, first, third]
+        try await wait("converged") {
+            converged.allSatisfy { $0.tasks.count == 2 && $0.linkedMemberCount == 3 && $0.pendingMailboxOperationCount == 0 }
+        }
+    }
+
+    func testRateLimitedAddIsDeliveredWithinThePairing() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("limited-add") { relay, host, _ in
+            await relay.rateLimitNext(adds: 2, of: host)
+        }
+        try await wait("third linked") { third.isPaired && !host.canCancelPairing }
+        XCTAssertNil(host.lastPairingFailure)
+        let all = [host, first, third]
+        try await wait("three members") { all.allSatisfy { $0.linkedMemberCount == 3 } }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 3)
+    }
+
+    func testOlderRelayRefusalHoldsTheAddOnlyUntilItsKeyPackageExpires() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("older-relay") { relay, _, _ in
+            await relay.limitWriters(to: 2, journaled: false)
+        }
+        try await wait("pairing failed") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        let held = try await XCTUnwrapAsync(host.mlsSessionForTesting).pendingDelivery()
+        XCTAssertNotNil(held?.welcome, "an Add refused without a journaled answer was discarded")
+        XCTAssertTrue(first.addTask(title: "Received while the Add waits"))
+        try await wait("inviter keeps receiving") { host.tasks.count == 1 }
+        XCTAssertTrue(host.addTask(title: "Sent after the refusal"))
+        await relay.expireKeyPackages()
+        try await wait("Add refused for good and the inviter sends again") {
+            first.tasks.count == 2 && host.pendingMailboxOperationCount == 0
+        }
+        let pending = try await XCTUnwrapAsync(host.mlsSessionForTesting).pendingDelivery()
+        XCTAssertNil(pending)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        XCTAssertFalse(third.isPaired)
+    }
+
+    func testCancelledPairingWithAHeldAddRemovesTheSilentDevice() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird(
+            "cancelled-add", provisionalMemberWindow: 1
+        ) { relay, host, third in
+            await relay.deferNextAddBeforeStore()
+            await relay.rateLimitNext(adds: 1_000, of: host)
+            await relay.setOffline(third, true)
+        }
+        try await wait("retrying the held Add") {
+            let deferred = await self.relay.holdsDeferredAdd
+            let remaining = await self.relay.rateLimitedAdds
+            return deferred && remaining < 1_000
+        }
+        host.cancelPairing(preserveLink: true)
+        try await wait("pairing ended") { !host.canCancelPairing }
+        third.cancelPairing()
+        let thirdFingerprint = try await XCTUnwrapAsync(third.mlsSessionForTesting).fingerprint()
+        let intent = host.provisionalMembersForTesting
+        XCTAssertFalse(intent.isEmpty, "no cleanup intent survived the cancelled pairing")
+        let held = try await XCTUnwrapAsync(host.mlsSessionForTesting).pendingDelivery()
+        let reference = try XCTUnwrap(held?.keyPackageReference)
+        try await Task.sleep(for: .milliseconds(1_200))
+        let fourth = engine("cancelled-add-fourth")
+        fourth.joinPrivateSync(url: try await invite(host))
+        try await wait("next safety code") { host.isHostApprovalPending && fourth.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("next pairing blocked behind the held Add") { !host.canCancelPairing }
+        XCTAssertFalse(fourth.isPaired)
+        await relay.rateLimitNext()
+        try await relay.releaseDeferredAdd()
+        try await wait("held Add applied, then the silent device removed") {
+            let log = await self.relay.log(group: group)
+            let added = log.filter { $0.delivery.keyPackageReference == reference }
+            guard added.count == 1, let writer = added[0].delivery.addWriter else { return false }
+            let removed = log.contains { $0.cursor > added[0].cursor && $0.delivery.removeWriter == writer }
+            return removed && host.linkedMemberCount == 2 && first.linkedMemberCount == 2
+        }
+        let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+        XCTAssertFalse(members.contains { $0.fingerprint == thirdFingerprint })
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        XCTAssertTrue(first.addTask(title: "Inviter not stranded"))
+        try await wait("group syncs") { host.tasks.count == 1 }
+    }
+
+    func testUnlinkingWithAHeldAddWithdrawsTheDeviceItAdds() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("unlink-held") { relay, host, third in
+            await relay.deferNextAddBeforeStore()
+            await relay.rateLimitNext(adds: 1_000, of: host)
+            await relay.setOffline(third, true)
+        }
+        try await wait("retrying the held Add") {
+            let deferred = await self.relay.holdsDeferredAdd
+            let remaining = await self.relay.rateLimitedAdds
+            return deferred && remaining < 1_000
+        }
+        host.unlinkAndKeepTasks()
+        third.cancelPairing()
+        await relay.rateLimitNext()
+        try await relay.releaseDeferredAdd()
+        try await wait("Add withdrawn and inviter gone") {
+            first.linkedMemberCount == 1
+        }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 1)
+        let log = await relay.log(group: group)
+        let add = try XCTUnwrap(log.last { $0.delivery.welcome != nil })
+        XCTAssertTrue(log.contains { $0.cursor > add.cursor && $0.delivery.removeWriter == add.delivery.addWriter })
+        XCTAssertFalse(third.isPaired)
+    }
+
+    func testUnlinkingRemovesAProvisionalDeviceThatNeverSpoke() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("unlink-silent") { relay, host, third in
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1_000, of: host)
+            await relay.setOffline(third, true)
+        }
+        try await wait("pairing failed") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        third.cancelPairing()
+        await relay.rateLimitNext()
+        try await wait("silent device admitted") { host.linkedMemberCount == 3 && first.linkedMemberCount == 3 }
+        XCTAssertFalse(host.provisionalMembersForTesting.isEmpty)
+        host.unlinkAndKeepTasks()
+        try await wait("silent device withdrawn and inviter gone") { first.linkedMemberCount == 1 }
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 1)
+    }
+
+    func testMemberRefreshKeepsCleanupIntentSavedDuringItsReads() async throws {
+        let host = engine("refresh-host")
+        let peer = engine("refresh-peer")
+        try await pair(host, peer)
+        await host.stop()
+        let expired = Data(repeating: 0xE1, count: 32)
+        let added = Data(repeating: 0xA1, count: 32)
+        try host.markProvisionalForTesting(expired, deadline: Date().addingTimeInterval(-1))
+        host.memberReadHookForTesting = {
+            try host.markProvisionalForTesting(added, deadline: Date().addingTimeInterval(600))
+        }
+        try await host.refreshMembersForTesting()
+        host.memberReadHookForTesting = nil
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(added), "a refresh overwrote intent saved during its reads")
+        XCTAssertFalse(host.provisionalMembersForTesting.contains(expired))
+    }
+
+    func testUnlinkingKeepsAJoinerThatSpokeBeforeItsRecordWasCleared() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("unlink-live") { relay, host, _ in
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1_000, of: host)
+        }
+        try await wait("pairing failed and the joiner joined") {
+            host.lastPairingFailure != nil && !host.canCancelPairing && third.isPaired && third.pendingMailboxOperationCount == 0
+        }
+        let thirdFingerprint = try await fingerprint(third)
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(thirdFingerprint))
+        let gate = SyncTestGate()
+        host.inboxReadHookForTesting = { [weak host] in
+            guard let session = host?.mlsSessionForTesting,
+                  (try? await session.inbox())?.contains(where: { $0.sender == thirdFingerprint }) == true
+            else { return }
+            await gate.pause()
+        }
+        await relay.rateLimitNext()
+        try await wait("joiner's message read") { gate.isPaused }
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(thirdFingerprint), "the record was cleared before unlinking")
+        host.unlinkAndKeepTasks()
+        gate.release()
+        try await wait("only the inviter left") { first.linkedMemberCount == 2 && third.linkedMemberCount == 2 }
+        XCTAssertTrue(third.isPaired)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        XCTAssertTrue(third.addTask(title: "From the joiner"))
+        XCTAssertTrue(first.addTask(title: "From the first"))
+        try await wait("remaining devices exchange edits") {
+            [first, third].allSatisfy { $0.tasks.count == 2 && $0.pendingMailboxOperationCount == 0 }
+        }
+    }
+
+    /// The provisional member's first message reaches the relay after the
+    /// inviter's last read and before its silent-member Remove does.
+    func testSilentMemberCleanupKeepsAMemberWhoseMessageLandsJustBefore() async throws {
+        let host = engine("racing-host", provisionalMemberWindow: 0.5)
+        let first = engine("racing-first")
+        try await pair(host, first)
+        let third = engine("racing-third")
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(first)])
+        try await pair(host, third)
+        let thirdFingerprint = try await fingerprint(third)
+        try host.markProvisionalForTesting(thirdFingerprint, deadline: Date().addingTimeInterval(-1))
+        let thirdSession = try XCTUnwrap(third.mlsSessionForTesting)
+        await relay.beforeNextRemoval { [relay] in
+            await relay?.holdApplications(except: nil)
+            _ = try await thirdSession.send(Data("I am here".utf8))
+        }
+        try await wait("cleanup attempted and settled") {
+            let log = await self.relay.log(group: try await self.groupID(host))
+            return log.contains { $0.delivery.removeWriter != nil } || host.provisionalMembersForTesting.isEmpty
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        let members = try await XCTUnwrapAsync(first.mlsSessionForTesting).members()
+        XCTAssertTrue(members.contains { $0.fingerprint == thirdFingerprint }, "silent cleanup removed a member whose message preceded it")
+        XCTAssertTrue(third.isPaired)
+    }
+
+    func testMemberWhoseMessagesWaitBehindAFullInboxIsNotRemovedAsSilent() async throws {
+        let foreign = (1..<(ReplicaLimits.maxOrigins - 3)).map { _ in ReplicaDeviceID(uuid: UUID()) }
+        let host = try await seededEngine("unread-host", taskCount: 1, foreignOrigins: foreign, deferredOperationLimit: 1)
+        let peer = engine("unread-peer")
+        let third = engine("unread-third")
+        try await pair(host, peer)
+        try await pair(host, third)
+        try await wait("linked") { [host, peer, third].allSatisfy { $0.linkedMemberCount == 3 && $0.phase == .synced } }
+        XCTAssertTrue(third.addTask(title: "Third before the fill"))
+        try await wait("third's origin held") { host.tasks.count == 2 }
+        try await send((0..<2).map { _ in create(ReplicaDeviceID(uuid: UUID()), 1, title: "Filling") }, from: peer)
+        try await wait("origins full") {
+            host.replicaForTesting.versionVector.origins.count == ReplicaLimits.maxOrigins && host.phase == .synced
+        }
+        try await send([create(ReplicaDeviceID(uuid: UUID()), 1, title: "Saved")], from: peer)
+        try await waitForCapacityReport(host, unapplied: 1)
+        let blockedOrigin = ReplicaDeviceID(uuid: UUID())
+        let blockedTask = UUID()
+        try await send([create(blockedOrigin, 1, task: blockedTask, title: "Blocked")], from: peer)
+        for sequence: UInt64 in 2...1_001 {
+            try await send([toggle(blockedOrigin, sequence, task: blockedTask)], from: peer)
+        }
+        try await wait("held inbox full", timeout: .seconds(60)) {
+            try await host.mlsSessionForTesting?.inbox().count == 1_000
+        }
+        XCTAssertTrue(third.addTask(title: "Third speaks behind the held inbox"))
+        try await wait("third uploaded") { third.pendingMailboxOperationCount == 0 }
+        let thirdFingerprint = try await fingerprint(third)
+        try host.markProvisionalForTesting(thirdFingerprint, deadline: Date().addingTimeInterval(-1))
+        try await Task.sleep(for: .seconds(1))
+        let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+        XCTAssertTrue(members.contains { $0.fingerprint == thirdFingerprint }, "a member with unread messages was removed")
+        XCTAssertEqual(third.linkedMemberCount, 3)
+        XCTAssertTrue(third.isPaired)
+    }
+
+    func testAddStillUnresolvedWhenThePairingEndsIsProvisional() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird(
+            "unresolved-add", provisionalMemberWindow: 1
+        ) { relay, host, third in
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1_000, of: host)
+            await relay.setOffline(third, true)
+        }
+        let thirdFingerprint = try await XCTUnwrapAsync(third.mlsSessionForTesting).fingerprint()
+        try await wait("pairing failed") { host.lastPairingFailure != nil && !host.canCancelPairing }
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(thirdFingerprint))
+        third.cancelPairing()
+        XCTAssertFalse(third.isPaired)
+        await relay.rateLimitNext()
+        try await wait("Add found, then the silent joiner removed") {
+            host.linkedMemberCount == 2 && first.linkedMemberCount == 2 && host.provisionalMembersForTesting.isEmpty
+        }
+        let members = try await XCTUnwrapAsync(host.mlsSessionForTesting).members()
+        XCTAssertFalse(members.contains { $0.fingerprint == thirdFingerprint })
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        let log = await relay.log(group: group)
+        let add = try XCTUnwrap(log.last { $0.delivery.welcome != nil }, "the Add never landed")
+        XCTAssertTrue(log.contains { $0.cursor > add.cursor && $0.delivery.removeWriter == add.delivery.addWriter })
+    }
+
+    func testLegacyGroupStillRefusesANinthDevice() async throws {
+        let linked = try await linkedGroup((1...8).map { "legacy-\($0)" })
+        let host = linked[0]
+        XCTAssertEqual(host.memberLimit, 8)
+        XCTAssertTrue(host.isGroupAtCapacity)
+        let group = try await groupID(host)
+        let stored = try await XCTUnwrapAsync(host.mlsSessionForTesting).groupProfile()
+        XCTAssertNil(stored)
+        linked[3].inviteToGroup()
+        XCTAssertEqual(linked[3].errorMessage, SyncError.groupAtCapacity.errorDescription)
+        XCTAssertFalse(linked[3].canCancelPairing)
+        XCTAssertNil(linked[3].invitationURL)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 8)
+    }
+
+    private func mlsStoreBytes(_ engine: SyncEngine) throws -> Data {
+        try Data(contentsOf: engine.mlsDirectoryForTesting.appendingPathComponent("mls-v2.sqlite3"))
+    }
+
+    func testRestartWithAnotherProfileFailsClosedAndKeepsTheGroup() async throws {
+        for (stored, configured) in [(tenDeviceProfile, SyncGroupProfile.legacyTaskDemo), (.legacyTaskDemo, tenDeviceProfile)] {
+            let prefix = stored.isLegacy ? "upgrade" : "downgrade"
+            profile = stored
+            let host = engine("\(prefix)-host")
+            let peer = engine("\(prefix)-peer")
+            XCTAssertTrue(host.addTask(title: "Kept"))
+            try await pair(host, peer)
+            try await wait("synced") { peer.tasks.count == 1 && host.phase == .synced }
+            await host.stop()
+            let checkpoint = try Data(contentsOf: root.appendingPathComponent("\(prefix)-host/\(ReplicationCheckpoint.filename)"))
+
+            let mismatched = engine("\(prefix)-host", profile: configured)
+            let before = try mlsStoreBytes(mismatched)
+            XCTAssertTrue(peer.addTask(title: "Not applied while blocked"))
+            try await wait("blocked") { mismatched.mailboxError == .incompatibleGroupProfile }
+            XCTAssertEqual(mismatched.phase, .failed)
+            XCTAssertTrue(mismatched.mailboxRequiresRepair)
+            XCTAssertTrue(mismatched.isPaired)
+            XCTAssertEqual(mismatched.tasks.compactMap(\.titleValue), ["Kept"])
+            mismatched.inviteToGroup()
+            try await wait("invitation refused") { mismatched.lastPairingFailure != nil }
+            XCTAssertEqual(mismatched.lastPairingFailure, .incompatibleGroupProfile)
+            XCTAssertNil(mismatched.invitationURL)
+            XCTAssertEqual(try mlsStoreBytes(mismatched), before)
+            XCTAssertEqual(
+                try Data(contentsOf: root.appendingPathComponent("\(prefix)-host/\(ReplicationCheckpoint.filename)")),
+                checkpoint
+            )
+            await mismatched.stop()
+
+            let restored = engine("\(prefix)-host", profile: stored)
+            try await wait("syncs again") { restored.tasks.count == 2 && restored.phase == .synced }
+            await restored.stop()
+            await peer.stop()
+        }
+    }
+
+    func testFoundingAddWhoseAnswerWasLostIsAdoptedWithItsProfile() async throws {
+        profile = tenDeviceProfile
+        let (host, first, _, _) = try await foundingHostWithLostAdd("profiled-adopt", offline: true)
+        await relay.setOffline(try await authorization(host), false)
+        let third = engine("profiled-adopt-third")
+        let url = try await invite(host)
+        XCTAssertTrue(host.isPaired)
+        third.joinPrivateSync(url: url)
+        try await wait("safety code") { host.isHostApprovalPending && third.safetyCode != nil }
+        host.approveSafetyCode()
+        try await wait("third joined") { third.isPaired && !host.canCancelPairing }
+        await relay.holdApplications(except: nil)
+        let all = [host, first, third]
+        for engine in all { engine.applicationDidBecomeActive() }
+        try await wait("all three linked") { all.allSatisfy { $0.linkedMemberCount == 3 } }
+        for engine in all {
+            let stored = try await XCTUnwrapAsync(engine.mlsSessionForTesting).groupProfile()
+            XCTAssertEqual(stored, tenDeviceProfile.descriptor)
+        }
+    }
+
+    func testAdoptedFoundingGroupWithAnotherProfileStaysBlocked() async throws {
+        profile = tenDeviceProfile
+        let (host, _, _, _) = try await foundingHostWithLostAdd("adopt-mismatch", offline: true)
+        await relay.setOffline(try await authorization(host), false)
+        await host.stop()
+        let reopened = engine("adopt-mismatch-host", profile: .legacyTaskDemo)
+        let directory = reopened.mlsDirectoryForTesting
+        let group = try await groupID(reopened)
+        reopened.createPrivateSync()
+        try await wait("refused") { reopened.lastPairingFailure != nil || reopened.mailboxError != nil }
+        try await wait("blocked") { reopened.mailboxError == .incompatibleGroupProfile }
+        XCTAssertNil(reopened.invitationURL)
+        XCTAssertTrue(reopened.isPaired)
+        let stored = try await XCTUnwrapAsync(reopened.mlsSessionForTesting).groupProfile()
+        XCTAssertEqual(stored, tenDeviceProfile.descriptor)
+        XCTAssertEqual(reopened.mlsDirectoryForTesting, directory)
+        let groupAfter = try await groupID(reopened)
+        XCTAssertEqual(groupAfter, group)
+        XCTAssertEqual(reopened.linkedMemberCount, 2)
+    }
+
+    func testSettledSoloFoundingGroupWithAnotherProfileIsReplaced() async throws {
+        let host = engine("solo-host", profile: .legacyTaskDemo)
+        let session = try XCTUnwrap(host.mlsSessionForTesting)
+        let stale = Data(repeating: 0x5A, count: 32)
+        try await session.createGroup(stale, profile: nil)
+        await host.stop()
+        profile = tenDeviceProfile
+        let reopened = engine("solo-host")
+        let joiner = engine("solo-joiner")
+        try await pair(reopened, joiner)
+        let group = try await groupID(reopened)
+        XCTAssertNotEqual(group, stale)
+        let stored = try await XCTUnwrapAsync(reopened.mlsSessionForTesting).groupProfile()
+        XCTAssertEqual(stored, tenDeviceProfile.descriptor)
+    }
 }

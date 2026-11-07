@@ -531,13 +531,13 @@ final class EngineStorageTests: XCTestCase {
     }
 
     func testReplyObligationKeepsBoundedSnapshotRecipientsUntilEachIsSent() throws {
-        let members = (0..<(SyncEngine.maximumGroupSize + 2)).map { Data(repeating: UInt8($0), count: 32) }
+        let members = (0..<(SyncGroupProfile.supportedMemberCeiling + 2)).map { Data(repeating: UInt8($0), count: 32) }
         var obligation = ReplyObligation()
         obligation.merge(ReplicaVersionVector(), provider: true)
         for member in members + members.suffix(3) {
             obligation.addRecipient(member)
         }
-        XCTAssertEqual(obligation.recipients, Array(members.suffix(SyncEngine.maximumGroupSize)))
+        XCTAssertEqual(obligation.recipients, Array(members.suffix(SyncGroupProfile.supportedMemberCeiling)))
 
         obligation.completeHistory()
         XCTAssertNil(obligation.provided)
@@ -547,7 +547,7 @@ final class EngineStorageTests: XCTestCase {
         try ReplyObligation.save(obligation, to: url)
         XCTAssertEqual(try ReplyObligation.load(from: url), obligation)
 
-        for member in members.suffix(SyncEngine.maximumGroupSize - 1) {
+        for member in members.suffix(SyncGroupProfile.supportedMemberCeiling - 1) {
             obligation.removeRecipient(member)
         }
         XCTAssertFalse(obligation.isEmpty)

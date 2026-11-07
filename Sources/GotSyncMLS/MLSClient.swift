@@ -7,6 +7,8 @@ public enum MLSClientError: Error {
     case invalidDelivery
     case storageUnavailable
     case capacityReached
+    /// The group's profile differs from the expected one or is malformed.
+    case unsupportedGroupProfile
 }
 
 public struct MLSJoiningIdentity: Sendable {
@@ -24,8 +26,12 @@ public struct MLSDelivery: Codable, Equatable, Sendable {
     public let keyPackageReference: Data?
     public let addWriter: Data?
     public let removeWriter: Data?
+    /// For a conditional Remove: the relay log position this member had read
+    /// when it prepared the commit. The relay appends it only while its log
+    /// head still equals this value. Relay entries never carry it.
+    public let expectedHead: UInt64?
 
-    public init(group: Data, epoch: UInt64, kind: Kind, payload: Data, welcome: Data? = nil, keyPackageReference: Data? = nil, addWriter: Data? = nil, removeWriter: Data? = nil) {
+    public init(group: Data, epoch: UInt64, kind: Kind, payload: Data, welcome: Data? = nil, keyPackageReference: Data? = nil, addWriter: Data? = nil, removeWriter: Data? = nil, expectedHead: UInt64? = nil) {
         self.group = group
         self.epoch = epoch
         self.kind = kind
@@ -34,6 +40,15 @@ public struct MLSDelivery: Codable, Equatable, Sendable {
         self.keyPackageReference = keyPackageReference
         self.addWriter = addWriter
         self.removeWriter = removeWriter
+        self.expectedHead = expectedHead
+    }
+
+    /// The entry as the relay stores it.
+    public var withoutExpectedHead: MLSDelivery {
+        MLSDelivery(
+            group: group, epoch: epoch, kind: kind, payload: payload, welcome: welcome,
+            keyPackageReference: keyPackageReference, addWriter: addWriter, removeWriter: removeWriter
+        )
     }
 }
 
@@ -77,6 +92,10 @@ struct ClientRecord: Codable {
     var departures: [Data]?
     var pendingTracked: Bool?
     var sent: [MLSSentMessage]?
+    var withdrawnWriter: Data?
+    /// Current members that sent this member an authenticated application
+    /// message, kept after the message leaves the inbox.
+    var spoke: [Data]?
 }
 
 struct IdentityRecord: Codable {
@@ -84,13 +103,22 @@ struct IdentityRecord: Codable {
 }
 
 public actor MLSClient {
+    /// The most members a group can have, whatever its profile allows.
+    public static let memberCeiling = Int(supportedMemberCeiling())
+
     private let store: MLSStore
 
     public init(directory: URL, deviceID: Data, stateKey: MLSStateKeyProvider) throws {
         store = try MLSStore(directory: directory, stateKey: stateKey)
         try store.update { record in
-            if let record {
-                guard record.deviceID == deviceID else { throw MLSClientError.invalidState }
+            if var existing = record {
+                guard existing.deviceID == deviceID else { throw MLSClientError.invalidState }
+                if existing.group != nil, !existing.removed, !existing.inbox.isEmpty {
+                    let current = try GotSyncMLSBindings.members(state: existing.state).map(\.fingerprint)
+                    let speakers = Set(existing.spoke ?? []).union(existing.inbox.map(\.sender))
+                    existing.spoke = current.filter(speakers.contains)
+                    record = existing
+                }
             } else {
                 let identity = try createIdentity(deviceId: deviceID)
                 record = ClientRecord(
@@ -102,10 +130,12 @@ public actor MLSClient {
         }
     }
 
-    public func joiningIdentity() throws -> MLSJoiningIdentity {
+    /// A KeyPackage for joining a group with `profile`, or a legacy group
+    /// when `profile` is `nil`.
+    public func joiningIdentity(profile: Data? = nil) throws -> MLSJoiningIdentity {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
-            let transition = try publishKeyPackage(state: record.state)
+            let transition = try publishKeyPackage(state: record.state, profile: profile)
             record.state = Data(transition.state)
             return MLSJoiningIdentity(keyPackage: Data(transition.output), fingerprint: record.identity.fingerprint)
         }
@@ -136,10 +166,21 @@ public actor MLSClient {
     /// oldest first, each with the SHA-256 digest of its plaintext.
     public func sentMessages() throws -> [MLSSentMessage] { try store.read().sent ?? [] }
 
-    public func createGroup(id: Data) throws {
+    /// The group's profile descriptor, or `nil` for a legacy group.
+    public func groupProfile() throws -> Data? {
+        let record = try store.read()
+        guard record.group != nil, !record.removed else { throw MLSClientError.invalidState }
+        do {
+            return try GotSyncMLSBindings.groupProfile(state: record.state)
+        } catch MlsError.InvalidInput {
+            throw MLSClientError.unsupportedGroupProfile
+        }
+    }
+
+    public func createGroup(id: Data, profile: Data? = nil) throws {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
-            let transition = try GotSyncMLSBindings.createGroup(state: record.state, groupId: id)
+            let transition = try GotSyncMLSBindings.createGroup(state: record.state, groupId: id, profile: profile)
             Self.apply(transition, to: &record)
         }
     }
@@ -155,12 +196,18 @@ public actor MLSClient {
         }
     }
 
-    public func prepareRemove(fingerprint: Data) throws -> MLSDelivery {
+    /// With `expectedHead`, the Remove is conditional: the relay appends it
+    /// only while its log head is still that position. The value is stored
+    /// with the pending commit and never changes for it.
+    public func prepareRemove(fingerprint: Data, expectedHead: UInt64? = nil) throws -> MLSDelivery {
         try mutate { record in
             guard record.pending == nil else { throw MLSClientError.invalidState }
             let transition = try GotSyncMLSBindings.prepareRemove(state: record.state, memberFingerprint: fingerprint)
             Self.apply(transition, to: &record)
-            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output), removeWriter: transition.removedWriter)
+            let delivery = MLSDelivery(
+                group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output),
+                removeWriter: transition.removedWriter, expectedHead: expectedHead
+            )
             record.pending = delivery
             return delivery
         }
@@ -200,10 +247,19 @@ public actor MLSClient {
         }
     }
 
-    public func join(welcome: Data, group: Data, verifiedInviterFingerprint: Data, cursor: UInt64) throws {
+    /// Joins only a group whose profile equals `expectedProfile`.
+    public func join(welcome: Data, group: Data, verifiedInviterFingerprint: Data, cursor: UInt64, expectedProfile: Data? = nil) throws {
         try mutate { record in
             guard record.group == nil else { throw MLSClientError.invalidState }
-            let transition = try joinGroup(state: record.state, welcome: welcome, expectedGroupId: group, inviterFingerprint: verifiedInviterFingerprint)
+            let transition: MlsTransition
+            do {
+                transition = try joinGroup(
+                    state: record.state, welcome: welcome, expectedGroupId: group,
+                    inviterFingerprint: verifiedInviterFingerprint, expectedProfile: expectedProfile
+                )
+            } catch MlsError.ProfileMismatch {
+                throw MLSClientError.unsupportedGroupProfile
+            }
             Self.apply(transition, to: &record)
             record.cursor = cursor
         }
@@ -220,7 +276,7 @@ public actor MLSClient {
                delivery.kind == pending.kind, delivery.epoch == pending.epoch {
                 if pending.kind == .commit {
                     Self.apply(try acceptCommit(state: record.state, acceptedCommit: delivery.payload), to: &record)
-                    try Self.pruneDepartures(in: &record)
+                    try Self.pruneMemberRecords(in: &record)
                 } else if pending.kind == .application {
                     Self.recordTrackedDelivery(at: cursor, in: &record)
                 }
@@ -253,11 +309,14 @@ public actor MLSClient {
                 else { throw MLSClientError.invalidDelivery }
                 Self.apply(transition, to: &record)
                 if let departed = transition.departed, !(record.departures ?? []).contains(departed) {
-                    record.departures = Array(((record.departures ?? []) + [departed]).suffix(8))
+                    record.departures = Array(((record.departures ?? []) + [departed]).suffix(Self.memberCeiling))
                 }
                 if let sender = transition.sender {
                     guard record.inbox.count < 1000 else { throw MLSClientError.capacityReached }
                     record.inbox.append(MLSInboxMessage(cursor: cursor, sender: sender, plaintext: transition.output))
+                    if !(record.spoke ?? []).contains(sender) {
+                        record.spoke = Array(((record.spoke ?? []) + [sender]).suffix(Self.memberCeiling))
+                    }
                 }
                 if transition.removed {
                     record.removed = true
@@ -269,7 +328,7 @@ public actor MLSClient {
                     record.departures = nil
                 } else {
                     if delivery.kind == .commit {
-                        try Self.pruneDepartures(in: &record)
+                        try Self.pruneMemberRecords(in: &record)
                     }
                     if let retryPlaintext {
                         _ = try Self.seal(retryPlaintext, in: &record)
@@ -278,6 +337,32 @@ public actor MLSClient {
             }
             record.cursor = cursor
         }
+    }
+
+    /// Marks the pending Add as withdrawn: if it lands, its member is to be
+    /// removed. The mark is kept until `clearWithdrawnAdd()`.
+    public func withdrawPendingAdd() throws {
+        try mutate { record in
+            guard let pending = record.pending, pending.kind == .commit, pending.welcome != nil,
+                  let writer = pending.addWriter
+            else { return }
+            record.withdrawnWriter = writer
+        }
+    }
+
+    /// Members that sent an authenticated application message, including
+    /// senders of messages still in the inbox of state written before this
+    /// record existed.
+    public func spokenMembers() throws -> Set<Data> {
+        let record = try store.read()
+        return Set(record.spoke ?? []).union(record.inbox.map(\.sender))
+    }
+
+    /// The writer hash of a withdrawn Add, if one is marked.
+    public func withdrawnAddWriter() throws -> Data? { try store.read().withdrawnWriter }
+
+    public func clearWithdrawnAdd() throws {
+        try mutate { record in record.withdrawnWriter = nil }
     }
 
     public func rejectAddForUnavailableKeyPackage(commit: Data, rejectedEpoch: UInt64) throws {
@@ -289,6 +374,21 @@ public actor MLSClient {
             Self.apply(try discardCommit(state: record.state), to: &record)
             record.rejectedCommit = pending
             record.pending = nil
+        }
+    }
+
+    /// Discards a pending conditional Remove after the relay refused it
+    /// because its log moved past the expected head. The refusal is final for
+    /// that exact request, so no copy of the commit can land later.
+    public func discardRefusedRemove(_ delivery: MLSDelivery) throws {
+        try mutate { record in
+            guard let pending = record.pending, pending == delivery, pending.kind == .commit,
+                  pending.expectedHead != nil, pending.removeWriter != nil, record.epoch == pending.epoch
+            else { throw MLSClientError.invalidDelivery }
+            Self.apply(try discardCommit(state: record.state), to: &record)
+            record.rejectedCommit = pending
+            record.pending = nil
+            record.pendingPlaintext = nil
         }
     }
 
@@ -325,10 +425,11 @@ public actor MLSClient {
         record.sent = Array(((record.sent ?? []) + [sent]).suffix(MLSSentMessage.retained))
     }
 
-    private static func pruneDepartures(in record: inout ClientRecord) throws {
-        guard let departures = record.departures else { return }
+    private static func pruneMemberRecords(in record: inout ClientRecord) throws {
+        guard record.departures != nil || record.spoke != nil else { return }
         let current = try GotSyncMLSBindings.members(state: record.state).map(\.fingerprint)
-        record.departures = departures.filter(current.contains)
+        record.departures = record.departures?.filter(current.contains)
+        record.spoke = record.spoke?.filter(current.contains)
     }
 
     private static func apply(_ transition: MlsTransition, to record: inout ClientRecord) {
