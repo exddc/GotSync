@@ -373,8 +373,45 @@ final class MLSClientTests: XCTestCase {
         try await alice.process(try await bob.prepareMessage(Data("written by an earlier build".utf8)), cursor: 2)
         let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: try XCTUnwrap(stateKeys[1]))
         try store.update { record in record!.spoke = nil }
-        let seeded = try await client(1).spokenMembers()
+        let upgraded = try client(1)
+        let seeded = try await upgraded.spokenMembers()
         XCTAssertEqual(seeded, [bobFingerprint])
+        try await upgraded.acknowledgeInbox(through: 2)
+        let remembered = try await client(1).spokenMembers()
+        XCTAssertEqual(remembered, [bobFingerprint])
+        XCTAssertEqual(try store.read().spoke, [bobFingerprint])
+        let removal = try await upgraded.prepareRemove(fingerprint: bobFingerprint)
+        try await upgraded.process(removal, cursor: 3)
+        let forgotten = try await client(1).spokenMembers()
+        XCTAssertTrue(forgotten.isEmpty)
+    }
+
+    func testOlderInboxActivitySurvivesANewSenderBeforeAcknowledgement() async throws {
+        let (alice, bob, group) = try await paired()
+        let charlie = try client(3)
+        let identity = try await charlie.joiningIdentity()
+        let addition = try await alice.prepareAdd(
+            keyPackage: identity.keyPackage, verifiedFingerprint: identity.fingerprint,
+            reference: Data(SHA256.hash(data: identity.keyPackage))
+        )
+        try await alice.process(addition, cursor: 2)
+        try await bob.process(addition, cursor: 2)
+        try await charlie.join(
+            welcome: XCTUnwrap(addition.welcome), group: group,
+            verifiedInviterFingerprint: alice.fingerprint(), cursor: 2
+        )
+        let bobFingerprint = try await bob.fingerprint()
+        let charlieFingerprint = try await charlie.fingerprint()
+        try await alice.process(try await bob.prepareMessage(Data("older activity".utf8)), cursor: 3)
+        let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: XCTUnwrap(stateKeys[1]))
+        try store.update { $0!.spoke = nil }
+
+        let upgraded = try client(1)
+        try await upgraded.process(try await charlie.prepareMessage(Data("new activity".utf8)), cursor: 4)
+        try await upgraded.acknowledgeInbox(through: 4)
+        let remembered = try await client(1).spokenMembers()
+        XCTAssertEqual(remembered, [bobFingerprint, charlieFingerprint])
+        XCTAssertEqual(Set(try XCTUnwrap(store.read().spoke)), remembered)
     }
 
     func testApplicationBeforeOwnCommitDoesNotBlockCatchup() async throws {

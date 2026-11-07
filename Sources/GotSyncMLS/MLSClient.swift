@@ -98,8 +98,14 @@ public actor MLSClient {
     public init(directory: URL, deviceID: Data, stateKey: MLSStateKeyProvider) throws {
         store = try MLSStore(directory: directory, stateKey: stateKey)
         try store.update { record in
-            if let record {
-                guard record.deviceID == deviceID else { throw MLSClientError.invalidState }
+            if var existing = record {
+                guard existing.deviceID == deviceID else { throw MLSClientError.invalidState }
+                if existing.group != nil, !existing.removed, !existing.inbox.isEmpty {
+                    let current = try GotSyncMLSBindings.members(state: existing.state).map(\.fingerprint)
+                    let speakers = Set(existing.spoke ?? []).union(existing.inbox.map(\.sender))
+                    existing.spoke = current.filter(speakers.contains)
+                    record = existing
+                }
             } else {
                 let identity = try createIdentity(deviceId: deviceID)
                 record = ClientRecord(
