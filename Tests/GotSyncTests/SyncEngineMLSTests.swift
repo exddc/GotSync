@@ -3392,8 +3392,7 @@ extension SyncEngineMLSTests {
 
     func testLostAddResponseIsResolvedWithinThePairingDespiteARateLimitedRead() async throws {
         let (host, first, third, group) = try await linkedPairWithPendingThird("lost-add") { relay, host, _ in
-            await relay.dropNextAddResponse()
-            await relay.rateLimitNext(fetches: 1, of: host)
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1, of: host)
         }
         try await wait("third linked") { third.isPaired && !host.canCancelPairing }
         XCTAssertNil(host.lastPairingFailure)
@@ -3517,8 +3516,7 @@ extension SyncEngineMLSTests {
 
     func testUnlinkingRemovesAProvisionalDeviceThatNeverSpoke() async throws {
         let (host, first, third, group) = try await linkedPairWithPendingThird("unlink-silent") { relay, host, third in
-            await relay.dropNextAddResponse()
-            await relay.rateLimitNext(fetches: 1_000, of: host)
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1_000, of: host)
             await relay.setOffline(third, true)
         }
         try await wait("pairing failed") { host.lastPairingFailure != nil && !host.canCancelPairing }
@@ -3530,6 +3528,55 @@ extension SyncEngineMLSTests {
         try await wait("silent device withdrawn and inviter gone") { first.linkedMemberCount == 1 }
         let writers = await relay.activeWriterCount(group: group)
         XCTAssertEqual(writers, 1)
+    }
+
+    func testMemberRefreshKeepsCleanupIntentSavedDuringItsReads() async throws {
+        let host = engine("refresh-host")
+        let peer = engine("refresh-peer")
+        try await pair(host, peer)
+        await host.stop()
+        let expired = Data(repeating: 0xE1, count: 32)
+        let added = Data(repeating: 0xA1, count: 32)
+        try host.markProvisionalForTesting(expired, deadline: Date().addingTimeInterval(-1))
+        host.memberReadHookForTesting = {
+            try host.markProvisionalForTesting(added, deadline: Date().addingTimeInterval(600))
+        }
+        try await host.refreshMembersForTesting()
+        host.memberReadHookForTesting = nil
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(added), "a refresh overwrote intent saved during its reads")
+        XCTAssertFalse(host.provisionalMembersForTesting.contains(expired))
+    }
+
+    func testUnlinkingKeepsAJoinerThatSpokeBeforeItsRecordWasCleared() async throws {
+        let (host, first, third, group) = try await linkedPairWithPendingThird("unlink-live") { relay, host, _ in
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1_000, of: host)
+        }
+        try await wait("pairing failed and the joiner joined") {
+            host.lastPairingFailure != nil && !host.canCancelPairing && third.isPaired && third.pendingMailboxOperationCount == 0
+        }
+        let thirdFingerprint = try await fingerprint(third)
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(thirdFingerprint))
+        let gate = SyncTestGate()
+        host.inboxReadHookForTesting = { [weak host] in
+            guard let session = host?.mlsSessionForTesting,
+                  (try? await session.inbox())?.contains(where: { $0.sender == thirdFingerprint }) == true
+            else { return }
+            await gate.pause()
+        }
+        await relay.rateLimitNext()
+        try await wait("joiner's message read") { gate.isPaused }
+        XCTAssertTrue(host.provisionalMembersForTesting.contains(thirdFingerprint), "the record was cleared before unlinking")
+        host.unlinkAndKeepTasks()
+        gate.release()
+        try await wait("only the inviter left") { first.linkedMemberCount == 2 && third.linkedMemberCount == 2 }
+        XCTAssertTrue(third.isPaired)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+        XCTAssertTrue(third.addTask(title: "From the joiner"))
+        XCTAssertTrue(first.addTask(title: "From the first"))
+        try await wait("remaining devices exchange edits") {
+            [first, third].allSatisfy { $0.tasks.count == 2 && $0.pendingMailboxOperationCount == 0 }
+        }
     }
 
     func testMemberWhoseMessagesWaitBehindAFullInboxIsNotRemovedAsSilent() async throws {
@@ -3572,8 +3619,7 @@ extension SyncEngineMLSTests {
         let (host, first, third, group) = try await linkedPairWithPendingThird(
             "unresolved-add", provisionalMemberWindow: 1
         ) { relay, host, third in
-            await relay.dropNextAddResponse()
-            await relay.rateLimitNext(fetches: 1_000, of: host)
+            await relay.dropNextAddResponse(thenRateLimitFetches: 1_000, of: host)
             await relay.setOffline(third, true)
         }
         let thirdFingerprint = try await XCTUnwrapAsync(third.mlsSessionForTesting).fingerprint()

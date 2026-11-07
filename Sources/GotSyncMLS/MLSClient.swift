@@ -80,6 +80,9 @@ struct ClientRecord: Codable {
     var pendingTracked: Bool?
     var sent: [MLSSentMessage]?
     var withdrawnWriter: Data?
+    /// Current members that sent this member an authenticated application
+    /// message, kept after the message leaves the inbox.
+    var spoke: [Data]?
 }
 
 struct IdentityRecord: Codable {
@@ -248,7 +251,7 @@ public actor MLSClient {
                delivery.kind == pending.kind, delivery.epoch == pending.epoch {
                 if pending.kind == .commit {
                     Self.apply(try acceptCommit(state: record.state, acceptedCommit: delivery.payload), to: &record)
-                    try Self.pruneDepartures(in: &record)
+                    try Self.pruneMemberRecords(in: &record)
                 } else if pending.kind == .application {
                     Self.recordTrackedDelivery(at: cursor, in: &record)
                 }
@@ -286,6 +289,9 @@ public actor MLSClient {
                 if let sender = transition.sender {
                     guard record.inbox.count < 1000 else { throw MLSClientError.capacityReached }
                     record.inbox.append(MLSInboxMessage(cursor: cursor, sender: sender, plaintext: transition.output))
+                    if !(record.spoke ?? []).contains(sender) {
+                        record.spoke = Array(((record.spoke ?? []) + [sender]).suffix(Self.memberCeiling))
+                    }
                 }
                 if transition.removed {
                     record.removed = true
@@ -297,7 +303,7 @@ public actor MLSClient {
                     record.departures = nil
                 } else {
                     if delivery.kind == .commit {
-                        try Self.pruneDepartures(in: &record)
+                        try Self.pruneMemberRecords(in: &record)
                     }
                     if let retryPlaintext {
                         _ = try Self.seal(retryPlaintext, in: &record)
@@ -317,6 +323,14 @@ public actor MLSClient {
             else { return }
             record.withdrawnWriter = writer
         }
+    }
+
+    /// Members that sent an authenticated application message, including
+    /// senders of messages still in the inbox of state written before this
+    /// record existed.
+    public func spokenMembers() throws -> Set<Data> {
+        let record = try store.read()
+        return Set(record.spoke ?? []).union(record.inbox.map(\.sender))
     }
 
     /// The writer hash of a withdrawn Add, if one is marked.
@@ -371,10 +385,11 @@ public actor MLSClient {
         record.sent = Array(((record.sent ?? []) + [sent]).suffix(MLSSentMessage.retained))
     }
 
-    private static func pruneDepartures(in record: inout ClientRecord) throws {
-        guard let departures = record.departures else { return }
+    private static func pruneMemberRecords(in record: inout ClientRecord) throws {
+        guard record.departures != nil || record.spoke != nil else { return }
         let current = try GotSyncMLSBindings.members(state: record.state).map(\.fingerprint)
-        record.departures = departures.filter(current.contains)
+        record.departures = record.departures?.filter(current.contains)
+        record.spoke = record.spoke?.filter(current.contains)
     }
 
     private static func apply(_ transition: MlsTransition, to record: inout ClientRecord) {

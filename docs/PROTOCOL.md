@@ -388,9 +388,16 @@ first appears as a member. If the Add lands after the pairing ended and the
 device never sends a message, the next sync cycle that has read the log to its
 head removes it. While messages wait unread behind a full inbox, no member is
 removed for silence. An inviter that unlinks takes these records into its
-departure journal. Before proposing its own removal, it delivers a pending Add
-and removes the member it added, together with every provisional member that
-has not sent a message.
+departure journal. Before proposing its own removal, it delivers a pending Add,
+reads the log, and removes the member it added and its other provisional
+members, unless they have sent an application message. A provisional record
+is an obligation to clean up, not evidence of silence. The MLS state keeps the
+fingerprints of current members that sent this device an authenticated
+application message. The list survives inbox acknowledgement and restart and
+moves with the state into a departure slot; a member leaves it when it leaves
+the group. State written before this list existed counts the senders still in
+its inbox. The check runs in the same serialized step that prepares the Remove.
+A removal the user requests with `removeDevice` does not consult it.
 
 A revoked writer cannot append. It can read entries up to its removal cursor
 until it acknowledges that cursor or 24 hours pass. The relay deletes entries

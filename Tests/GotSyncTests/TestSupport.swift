@@ -208,6 +208,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var rateLimitedFetches = 0
     private var rateLimitedWriter: Data?
     private var dropAddResponse = false
+    private var fetchesLimitedAfterDrop: (count: Int, authorization: Data?) = (0, nil)
 
     /// Accepts the next append without answering. With `thenUnavailable`,
     /// every later append fails until `setAppendsUnavailable(false)`. With
@@ -230,8 +231,13 @@ actor FakeMLSRelay: MLSRelayTransport {
         heldApplicationWriters = authorizations.map { Set($0.map(Self.digest)) }
     }
 
-    /// Accepts the next Add without answering.
-    func dropNextAddResponse() { dropAddResponse = true }
+    /// Accepts the next Add without answering. From then on, the next
+    /// `fetches` fetches of `authorization` are rate limited, so that writer
+    /// cannot read the log to learn the Add landed.
+    func dropNextAddResponse(thenRateLimitFetches fetches: Int = 0, of authorization: Data? = nil) {
+        dropAddResponse = true
+        fetchesLimitedAfterDrop = (fetches, authorization)
+    }
 
     /// Answers the next Adds and fetches, of `authorization` only if given,
     /// with the relay gateway's HTTP 429 before the delivery store sees them,
@@ -438,6 +444,9 @@ actor FakeMLSRelay: MLSRelayTransport {
         }
         if dropAddResponse, delivery.welcome != nil {
             dropAddResponse = false
+            if fetchesLimitedAfterDrop.count > 0 {
+                rateLimitNext(fetches: fetchesLimitedAfterDrop.count, of: fetchesLimitedAfterDrop.authorization)
+            }
             throw URLError(.networkConnectionLost)
         }
         return try respond(.accepted(cursor: cursor))

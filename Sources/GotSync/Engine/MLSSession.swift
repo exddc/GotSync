@@ -87,6 +87,7 @@ actor MLSSession {
     func cursor() async throws -> UInt64 { try await client.cursor() }
     func members() async throws -> [MLSMember] { try await client.members() }
     func groupProfile() async throws -> Data? { try await client.groupProfile() }
+    func spokenMembers() async throws -> Set<Data> { try await client.spokenMembers() }
     func isRemoved() async throws -> Bool { try await client.isRemoved() }
     func pendingDelivery() async throws -> MLSDelivery? { try await client.pendingDelivery() }
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
@@ -160,10 +161,16 @@ actor MLSSession {
         }
     }
 
-    func remove(fingerprint: Data) async throws -> MLSSubmission {
+    /// With `onlyIfSilent`, the member is kept if it has sent an
+    /// authenticated application message, checked in the same serialized
+    /// step that prepares the Remove.
+    func remove(fingerprint: Data, onlyIfSilent: Bool = false) async throws -> MLSSubmission {
         try await exclusive { session in
             try await session.submit { client in
-                guard try await client.members().contains(where: { $0.fingerprint == fingerprint }) else {
+                let spoken = onlyIfSilent ? try await client.spokenMembers() : []
+                guard try await client.members().contains(where: { $0.fingerprint == fingerprint }),
+                      !spoken.contains(fingerprint)
+                else {
                     return nil
                 }
                 return try await client.prepareRemove(fingerprint: fingerprint)
@@ -186,8 +193,9 @@ actor MLSSession {
     /// the leave.
     ///
     /// First, an Add still pending is delivered, because its outcome may be
-    /// unknown, and the member it adds is removed again together with the
-    /// members in `withdrawing`: only this member knows they never spoke.
+    /// unknown. After reading the log, the member it added and the members in
+    /// `withdrawing` are removed unless they sent an application message:
+    /// only this member knows they may never have joined.
     func leave(withdrawing: [Data] = []) async throws {
         try await exclusive { session in
             session.keepsInbox = false
@@ -209,15 +217,24 @@ actor MLSSession {
                     continue
                 }
                 let writer = try await session.client.withdrawnAddWriter()
-                let own = try await session.client.fingerprint()
-                if try await session.client.pendingDelivery() == nil, let target = try await session.client.members().first(where: {
-                    $0.fingerprint != own && (withdrawing.contains($0.fingerprint) || $0.writerHash == writer)
-                }) {
-                    _ = try await session.submit { try await $0.prepareRemove(fingerprint: target.fingerprint) }
-                    continue
-                }
-                if writer != nil {
-                    try await session.client.clearWithdrawnAdd()
+                if writer != nil || !withdrawing.isEmpty, try await session.client.pendingDelivery() == nil {
+                    _ = try await session.catchUp()
+                    if try await session.client.isRemoved() { throw MLSSessionError.removed }
+                    var removing = false
+                    _ = try await session.submit { client in
+                        let own = try await client.fingerprint()
+                        let spoken = try await client.spokenMembers()
+                        guard let target = try await client.members().first(where: {
+                            $0.fingerprint != own && !spoken.contains($0.fingerprint)
+                                && (withdrawing.contains($0.fingerprint) || $0.writerHash == writer)
+                        }) else { return nil }
+                        removing = true
+                        return try await client.prepareRemove(fingerprint: target.fingerprint)
+                    }
+                    if removing { continue }
+                    if writer != nil {
+                        try await session.client.clearWithdrawnAdd()
+                    }
                 }
                 let proposal: MLSDelivery
                 if let pending = try await session.client.pendingDelivery() {

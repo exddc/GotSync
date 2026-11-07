@@ -353,6 +353,30 @@ final class MLSClientTests: XCTestCase {
         return (alice, bob, group)
     }
 
+    func testSpeakersAreRememberedAfterTheInboxIsEmptiedAndForgottenOnRemoval() async throws {
+        let (alice, bob, _) = try await paired()
+        let bobFingerprint = try await bob.fingerprint()
+        try await alice.process(try await bob.prepareMessage(Data("hello".utf8)), cursor: 2)
+        try await alice.acknowledgeInbox(through: 2)
+        let reopened = try client(1)
+        let remembered = try await reopened.spokenMembers()
+        XCTAssertEqual(remembered, [bobFingerprint])
+        let removal = try await reopened.prepareRemove(fingerprint: bobFingerprint)
+        try await reopened.process(removal, cursor: 3)
+        let forgotten = try await reopened.spokenMembers()
+        XCTAssertTrue(forgotten.isEmpty)
+    }
+
+    func testInboxSendersOfStateWithoutSpeakerRecordsCount() async throws {
+        let (alice, bob, _) = try await paired()
+        let bobFingerprint = try await bob.fingerprint()
+        try await alice.process(try await bob.prepareMessage(Data("written by an earlier build".utf8)), cursor: 2)
+        let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: try XCTUnwrap(stateKeys[1]))
+        try store.update { record in record!.spoke = nil }
+        let seeded = try await client(1).spokenMembers()
+        XCTAssertEqual(seeded, [bobFingerprint])
+    }
+
     func testApplicationBeforeOwnCommitDoesNotBlockCatchup() async throws {
         let (alice, bob, _) = try await paired()
         let message = try await bob.prepareMessage(Data("before commit".utf8))

@@ -367,6 +367,87 @@ final class MLSSessionTests: XCTestCase {
         try await assertDelayedAddIsDelivered(originalFirst: true, restart: true)
     }
 
+    /// Reads the log to its head, acknowledging a full inbox on the way.
+    private func drain(_ session: MLSSession) async throws {
+        while true {
+            do {
+                try await session.synchronize()
+                return
+            } catch MLSClientError.capacityReached {
+                try await session.acknowledgeInbox(through: try await session.cursor())
+            }
+        }
+    }
+
+    /// Alice's Add of Charlie lands but its answer is lost, and Charlie joins
+    /// and sends. Alice leaving must remove only Alice. `prepare` runs on
+    /// Alice before she leaves.
+    private func assertLeavingKeepsAJoinerWhoSpoke(
+        floodAfterCharlieSpeaks: Bool = false,
+        prepare: (MLSSession, FakeMLSRelay) async throws -> MLSSession = { session, _ in session },
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.dropNextAddResponse()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The response should be lost", file: file, line: line)
+        } catch is URLError {}
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined, file: file, line: line)
+        guard case .accepted = try await charlie.send(Data("I joined and spoke".utf8)) else {
+            return XCTFail("Charlie could not speak", file: file, line: line)
+        }
+        if floodAfterCharlieSpeaks {
+            for index in 0...1_000 { _ = try await bob.send(Data("flood \(index)".utf8)) }
+        }
+        let leaving = try await prepare(alice, relay)
+        try await leaving.leave(withdrawing: [published.fingerprint])
+        let charlieFingerprint = try await charlie.fingerprint()
+        let evidence = try await leaving.spokenMembers()
+        XCTAssertTrue(evidence.contains(charlieFingerprint), file: file, line: line)
+        if floodAfterCharlieSpeaks {
+            let kept = try await leaving.inbox()
+            XCTAssertFalse(kept.contains { $0.sender == charlieFingerprint }, "the inbox still held the proof", file: file, line: line)
+        }
+        try await drain(bob)
+        guard case .accepted = try await bob.send(Data("remaining members".utf8)) else {
+            return XCTFail("Bob could not commit Alice's departure", file: file, line: line)
+        }
+        try await drain(charlie)
+        let removed = try await charlie.isRemoved()
+        XCTAssertFalse(removed, "leaving removed a joiner that already spoke", file: file, line: line)
+        for session in [bob, charlie] {
+            try await session.acknowledgeInbox(through: try await session.cursor())
+        }
+        try await assertConverged([bob, charlie], relay: relay, group: group, file: file, line: line)
+    }
+
+    func testLeavingAfterLostAddKeepsTheJoinerWhoAlreadySpoke() async throws {
+        try await assertLeavingKeepsAJoinerWhoSpoke()
+    }
+
+    func testLeavingKeepsAJoinerWhoseMessageWasAcknowledgedBeforeRestart() async throws {
+        try await assertLeavingKeepsAJoinerWhoSpoke { alice, relay in
+            guard case .accepted = try await alice.flush() else { throw SessionTestError.unexpected }
+            let inbox = try await alice.inbox()
+            try await alice.acknowledgeInbox(through: try XCTUnwrap(inbox.last).cursor)
+            let emptied = try await alice.inbox()
+            XCTAssertTrue(emptied.isEmpty)
+            return try self.session("alice", transport: relay)
+        }
+    }
+
+    func testLeavingKeepsAJoinerWhoseMessageAFullInboxDropped() async throws {
+        try await assertLeavingKeepsAJoinerWhoSpoke(floodAfterCharlieSpeaks: true)
+    }
+
     func testRateLimitedAddIsKeptAndDeliveredOnRetry() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)
@@ -866,4 +947,8 @@ private final class TooManyRequestsProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private enum SessionTestError: Error {
+    case unexpected
 }

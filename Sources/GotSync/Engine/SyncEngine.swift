@@ -326,6 +326,7 @@ public final class SyncEngine {
     private var departureTask: Task<Void, Never>?
     private var syncCycleID: UUID?
     var inboxReadHookForTesting: (@MainActor () async -> Void)?
+    var memberReadHookForTesting: (@MainActor () async throws -> Void)?
     var replyBatchHookForTesting: (@MainActor () async -> Void)?
     var snapshotSendHookForTesting: (@MainActor () throws -> Void)?
     private var syncCycleRequested = false
@@ -2939,27 +2940,32 @@ public final class SyncEngine {
         }
     }
 
+    /// Reads every session fact first and only then copies the checkpoint,
+    /// so a change saved while those reads were suspended is kept.
     @discardableResult
     private func refreshMembers(session: MLSSession) async throws -> [MLSMember] {
         let roster = try await session.members()
+        let addPending = try await session.pendingDelivery()?.welcome != nil
+        let spoken = try await session.spokenMembers()
+        try await memberReadHookForTesting?()
         try requireCurrent(session)
         let fingerprints = roster.map(\.fingerprint)
         guard var current = checkpoint else {
             return roster
         }
         let previous = current
-        let addPending = try await session.pendingDelivery()?.welcome != nil
-        try requireCurrent(session)
         current.members = roster.map(ReplicationCheckpoint.Member.init)
         current.pendingRemovals.removeAll { !fingerprints.contains($0) }
         let now = Date()
         let known = Set(previous.members.map(\.fingerprint))
         // A device not yet a member keeps its record while an Add for it may
-        // still land, and its window starts again when it first appears.
+        // still land, and its window starts again when it first appears. A
+        // member that sent a message has joined.
         current.provisionalMembers = current.provisionalMembers.compactMap { entry in
             guard fingerprints.contains(entry.fingerprint) else {
                 return addPending || entry.deadline > now ? entry : nil
             }
+            guard !spoken.contains(entry.fingerprint) else { return nil }
             guard !known.contains(entry.fingerprint) else { return entry }
             return ReplicationCheckpoint.ProvisionalMember(
                 fingerprint: entry.fingerprint, deadline: max(entry.deadline, now.addingTimeInterval(provisionalMemberWindow))
@@ -2983,16 +2989,14 @@ public final class SyncEngine {
             let roster = try await refreshMembers(session: session)
             guard let current = checkpoint else { return }
             let now = Date()
-            let silent = removesSilentMembers ? current.provisionalMembers.filter { $0.deadline <= now } : []
-            let candidates = current.pendingRemovals
-                + (try await session.departures())
-                + silent.map(\.fingerprint)
-            guard let target = candidates.first(where: { candidate in
+            let silent = removesSilentMembers ? current.provisionalMembers.filter { $0.deadline <= now }.map(\.fingerprint) : []
+            let requested = current.pendingRemovals + (try await session.departures())
+            guard let target = (requested + silent).first(where: { candidate in
                 roster.contains { $0.fingerprint == candidate && $0.deviceID != deviceID.bytes }
             }) else {
                 return
             }
-            _ = try await session.remove(fingerprint: target)
+            _ = try await session.remove(fingerprint: target, onlyIfSilent: !requested.contains(target))
         }
         try await refreshMembers(session: session)
     }
@@ -3442,6 +3446,10 @@ extension SyncEngine {
     var awaitsReservationsForTesting: Bool { checkpoint?.reservationsVisible == false }
     var reservationsForTesting: [OriginReservation] { checkpoint?.originReservations ?? [] }
     var provisionalMembersForTesting: [Data] { checkpoint?.provisionalMembers.map(\.fingerprint) ?? [] }
+    func refreshMembersForTesting() async throws {
+        guard let session else { throw SyncError.localStorageUnavailable }
+        _ = try await refreshMembers(session: session)
+    }
     func markProvisionalForTesting(_ member: Data, deadline: Date) throws {
         guard var current = checkpoint else { return }
         current.provisionalMembers.append(ReplicationCheckpoint.ProvisionalMember(fingerprint: member, deadline: deadline))
