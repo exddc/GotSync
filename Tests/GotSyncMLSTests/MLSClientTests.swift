@@ -353,6 +353,67 @@ final class MLSClientTests: XCTestCase {
         return (alice, bob, group)
     }
 
+    func testSpeakersAreRememberedAfterTheInboxIsEmptiedAndForgottenOnRemoval() async throws {
+        let (alice, bob, _) = try await paired()
+        let bobFingerprint = try await bob.fingerprint()
+        try await alice.process(try await bob.prepareMessage(Data("hello".utf8)), cursor: 2)
+        try await alice.acknowledgeInbox(through: 2)
+        let reopened = try client(1)
+        let remembered = try await reopened.spokenMembers()
+        XCTAssertEqual(remembered, [bobFingerprint])
+        let removal = try await reopened.prepareRemove(fingerprint: bobFingerprint)
+        try await reopened.process(removal, cursor: 3)
+        let forgotten = try await reopened.spokenMembers()
+        XCTAssertTrue(forgotten.isEmpty)
+    }
+
+    func testInboxSendersOfStateWithoutSpeakerRecordsCount() async throws {
+        let (alice, bob, _) = try await paired()
+        let bobFingerprint = try await bob.fingerprint()
+        try await alice.process(try await bob.prepareMessage(Data("written by an earlier build".utf8)), cursor: 2)
+        let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: try XCTUnwrap(stateKeys[1]))
+        try store.update { record in record!.spoke = nil }
+        let upgraded = try client(1)
+        let seeded = try await upgraded.spokenMembers()
+        XCTAssertEqual(seeded, [bobFingerprint])
+        try await upgraded.acknowledgeInbox(through: 2)
+        let remembered = try await client(1).spokenMembers()
+        XCTAssertEqual(remembered, [bobFingerprint])
+        XCTAssertEqual(try store.read().spoke, [bobFingerprint])
+        let removal = try await upgraded.prepareRemove(fingerprint: bobFingerprint)
+        try await upgraded.process(removal, cursor: 3)
+        let forgotten = try await client(1).spokenMembers()
+        XCTAssertTrue(forgotten.isEmpty)
+    }
+
+    func testOlderInboxActivitySurvivesANewSenderBeforeAcknowledgement() async throws {
+        let (alice, bob, group) = try await paired()
+        let charlie = try client(3)
+        let identity = try await charlie.joiningIdentity()
+        let addition = try await alice.prepareAdd(
+            keyPackage: identity.keyPackage, verifiedFingerprint: identity.fingerprint,
+            reference: Data(SHA256.hash(data: identity.keyPackage))
+        )
+        try await alice.process(addition, cursor: 2)
+        try await bob.process(addition, cursor: 2)
+        try await charlie.join(
+            welcome: XCTUnwrap(addition.welcome), group: group,
+            verifiedInviterFingerprint: alice.fingerprint(), cursor: 2
+        )
+        let bobFingerprint = try await bob.fingerprint()
+        let charlieFingerprint = try await charlie.fingerprint()
+        try await alice.process(try await bob.prepareMessage(Data("older activity".utf8)), cursor: 3)
+        let store = try MLSStore(directory: root.appendingPathComponent("1"), stateKey: XCTUnwrap(stateKeys[1]))
+        try store.update { $0!.spoke = nil }
+
+        let upgraded = try client(1)
+        try await upgraded.process(try await charlie.prepareMessage(Data("new activity".utf8)), cursor: 4)
+        try await upgraded.acknowledgeInbox(through: 4)
+        let remembered = try await client(1).spokenMembers()
+        XCTAssertEqual(remembered, [bobFingerprint, charlieFingerprint])
+        XCTAssertEqual(Set(try XCTUnwrap(store.read().spoke)), remembered)
+    }
+
     func testApplicationBeforeOwnCommitDoesNotBlockCatchup() async throws {
         let (alice, bob, _) = try await paired()
         let message = try await bob.prepareMessage(Data("before commit".utf8))
@@ -437,6 +498,67 @@ final class MLSClientTests: XCTestCase {
         try await alice.process(message, cursor: 2)
         let inbox = try await alice.inbox()
         XCTAssertEqual(inbox.last?.plaintext, Data("survives failure".utf8))
+    }
+
+    private func profile(limit: UInt8) -> Data {
+        Data([1, 7]) + Data("example".utf8) + Data([5]) + Data("tasks".utf8) + Data([0, 2, limit])
+    }
+
+    func testWelcomeForAnotherProfileLeavesTheJoinerUnchanged() async throws {
+        let alice = try client(1)
+        let bob = try client(2)
+        let group = Data(repeating: 7, count: 32)
+        try await alice.createGroup(id: group, profile: profile(limit: 10))
+        let stored = try await alice.groupProfile()
+        XCTAssertEqual(stored, profile(limit: 10))
+        let legacy = try await bob.joiningIdentity()
+        do {
+            _ = try await alice.prepareAdd(keyPackage: legacy.keyPackage, verifiedFingerprint: legacy.fingerprint, reference: Data(SHA256.hash(data: legacy.keyPackage)))
+            XCTFail("A legacy KeyPackage was added to a profiled group")
+        } catch {}
+        let identity = try await bob.joiningIdentity(profile: profile(limit: 10))
+        let pending = try await alice.prepareAdd(keyPackage: identity.keyPackage, verifiedFingerprint: identity.fingerprint, reference: Data(SHA256.hash(data: identity.keyPackage)))
+        try await alice.process(pending, cursor: 1)
+        for expected in [profile(limit: 9), nil] {
+            do {
+                try await bob.join(welcome: XCTUnwrap(pending.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: 1, expectedProfile: expected)
+                XCTFail("Joined a group with another profile")
+            } catch MLSClientError.unsupportedGroupProfile {}
+            let joined = try await bob.group()
+            XCTAssertNil(joined)
+        }
+        try await bob.join(welcome: XCTUnwrap(pending.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: 1, expectedProfile: profile(limit: 10))
+        let joinedProfile = try await bob.groupProfile()
+        XCTAssertEqual(joinedProfile, profile(limit: 10))
+    }
+
+    func testTenMemberGroupRecordsEveryDeparture() async throws {
+        let alice = try client(1)
+        let group = Data(repeating: 7, count: 32)
+        try await alice.createGroup(id: group, profile: profile(limit: 10))
+        var members: [MLSClient] = []
+        var cursor: UInt64 = 0
+        for id in UInt8(2)...10 {
+            let joiner = try client(id)
+            let identity = try await joiner.joiningIdentity(profile: profile(limit: 10))
+            let pending = try await alice.prepareAdd(keyPackage: identity.keyPackage, verifiedFingerprint: identity.fingerprint, reference: Data(SHA256.hash(data: identity.keyPackage)))
+            cursor += 1
+            try await alice.process(pending, cursor: cursor)
+            for member in members { try await member.process(pending, cursor: cursor) }
+            try await joiner.join(welcome: XCTUnwrap(pending.welcome), group: group, verifiedInviterFingerprint: alice.fingerprint(), cursor: cursor, expectedProfile: profile(limit: 10))
+            members.append(joiner)
+        }
+        let roster = try await alice.members()
+        XCTAssertEqual(roster.count, MLSClient.memberCeiling)
+        var leavers: [Data] = []
+        for member in members {
+            let leave = try await member.prepareLeave()
+            cursor += 1
+            try await alice.process(leave, cursor: cursor)
+            leavers.append(try await member.fingerprint())
+        }
+        let departures = try await alice.departures()
+        XCTAssertEqual(departures, leavers)
     }
 
     func testLeaveProposalIsRecordedUntilAnotherMemberCommitsRemoval() async throws {

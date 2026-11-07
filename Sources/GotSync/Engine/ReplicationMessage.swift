@@ -331,7 +331,7 @@ struct ReplyObligation: Codable, Equatable, Sendable {
         if !members.contains(member) {
             members.append(member)
         }
-        recipients = Array(members.suffix(SyncEngine.maximumGroupSize))
+        recipients = Array(members.suffix(SyncGroupProfile.supportedMemberCeiling))
     }
 
     mutating func removeRecipient(_ member: Data) {
@@ -384,7 +384,7 @@ struct ReplyObligation: Codable, Equatable, Sendable {
     static func load(from url: URL) throws -> ReplyObligation? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let stored = try ReplicaCanonicalJSON.decode(ReplyObligation.self, from: Data(contentsOf: url))
-        guard stored.version == version, (stored.recipients ?? []).count <= SyncEngine.maximumGroupSize else {
+        guard stored.version == version, (stored.recipients ?? []).count <= SyncGroupProfile.supportedMemberCeiling else {
             throw ReplicaError.corruptArchive("The reply obligation is unreadable.")
         }
         return stored.isEmpty ? nil : stored

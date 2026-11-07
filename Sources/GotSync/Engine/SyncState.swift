@@ -26,6 +26,8 @@ public struct SyncState: Sendable {
     public let showsSavingNotice: Bool
     public let linkEndedReason: SyncError?
     public let linkedMemberCount: Int
+    /// How many devices the configured group profile admits.
+    public let memberLimit: Int
     public let linkedDevices: [LinkedDevice]
 }
 

@@ -21,7 +21,12 @@ enum MLSRelayError: Error, Equatable {
     case unsupportedVersion
     case unauthorized
     case epochConflict
+    /// The delivery store refused the request for lack of room.
     case capacityReached
+    /// HTTP 429 from anything other than the delivery store, such as the
+    /// relay's admission rate limit or a proxy. The request never reached the
+    /// store.
+    case rateLimited
     case historyExpired
     case rejected(status: Int, code: String)
 }
@@ -34,6 +39,10 @@ struct MLSRelayEntry: Equatable, Sendable {
 enum MLSAppendResult: Equatable, Sendable {
     case accepted(cursor: UInt64)
     case keyPackageUnavailable(epoch: UInt64)
+    /// A conditional append was refused because the log had moved past the
+    /// expected head. The head only grows, so every copy of the same request
+    /// is refused too.
+    case headAdvanced(head: UInt64)
 }
 
 protocol MLSRelayTransport: Sendable {
@@ -41,6 +50,12 @@ protocol MLSRelayTransport: Sendable {
     func fetchKeyPackage(reference: Data, pairingToken: Data) async throws -> Data?
     func createGroup(_ group: Data, authorization: Data) async throws
     func append(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult
+    /// Appends a Remove commit only while the group's log head equals
+    /// `delivery.expectedHead`.
+    func appendIfHead(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult
+    /// Whether the relay offers `appendIfHead`. Earlier relays answer the
+    /// request as invalid, which reports `false`.
+    func supportsConditionalAppend(group: Data, authorization: Data) async throws -> Bool
     func fetch(group: Data, after cursor: UInt64, limit: Int, authorization: Data) async throws -> [MLSRelayEntry]
     func acknowledge(group: Data, through cursor: UInt64, authorization: Data) async throws
 }
@@ -81,6 +96,16 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
         let reference: String?
         let addWriter: String?
         let removeWriter: String?
+        var expectedHead: UInt64? = nil
+    }
+
+    private struct CapabilitiesRequest: Encodable {
+        let version = MLSRelayLimits.version
+        let group: String
+    }
+
+    private struct CapabilitiesResponse: Decodable {
+        let conditionalAppend: Bool?
     }
 
     private struct Entry: Decodable {
@@ -120,6 +145,7 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
     private struct ErrorResponse: Decodable {
         let error: String
         let epoch: UInt64?
+        let head: UInt64?
     }
 
     private struct VersionResponse: Decodable {
@@ -129,6 +155,7 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
     private enum Outcome<Response> {
         case success(Response)
         case keyPackageUnavailable(epoch: UInt64)
+        case headAdvanced(head: UInt64)
     }
 
     private let baseURL: URL
@@ -186,6 +213,32 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
     }
 
     func append(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        guard delivery.expectedHead == nil else { throw MLSRelayError.invalidRequest }
+        return try await append(delivery, endpoint: "append", authorization: authorization)
+    }
+
+    func appendIfHead(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        guard let head = delivery.expectedHead, head < MLSRelayLimits.maximumCursor,
+              delivery.kind == .commit, delivery.removeWriter != nil, delivery.welcome == nil
+        else {
+            throw MLSRelayError.invalidRequest
+        }
+        return try await append(delivery, endpoint: "append-if-head", authorization: authorization)
+    }
+
+    func supportsConditionalAppend(group: Data, authorization: Data) async throws -> Bool {
+        guard group.count == 32 else { throw MLSRelayError.invalidRequest }
+        do {
+            let response: CapabilitiesResponse = try await post(
+                "capabilities", body: CapabilitiesRequest(group: group.base64URLString), authorization: authorization
+            )
+            return response.conditionalAppend == true
+        } catch MLSRelayError.rejected(status: 400, code: "invalidRequest") {
+            return false
+        }
+    }
+
+    private func append(_ delivery: MLSDelivery, endpoint: String, authorization: Data) async throws -> MLSAppendResult {
         guard
             delivery.group.count == 32,
             delivery.epoch < MLSRelayLimits.maximumCursor,
@@ -202,15 +255,19 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
             welcome: delivery.welcome?.base64URLString,
             reference: delivery.keyPackageReference?.base64URLString,
             addWriter: delivery.addWriter?.base64URLString,
-            removeWriter: delivery.removeWriter?.base64URLString
+            removeWriter: delivery.removeWriter?.base64URLString,
+            expectedHead: delivery.expectedHead
         )
-        let outcome: Outcome<AppendResponse> = try await send("append", body: request, authorization: authorization)
+        let outcome: Outcome<AppendResponse> = try await send(endpoint, body: request, authorization: authorization)
         switch outcome {
         case .keyPackageUnavailable(let epoch):
             return .keyPackageUnavailable(epoch: epoch)
+        case .headAdvanced(let head):
+            guard let expected = delivery.expectedHead, head > expected else { throw MLSRelayError.invalidResponse }
+            return .headAdvanced(head: head)
         case .success(let response):
             let entry = try decode(response.entry, group: delivery.group)
-            guard entry.delivery == delivery else { throw MLSRelayError.invalidResponse }
+            guard entry.delivery == delivery.withoutExpectedHead else { throw MLSRelayError.invalidResponse }
             return .accepted(cursor: entry.cursor)
         }
     }
@@ -283,7 +340,7 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
     ) async throws -> Response {
         switch try await send(endpoint, body: body, authorization: authorization) as Outcome<Response> {
         case .success(let response): return response
-        case .keyPackageUnavailable: throw MLSRelayError.invalidResponse
+        case .keyPackageUnavailable, .headAdvanced: throw MLSRelayError.invalidResponse
         }
     }
 
@@ -328,10 +385,16 @@ final class HTTPMLSRelayTransport: MLSRelayTransport, @unchecked Sendable {
                     throw MLSRelayError.invalidResponse
                 }
                 return .keyPackageUnavailable(epoch: epoch)
+            case (409, "headAdvanced"):
+                guard let head = failure?.head, head < MLSRelayLimits.maximumCursor else {
+                    throw MLSRelayError.invalidResponse
+                }
+                return .headAdvanced(head: head)
             case (409, "epochConflict"): throw MLSRelayError.epochConflict
             case (403, _): throw MLSRelayError.unauthorized
             case (410, "historyExpired"): throw MLSRelayError.historyExpired
-            case (429, _): throw MLSRelayError.capacityReached
+            case (429, "deliveryCapacity"): throw MLSRelayError.capacityReached
+            case (429, _): throw MLSRelayError.rateLimited
             case (_, "unsupportedVersion"): throw MLSRelayError.unsupportedVersion
             case (let status, let code): throw MLSRelayError.rejected(status: status, code: code ?? "http\(status)")
             }
