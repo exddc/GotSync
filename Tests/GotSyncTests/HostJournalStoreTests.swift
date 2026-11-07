@@ -87,6 +87,100 @@ final class HostJournalStoreTests: XCTestCase {
         }
     }
 
+    func testUnsupportedWALStoreIsPreservedExactly() throws {
+        let url = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 3, count: 16))
+        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=2", create: true)
+        let before = JournalFixture.storedState(url)
+        XCTAssertEqual(Array(try XCTUnwrap(before[""])[18...19]), [2, 2])
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(2)) }
+        XCTAssertEqual(JournalFixture.storedState(url), before)
+    }
+
+    func testSupportedFormatWALStoreIsReportedWithoutConversion() throws {
+        let (store, _) = try enrolled()
+        _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 2), cursor: 1)])
+        let withIndex = directory.appendingPathComponent("wal-index.sqlite3")
+        try FileManager.default.copyItem(at: store.url, to: withIndex)
+        try JournalFixture.tamper(withIndex, "PRAGMA journal_mode=WAL; UPDATE meta SET value = value WHERE key = 'revision'")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: withIndex.path + "-shm"))
+        let indexed = JournalFixture.storedState(withIndex)
+        XCTAssertEqual(Array(try XCTUnwrap(indexed[""])[18...19]), [2, 2])
+        XCTAssertThrowsError(try HostJournalStore.open(withIndex)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("journal mode wal")) }
+        XCTAssertEqual(JournalFixture.storedState(withIndex), indexed)
+
+        let withoutIndex = directory.appendingPathComponent("wal-bare.sqlite3")
+        try FileManager.default.copyItem(at: store.url, to: withoutIndex)
+        try JournalFixture.tamper(withoutIndex, "PRAGMA journal_mode=WAL")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: withoutIndex.path + "-shm"))
+        let bare = JournalFixture.storedState(withoutIndex)
+        XCTAssertEqual(Array(try XCTUnwrap(bare[""])[18...19]), [2, 2])
+        XCTAssertThrowsError(try HostJournalStore.open(withoutIndex)) {
+            guard case .storeUnreadable(let reason) = $0 as? HostJournalError, reason.hasPrefix("14:") else { return XCTFail("\($0)") }
+        }
+        XCTAssertEqual(JournalFixture.storedState(withoutIndex), bare)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: withoutIndex.path + "-shm"))
+    }
+
+    func testHotRollbackJournalIsRecoveredToTheCommittedState() throws {
+        let (store, _) = try enrolled()
+        _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 3), cursor: 1)])
+        let committed = store.view
+        let original = JournalFixture.storedState(store.url)
+        let copy = try JournalFixture.hotImage(of: store.url, into: directory.appendingPathComponent("hot", isDirectory: true))
+        XCTAssertEqual(JournalFixture.storedState(store.url), original)
+        let journal = try Data(contentsOf: URL(fileURLWithPath: copy.path + "-journal"))
+        XCTAssertEqual(Array(journal.prefix(8)), [0xD9, 0xD5, 0x05, 0xF9, 0x20, 0xA1, 0x63, 0xD7], "the image must hold a hot journal")
+        XCTAssertNotEqual(try Data(contentsOf: copy), try XCTUnwrap(original[""]))
+        let recovered = try HostJournalStore.open(copy)
+        XCTAssertEqual(recovered.view, committed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path + "-journal"))
+        XCTAssertEqual(try Data(contentsOf: copy), try XCTUnwrap(original[""]))
+        XCTAssertEqual(try HostJournalStore.open(copy).view, committed)
+    }
+
+    func testSameOriginPositionInversionIsRejectedBeforeUse() throws {
+        let (store, _) = try enrolled()
+        _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 2), cursor: 1)])
+        try JournalFixture.tamper(store.url, """
+            BEGIN IMMEDIATE; UPDATE records SET position = 3 WHERE position = 1;
+            UPDATE records SET position = 1 WHERE position = 2; UPDATE records SET position = 2 WHERE position = 3; COMMIT
+            """)
+        let before = JournalFixture.storedState(store.url)
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("position order")) }
+        XCTAssertEqual(JournalFixture.storedState(store.url), before)
+    }
+
+    func testInterleavedOriginsReopenAndApplyInPositionOrder() throws {
+        let (store, host) = try enrolled()
+        let a = try JournalFixture.chain(JournalFixture.origin(2), count: 2)
+        let b = try JournalFixture.chain(JournalFixture.origin(3), count: 2)
+        _ = try store.intake([a[0], b[0], a[1], b[1]].enumerated().map { JournalFixture.arrival([$0.element], cursor: UInt64($0.offset + 1)) })
+        let reopened = try reopen(store)
+        _ = try reopened.resume(XCTUnwrap(host.provenance))
+        XCTAssertEqual(try reopened.incoming(after: 0, limit: 4).map(\.record), [a[0].id, b[0].id, a[1].id, b[1].id])
+        try reopened.markApplied(through: 3)
+        try reopened.markApplied(through: 4)
+        XCTAssertEqual(try reopen(reopened).view.appliedThrough, 4)
+    }
+
+    func testNegativeRawCursorsAreRejectedBeforeUse() throws {
+        let (store, _) = try enrolled()
+        _ = try store.intake([JournalFixture.raw(Data("raw".utf8), cursor: 1)])
+        try JournalFixture.tamper(store.url, "UPDATE quarantine SET cursor = -1")
+        let quarantine = JournalFixture.storedState(store.url)
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("quarantine")) }
+        XCTAssertEqual(JournalFixture.storedState(store.url), quarantine)
+
+        directory = root.appendingPathComponent("held", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let retired = try HostJournalStore.create(in: directory, group: JournalFixture.group)
+        try retired.retire(.unlink, heldInbox: [HostJournalHeldMessage(sender: JournalFixture.sender, cursor: 4, plaintext: Data("h".utf8))])
+        try JournalFixture.tamper(retired.url, "UPDATE heldInbox SET cursor = -4")
+        let held = JournalFixture.storedState(retired.url)
+        XCTAssertThrowsError(try HostJournalStore.open(retired.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("heldInbox")) }
+        XCTAssertEqual(JournalFixture.storedState(retired.url), held)
+    }
+
     func testSymbolicLinkIsNotFollowed() throws {
         let store = try HostJournalStore.create(in: directory, group: JournalFixture.group)
         let link = directory.appendingPathComponent("host-journal-link.sqlite3")

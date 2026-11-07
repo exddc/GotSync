@@ -46,15 +46,56 @@ enum JournalFixture {
     }
 
     /// Runs one statement directly against a journal file, as on-disk damage would.
-    static func tamper(_ url: URL, _ sql: String) throws {
+    static func tamper(_ url: URL, _ sql: String, create: Bool = false) throws {
         var database: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+        let flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK else {
             throw HostJournalError.storeMissing
         }
         defer { sqlite3_close_v2(database) }
         guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
             throw HostJournalError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
         }
+    }
+
+    /// Copies `url` and its rollback journal while a raw transaction with a
+    /// one-page cache has spilled pages into the database file, then rolls
+    /// that transaction back. The copy is a genuine crash image with a hot
+    /// journal; `url` itself ends unchanged.
+    static func hotImage(of url: URL, into directory: URL) throws -> URL {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            throw HostJournalError.storeMissing
+        }
+        defer { sqlite3_close_v2(database) }
+        let spill = """
+            PRAGMA cache_size=1; PRAGMA cache_spill=ON; BEGIN IMMEDIATE;
+            UPDATE meta SET value = value + 1000 WHERE key = 'revision';
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+            INSERT INTO heldInbox(sender, cursor, plaintext, digest) SELECT randomblob(32), i, zeroblob(20000), randomblob(32) FROM n;
+            """
+        guard sqlite3_exec(database, spill, nil, nil, nil) == SQLITE_OK else {
+            throw HostJournalError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let copy = directory.appendingPathComponent(url.lastPathComponent)
+        try FileManager.default.copyItem(atPath: url.path, toPath: copy.path)
+        try FileManager.default.copyItem(atPath: url.path + "-journal", toPath: copy.path + "-journal")
+        sqlite3_exec(database, "ROLLBACK", nil, nil, nil)
+        return copy
+    }
+
+    /// Bytes of the database and of every sidecar that holds content. The
+    /// `-shm` WAL index is SQLite's derived shared memory, which any reader
+    /// rewrites, so it is not part of the preserved state.
+    static func storedState(_ url: URL) -> [String: Data] {
+        var state: [String: Data] = [:]
+        for suffix in ["", "-wal", "-journal"] {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: url.path + suffix)) {
+                state[suffix] = data
+            }
+        }
+        return state
     }
 
     @MainActor static func exportAll(_ url: URL, pageSize: Int = 7) throws -> [HostJournalExportItem] {

@@ -200,24 +200,41 @@ final class HostJournalStore {
 
     /// Opens and fully validates an existing journal. A missing, unreadable,
     /// unsupported or inconsistent file is reported, never recreated.
+    ///
+    /// The format, journal mode and contents are inspected on a read-only
+    /// connection first, so a rejected file is never recovered, checkpointed
+    /// or converted. Only a hot rollback journal, which SQLite must roll back
+    /// before any read, is recovered on a read-write connection and then
+    /// inspected the same way. Write settings apply after inspection succeeds.
     static func open(_ url: URL, limits: HostJournalLimits = .standard) throws -> HostJournalStore {
         try requireRegularFile(url)
-        let database: JournalDatabase
+        var inspected: HostJournalCoreView?
         do {
-            database = try JournalDatabase(url: url, readOnly: false)
+            inspected = try inspect(JournalDatabase(url: url, readOnly: true))
+        } catch HostJournalError.storage(let code, _) where code == JournalDatabase.hotJournalCode {
+            inspected = nil
+        } catch HostJournalError.storage(let code, let message) {
+            throw HostJournalError.storeUnreadable("\(code): \(message)")
+        }
+        do {
+            let database = try JournalDatabase(url: url, readOnly: false)
+            let view = try inspected ?? inspect(database)
             try configure(database)
-        } catch let error as HostJournalError {
-            throw HostJournalError.storeUnreadable("\(error)")
-        }
-        try database.execute("BEGIN")
-        do {
-            let view = try validate(database)
-            try database.execute("COMMIT")
             return HostJournalStore(url: url, limits: limits, database: database, view: view)
-        } catch {
-            try? database.execute("ROLLBACK")
-            throw error
+        } catch HostJournalError.storage(let code, let message) {
+            throw HostJournalError.storeUnreadable("\(code): \(message)")
         }
+    }
+
+    private static func inspect(_ database: JournalDatabase) throws -> HostJournalCoreView {
+        try database.execute("BEGIN")
+        defer { try? database.execute("COMMIT") }
+        try checkFormat(database)
+        let mode = try database.first("PRAGMA journal_mode", [], { try $0.text(0) }) ?? ""
+        guard mode == "delete" else {
+            throw HostJournalError.storeCorrupt("journal mode \(mode)")
+        }
+        return try validate(database)
     }
 
     private init(url: URL, limits: HostJournalLimits, database: JournalDatabase, view: HostJournalCoreView) {
@@ -911,10 +928,10 @@ final class HostJournalStore {
         guard try database.first("PRAGMA quick_check", [], { try $0.text(0) }) == "ok" else {
             throw HostJournalError.storeCorrupt("quick_check")
         }
-        try checkFormat(database)
         let meta = try readMeta(database)
         var counters = Counters()
         var heads: [Data: (received: UInt64, digest: Data)] = [:]
+        var lastPositions: [Data: UInt64] = [:]
         var positions: UInt64 = 0
         var maxPosition: UInt64 = 0
         var ownPayloads: [UInt64: Data] = [:]
@@ -932,7 +949,10 @@ final class HostJournalStore {
                 ownPayloads[sequence] = Data(SHA256.hash(data: envelope.payload))
             } else {
                 let position = try row.unsigned(4)
-                guard position >= 1 else { throw HostJournalError.storeCorrupt("position") }
+                guard position >= 1, position > lastPositions[origin] ?? 0 else {
+                    throw HostJournalError.storeCorrupt("position order")
+                }
+                lastPositions[origin] = position
                 positions += 1
                 maxPosition = max(maxPosition, position)
             }
@@ -978,9 +998,11 @@ final class HostJournalStore {
             counters.pendingBytes += UInt64(envelope.bytes.count)
         }
         for (table, column) in [("quarantine", "bytes"), ("heldInbox", "plaintext")] {
-            try database.rows("SELECT sender, \(column), digest FROM \(table)") { row in
+            try database.rows("SELECT sender, \(column), digest, cursor FROM \(table)") { row in
                 let bytes = try row.blob(1)
-                guard try row.blob(0).count == 32, Data(SHA256.hash(data: bytes)) == (try row.blob(2)) else {
+                guard try row.blob(0).count == 32, Data(SHA256.hash(data: bytes)) == (try row.blob(2)),
+                      try row.int64(3) >= 0
+                else {
                     throw HostJournalError.storeCorrupt(table)
                 }
                 if table == "quarantine" {

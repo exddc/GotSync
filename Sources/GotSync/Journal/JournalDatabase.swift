@@ -12,6 +12,9 @@ enum JournalValue: Hashable, Sendable {
 /// through `integer(_:)`, which refuses values above `Int64.max` instead of
 /// wrapping them.
 final class JournalDatabase {
+    /// `SQLITE_READONLY_ROLLBACK`: a read-only connection found a hot
+    /// rollback journal that only a read-write connection may roll back.
+    static let hotJournalCode = SQLITE_READONLY | (3 << 8)
     private var handle: OpaquePointer?
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
