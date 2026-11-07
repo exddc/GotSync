@@ -46,6 +46,9 @@ actor MLSSession {
     private let fetchLimit: Int
     private var acknowledged: UInt64 = 0
     private var keepsInbox = true
+    /// The relay's answer to `supportsConditionalAppend`, asked once per
+    /// session.
+    private var conditionalAppendSupported: Bool?
     private var tail: Task<Void, Never>?
 
     init(
@@ -161,16 +164,18 @@ actor MLSSession {
         }
     }
 
-    /// With `onlyIfSilent`, the member is kept if it has sent an
-    /// authenticated application message, checked in the same serialized
-    /// step that prepares the Remove.
+    /// With `onlyIfSilent`, the member is removed only through
+    /// `removeSilent`, so a message it sent before the Remove keeps it.
     func remove(fingerprint: Data, onlyIfSilent: Bool = false) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit { client in
-                let spoken = onlyIfSilent ? try await client.spokenMembers() : []
-                guard try await client.members().contains(where: { $0.fingerprint == fingerprint }),
-                      !spoken.contains(fingerprint)
-                else {
+            if onlyIfSilent {
+                return try await session.removeSilent { spoken, members, own in
+                    fingerprint != own && !spoken.contains(fingerprint) && members.contains { $0.fingerprint == fingerprint }
+                        ? fingerprint : nil
+                } ?? .superseded
+            }
+            return try await session.submit { client in
+                guard try await client.members().contains(where: { $0.fingerprint == fingerprint }) else {
                     return nil
                 }
                 return try await client.prepareRemove(fingerprint: fingerprint)
@@ -218,20 +223,13 @@ actor MLSSession {
                 }
                 let writer = try await session.client.withdrawnAddWriter()
                 if writer != nil || !withdrawing.isEmpty, try await session.client.pendingDelivery() == nil {
-                    _ = try await session.catchUp()
-                    if try await session.client.isRemoved() { throw MLSSessionError.removed }
-                    var removing = false
-                    _ = try await session.submit { client in
-                        let own = try await client.fingerprint()
-                        let spoken = try await client.spokenMembers()
-                        guard let target = try await client.members().first(where: {
+                    let removal = try await session.removeSilent { spoken, members, own in
+                        members.first {
                             $0.fingerprint != own && !spoken.contains($0.fingerprint)
                                 && (withdrawing.contains($0.fingerprint) || $0.writerHash == writer)
-                        }) else { return nil }
-                        removing = true
-                        return try await client.prepareRemove(fingerprint: target.fingerprint)
+                        }?.fingerprint
                     }
-                    if removing { continue }
+                    if removal != nil { continue }
                     if writer != nil {
                         try await session.client.clearWithdrawnAdd()
                     }
@@ -333,7 +331,9 @@ actor MLSSession {
             guard let pending = try await client.pendingDelivery() else { return .superseded }
             let result: MLSAppendResult
             do {
-                result = try await transport.append(pending, authorization: authorization)
+                result = pending.expectedHead == nil
+                    ? try await transport.append(pending, authorization: authorization)
+                    : try await transport.appendIfHead(pending, authorization: authorization)
             } catch MLSRelayError.epochConflict {
                 _ = try await catchUp()
                 if try await client.isRemoved() { throw MLSSessionError.removed }
@@ -350,9 +350,42 @@ actor MLSSession {
             case .keyPackageUnavailable(let epoch):
                 try await client.rejectAddForUnavailableKeyPackage(commit: pending.payload, rejectedEpoch: epoch)
                 return .superseded
+            case .headAdvanced:
+                try await client.discardRefusedRemove(pending)
+                return .superseded
             }
         }
         throw MLSSessionError.unresolvedConflict
+    }
+
+    /// Removes the member `choose` picks from the activity evidence, the
+    /// roster and this member's fingerprint, ordered against every other
+    /// writer: it reads the log to its head, chooses, and sends a Remove the
+    /// relay appends only while its head is still the position just read. A
+    /// message appended in between refuses the Remove for good, and the next
+    /// call reads it first. Returns `nil` when nobody is chosen or the relay
+    /// cannot append conditionally, in which case nothing is removed.
+    private func removeSilent(
+        _ choose: (_ spoken: Set<Data>, _ members: [MLSMember], _ own: Data) -> Data?
+    ) async throws -> MLSSubmission? {
+        guard let group = try await client.group() else { throw MLSSessionError.notInGroup }
+        _ = try await catchUp()
+        if try await client.isRemoved() { throw MLSSessionError.removed }
+        if conditionalAppendSupported == nil {
+            conditionalAppendSupported = try await transport.supportsConditionalAppend(
+                group: group, authorization: client.transportAuthorization()
+            )
+        }
+        guard conditionalAppendSupported == true else { return nil }
+        var prepared = false
+        let result = try await submit { client in
+            guard let target = choose(
+                try await client.spokenMembers(), try await client.members(), try await client.fingerprint()
+            ) else { return nil }
+            prepared = true
+            return try await client.prepareRemove(fingerprint: target, expectedHead: try await client.cursor())
+        }
+        return prepared ? result : nil
     }
 
     private func catchUp() async throws -> Int {

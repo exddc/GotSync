@@ -184,6 +184,7 @@ class MLSDeliveryStore:
         operations = {
             "key-package/publish": self._publish, "key-package/fetch": self._package_fetch,
             "create": self._create, "fetch": self._fetch, "ack": self._ack, "append": self._append,
+            "append-if-head": self._append_if_head, "capabilities": self._capabilities,
         }
         handler = operations.get(operation)
         if handler is None:
@@ -296,10 +297,35 @@ class MLSDeliveryStore:
             (now - GRACE_SECONDS,),
         )
 
+    def _capabilities(self, doc: dict) -> dict:
+        route = blob(doc, "group", 32)
+        self._authorize(doc, route)
+        return {"conditionalAppend": True}
+
     def _append(self, doc: dict) -> dict:
+        if "expectedHead" in doc:
+            raise RequestError("expectedHead requires append-if-head")
+        route = blob(doc, "group", 32)
+        writer = self._authorize(doc, route, writing=True).digest
+        return self._append_entry(route, writer, self._parse_entry(doc, writer))
+
+    def _append_if_head(self, doc: dict) -> dict:
+        """Append a Remove commit only while the group's log head is `expectedHead`.
+
+        The head only grows, so a refusal is final for every copy of the request.
+        The write lock is taken first, so no other connection can append between
+        the head check and the insert.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
         route = blob(doc, "group", 32)
         writer = self._authorize(doc, route, writing=True).digest
         entry = self._parse_entry(doc, writer)
+        _, kind, _, welcome, _, removed_writer, _ = entry
+        if kind != "commit" or removed_writer is None or welcome is not None:
+            raise RequestError("conditional append requires a commit that removes a writer")
+        return self._append_entry(route, writer, entry, expected_head=number(doc, "expectedHead"))
+
+    def _append_entry(self, route: bytes, writer: bytes, entry: tuple, expected_head: int | None = None) -> dict:
         duplicate = self._db.execute(
             "SELECT cursor,epoch,kind,payload,welcome,package,removed_writer,added_writer FROM mls_entries WHERE route=? AND payload=?", (route, entry[2])
         ).fetchone()
@@ -307,6 +333,12 @@ class MLSDeliveryStore:
             if entry != duplicate[1:]:
                 raise DeliveryConflict("retry differs from accepted message")
             return {"entry": self._entry(duplicate)}
+        if expected_head is not None:
+            head = self._db.execute("SELECT head FROM mls_groups WHERE route=?", (route,)).fetchone()[0]
+            if expected_head > head:
+                raise RequestError("expectedHead is beyond the log")
+            if head > expected_head:
+                return {"error": "headAdvanced", "head": head}
         digest = hashlib.sha256(entry[2]).digest()
         rejected = self._db.execute("SELECT epoch FROM mls_rejections WHERE route=? AND digest=?", (route, digest)).fetchone()
         if rejected:

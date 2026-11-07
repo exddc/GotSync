@@ -2985,18 +2985,25 @@ public final class SyncEngine {
     /// The last only with `removesSilentMembers`, after the log was read to
     /// its head, so a member whose messages wait unread is not removed.
     private func processRemovals(session: MLSSession, removesSilentMembers: Bool) async throws {
+        var triedSilent: Set<Data> = []
         for _ in 0..<Self.maximumRemovalAttempts {
             let roster = try await refreshMembers(session: session)
             guard let current = checkpoint else { return }
             let now = Date()
-            let silent = removesSilentMembers ? current.provisionalMembers.filter { $0.deadline <= now }.map(\.fingerprint) : []
+            let silent = removesSilentMembers
+                ? current.provisionalMembers.filter { $0.deadline <= now && !triedSilent.contains($0.fingerprint) }.map(\.fingerprint)
+                : []
             let requested = current.pendingRemovals + (try await session.departures())
             guard let target = (requested + silent).first(where: { candidate in
                 roster.contains { $0.fingerprint == candidate && $0.deviceID != deviceID.bytes }
             }) else {
                 return
             }
-            _ = try await session.remove(fingerprint: target, onlyIfSilent: !requested.contains(target))
+            let onlyIfSilent = !requested.contains(target)
+            if onlyIfSilent {
+                triedSilent.insert(target)
+            }
+            _ = try await session.remove(fingerprint: target, onlyIfSilent: onlyIfSilent)
         }
         try await refreshMembers(session: session)
     }

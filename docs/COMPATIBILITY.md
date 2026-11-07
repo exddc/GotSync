@@ -151,6 +151,22 @@ good and the inviter discards it and catches up. The eight current members keep
 syncing, and the relay keeps eight writers. Ten-device groups therefore need
 the ten-writer relay. The current production relay release accepts eight.
 
+### Ordered cleanup
+
+Automatic removal of a provisional member, and the withdrawal a departing
+inviter performs, use the `append-if-head` and `capabilities` delivery
+operations. Relays without them answer both as invalid requests. A client then
+removes nobody automatically. A device that was admitted but never spoke stays
+a member until someone removes it with `removeDevice`, and a departing inviter
+leaves without withdrawing its unspoken admissions. Explicit removal, leaving,
+and every other delivery keep working on older relays. A cleanup Remove sent
+unconditionally by an earlier build of this branch keeps its uncertain outcome;
+it is delivered or superseded as before. If a relay is downgraded while a
+conditional Remove is pending, that member keeps retrying it and sends nothing
+else until the relay supports the operation again. An earlier build reopening
+state with such a pending Remove ignores its `expectedHead` and sends it as an
+ordinary append.
+
 ### Rollback
 
 A group with more than eight members cannot move back to an eight-member

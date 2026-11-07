@@ -208,6 +208,12 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var rateLimitedFetches = 0
     private var rateLimitedWriter: Data?
     private var dropAddResponse = false
+    private var removalHook: (@Sendable () async throws -> Void)?
+    private var conditionalAppend = true
+    private var deferNextRemoval = false
+    private var deferredRemoval: (delivery: MLSDelivery, authorization: Data)?
+    private var dropRemovalResponse = false
+    private(set) var conditionalRequests = 0
     private var fetchesLimitedAfterDrop: (count: Int, authorization: Data?) = (0, nil)
 
     /// Accepts the next append without answering. With `thenUnavailable`,
@@ -369,7 +375,87 @@ actor FakeMLSRelay: MLSRelayTransport {
         groups[group] = Group(writers: [writer: (0, nil)])
     }
 
+    /// Runs `action` when the next commit removing a writer reaches the
+    /// relay, before the relay looks at it, so other members can append
+    /// first.
+    func beforeNextRemoval(_ action: @escaping @Sendable () async throws -> Void) { removalHook = action }
+
+    /// Without it, the relay behaves like one that predates conditional
+    /// appends: it reports no support and answers them as invalid.
+    func setConditionalAppendSupported(_ supported: Bool) { conditionalAppend = supported }
+
+    /// Holds the next conditional Remove before the delivery store and
+    /// reports a lost connection; `releaseDeferredRemoval()` delivers it.
+    func deferNextRemovalBeforeStore() { deferNextRemoval = true }
+
+    @discardableResult
+    func releaseDeferredRemoval() throws -> MLSAppendResult? {
+        guard let held = deferredRemoval else { return nil }
+        deferredRemoval = nil
+        return try appendIfHeadNow(held.delivery, authorization: held.authorization)
+    }
+
+    /// Accepts the next conditional Remove without answering.
+    func dropNextRemovalResponse() { dropRemovalResponse = true }
+
+    func supportsConditionalAppend(group: Data, authorization: Data) throws -> Bool {
+        _ = try authorize(group: group, authorization: authorization)
+        return conditionalAppend
+    }
+
+    func appendIfHead(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        conditionalRequests += 1
+        if delivery.removeWriter != nil, let hook = removalHook {
+            removalHook = nil
+            try await hook()
+        }
+        if deferNextRemoval {
+            deferNextRemoval = false
+            deferredRemoval = (delivery, authorization)
+            throw URLError(.networkConnectionLost)
+        }
+        let result = try appendIfHeadNow(delivery, authorization: authorization)
+        if dropRemovalResponse, case .accepted = result {
+            dropRemovalResponse = false
+            throw URLError(.networkConnectionLost)
+        }
+        return result
+    }
+
+    /// The store's order: authorization, an accepted duplicate, the head
+    /// precondition, then the ordinary append checks.
+    private func appendIfHeadNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        guard conditionalAppend else { throw MLSRelayError.rejected(status: 400, code: "invalidRequest") }
+        guard let expected = delivery.expectedHead, delivery.kind == .commit, delivery.removeWriter != nil else {
+            throw MLSRelayError.rejected(status: 400, code: "invalidRequest")
+        }
+        if appendsUnavailable || offlineWriters.contains(Self.digest(authorization)) {
+            throw URLError(.notConnectedToInternet)
+        }
+        guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
+            throw MLSRelayError.unauthorized
+        }
+        let stored = delivery.withoutExpectedHead
+        if let duplicate = entries.first(where: { $0.delivery.group == delivery.group && $0.delivery.payload == delivery.payload }) {
+            guard duplicate.delivery == stored else { throw MLSRelayError.epochConflict }
+            return .accepted(cursor: duplicate.cursor)
+        }
+        let head = head(of: delivery.group)
+        guard expected <= head else { throw MLSRelayError.rejected(status: 400, code: "invalidRequest") }
+        guard expected == head else { return .headAdvanced(head: head) }
+        return try appendNow(stored, authorization: authorization)
+    }
+
+    func head(of group: Data) -> UInt64 {
+        entries.last { $0.delivery.group == group }?.cursor ?? 0
+    }
+
     func append(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        guard delivery.expectedHead == nil else { throw MLSRelayError.invalidRequest }
+        if delivery.removeWriter != nil, let hook = removalHook {
+            removalHook = nil
+            try await hook()
+        }
         let dropping = dropAppendResponse
         do {
             return try appendNow(delivery, authorization: authorization)

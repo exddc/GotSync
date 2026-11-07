@@ -78,7 +78,10 @@ final class SyncEngineMLSTests: XCTestCase {
         }
     }
 
+    /// A host still finishing its previous pairing ignores a new invitation,
+    /// so wait for that attempt to end first.
     private func invite(_ host: SyncEngine) async throws -> URL {
+        try await wait("host ready to invite") { !host.canCancelPairing }
         host.createPrivateSync()
         try await wait("invitation") { host.invitationURL != nil }
         return try XCTUnwrap(host.invitationURL)
@@ -94,7 +97,7 @@ final class SyncEngineMLSTests: XCTestCase {
         try await wait("safety code") { host.isHostApprovalPending && joiner.safetyCode != nil }
         XCTAssertEqual(host.safetyCode, joiner.safetyCode)
         host.approveSafetyCode()
-        try await wait("paired") { host.isPaired && joiner.isPaired }
+        try await wait("paired") { host.isPaired && joiner.isPaired && !host.canCancelPairing }
     }
 
     private func groupID(_ engine: SyncEngine) async throws -> Data {
@@ -3376,16 +3379,15 @@ extension SyncEngineMLSTests {
         let group = try await groupID(host)
         let hostAuthorization = try await authorization(host)
         let third = engine("\(prefix)-third")
-        var armed = true
-        var thirdAuthorization = Data()
-        host.reservationHookForTesting = { [relay] in
-            guard armed, let relay else { return }
-            armed = false
+        host.reservationHookForTesting = { [relay, weak host, weak third] in
+            host?.reservationHookForTesting = nil
+            guard let relay, let session = third?.mlsSessionForTesting,
+                  let thirdAuthorization = try? await session.client.transportAuthorization()
+            else { return }
             await arm(relay, hostAuthorization, thirdAuthorization)
         }
         third.joinPrivateSync(url: try await invite(host))
         try await wait("safety code") { host.isHostApprovalPending && third.safetyCode != nil }
-        thirdAuthorization = try await authorization(third)
         host.approveSafetyCode()
         return (host, first, third, group)
     }
@@ -3577,6 +3579,32 @@ extension SyncEngineMLSTests {
         try await wait("remaining devices exchange edits") {
             [first, third].allSatisfy { $0.tasks.count == 2 && $0.pendingMailboxOperationCount == 0 }
         }
+    }
+
+    /// The provisional member's first message reaches the relay after the
+    /// inviter's last read and before its silent-member Remove does.
+    func testSilentMemberCleanupKeepsAMemberWhoseMessageLandsJustBefore() async throws {
+        let host = engine("racing-host", provisionalMemberWindow: 0.5)
+        let first = engine("racing-first")
+        try await pair(host, first)
+        let third = engine("racing-third")
+        await relay.holdApplications(except: [try await authorization(host), try await authorization(first)])
+        try await pair(host, third)
+        let thirdFingerprint = try await fingerprint(third)
+        try host.markProvisionalForTesting(thirdFingerprint, deadline: Date().addingTimeInterval(-1))
+        let thirdSession = try XCTUnwrap(third.mlsSessionForTesting)
+        await relay.beforeNextRemoval { [relay] in
+            await relay?.holdApplications(except: nil)
+            _ = try await thirdSession.send(Data("I am here".utf8))
+        }
+        try await wait("cleanup attempted and settled") {
+            let log = await self.relay.log(group: try await self.groupID(host))
+            return log.contains { $0.delivery.removeWriter != nil } || host.provisionalMembersForTesting.isEmpty
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        let members = try await XCTUnwrapAsync(first.mlsSessionForTesting).members()
+        XCTAssertTrue(members.contains { $0.fingerprint == thirdFingerprint }, "silent cleanup removed a member whose message preceded it")
+        XCTAssertTrue(third.isPaired)
     }
 
     func testMemberWhoseMessagesWaitBehindAFullInboxIsNotRemovedAsSilent() async throws {

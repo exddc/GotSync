@@ -346,6 +346,8 @@ also part of the device's MLS credential identity.
 | `append` | Append a `commit`, `application`, or `proposal` entry at the current epoch |
 | `fetch` | Return up to 32 entries after a cursor |
 | `ack` | Record that this writer has durably processed entries up to a cursor |
+| `append-if-head` | Append a commit that removes a writer only while the group's log head equals `expectedHead` |
+| `capabilities` | Report `conditionalAppend: true` to a current writer |
 
 An append whose epoch differs from the group's current epoch fails with
 `epochConflict`; the client fetches the winning commit and retries. A commit
@@ -396,8 +398,33 @@ fingerprints of current members that sent this device an authenticated
 application message. The list survives inbox acknowledgement and restart and
 moves with the state into a departure slot; a member leaves it when it leaves
 the group. State written before this list existed counts the senders still in
-its inbox. The check runs in the same serialized step that prepares the Remove.
-A removal the user requests with `removeDevice` does not consult it.
+its inbox. A removal the user requests with `removeDevice`, or the commit of
+another member's leave proposal, does not consult it.
+
+Cleanup of a provisional or withdrawn member is ordered against every other
+writer, because an application message does not change the epoch and could
+otherwise land between the last read and the Remove:
+
+1. The member reads the log to its head and checks the list in the same
+   serialized step that prepares the Remove.
+2. It stores the position it read as `expectedHead` with the pending commit;
+   that value never changes for the commit.
+3. It sends the commit with `append-if-head`. The relay answers a copy of an
+   accepted entry as accepted, then compares `expectedHead` with the group's
+   log head inside one write transaction. The head is the cursor of the
+   group's last accepted entry and never decreases, including when entries
+   are pruned.
+4. If the head has moved, the relay answers HTTP 409 `headAdvanced` with the
+   current head and appends nothing. Every later copy of that request is
+   refused the same way. The member then discards the commit, reads the log,
+   and decides again, so a member whose message landed first stays. An
+   `expectedHead` beyond the head is an invalid request.
+5. A lost answer, a rate limit, or a restart keeps the commit and its
+   `expectedHead`, and the member sends the same request again.
+
+Before preparing such a commit, the member asks `capabilities`. A relay that
+answers it as an unknown operation gets no cleanup at all: the member removes
+nobody automatically and never falls back to an ordinary append.
 
 A revoked writer cannot append. It can read entries up to its removal cursor
 until it acknowledges that cursor or 24 hours pass. The relay deletes entries

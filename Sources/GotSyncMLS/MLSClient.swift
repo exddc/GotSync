@@ -26,8 +26,12 @@ public struct MLSDelivery: Codable, Equatable, Sendable {
     public let keyPackageReference: Data?
     public let addWriter: Data?
     public let removeWriter: Data?
+    /// For a conditional Remove: the relay log position this member had read
+    /// when it prepared the commit. The relay appends it only while its log
+    /// head still equals this value. Relay entries never carry it.
+    public let expectedHead: UInt64?
 
-    public init(group: Data, epoch: UInt64, kind: Kind, payload: Data, welcome: Data? = nil, keyPackageReference: Data? = nil, addWriter: Data? = nil, removeWriter: Data? = nil) {
+    public init(group: Data, epoch: UInt64, kind: Kind, payload: Data, welcome: Data? = nil, keyPackageReference: Data? = nil, addWriter: Data? = nil, removeWriter: Data? = nil, expectedHead: UInt64? = nil) {
         self.group = group
         self.epoch = epoch
         self.kind = kind
@@ -36,6 +40,15 @@ public struct MLSDelivery: Codable, Equatable, Sendable {
         self.keyPackageReference = keyPackageReference
         self.addWriter = addWriter
         self.removeWriter = removeWriter
+        self.expectedHead = expectedHead
+    }
+
+    /// The entry as the relay stores it.
+    public var withoutExpectedHead: MLSDelivery {
+        MLSDelivery(
+            group: group, epoch: epoch, kind: kind, payload: payload, welcome: welcome,
+            keyPackageReference: keyPackageReference, addWriter: addWriter, removeWriter: removeWriter
+        )
     }
 }
 
@@ -183,12 +196,18 @@ public actor MLSClient {
         }
     }
 
-    public func prepareRemove(fingerprint: Data) throws -> MLSDelivery {
+    /// With `expectedHead`, the Remove is conditional: the relay appends it
+    /// only while its log head is still that position. The value is stored
+    /// with the pending commit and never changes for it.
+    public func prepareRemove(fingerprint: Data, expectedHead: UInt64? = nil) throws -> MLSDelivery {
         try mutate { record in
             guard record.pending == nil else { throw MLSClientError.invalidState }
             let transition = try GotSyncMLSBindings.prepareRemove(state: record.state, memberFingerprint: fingerprint)
             Self.apply(transition, to: &record)
-            let delivery = MLSDelivery(group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output), removeWriter: transition.removedWriter)
+            let delivery = MLSDelivery(
+                group: Data(transition.groupId), epoch: transition.epoch, kind: .commit, payload: Data(transition.output),
+                removeWriter: transition.removedWriter, expectedHead: expectedHead
+            )
             record.pending = delivery
             return delivery
         }
@@ -355,6 +374,21 @@ public actor MLSClient {
             Self.apply(try discardCommit(state: record.state), to: &record)
             record.rejectedCommit = pending
             record.pending = nil
+        }
+    }
+
+    /// Discards a pending conditional Remove after the relay refused it
+    /// because its log moved past the expected head. The refusal is final for
+    /// that exact request, so no copy of the commit can land later.
+    public func discardRefusedRemove(_ delivery: MLSDelivery) throws {
+        try mutate { record in
+            guard let pending = record.pending, pending == delivery, pending.kind == .commit,
+                  pending.expectedHead != nil, pending.removeWriter != nil, record.epoch == pending.epoch
+            else { throw MLSClientError.invalidDelivery }
+            Self.apply(try discardCommit(state: record.state), to: &record)
+            record.rejectedCommit = pending
+            record.pending = nil
+            record.pendingPlaintext = nil
         }
     }
 
