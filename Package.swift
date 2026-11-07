@@ -4,8 +4,8 @@ import PackageDescription
 
 let mlsBinary = (
     path: "Artifacts/gotsync_mlsFFI.xcframework",
-    url: "https://github.com/exddc/GotSync/releases/download/mls-ffi-0.1.0/gotsync_mlsFFI.xcframework.zip",
-    checksum: "b418f2033ad6b9e3b603c2bbcabaa5201dd2577fb27034ba0013b95d9fe49851"
+    url: "https://github.com/exddc/GotSync/releases/download/mls-ffi-0.1.1-gotdone.1/gotsync_mlsFFI.xcframework.zip",
+    checksum: "05c28414aff8b39b3b841b5134e5899f89dfdac99e90ddba6166e5457d1e7094"
 )
 let mlsBinaryTarget: Target = FileManager.default.fileExists(atPath: "\(Context.packageDirectory)/\(mlsBinary.path)")
     ? .binaryTarget(name: "gotsync_mlsFFI", path: mlsBinary.path)
