@@ -314,7 +314,16 @@ public final class SyncEngine {
     private var historyRequestCycles = 0
     static let hostLifecycleFilename = "host-lifecycle.json"
     static let hostJoinBudget: UInt64 = 8 * 1_024 * 1_024
-    private var session: MLSSession?
+    private var session: MLSSession? {
+        didSet {
+            guard oldValue !== session else { return }
+            hostSessionRevisionBase &+= (oldValue?.operationCount.started ?? 0) &+ 1
+            publishHostView()
+        }
+    }
+    /// Keeps the composed view's revision growing across session
+    /// replacement, since a new session counts its operations from zero.
+    private var hostSessionRevisionBase: UInt64 = 0
     private var checkpoint: ReplicationCheckpoint? { didSet { publishState() } }
     private let pairingRetryDelayNanoseconds: UInt64
     private let syncIntervalNanoseconds: UInt64
@@ -344,6 +353,10 @@ public final class SyncEngine {
     var afterJoinHookForTesting: (@MainActor () async -> Void)?
     var beforeReservationRequestHookForTesting: (@MainActor () throws -> Void)?
     private var reconcileTask: Task<Void, Never>?
+    private var reconcileTaskID: UUID?
+    /// Settles a cancelled host join. While it runs no pairing may start,
+    /// because only it may adopt or discard the session that attempt used.
+    private var joinSettlementTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var syncCycleTask: Task<Void, Never>?
     private var backgroundFlushTask: Task<Void, Never>?
@@ -621,9 +634,7 @@ public final class SyncEngine {
                 await self?.runHostClosing(record)
             }
         } else if session != nil, hostRepair == nil {
-            reconcileTask = Task { [weak self] in
-                await self?.reconcileSession()
-            }
+            startReconcile()
         }
         startDepartures()
         self.backgroundMailboxScheduler.register { [weak self] in
@@ -787,6 +798,7 @@ public final class SyncEngine {
         origins: Set<ReplicaDeviceID>,
         session: MLSSession
     ) async throws -> OriginReservation {
+        invalidateHostIntake()
         try await prepareToReserve(session: session)
         let epoch = try await session.epoch()
         let message = ReplicationMessage.reservation(member: joiner, origins: Array(origins), epoch: epoch)
@@ -1079,28 +1091,38 @@ public final class SyncEngine {
     /// becomes the link as at launch; only a join that never committed is
     /// discarded with its journal and intent.
     private func settleCancelledJoin(after attempt: Task<Void, Never>?) {
-        let previous = reconcileTask
-        reconcileTask = Task { [weak self] in
-            await previous?.value
+        guard let owner = session else { return }
+        let journal = hostAdapter?.store?.view.journalID
+        joinSettlementTask = Task { [weak self] in
             await attempt?.value
-            guard let self, !Task.isCancelled, let session = self.session else { return }
-            let joined: Bool
-            do {
-                joined = try await session.group() != nil
-            } catch {
-                return
-            }
-            guard !Task.isCancelled, self.session === session, self.pairingTask == nil, !self.isPaired else {
-                return
-            }
-            if joined {
-                await self.reconcileSession()
-                return
-            }
-            try? self.resetSession()
-            try? self.abandonHostJournal()
-            try? ReplicationCheckpoint.remove(at: self.joinIntentURL)
-            self.reconcileTask = nil
+            await self?.settleCancelledJoin(owner: owner, journal: journal)
+            self?.joinSettlementTask = nil
+        }
+    }
+
+    /// Decides the cancelled attempt's session `owner` once nothing else can
+    /// change it. A stop or an unreadable state leaves everything for the
+    /// next launch.
+    private func settleCancelledJoin(owner: MLSSession, journal: Data?) async {
+        guard session === owner, !isPaired else { return }
+        invalidateHostIntake()
+        let joined: Bool
+        do {
+            joined = try await owner.group() != nil
+        } catch {
+            return
+        }
+        guard !Task.isCancelled, session === owner, !isPaired else { return }
+        if joined {
+            await reconcileSession()
+            return
+        }
+        try? resetSession()
+        if let journal, hostAdapter?.store?.view.journalID == journal {
+            try? abandonHostJournal()
+        }
+        if let intent = try? ReplicationCheckpoint.load(from: joinIntentURL), intent.hostJournal == journal {
+            try? ReplicationCheckpoint.remove(at: joinIntentURL)
         }
     }
 
@@ -1108,8 +1130,19 @@ public final class SyncEngine {
         guard session != nil, reconcileTask == nil else {
             return
         }
+        startReconcile()
+    }
+
+    /// Only the task that started last clears the handle, so an earlier one
+    /// finishing late cannot drop its replacement.
+    private func startReconcile() {
+        let id = UUID()
+        reconcileTaskID = id
         reconcileTask = Task { [weak self] in
             await self?.reconcileSession()
+            guard let self, self.reconcileTaskID == id else { return }
+            self.reconcileTask = nil
+            self.reconcileTaskID = nil
         }
     }
 
@@ -1395,7 +1428,7 @@ public final class SyncEngine {
     }
 
     public var canJoinExistingSync: Bool {
-        hasDurableIdentity && hasDurableStorage && session != nil && !isPaired && pairingTask == nil
+        hasDurableIdentity && hasDurableStorage && session != nil && !isPaired && pairingTask == nil && joinSettlementTask == nil
     }
 
     public var canEditLocalTasks: Bool {
@@ -1412,7 +1445,7 @@ public final class SyncEngine {
             inviteToGroup()
             return
         }
-        guard hasDurableIdentity, hasDurableStorage, pairingTask == nil else {
+        guard hasDurableIdentity, hasDurableStorage, pairingTask == nil, joinSettlementTask == nil else {
             return
         }
         beginInvitation(linked: false)
@@ -1420,7 +1453,7 @@ public final class SyncEngine {
 
     /// Any linked member can issue a join invite into the existing group.
     public func inviteToGroup() {
-        guard hasDurableIdentity, hasDurableStorage, isPaired, pairingTask == nil else {
+        guard hasDurableIdentity, hasDurableStorage, isPaired, pairingTask == nil, joinSettlementTask == nil else {
             return
         }
         if let refusal = linkedInviteRefusal {
@@ -1725,7 +1758,7 @@ public final class SyncEngine {
         var settled: Set<Task<Void, Never>> = []
         while true {
             let running = Set([
-                pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask,
+                pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask, joinSettlementTask,
                 syncLoopTask, syncCycleTask, backgroundFlushTask, departureTask, hostLifecycleTask,
             ].compactMap { $0 }).subtracting(settled)
             guard !running.isEmpty else { break }
@@ -1745,6 +1778,8 @@ public final class SyncEngine {
         pairingReaderTask = nil
         pairingConnection = nil
         reconcileTask = nil
+        reconcileTaskID = nil
+        joinSettlementTask = nil
         syncLoopTask = nil
         syncCycleTask = nil
         syncCycleID = nil
@@ -1839,6 +1874,7 @@ public final class SyncEngine {
     private func runInviterPairing(session: MLSSession, linked: Bool, attemptID: UUID) async {
         var linked = linked
         var session = session
+        invalidateHostIntake()
         do {
             if !linked {
                 if try await adoptFoundingGroupIfJoined(session: session) {
@@ -2160,7 +2196,12 @@ public final class SyncEngine {
     }
 
     private func runJoinerPairing(_ invitation: Invitation, session: MLSSession, attemptID: UUID) async {
+        invalidateHostIntake()
         do {
+            if isHostMode, try await session.group() != nil {
+                throw HostEngineError.unsettledJoin
+            }
+            try requireCurrentPairingAttempt(attemptID)
             try resetSession()
             guard let session = self.session else { throw SyncError.localStorageUnavailable }
             let (connection, groupID, inviterFingerprint, offeredProfile) = try await awaitInviterOffer(
@@ -2524,6 +2565,8 @@ public final class SyncEngine {
                 try? abandonHostJournal()
                 try? ReplicationCheckpoint.remove(at: joinIntentURL)
             }
+        } else if wasJoining && !isPaired && isHostMode {
+            scheduleReconcile()
         }
         if !wasJoining && !isPaired {
             scheduleReconcile()
@@ -2567,7 +2610,7 @@ public final class SyncEngine {
     // MARK: - Replication
 
     private func reconcileSession() async {
-        defer { reconcileTask = nil }
+        invalidateHostIntake()
         guard let session else {
             return
         }
@@ -2768,9 +2811,7 @@ public final class SyncEngine {
         if try await !session.isRemoved() {
             try await requireGroupProfile(session: session)
         }
-        if isHostMode {
-            hostIntake = .unknown
-        }
+        invalidateHostIntake()
         var flushed = true
         do {
             _ = try await session.flush()
@@ -2831,6 +2872,15 @@ public final class SyncEngine {
             hostIntake = .unknown
             hostIntakeOwner = nil
         }
+        publishHostView()
+    }
+
+    /// Engine work about to use MLS may change the inbox; observers learn
+    /// that the settled intake no longer holds before the work begins.
+    private func invalidateHostIntake() {
+        guard isHostMode, case .settled = hostIntake else { return }
+        hostIntake = .unknown
+        hostIntakeOwner = nil
         publishHostView()
     }
 
@@ -3151,9 +3201,7 @@ public final class SyncEngine {
     }
 
     private func send(plaintext: Data, session: MLSSession) async throws {
-        if isHostMode {
-            hostIntake = .unknown
-        }
+        invalidateHostIntake()
         guard case .accepted = try await session.send(plaintext) else {
             throw SyncCycleError.notDelivered
         }
@@ -3426,6 +3474,7 @@ public final class SyncEngine {
     private func cancelAllWork() {
         endPairingAttempt()
         reconcileTask?.cancel()
+        joinSettlementTask?.cancel()
         syncLoopTask?.cancel()
         syncCycleTask?.cancel()
         backgroundFlushTask?.cancel()
@@ -3727,7 +3776,8 @@ extension SyncEngine {
             }
         }
         return HostEngineView(
-            revision: hostViewRevision, journal: journal, uploadedThrough: uploaded,
+            revision: hostViewRevision &+ hostSessionRevisionBase &+ (session?.operationCount.started ?? 0),
+            journal: journal, uploadedThrough: uploaded,
             intake: currentHostIntake, lifecycle: hostLifecycle, repair: hostRepair
         )
     }
@@ -3955,7 +4005,7 @@ extension SyncEngine {
         }
         lastHostLifecycleError = nil
         let running = [
-            pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask,
+            pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask, joinSettlementTask,
             syncLoopTask, syncCycleTask, backgroundFlushTask, hostLifecycleTask,
         ].compactMap { $0 }
         hostLifecycle = .closing(intent)
@@ -3975,6 +4025,7 @@ extension SyncEngine {
     /// its durable intent for the next launch and starts nothing new.
     private func runHostClosing(_ record: HostLifecycleRecord) async {
         let intent = record.intent
+        invalidateHostIntake()
         do {
             try await hostClosingHookForTesting?("start")
             try Task.checkCancellation()
@@ -4039,7 +4090,9 @@ extension SyncEngine {
             journal.fenceHost()
         }
         let group = journal.view.group
-        guard record.group.map({ $0 == group }) ?? true, mlsGroup.map({ $0 == group }) ?? true else {
+        guard journal.view.journalID == journalID, record.group.map({ $0 == group }) ?? true,
+              mlsGroup.map({ $0 == group }) ?? true
+        else {
             throw HostEngineError.handoffUnproven
         }
         if !journal.view.isRetired {

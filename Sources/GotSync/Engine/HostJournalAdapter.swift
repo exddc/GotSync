@@ -14,6 +14,9 @@ enum HostEngineError: Error, Equatable {
     /// No journal of the closing generation can take over the MLS inbox, so
     /// the link is kept as it is.
     case handoffUnproven
+    /// An earlier join may still own this session's group; it is adopted
+    /// before any new join may replace the session.
+    case unsettledJoin
 }
 
 enum HostLifecycleIntent: String, Codable, Sendable {
