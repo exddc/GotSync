@@ -37,6 +37,9 @@ FORMAT_VERSION = 1
 APPLICATION_ID = 0x47534231
 GLOBAL_SCOPE = b"\x00"
 BLOCK_BYTES = 4096
+PAGE_BYTES = 4096
+MAX_SECTOR_BYTES = 65_536
+SUPPORTED_TEMP_STORE = frozenset({"TEMP_STORE=1", "TEMP_STORE=2", "TEMP_STORE=3"})
 SQLITE_READONLY_ROLLBACK = 776
 TEMP_DIRECTORY = "tmp"
 _ROUTE_DIRECTORY = re.compile(r"[0-9a-f]{64}")
@@ -122,8 +125,22 @@ class BlobStoreCorrupt(BlobStoreError):
     pass
 
 
+class BlobStoreCapacity(BlobStoreError):
+    """A new store would not fit its metadata reservation within the physical budget or disk reserve."""
+
+
 def round_up(size: int) -> int:
     return -(-size // BLOCK_BYTES) * BLOCK_BYTES
+
+
+def metadata_reservation(pages: int) -> int:
+    """Physical bytes reserved for a database of at most `pages` pages and one rollback journal.
+
+    A rollback journal holds one sector-padded header (sector size at most 65,536) and at most one
+    `page + 8` byte record per page that existed when the transaction began. With `cache_spill=OFF`
+    there is no mid-transaction journal sync, so no second segment header.
+    """
+    return pages * PAGE_BYTES + round_up(MAX_SECTOR_BYTES + pages * (PAGE_BYTES + 8))
 
 
 @dataclass(frozen=True)
@@ -139,7 +156,9 @@ class BlobLimits:
     disk_reserve_bytes: int = 1024**3
     doomed_max_bytes: int = 512 * 1024**2
     doomed_max_files: int = 20_000
-    metadata_allowance_bytes: int = 4 * 1024**2
+    metadata_database_bytes: int = 160 * 1024**2
+    metadata_emergency_bytes: int = 4 * 1024**2
+    global_wanted: int = 8_192
     complete_seconds: float = 30 * 86400
     incomplete_seconds: float = 86400
     released_seconds: float = 86400
@@ -159,13 +178,16 @@ class BlobLimits:
                 raise ValueError(f"invalid blob limit {name}")
         if min(self.expiry_batch, self.cleanup_batch, self.objects_per_request) < 1:
             raise ValueError("blob batches must be positive")
+        if (self.metadata_database_bytes % PAGE_BYTES or self.metadata_emergency_bytes % PAGE_BYTES
+                or not self.metadata_emergency_bytes < self.metadata_database_bytes):
+            raise ValueError("metadata limits must be page multiples with the emergency reserve below the ceiling")
 
 
 _INTEGER_LIMITS = {
     "group_logical_bytes", "group_objects", "group_incomplete", "writer_incomplete", "global_logical_bytes",
     "global_objects", "global_incomplete", "max_physical_bytes", "disk_reserve_bytes", "doomed_max_bytes",
-    "doomed_max_files", "metadata_allowance_bytes", "wanted_per_group", "objects_per_request", "expiry_batch",
-    "cleanup_batch",
+    "doomed_max_files", "metadata_database_bytes", "metadata_emergency_bytes", "global_wanted", "wanted_per_group",
+    "objects_per_request", "expiry_batch", "cleanup_batch",
 }
 
 
@@ -243,6 +265,7 @@ class BlobFiles:
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 return None
+            self.reading(descriptor)
             chunks = []
             remaining = size + 1
             while remaining:
@@ -254,6 +277,9 @@ class BlobFiles:
             return b"".join(chunks)
         finally:
             os.close(descriptor)
+
+    def reading(self, descriptor: int) -> None:
+        """Called with the open part descriptor before it is read; a test seam."""
 
     def unlink(self, file: str) -> None:
         """Removes a stored `route/name` or `tmp/name` entry. A missing entry counts as removed."""
@@ -383,6 +409,7 @@ class BlobTicket:
         self.part_hash = part_hash
         self.reservation = reservation
         self.file = file
+        self.pinned = False
         self.files: list[str] = []
         self.state = "admitted"
         self.started = False
@@ -412,6 +439,8 @@ class ExpiryReport:
     wanted: int = 0
     unlinked: int = 0
     failed_unlinks: int = 0
+    deferred: int = 0
+    errors: int = 0
 
 
 @dataclass
@@ -436,6 +465,7 @@ class BlobStore:
         self._database_path = Path(database)
         self._journal_path = Path(f"{self._database_path}-journal")
         self.startup = StartupReport()
+        self._temp_store_always_memory = _supported_sqlite_build()
         self._db = self._open_database()
         try:
             self._files = files(Path(directory))
@@ -453,8 +483,20 @@ class BlobStore:
         self._journal_peak = 0
         self._live: set[BlobTicket] = set()
         self._cleaning: set[str] = set()
+        self._readers: dict[str, int] = {}
+        self._debt: dict[str, tuple[int, int]] = {}
+        self._pages = {False: 0, True: 0}
+        self.touch_refused = 0
         try:
+            with self._lock:
+                self._set_ceiling(ownership=True)
+                self._set_ceiling(ownership=False)
             self._reconcile()
+        except sqlite3.Error as error:
+            self._files.close()
+            self._db.close()
+            failure = BlobStoreCapacity if _full(error) else BlobStoreCorrupt
+            raise failure(f"blob startup reconciliation failed: {error}") from error
         except BaseException:
             self._files.close()
             self._db.close()
@@ -467,6 +509,7 @@ class BlobStore:
         try:
             mode = os.lstat(path).st_mode
         except FileNotFoundError:
+            self._admit_creation(path)
             self._create_database(path)
             mode = os.lstat(path).st_mode
         if not stat.S_ISREG(mode):
@@ -490,8 +533,9 @@ class BlobStore:
                 self._inspect(db)
                 self.startup.recovered_journal = True
             for pragma in ("journal_mode=DELETE", "synchronous=FULL", "fullfsync=ON", "secure_delete=ON",
-                           "foreign_keys=OFF"):
+                           "foreign_keys=OFF", "cache_spill=OFF", "temp_store=MEMORY"):
                 db.execute(f"PRAGMA {pragma}")
+            self._verify_settings(db)
         except sqlite3.Error as error:
             db.close()
             raise BlobStoreCorrupt(f"blob database unreadable: {error}") from error
@@ -499,6 +543,26 @@ class BlobStore:
             db.close()
             raise
         return db
+
+    def _admit_creation(self, path: Path) -> None:
+        reserved = metadata_reservation(self.limits.metadata_database_bytes // PAGE_BYTES)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        status = os.statvfs(path.parent)
+        if (reserved > self.limits.max_physical_bytes
+                or status.f_bavail * status.f_frsize - reserved < self.limits.disk_reserve_bytes):
+            raise BlobStoreCapacity("no physical capacity or disk reserve for a new blob store")
+
+    def _verify_settings(self, db: sqlite3.Connection) -> None:
+        expected = {"journal_mode": "delete", "synchronous": 2, "fullfsync": 1, "secure_delete": 1, "cache_spill": 0,
+                    "page_size": PAGE_BYTES}
+        for name, value in expected.items():
+            actual = db.execute(f"PRAGMA {name}").fetchone()[0]
+            if actual != value:
+                raise BlobStoreUnsupported(f"unsupported blob database setting {name}={actual}")
+        if db.execute("PRAGMA temp_store").fetchone()[0] != 2 and not self._temp_store_always_memory:
+            raise BlobStoreUnsupported("SQLite did not accept in-memory temporary storage")
+        if [row[1] for row in db.execute("PRAGMA database_list")] != ["main"]:
+            raise BlobStoreUnsupported("blob database connection has attached databases")
 
     @staticmethod
     def _create_database(path: Path) -> None:
@@ -510,6 +574,8 @@ class BlobStore:
         os.close(os.open(staging, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600))
         db = sqlite3.connect(staging, isolation_level=None)
         try:
+            db.execute(f"PRAGMA page_size = {PAGE_BYTES}")
+            db.execute("PRAGMA temp_store=MEMORY")
             db.execute("PRAGMA journal_mode=DELETE")
             db.execute("PRAGMA synchronous=FULL")
             db.executescript(SCHEMA)
@@ -540,6 +606,9 @@ class BlobStore:
             mode = db.execute("PRAGMA journal_mode").fetchone()[0]
             if mode != "delete":
                 raise BlobStoreUnsupported(f"unsupported blob database journal mode {mode}")
+            page_size = db.execute("PRAGMA page_size").fetchone()[0]
+            if page_size != PAGE_BYTES:
+                raise BlobStoreUnsupported(f"unsupported blob database page size {page_size}")
             if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
                 raise BlobStoreCorrupt("blob database failed quick_check")
             if _schema(db) != _expected_schema():
@@ -551,31 +620,65 @@ class BlobStore:
 
     # Ledgers and transactions
 
-    @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        assert self._lock.held()
-        self._db.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._db
-            try:
-                self._journal_peak = max(self._journal_peak, self._journal_path.stat().st_size)
-            except FileNotFoundError:
-                pass
-            self._db.execute("COMMIT")
-        except BaseException:
-            if self._db.in_transaction:
-                self._db.execute("ROLLBACK")
-            raise
+    def _set_ceiling(self, *, ownership: bool) -> int:
+        """Sets SQLite's page ceiling for the next transaction and returns the effective value.
 
-    def _database_bytes(self) -> int:
-        return self._database_path.stat().st_size + max(self.limits.metadata_allowance_bytes, self._journal_peak)
+        Ordinary transactions stop `metadata_emergency_bytes` below `metadata_database_bytes`; ownership
+        transactions may use the rest. SQLite never lowers the ceiling below the current page count, so a file
+        already past a boundary can only reuse its free pages.
+        """
+        limit = self.limits.metadata_database_bytes // PAGE_BYTES
+        if not ownership:
+            limit -= self.limits.metadata_emergency_bytes // PAGE_BYTES
+        effective = self._db.execute(f"PRAGMA max_page_count = {limit}").fetchone()[0]
+        self._pages[ownership] = effective
+        return effective
+
+    @contextmanager
+    def _transaction(self, *, ownership: bool = False) -> Iterator[sqlite3.Connection]:
+        """One write transaction. An ordinary transaction that hits its page ceiling raises `BlobCapacity`."""
+        assert self._lock.held()
+        try:
+            self._set_ceiling(ownership=ownership)
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._db
+                try:
+                    self._journal_peak = max(self._journal_peak, self._journal_path.stat().st_size)
+                except FileNotFoundError:
+                    pass
+                self._db.execute("COMMIT")
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+        except sqlite3.Error as error:
+            if not ownership and _full(error):
+                raise BlobCapacity("blob metadata ceiling reached") from error
+            raise
+        finally:
+            if ownership:
+                self._set_ceiling(ownership=False)
+
+    @contextmanager
+    def _metadata_transaction(self) -> Iterator[sqlite3.Connection]:
+        self._admit_metadata()
+        with self._transaction() as db:
+            yield db
+
+    def _metadata_reserved(self) -> int:
+        pages = self._db.execute("PRAGMA page_count").fetchone()[0]
+        return metadata_reservation(max(self.limits.metadata_database_bytes // PAGE_BYTES, pages))
 
     def ledger(self) -> dict[str, int]:
         with self._lock:
             return {
                 "committed": self._committed, "doomed": self._doomed, "doomedFiles": self._doomed_files,
-                "outstanding": self._outstanding, "database": self._database_bytes(),
-                "journalPeak": self._journal_peak, "liveTickets": len(self._live),
+                "outstanding": self._outstanding, "database": self._metadata_reserved(),
+                "databaseFile": self._database_path.stat().st_size, "journalPeak": self._journal_peak,
+                "liveTickets": len(self._live), "pinnedFiles": len(self._readers), "debtFiles": len(self._debt),
+                "ordinaryPages": self._pages[False], "ownershipPages": self._pages[True],
+                "touchRefused": self.touch_refused,
             }
 
     def usage(self, route: bytes = GLOBAL_SCOPE) -> tuple[int, int, int]:
@@ -603,7 +706,7 @@ class BlobStore:
         writer = identifier(writer, "writer")
         now = self._clock()
         limits = self.limits
-        with self._lock, self._transaction() as db:
+        with self._lock, self._metadata_transaction() as db:
             row = db.execute(
                 "SELECT length, part_hashes, complete, released, touched_at, lease_writer, lease_until "
                 "FROM blob_objects WHERE route=? AND object=?", (manifest.route, manifest.object)).fetchone()
@@ -651,26 +754,29 @@ class BlobStore:
                     "complete": bool(row[2])}
 
     def want(self, route: bytes, objects: Iterable[bytes]) -> int:
+        """Records or refreshes wanted objects, all or nothing. Complete objects are skipped."""
         route = identifier(route, "route")
         objects = self._object_list(objects)
         now = self._clock()
-        with self._lock, self._transaction() as db:
-            accepted = 0
-            count = db.execute("SELECT COUNT(*) FROM blob_wanted WHERE route=?", (route,)).fetchone()[0]
+        with self._lock, self._metadata_transaction() as db:
+            fresh, refresh = [], []
             for object_ in objects:
                 complete = db.execute("SELECT complete FROM blob_objects WHERE route=? AND object=?",
                                       (route, object_)).fetchone()
                 if complete is not None and complete[0]:
                     continue
                 exists = db.execute("SELECT 1 FROM blob_wanted WHERE route=? AND object=?", (route, object_)).fetchone()
-                if exists is None:
-                    if count >= self.limits.wanted_per_group:
-                        continue
-                    count += 1
+                (refresh if exists else fresh).append(object_)
+            if fresh:
+                if (db.execute("SELECT COUNT(*) FROM blob_wanted WHERE route=?", (route,)).fetchone()[0] + len(fresh)
+                        > self.limits.wanted_per_group):
+                    raise BlobGroupQuota("blob wanted list full")
+                if db.execute("SELECT COUNT(*) FROM blob_wanted").fetchone()[0] + len(fresh) > self.limits.global_wanted:
+                    raise BlobCapacity("blob wanted capacity reached")
+            for object_ in fresh + refresh:
                 db.execute("INSERT INTO blob_wanted VALUES (?, ?, ?) ON CONFLICT(route, object) DO UPDATE "
                            "SET wanted_at=excluded.wanted_at", (route, object_, now))
-                accepted += 1
-            return accepted
+            return len(fresh) + len(refresh)
 
     def wanted(self, route: bytes) -> list[bytes]:
         route = identifier(route, "route")
@@ -686,7 +792,7 @@ class BlobStore:
         route = identifier(route, "route")
         objects = self._object_list(objects)
         deadline = self._clock() + self.limits.released_seconds
-        with self._lock, self._transaction() as db:
+        with self._lock, self._metadata_transaction() as db:
             for object_ in objects:
                 db.execute("UPDATE blob_objects SET released=1, expires_at=MIN(expires_at, ?) WHERE route=? AND object=?",
                            (deadline, route, object_))
@@ -802,6 +908,8 @@ class BlobStore:
             if file is None:
                 raise BlobPartMissing("blob part missing")
             ticket = BlobTicket("get", route, object_, index, size, manifest.part_hashes[index], 0, file)
+            self._readers[file] = self._readers.get(file, 0) + 1
+            ticket.pinned = True
             self._live.add(ticket)
             return ticket
 
@@ -817,8 +925,7 @@ class BlobStore:
             if data is None or len(data) != ticket.size or hashlib.sha256(data).digest() != ticket.part_hash:
                 status = self._files.status(ticket.file)
                 owned = ticket.size if status is not None and status[0] == "other" else _owned_bytes(ticket.file, status)
-                if self._drop_part(ticket.route, ticket.object, ticket.index, ticket.file, owned):
-                    self._unlink_doomed([(ticket.file, owned)])
+                self._drop_part(ticket.route, ticket.object, ticket.index, ticket.file, owned)
                 raise BlobPartMissing("blob part missing")
             now = self._clock()
             with self._lock:
@@ -827,8 +934,11 @@ class BlobStore:
                 row = self._db.execute("SELECT complete, touched_at, released FROM blob_objects WHERE route=? AND object=?",
                                        (ticket.route, ticket.object)).fetchone()
                 if row is not None and row[0] and (row[2] or now - row[1] >= self.limits.touch_resolution_seconds):
-                    with self._transaction() as db:
-                        self._touch(db, ticket.route, ticket.object, now, row[1], row[2])
+                    try:
+                        with self._metadata_transaction() as db:
+                            self._touch(db, ticket.route, ticket.object, now, row[1], row[2])
+                    except BlobCapacity:
+                        self.touch_refused += 1
                 ticket.state = "decided"
             return data
         finally:
@@ -874,7 +984,12 @@ class BlobStore:
             return True
 
     def _dispose(self, ticket: BlobTicket) -> None:
-        """Runs when the worker returns: unlink what it still owns, then release its reservation."""
+        """Runs when the worker returns: unlink what it still owns, release its reservation and its read pin.
+
+        A file that cannot be unlinked or recorded as doomed becomes ownership debt: it keeps its reservation
+        and blocks ordinary admission until `cleanup` unlinks or records it. The last reader of a doomed file
+        unlinks it here, once, after the lock is released.
+        """
         assert not self._lock.held()
         failed = []
         for file in ticket.files:
@@ -883,32 +998,60 @@ class BlobStore:
             except OSError:
                 failed.append(file)
         ticket.files.clear()
+        last_reader = None
         with self._lock:
-            retained = False
             if failed:
                 try:
-                    with self._transaction() as db:
+                    with self._transaction(ownership=True) as db:
                         db.executemany("INSERT OR IGNORE INTO blob_doomed VALUES (?, ?)",
                                        [(file, ticket.size) for file in failed])
                 except sqlite3.Error:
-                    retained = True
+                    for position, file in enumerate(failed):
+                        self._debt[file] = (ticket.size, ticket.reservation if position == 0 else 0)
+                    ticket.reservation = 0
                 else:
                     self._doomed += round_up(ticket.size) * len(failed)
                     self._doomed_files += len(failed)
-            if not retained:
-                self._outstanding -= ticket.reservation
-                ticket.reservation = 0
+            self._outstanding -= ticket.reservation
+            ticket.reservation = 0
+            if ticket.pinned:
+                ticket.pinned = False
+                last_reader = self._unpin(ticket.file)
             self._live.discard(ticket)
             ticket.state = "returned"
+        if last_reader is not None:
+            self._unlink_doomed([last_reader])
+
+    def _unpin(self, file: str) -> tuple[str, int] | None:
+        """Drops one read pin. Returns the doomed row the caller must unlink when this was the last reader."""
+        count = self._readers[file] - 1
+        if count:
+            self._readers[file] = count
+            return None
+        del self._readers[file]
+        row = self._db.execute("SELECT size FROM blob_doomed WHERE file=?", (file,)).fetchone()
+        if row is None or file in self._cleaning:
+            return None
+        self._cleaning.add(file)
+        return file, row[0]
 
     def _admit_physical(self, need: int) -> None:
         limits = self.limits
         if self._doomed > limits.doomed_max_bytes or self._doomed_files > limits.doomed_max_files:
             raise BlobCleanupBacklog("blob cleanup backlog")
-        if (self._committed + self._doomed + self._outstanding + need + self._database_bytes()
-                > limits.max_physical_bytes):
+        self._admit_metadata(need)
+
+    def _admit_metadata(self, need: int = 0) -> None:
+        """Ordinary admission: no ownership debt, the full metadata reservation and `need` fit the physical
+        budget, and the unallocated reservation and `need` leave the disk reserve free."""
+        limits = self.limits
+        if self._debt:
+            raise BlobCapacity("blob ownership debt pending")
+        reserved = self._metadata_reserved()
+        if self._committed + self._doomed + self._outstanding + reserved + need > limits.max_physical_bytes:
             raise BlobCapacity("blob physical capacity reached")
-        if self._files.free_bytes() - self._outstanding - need < limits.disk_reserve_bytes:
+        unallocated = reserved - self._database_path.stat().st_size
+        if self._files.free_bytes() - self._outstanding - need - unallocated < limits.disk_reserve_bytes:
             raise BlobCapacity("blob disk reserve reached")
 
     def _stored_manifest(self, route: bytes, object_: bytes) -> tuple[Manifest, bool]:
@@ -923,23 +1066,25 @@ class BlobStore:
                                (route, object_, index)).fetchone()
         return row[0] if row else None
 
-    def _drop_part(self, route: bytes, object_: bytes, index: int, file: str, owned: int) -> bool:
-        """Moves a damaged part row to the doomed ledger at `owned` bytes. True when the caller now owns its unlink."""
+    def _drop_part(self, route: bytes, object_: bytes, index: int, file: str, owned: int) -> None:
+        """Moves a damaged part row to the doomed ledger at `owned` bytes; its last reader unlinks it.
+
+        If the ownership write fails, the row and its charge stay and a later read retries.
+        """
         now = self._clock()
         with self._lock:
             row = self._db.execute("SELECT size FROM blob_parts WHERE route=? AND object=? AND idx=? AND file=?",
                                    (route, object_, index, file)).fetchone()
             if row is None:
-                return False
-            with self._transaction() as db:
-                self._drop_rows(db, [(route, object_, index, file, owned)], now)
+                return
+            try:
+                with self._transaction(ownership=True) as db:
+                    self._drop_rows(db, [(route, object_, index, file, owned)], now)
+            except sqlite3.Error:
+                return
             self._committed -= round_up(row[0])
             self._doomed += round_up(owned)
             self._doomed_files += 1
-            if file in self._cleaning:
-                return False
-            self._cleaning.add(file)
-            return True
 
     def _drop_rows(self, db: sqlite3.Connection, rows: list[tuple[bytes, bytes, int, str, int]], now: float) -> None:
         for route, object_, index, file, size in rows:
@@ -955,42 +1100,56 @@ class BlobStore:
     # Expiry, cleanup and startup
 
     def expire(self, dead_routes: Iterable[bytes] = ()) -> ExpiryReport:
-        """Dooms expired objects and every object of `dead_routes`, in bounded transactions, then unlinks."""
+        """Dooms expired objects and every object of `dead_routes`, in bounded ownership transactions, then unlinks.
+
+        A batch whose transaction fails is rolled back, counted in `errors` and retried by the next call.
+        """
         dead = sorted({identifier(route, "route") for route in dead_routes})
         report = ExpiryReport()
-        batch = self.limits.expiry_batch
         while True:
-            now = self._clock()
-            with self._lock:
-                with self._transaction() as db:
-                    victims = db.execute("SELECT route, object FROM blob_objects WHERE expires_at<=? LIMIT ?",
-                                         (now, batch)).fetchall()
-                    for route in dead:
-                        if len(victims) >= batch:
-                            break
-                        victims += db.execute("SELECT route, object FROM blob_objects WHERE route=? LIMIT ?",
-                                              (route, batch - len(victims))).fetchall()
-                    victims = list(dict.fromkeys(victims))
-                    doomed = self._delete_objects(db, victims)
-                    wanted = db.execute(
-                        "DELETE FROM blob_wanted WHERE rowid IN (SELECT w.rowid FROM blob_wanted w LEFT JOIN blob_objects o "
-                        "ON o.route=w.route AND o.object=w.object WHERE w.wanted_at<=? OR o.complete=1 LIMIT ?)",
-                        (now - self.limits.wanted_seconds, batch)).rowcount
-                    if not victims and dead:
-                        wanted += db.execute(
-                            f"DELETE FROM blob_wanted WHERE rowid IN (SELECT rowid FROM blob_wanted WHERE route IN "
-                            f"({','.join('?' * len(dead))}) LIMIT ?)", (*dead, batch)).rowcount
-                self._committed -= sum(round_up(size) for size in doomed)
-                self._doomed += sum(round_up(size) for size in doomed)
-                self._doomed_files += len(doomed)
-            report.objects += len(victims)
-            report.parts += len(doomed)
+            try:
+                victims, parts, wanted = self._expire_batch(dead)
+            except sqlite3.Error:
+                report.errors += 1
+                break
+            report.objects += victims
+            report.parts += parts
             report.wanted += wanted
-            if not victims and wanted < batch:
+            if not victims and wanted < self.limits.expiry_batch:
                 break
         unlinked, failed = self.cleanup()
         report.unlinked, report.failed_unlinks = unlinked, failed
+        with self._lock:
+            report.deferred = sum(1 for file in self._readers
+                                  if self._db.execute("SELECT 1 FROM blob_doomed WHERE file=?", (file,)).fetchone())
         return report
+
+    def _expire_batch(self, dead: list[bytes]) -> tuple[int, int, int]:
+        now = self._clock()
+        batch = self.limits.expiry_batch
+        with self._lock:
+            with self._transaction(ownership=True) as db:
+                victims = db.execute("SELECT route, object FROM blob_objects WHERE expires_at<=? LIMIT ?",
+                                     (now, batch)).fetchall()
+                for route in dead:
+                    if len(victims) >= batch:
+                        break
+                    victims += db.execute("SELECT route, object FROM blob_objects WHERE route=? LIMIT ?",
+                                          (route, batch - len(victims))).fetchall()
+                victims = list(dict.fromkeys(victims))
+                doomed = self._delete_objects(db, victims)
+                wanted = db.execute(
+                    "DELETE FROM blob_wanted WHERE rowid IN (SELECT w.rowid FROM blob_wanted w LEFT JOIN blob_objects o "
+                    "ON o.route=w.route AND o.object=w.object WHERE w.wanted_at<=? OR o.complete=1 LIMIT ?)",
+                    (now - self.limits.wanted_seconds, batch)).rowcount
+                if not victims and dead:
+                    wanted += db.execute(
+                        f"DELETE FROM blob_wanted WHERE rowid IN (SELECT rowid FROM blob_wanted WHERE route IN "
+                        f"({','.join('?' * len(dead))}) LIMIT ?)", (*dead, batch)).rowcount
+            self._committed -= sum(round_up(size) for size in doomed)
+            self._doomed += sum(round_up(size) for size in doomed)
+            self._doomed_files += len(doomed)
+        return len(victims), len(doomed), wanted
 
     def _delete_objects(self, db: sqlite3.Connection, victims: list[tuple[bytes, bytes]]) -> list[int]:
         doomed = []
@@ -1009,13 +1168,14 @@ class BlobStore:
 
     def cleanup(self) -> tuple[int, int]:
         """Unlinks doomed files one at a time outside the lock. Bytes leave the ledger only after unlink."""
+        self._retry_debt()
         unlinked = failed = 0
         attempted: set[str] = set()
         while True:
             with self._lock:
                 rows = []
                 for file, size in self._db.execute("SELECT file, size FROM blob_doomed ORDER BY file"):
-                    if file not in attempted and file not in self._cleaning:
+                    if file not in attempted and file not in self._cleaning and file not in self._readers:
                         rows.append((file, size))
                         if len(rows) == self.limits.cleanup_batch:
                             break
@@ -1026,6 +1186,30 @@ class BlobStore:
             done, refused = self._unlink_doomed(rows)
             unlinked += done
             failed += refused
+
+    def _retry_debt(self) -> None:
+        """Retries ownership debt: unlink each file, or record it as doomed; only then release its reservation."""
+        with self._lock:
+            debts = list(self._debt.items())
+        for file, (size, reservation) in debts:
+            try:
+                self._files.unlink(file)
+                removed = True
+            except OSError:
+                removed = False
+            with self._lock:
+                if file not in self._debt:
+                    continue
+                if not removed:
+                    try:
+                        with self._transaction(ownership=True) as db:
+                            db.execute("INSERT OR IGNORE INTO blob_doomed VALUES (?, ?)", (file, size))
+                    except sqlite3.Error:
+                        continue
+                    self._doomed += round_up(size)
+                    self._doomed_files += 1
+                del self._debt[file]
+                self._outstanding -= reservation
 
     def _unlink_doomed(self, rows: list[tuple[str, int]]) -> tuple[int, int]:
         """Unlinks rows the caller marked in `_cleaning`, then deletes their rows and ledger bytes once."""
@@ -1043,10 +1227,13 @@ class BlobStore:
                 try:
                     if done:
                         removed = []
-                        with self._transaction() as db:
-                            for file, size in done:
-                                if db.execute("DELETE FROM blob_doomed WHERE file=?", (file,)).rowcount:
-                                    removed.append(size)
+                        try:
+                            with self._transaction(ownership=True) as db:
+                                for file, size in done:
+                                    if db.execute("DELETE FROM blob_doomed WHERE file=?", (file,)).rowcount:
+                                        removed.append(size)
+                        except sqlite3.Error:
+                            removed = []
                         self._doomed -= sum(round_up(size) for size in removed)
                         self._doomed_files -= len(removed)
                 finally:
@@ -1086,13 +1273,13 @@ class BlobStore:
         report.unexpected += unexpected
         batch = self.limits.cleanup_batch
         for start in range(0, len(damaged), batch):
-            with self._lock, self._transaction() as db:
+            with self._lock, self._transaction(ownership=True) as db:
                 self._drop_rows(db, damaged[start:start + batch], self._clock())
         for start in range(0, len(recount), batch):
-            with self._lock, self._transaction() as db:
+            with self._lock, self._transaction(ownership=True) as db:
                 db.executemany("UPDATE blob_doomed SET size=? WHERE file=?", recount[start:start + batch])
         for start in range(0, len(orphans), batch):
-            with self._lock, self._transaction() as db:
+            with self._lock, self._transaction(ownership=True) as db:
                 db.executemany("INSERT OR IGNORE INTO blob_doomed VALUES (?, ?)", orphans[start:start + batch])
         report.rows_dropped, report.orphans_doomed = len(damaged), len(orphans)
         with self._lock:
@@ -1267,6 +1454,22 @@ async def run_blob_worker(
         if submitted is not None:
             submitted.cancel()
         raise
+
+
+def _full(error: sqlite3.Error) -> bool:
+    return (getattr(error, "sqlite_errorcode", 0) & 0xFF) == sqlite3.SQLITE_FULL
+
+
+def _supported_sqlite_build() -> bool:
+    """Refuses SQLite builds that force temporary files to disk. Returns whether temporary storage is always memory."""
+    db = sqlite3.connect(":memory:")
+    try:
+        options = {row[0] for row in db.execute("PRAGMA compile_options")}
+    finally:
+        db.close()
+    if not options & SUPPORTED_TEMP_STORE:
+        raise BlobStoreUnsupported("SQLite build does not allow in-memory temporary storage")
+    return "TEMP_STORE=3" in options
 
 
 def _owned_bytes(file: str, status: tuple[str, int] | None) -> int:

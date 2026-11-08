@@ -10,16 +10,19 @@ import subprocess
 import sys
 import textwrap
 import threading
+from contextlib import contextmanager
 import weakref
 from concurrent.futures.thread import BrokenThreadPool
 from pathlib import Path
 
 import pytest
 
+from gotsync_server import blob as blob_module
 from gotsync_server.blob import (
     BlobBusy, BlobCancelled, BlobCapacity, BlobCleanupBacklog, BlobDeadline, BlobFiles, BlobGroupQuota, BlobLimits,
-    BlobObjectMissing, BlobPartMismatch, BlobPartMissing, BlobStore, BlobStoreCorrupt, BlobStoreUnsupported,
-    PutResult, round_up, run_blob_worker,
+    BlobObjectMissing, BlobPartMismatch, BlobPartMissing, BlobStore, BlobStoreCapacity, BlobStoreCorrupt,
+    BlobStoreUnsupported,
+    PutResult, metadata_reservation, round_up, run_blob_worker,
 )
 from gotsync_server.blob_format import PART_BYTES, object_id
 from gotsync_server.http import RequestError, encode_base64url
@@ -51,6 +54,9 @@ class ProbeFiles(BlobFiles):
         self.pauses = {}
         self.faults = {}
         self.free = None
+        self.descriptors = []
+        self.unlinked = []
+        self.store = None
 
     def pause(self, name):
         entered, release = threading.Event(), threading.Event()
@@ -89,8 +95,15 @@ class ProbeFiles(BlobFiles):
         self._hook("read")
         return super().read(route, name, size)
 
+    def reading(self, descriptor):
+        self.descriptors.append(descriptor)
+        self._hook("reading")
+
     def unlink(self, file):
         self._hook("unlink")
+        if self.store is not None:
+            assert file not in self.store._readers, f"unlinked pinned file {file}"
+        self.unlinked.append(file)
         super().unlink(file)
 
 
@@ -112,13 +125,14 @@ def harness(tmp_path):
             self.probes = []
             self.store = None
 
-        def open(self, limits=BlobLimits(), files=None):
+        def open(self, limits=BlobLimits(), files=None, store_class=None):
             def factory(directory):
                 probe = (files or ProbeFiles)(directory)
                 self.probes.append(probe)
                 return probe
-            self.store = BlobStore(tmp_path / "blobs.sqlite3", tmp_path / "blobs", limits=limits, clock=self.clock,
-                                   files=factory)
+            self.store = (store_class or BlobStore)(tmp_path / "blobs.sqlite3", tmp_path / "blobs", limits=limits,
+                                                    clock=self.clock, files=factory)
+            self.probes[-1].store = self.store
             return self.store
 
         @property
@@ -219,9 +233,9 @@ def test_duplicate_puts_each_reserve_and_one_commits(harness):
         assert store.put_part(second, parts[0]) == PutResult(True, True)
         release.set()
         assert pending.result(WAIT) == PutResult(True, True)
-    assert store.ledger() | {"database": 0, "journalPeak": 0} == {
-        "committed": round_up(PART_BYTES), "doomed": 0, "doomedFiles": 0, "outstanding": 0, "database": 0,
-        "journalPeak": 0, "liveTickets": 0}
+    ledger = store.ledger()
+    assert {key: ledger[key] for key in ("committed", "doomed", "doomedFiles", "outstanding", "liveTickets")} == {
+        "committed": round_up(PART_BYTES), "doomed": 0, "doomedFiles": 0, "outstanding": 0, "liveTickets": 0}
     assert len(harness.stored_files()) == 1
 
 
@@ -277,7 +291,8 @@ def test_parallel_puts_respect_the_disk_reserve(harness):
     objects = [make_object(PART_BYTES, bytes([seed])) for seed in range(5)]
     for number, (object_, hashes, _) in enumerate(objects):
         store.begin(ROUTE, object_, PART_BYTES, hashes, writer=bytes([number]) * 32)
-    harness.files.free = 10 * 1024**2 + 2 * round_up(PART_BYTES)
+    ledger = store.ledger()
+    harness.files.free = 10 * 1024**2 + (ledger["database"] - ledger["databaseFile"]) + 2 * round_up(PART_BYTES)
     barrier = threading.Barrier(len(objects))
 
     def attempt(item):
@@ -556,7 +571,10 @@ def test_want_and_release_bound_their_inputs(harness):
         store.want(ROUTE, [b"a" * 32] * 2)
     with pytest.raises(RequestError):
         store.release(ROUTE, [bytes([n]) * 32 for n in range(17)])
-    assert store.want(ROUTE, [b"a" * 32, b"b" * 32, b"c" * 32]) == 2
+    with pytest.raises(BlobGroupQuota):
+        store.want(ROUTE, [b"a" * 32, b"b" * 32, b"c" * 32])
+    assert store.wanted(ROUTE) == []
+    assert store.want(ROUTE, [b"a" * 32, b"b" * 32]) == 2
     assert store.want(ROUTE, [b"a" * 32]) == 1
 
 
@@ -1230,7 +1248,8 @@ def test_expiry_batches_bound_the_rollback_journal(harness, tmp_path):
     assert (report.objects, report.parts, report.unlinked) == (192, 3840, 3840)
     assert max(per_transaction) == store.limits.expiry_batch
     peak = store.ledger()["journalPeak"]
-    assert 0 < peak <= store.limits.metadata_allowance_bytes
+    pages = store.limits.metadata_database_bytes // 4096
+    assert 0 < peak <= metadata_reservation(pages) - pages * 4096
     print(f"journal peak {peak} bytes, database {(tmp_path / 'blobs.sqlite3').stat().st_size} bytes")
 
 
@@ -1253,3 +1272,486 @@ def test_importing_and_constructing_limits_opens_nothing(tmp_path):
     """)
     subprocess.run([sys.executable, "-c", script], cwd=tmp_path, check=True, timeout=60)
     assert list(tmp_path.iterdir()) == []
+
+
+PAGE = 4096
+
+
+def database_bytes(tmp_path):
+    return (tmp_path / "blobs.sqlite3").read_bytes()
+
+
+def row_counts(store):
+    with store._lock:
+        return tuple(store._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                     for table in ("blob_objects", "blob_parts", "blob_wanted", "blob_usage", "blob_doomed"))
+
+
+def route_number(number):
+    return number.to_bytes(32, "big")
+
+
+def small_ceiling(store, extra_pages, emergency_pages, **options):
+    pages = store.ledger()["databaseFile"] // PAGE
+    return BlobLimits(metadata_database_bytes=(pages + extra_pages) * PAGE,
+                      metadata_emergency_bytes=emergency_pages * PAGE, **options)
+
+
+def fill_wanted(store, start=0, limit=10_000):
+    """Adds wanted rows on fresh routes until the ordinary ceiling refuses one; returns the next route number."""
+    for number in range(start, start + limit):
+        try:
+            store.want(route_number(number), [bytes([n]) * 32 for n in range(1, 17)])
+        except BlobCapacity:
+            return number
+    raise AssertionError("ceiling never reached")
+
+
+class FlakyOwnership(BlobStore):
+    fail_ownership = False
+
+    @contextmanager
+    def _transaction(self, *, ownership=False):
+        if ownership and self.fail_ownership:
+            raise sqlite3.OperationalError("injected ownership write failure")
+        with super()._transaction(ownership=ownership) as db:
+            yield db
+
+
+def test_review_metadata_reproduction_is_refused(harness, tmp_path):
+    store = harness.open()
+    store.limits = BlobLimits(max_physical_bytes=store.ledger()["databaseFile"] + 4096)
+    before, counts = database_bytes(tmp_path), row_counts(store)
+    for number in range(300):
+        with pytest.raises(BlobCapacity):
+            store.want(route_number(number), [b"x" * 32])
+    assert database_bytes(tmp_path) == before and row_counts(store) == counts
+
+
+def test_database_ceiling_is_enforced(harness, tmp_path):
+    store = harness.open()
+    store.limits = small_ceiling(store, extra_pages=16, emergency_pages=4, global_wanted=100_000,
+                                 wanted_per_group=16)
+    ordinary_bytes = (store.limits.metadata_database_bytes - store.limits.metadata_emergency_bytes)
+    number = fill_wanted(store)
+    assert number > 0
+    for attempt in range(3):
+        before, counts = database_bytes(tmp_path), row_counts(store)
+        with pytest.raises(BlobCapacity):
+            store.want(route_number(number + attempt), [bytes([n]) * 32 for n in range(1, 17)])
+        assert database_bytes(tmp_path) == before and row_counts(store) == counts
+    assert store.ledger()["databaseFile"] <= ordinary_bytes
+    assert store.ledger()["ordinaryPages"] == ordinary_bytes // PAGE
+
+
+def test_updates_and_touch_when_over_capacity_change_nothing(harness, tmp_path):
+    store = harness.open()
+    complete, _, parts, _ = harness.upload(17, b"touch")
+    pending, hashes, _ = make_object(2 * PART_BYTES, b"lease")
+    store.begin(ROUTE, pending, 2 * PART_BYTES, hashes, writer=WRITER)
+    store.want(ROUTE, [b"w" * 32])
+    store.limits = BlobLimits(max_physical_bytes=store.ledger()["committed"] + 1)
+    harness.clock.now += 3600
+    before, counts = database_bytes(tmp_path), row_counts(store)
+    with pytest.raises(BlobCapacity):
+        store.begin(ROUTE, pending, 2 * PART_BYTES, hashes, writer=OTHER_WRITER)
+    with pytest.raises(BlobCapacity):
+        store.release(ROUTE, [complete])
+    with pytest.raises(BlobCapacity):
+        store.want(ROUTE, [b"w" * 32])
+    assert store.get_part(store.admit_get(ROUTE, complete, 0)) == parts[0]
+    assert store.ledger()["touchRefused"] == 1
+    assert database_bytes(tmp_path) == before and row_counts(store) == counts
+
+
+def test_emergency_pages_serve_ownership_writes_and_bound_ordinary_growth(harness, tmp_path):
+    store = harness.open()
+    limits = small_ceiling(store, extra_pages=40, emergency_pages=32, global_wanted=100_000, wanted_per_group=16)
+    store.limits = limits
+    fill_wanted(store)
+    ordinary_pages = (limits.metadata_database_bytes - limits.metadata_emergency_bytes) // PAGE
+    assert store.ledger()["databaseFile"] <= ordinary_pages * PAGE
+    store.close()
+    route = tmp_path / "blobs" / ROUTE.hex()
+    route.mkdir()
+    for number in range(100):
+        (route / f"{number:064x}.0.{'00' * 8}").write_bytes(b"o" * 17)
+    store = harness.open(limits=limits, files=RefuseUnlink)
+    assert store.startup.orphans_doomed == 100
+    grown = store.ledger()["databaseFile"]
+    assert grown > ordinary_pages * PAGE
+    assert store.ledger()["ordinaryPages"] == grown // PAGE
+    assert store.ledger()["ownershipPages"] == limits.metadata_database_bytes // PAGE
+    number = fill_wanted(store, start=50_000)
+    assert store.ledger()["databaseFile"] == grown and number >= 50_000
+    store.close()
+    store = harness.open(limits=limits)
+    assert store.startup.doomed_finished == 100 and store.ledger()["doomed"] == 0
+
+
+def test_exhausted_emergency_pages_fail_startup_preserving(harness, tmp_path):
+    store = harness.open()
+    limits = small_ceiling(store, extra_pages=8, emergency_pages=4)
+    store.close()
+    route = tmp_path / "blobs" / ROUTE.hex()
+    route.mkdir()
+    for number in range(2000):
+        (route / f"{number:064x}.0.{'00' * 8}").write_bytes(b"o" * 17)
+    with pytest.raises(BlobStoreCapacity, match="reconciliation"):
+        harness.open(limits=limits)
+    assert len(list(route.iterdir())) == 2000
+    harness.store = None
+    store = harness.open()
+    assert store.startup.doomed_finished == 2000 and harness.stored_files() == []
+
+
+def test_exhausted_ownership_write_keeps_files_charge_and_blocks_admission(harness, tmp_path):
+    store = harness.open(files=RefuseUnlink, store_class=FlakyOwnership)
+    object_, hashes, parts = make_object(17, b"debt")
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    harness.files.faults["published"] = lambda: OSError(errno.EIO, "directory sync failed")
+    store.fail_ownership = True
+    with pytest.raises(OSError):
+        store.put_part(store.admit_put(ROUTE, object_, 0, 17, writer=WRITER), parts[0])
+    ledger = store.ledger()
+    assert ledger["debtFiles"] == 2 and ledger["outstanding"] == round_up(17) and ledger["liveTickets"] == 0
+    final = [name for name in harness.stored_files() if name.startswith(ROUTE.hex())]
+    assert len(final) == 1
+    other, other_hashes, _ = make_object(17, b"other")
+    with pytest.raises(BlobCapacity):
+        store.begin(ROUTE, other, 17, other_hashes, writer=OTHER_WRITER)
+    with pytest.raises(BlobCapacity):
+        store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+    store.cleanup()
+    assert store.ledger()["debtFiles"] == 2
+    store.fail_ownership = False
+    store.cleanup()
+    ledger = store.ledger()
+    assert ledger["debtFiles"] == 0 and ledger["outstanding"] == 0
+    assert ledger["doomedFiles"] == 2 and ledger["doomed"] == 2 * round_up(17)
+    store.close()
+    store = harness.open()
+    assert store.startup.doomed_finished == 2 and harness.stored_files() == []
+    assert store.ledger()["doomed"] == 0 and store.ledger()["outstanding"] == 0
+
+
+def test_debt_files_left_at_close_are_recovered_before_admission(harness, tmp_path):
+    store = harness.open(files=RefuseUnlink, store_class=FlakyOwnership)
+    object_, hashes, parts = make_object(17, b"close")
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    harness.files.faults["published"] = lambda: OSError(errno.EIO, "directory sync failed")
+    store.fail_ownership = True
+    with pytest.raises(OSError):
+        store.put_part(store.admit_put(ROUTE, object_, 0, 17, writer=WRITER), parts[0])
+    assert store.ledger()["debtFiles"] == 2
+    store.close()
+    store = harness.open(files=RefuseUnlink)
+    assert store.startup.orphans_doomed == 1
+    assert store.ledger()["doomed"] == round_up(17) and store.ledger()["doomedFiles"] == 1
+    store.close()
+    store = harness.open()
+    assert store.startup.doomed_finished == 1 and harness.stored_files() == []
+    assert store.put_part(store.admit_put(ROUTE, object_, 0, 17, writer=WRITER), parts[0]) == PutResult(True, True)
+
+
+def test_metadata_charge_and_disk_reserve(harness, tmp_path):
+    store = harness.open()
+    ledger = store.ledger()
+    assert ledger["database"] == metadata_reservation(160 * 1024**2 // PAGE)
+    assert 0 < ledger["databaseFile"] < ledger["database"]
+    object_, hashes, parts = make_object(17, b"charge")
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    store.limits = BlobLimits(max_physical_bytes=ledger["database"] + round_up(17) - 1)
+    with pytest.raises(BlobCapacity):
+        store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+    store.limits = BlobLimits(max_physical_bytes=ledger["database"] - 1)
+    with pytest.raises(BlobCapacity):
+        store.want(ROUTE, [b"w" * 32])
+    store.limits = BlobLimits(disk_reserve_bytes=10 * 1024**2)
+    unallocated = store.ledger()["database"] - store.ledger()["databaseFile"]
+    harness.files.free = 10 * 1024**2 + unallocated - 1
+    with pytest.raises(BlobCapacity):
+        store.want(ROUTE, [b"w" * 32])
+    harness.files.free = 10 * 1024**2 + unallocated
+    assert store.want(ROUTE, [b"w" * 32]) == 1
+    harness.files.free = 10 * 1024**2 + unallocated + round_up(17) - 1
+    with pytest.raises(BlobCapacity):
+        store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+
+
+def test_parallel_metadata_admission_stays_within_ceilings(harness, tmp_path):
+    store = harness.open()
+    store.limits = small_ceiling(store, extra_pages=24, emergency_pages=4, global_wanted=100_000,
+                                 wanted_per_group=16)
+    ordinary_bytes = store.limits.metadata_database_bytes - store.limits.metadata_emergency_bytes
+    barrier = threading.Barrier(8)
+    outcomes = []
+
+    def worker(offset):
+        barrier.wait(WAIT)
+        for number in range(offset, 100_000, 8):
+            try:
+                store.want(route_number(number), [bytes([n]) * 32 for n in range(1, 17)])
+            except BlobCapacity:
+                outcomes.append("refused")
+                return
+        outcomes.append("never refused")
+
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        list(pool.map(worker, range(8)))
+    assert outcomes == ["refused"] * 8
+    assert store.ledger()["databaseFile"] <= ordinary_bytes
+
+
+def test_want_is_all_or_nothing_at_route_and_global_limits(harness):
+    store = harness.open(BlobLimits(global_wanted=3, wanted_per_group=2))
+    assert store.want(ROUTE, [b"a" * 32, b"b" * 32]) == 2
+    with pytest.raises(BlobCapacity):
+        store.want(OTHER_ROUTE, [b"c" * 32, b"d" * 32])
+    assert store.wanted(OTHER_ROUTE) == []
+    with pytest.raises(BlobGroupQuota):
+        store.want(ROUTE, [b"a" * 32, b"e" * 32])
+    assert sorted(store.wanted(ROUTE)) == [b"a" * 32, b"b" * 32]
+    assert store.want(OTHER_ROUTE, [b"c" * 32]) == 1
+    assert store.want(ROUTE, [b"a" * 32, b"b" * 32]) == 2
+
+
+def test_page_size_other_than_4096_is_unsupported(tmp_path):
+    BlobStore(tmp_path / "blobs.sqlite3", tmp_path / "blobs").close()
+    with sqlite3.connect(tmp_path / "blobs.sqlite3", isolation_level=None) as db:
+        db.execute("PRAGMA page_size=8192")
+        db.execute("VACUUM")
+        assert db.execute("PRAGMA page_size").fetchone()[0] == 8192
+    db.close()
+    before = database_bytes(tmp_path)
+    with pytest.raises(BlobStoreUnsupported, match="page size"):
+        BlobStore(tmp_path / "blobs.sqlite3", tmp_path / "blobs")
+    assert database_bytes(tmp_path) == before
+
+
+def test_lowered_ceiling_opens_and_refuses_growth(harness, tmp_path):
+    store = harness.open()
+    harness.upload(17, b"low")
+    store.want(ROUTE, [b"w" * 32])
+    store.close()
+    pages = (tmp_path / "blobs.sqlite3").stat().st_size // PAGE
+    limits = BlobLimits(metadata_database_bytes=4 * PAGE, metadata_emergency_bytes=PAGE, global_wanted=100_000)
+    store = harness.open(limits=limits)
+    ledger = store.ledger()
+    assert ledger["ordinaryPages"] == pages and ledger["ownershipPages"] == pages
+    assert ledger["database"] == metadata_reservation(pages)
+    fill_wanted(store)
+    assert store.ledger()["databaseFile"] == pages * PAGE
+
+
+def test_new_store_creation_requires_capacity_and_old_stores_open_preserved(harness, tmp_path):
+    reserved = metadata_reservation(160 * 1024**2 // PAGE)
+    with pytest.raises(BlobStoreCapacity):
+        BlobStore(tmp_path / "blobs.sqlite3", tmp_path / "blobs", limits=BlobLimits(max_physical_bytes=reserved - 1))
+    with pytest.raises(BlobStoreCapacity):
+        BlobStore(tmp_path / "blobs.sqlite3", tmp_path / "blobs", limits=BlobLimits(disk_reserve_bytes=2**62))
+    assert not (tmp_path / "blobs.sqlite3").exists() and not (tmp_path / "blobs.sqlite3.creating").exists()
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"old")
+    store.close()
+    before = database_bytes(tmp_path)
+    store = harness.open(limits=BlobLimits(max_physical_bytes=1))
+    assert database_bytes(tmp_path) == before and store.manifest(ROUTE, object_)["complete"] is True
+    with pytest.raises(BlobCapacity):
+        store.want(ROUTE, [b"w" * 32])
+
+
+def test_connection_settings_and_sqlite_build_are_verified(harness, tmp_path, monkeypatch):
+    store = harness.open()
+    with store._lock:
+        settings = {name: store._db.execute(f"PRAGMA {name}").fetchone()[0]
+                    for name in ("journal_mode", "synchronous", "fullfsync", "secure_delete", "cache_spill",
+                                 "temp_store", "page_size")}
+        names = [row[1] for row in store._db.execute("PRAGMA database_list")]
+        options = {row[0] for row in store._db.execute("PRAGMA compile_options")}
+    assert settings == {"journal_mode": "delete", "synchronous": 2, "fullfsync": 1, "secure_delete": 1,
+                        "cache_spill": 0, "temp_store": 2, "page_size": PAGE}
+    assert names == ["main"] and options & blob_module.SUPPORTED_TEMP_STORE
+    store.close()
+    before = database_bytes(tmp_path)
+    monkeypatch.setattr(blob_module, "SUPPORTED_TEMP_STORE", frozenset({"TEMP_STORE=9"}))
+    with pytest.raises(BlobStoreUnsupported, match="temporary storage"):
+        harness.open()
+    with pytest.raises(BlobStoreUnsupported, match="temporary storage"):
+        BlobStore(tmp_path / "fresh.sqlite3", tmp_path / "fresh")
+    assert database_bytes(tmp_path) == before and not (tmp_path / "fresh.sqlite3").exists()
+
+
+def test_largest_transactions_create_no_temporary_files(tmp_path):
+    temporary = tmp_path / "sqlite-tmp"
+    temporary.mkdir()
+    script = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+        sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+        from test_blob import make_object, ROUTE, WRITER
+        from gotsync_server.blob import BlobStore, BlobLimits
+        from gotsync_server.blob_format import PART_BYTES
+        now = [1_000_000.0]
+        store = BlobStore({str(tmp_path / "blobs.sqlite3")!r}, {str(tmp_path / "blobs")!r}, clock=lambda: now[0],
+                          limits=BlobLimits(global_wanted=100_000))
+        for number in range(80):
+            object_, hashes, parts = make_object(17, number.to_bytes(4, "big"))
+            store.begin(ROUTE, object_, 17, hashes, writer=number.to_bytes(32, "big"))
+            store.put_part(store.admit_put(ROUTE, object_, 0, 17, writer=WRITER), parts[0])
+        for number in range(100):
+            store.want(number.to_bytes(32, "big"), [bytes([n]) * 32 for n in range(1, 17)])
+        now[0] += 40 * 86400
+        report = store.expire()
+        assert report.objects == 80 and report.unlinked == 80, report
+        store.close()
+    """)
+    environment = {**os.environ, "SQLITE_TMPDIR": str(temporary), "TMPDIR": str(temporary)}
+    subprocess.run([sys.executable, "-c", script], env=environment, check=True, timeout=120)
+    assert list(temporary.iterdir()) == []
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["blobs", "blobs.sqlite3", "sqlite-tmp"]
+
+
+def paused_get(harness, store, object_):
+    ticket = store.admit_get(ROUTE, object_, 0)
+    entered, release = harness.files.pause("reading")
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    pending = pool.submit(store.get_part, ticket)
+    assert entered.wait(WAIT)
+    return ticket, release, pending, pool
+
+
+def test_open_get_descriptor_keeps_expired_part_charged(harness, tmp_path):
+    store = harness.open()
+    object_, hashes, parts, _ = harness.upload(PART_BYTES, b"held")
+    path = tmp_path / "blobs" / harness.stored_files()[0]
+    ticket, release, pending, pool = paused_get(harness, store, object_)
+    descriptor = harness.files.descriptors[-1]
+    harness.clock.now += 31 * DAY
+    report = store.expire()
+    assert (report.objects, report.unlinked, report.deferred) == (1, 0, 1)
+    assert path.exists() and os.fstat(descriptor).st_nlink == 1
+    ledger = store.ledger()
+    assert (ledger["committed"], ledger["doomed"], ledger["pinnedFiles"]) == (0, round_up(PART_BYTES), 1)
+    store.begin(ROUTE, object_, PART_BYTES, hashes, writer=WRITER)
+    store.limits = BlobLimits(max_physical_bytes=ledger["database"] + round_up(PART_BYTES) * 2 - 1)
+    with pytest.raises(BlobCapacity):
+        store.admit_put(ROUTE, object_, 0, PART_BYTES, writer=WRITER)
+    release.set()
+    assert pending.result(WAIT) == parts[0]
+    pool.shutdown(wait=True)
+    assert not path.exists() and store.ledger()["doomed"] == 0 and store.ledger()["pinnedFiles"] == 0
+    assert store.put_part(store.admit_put(ROUTE, object_, 0, PART_BYTES, writer=WRITER), parts[0]) == PutResult(
+        True, True)
+    del ticket
+
+
+def test_cancelled_get_keeps_its_pin_until_return(harness, tmp_path):
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"cancel")
+    path = tmp_path / "blobs" / harness.stored_files()[0]
+    ticket = store.admit_get(ROUTE, object_, 0)
+    entered, release = harness.files.pause("reading")
+
+    async def interrupt(task):
+        assert await asyncio.to_thread(entered.wait, WAIT)
+        task.cancel()
+        harness.clock.now += 31 * DAY
+        assert store.expire().deferred == 1 and path.exists()
+
+    (during, returned_during, state), returned = await_worker(
+        store, ticket, lambda: store.get_part(ticket), timeout=WAIT, interrupt=interrupt)(release.set)
+    assert during["pinnedFiles"] == 1 and during["doomed"] == round_up(17) and returned_during == []
+    assert returned == [True] and not path.exists()
+    assert store.ledger()["pinnedFiles"] == 0 and store.ledger()["doomed"] == 0
+
+
+@pytest.mark.parametrize("exit_path", ["abandon", "queued-deadline", "initializer"])
+def test_get_pins_are_released_when_the_reader_never_enters(harness, tmp_path, exit_path):
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"never")
+    path = tmp_path / "blobs" / harness.stored_files()[0]
+    ticket = store.admit_get(ROUTE, object_, 0)
+    harness.clock.now += 31 * DAY
+    assert store.expire().deferred == 1 and path.exists()
+
+    def initializer():
+        raise OSError("worker initialization failed")
+
+    async def main():
+        if exit_path == "queued-deadline":
+            pool = concurrent.futures.ThreadPoolExecutor(1)
+            release = threading.Event()
+            pool.submit(release.wait, WAIT)
+            with pytest.raises(BlobDeadline):
+                await run_blob_worker(store, ticket, lambda: store.get_part(ticket), executor=pool, timeout=0.05)
+            release.set()
+        else:
+            pool = concurrent.futures.ThreadPoolExecutor(1, initializer=initializer)
+            with pytest.raises(BrokenThreadPool):
+                await run_blob_worker(store, ticket, lambda: store.get_part(ticket), executor=pool, timeout=WAIT)
+        await asyncio.to_thread(pool.shutdown, wait=True)
+
+    if exit_path == "abandon":
+        store.abandon(ticket)
+    else:
+        asyncio.run(main())
+    assert not path.exists() and store.ledger()["pinnedFiles"] == 0 and store.ledger()["doomed"] == 0
+    assert harness.files.unlinked.count(harness.files.unlinked[-1]) == 1
+
+
+def test_corruption_repair_waits_for_other_readers(harness, tmp_path):
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"repair")
+    path = tmp_path / "blobs" / harness.stored_files()[0]
+    _, release, pending, pool = paused_get(harness, store, object_)
+    with open(path, "r+b") as damaged:
+        damaged.write(b"!")
+    with pytest.raises(BlobPartMissing):
+        store.get_part(store.admit_get(ROUTE, object_, 0))
+    assert path.exists() and store.ledger()["doomed"] == round_up(17) and store.ledger()["pinnedFiles"] == 1
+    release.set()
+    with pytest.raises(BlobPartMissing):
+        pending.result(WAIT)
+    pool.shutdown(wait=True)
+    assert not path.exists() and store.ledger()["doomed"] == 0 and store.ledger()["pinnedFiles"] == 0
+
+
+def test_no_new_reader_after_doom(harness):
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"doom")
+    harness.files.faults["unlink"] = lambda: PermissionError(errno.EPERM, "unlink refused")
+    harness.clock.now += 31 * DAY
+    store.expire()
+    with pytest.raises(BlobObjectMissing):
+        store.admit_get(ROUTE, object_, 0)
+    assert store.ledger()["pinnedFiles"] == 0 and store.ledger()["doomedFiles"] == 1
+
+
+def test_cleanup_never_unlinks_pinned_files(harness):
+    store = harness.open()
+    for round_number in range(50):
+        object_, *_ = harness.upload(17, round_number.to_bytes(2, "big"))
+        harness.clock.now += 31 * DAY
+        barrier = threading.Barrier(2)
+
+        def read(barrier=barrier, object_=object_):
+            barrier.wait(WAIT)
+            try:
+                ticket = store.admit_get(ROUTE, object_, 0)
+            except (BlobObjectMissing, BlobPartMissing):
+                return None
+            return store.get_part(ticket)
+
+        def expire(barrier=barrier):
+            barrier.wait(WAIT)
+            return store.expire()
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            reader, expiry = pool.submit(read), pool.submit(expire)
+            reader.result(WAIT)
+            expiry.result(WAIT)
+        store.cleanup()
+        ledger = store.ledger()
+        assert ledger["pinnedFiles"] == 0 and ledger["doomed"] == 0 and ledger["committed"] == 0
+    assert harness.stored_files() == []
