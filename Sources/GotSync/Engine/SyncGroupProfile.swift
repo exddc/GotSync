@@ -16,6 +16,22 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
         self.identifier = identifier
         self.version = version
     }
+
+    static let hostJournalPrefix = "gotsync.journal1."
+
+    /// Opaque host records of `payload` at `version`, carried by the host
+    /// journal. Internal until the preview SPI exists.
+    static func hostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
+        let identifier = hostJournalPrefix + payload
+        guard version > 0, !payload.hasPrefix("gotsync."), SyncGroupProfile.isLabel(payload),
+              SyncGroupProfile.isLabel(identifier)
+        else {
+            throw SyncGroupProfileError.invalidDescriptor
+        }
+        return SyncPayloadSchema(identifier: identifier, version: version)
+    }
+
+    var isHostJournal: Bool { identifier.hasPrefix(Self.hostJournalPrefix) }
 }
 
 public enum SyncGroupProfileError: Error, Equatable, Sendable {
@@ -109,7 +125,7 @@ public struct SyncGroupProfile: Equatable, Hashable, Sendable {
         )
     }
 
-    private static func isLabel(_ text: String) -> Bool {
+    static func isLabel(_ text: String) -> Bool {
         let bytes = Array(text.utf8)
         guard let first = bytes.first, bytes.count <= maximumLabelBytes,
               isLowercaseAlphanumeric(first)
