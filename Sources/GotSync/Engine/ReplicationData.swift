@@ -57,8 +57,11 @@ protocol ReplicationData: AnyObject {
     func chunks(of window: [ReplicationWindowItem]) -> [Range<Int>]
     func intake(_ chunk: [ReplicationWindowItem]) throws -> ReplicationChunkIntake
 
-    /// The next reply message for `obligation` and the records it carries.
-    func reply(for obligation: ReplyObligation, uploadedThrough: UInt64) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])?
+    /// The next reply message for `obligation` and the records it carries,
+    /// none above `bound` when one is given.
+    func reply(
+        for obligation: ReplyObligation, uploadedThrough: UInt64, bound: ReplicaVersionVector?
+    ) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])?
     /// A joiner's hello vector and the data messages announced after it.
     func joinAnnouncement() throws -> (vector: ReplicaVersionVector, messages: [Data])
     /// The next local batch after `uploadedThrough` and its last sequence.

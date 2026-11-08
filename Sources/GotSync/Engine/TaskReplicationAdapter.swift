@@ -240,7 +240,9 @@ extension TaskReplicationAdapter: ReplicationData {
         )
     }
 
-    func reply(for obligation: ReplyObligation, uploadedThrough: UInt64) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
+    func reply(
+        for obligation: ReplyObligation, uploadedThrough: UInt64, bound: ReplicaVersionVector?
+    ) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
         guard let batch = try OperationBatcher.batches(replyOperations(for: obligation, uploadedThrough: uploadedThrough)).first else {
             return nil
         }

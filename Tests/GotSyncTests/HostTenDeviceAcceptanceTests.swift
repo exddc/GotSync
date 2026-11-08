@@ -100,7 +100,7 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
         let idleRate = Double(idleEnd["delivery_requests", default: 0] - idleStart["delivery_requests", default: 0]) / idleWindow
         print("ten-host idle delivery requests per second from one source: \(idleRate)")
         XCTAssertLessThan(idleRate, 40, "idle traffic must stay below the default per-source rate")
-        XCTAssertTrue(linked.allSatisfy { $0.hostView?.isQuiescent == true })
+        try await wait("idle hosts quiescent together") { linked.allSatisfy { $0.hostView?.isQuiescent == true } }
 
         let after = try await counters()
         for counter in ["rate_limit_rejections", "source_concurrency_rejections", "admission_rejections", "internal_errors"] {

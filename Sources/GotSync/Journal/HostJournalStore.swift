@@ -19,6 +19,8 @@ enum HostJournalError: Error, Equatable {
     case formatUnsupported(Int64)
     case storeCorrupt(String)
     case retired
+    /// The engine stopped host work on this handle; only the handoff remains.
+    case fenced
     case notResumed
     case enrollmentRequired
     case staleJournal
@@ -178,6 +180,10 @@ final class HostJournalStore {
     /// Set by a successful `resume` in this process; submission, enumeration
     /// and application require it.
     private(set) var isResumed = false
+    /// Set once the engine starts closing or replaces this generation; host
+    /// enrollment, submission, application and readiness are refused from then
+    /// on, while the handoff and export stay available.
+    private(set) var isHostFenced = false
     var faultHookForTesting: ((HostJournalCommitPoint) throws -> Void)?
     /// Called after every commit, once `view` shows it.
     var committed: (@MainActor () -> Void)?
@@ -271,7 +277,8 @@ final class HostJournalStore {
     /// the returned provenance. Refused once an enrollment was confirmed,
     /// whether or not any record exists.
     func enroll() throws -> HostJournalProvenance {
-        try transaction("enroll") {
+        try requireHostOpen()
+        return try transaction("enroll") {
             let meta = try readMeta()
             guard meta.retirement == nil else { throw HostJournalError.retired }
             if case .confirmed = meta.enrollment { throw HostJournalError.hostProvenanceMissing }
@@ -290,6 +297,7 @@ final class HostJournalStore {
     /// host's saved provenance. A host behind what the library recorded stops;
     /// a host ahead in application advances the library.
     func resume(_ stored: HostJournalProvenance) throws -> HostJournalProvenance {
+        try requireHostOpen()
         let result = try transaction("resume") { () -> HostJournalProvenance in
             let meta = try readMeta()
             guard stored.journalID == meta.journalID else { throw HostJournalError.staleJournal }
@@ -881,7 +889,32 @@ final class HostJournalStore {
         isResumed = false
     }
 
+    /// Whether this retired journal holds every one of `messages` with the
+    /// same bytes, which proves an earlier handoff took them over.
+    func holdsInbox(_ messages: [HostJournalHeldMessage]) throws -> Bool {
+        guard view.isRetired else { return false }
+        try database.execute("BEGIN")
+        defer { try? database.execute("COMMIT") }
+        for message in messages {
+            let key: [JournalValue] = [.blob(message.sender), try JournalDatabase.integer(message.cursor)]
+            let stored = try database.first("SELECT plaintext FROM heldInbox WHERE sender = ? AND cursor = ?", key, { try $0.blob(0) })
+            guard stored == message.plaintext else { return false }
+        }
+        return true
+    }
+
+    /// Refuses host work from now on, for this handle only.
+    func fenceHost() {
+        isHostFenced = true
+    }
+
+    private func requireHostOpen() throws {
+        if view.isRetired { throw HostJournalError.retired }
+        if isHostFenced { throw HostJournalError.fenced }
+    }
+
     private func requireResumed() throws {
+        try requireHostOpen()
         guard isResumed else { throw view.isRetired ? HostJournalError.retired : HostJournalError.notResumed }
     }
 

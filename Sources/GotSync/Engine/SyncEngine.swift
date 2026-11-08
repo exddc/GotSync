@@ -300,9 +300,15 @@ public final class SyncEngine {
     private let hostJournalLimits: HostJournalLimits
     private(set) var hostLifecycle: HostLifecycle = .active { didSet { publishHostView() } }
     private var hostLifecycleTask: Task<Void, Never>?
+    /// Set while `stop` settles work; nothing new may start meanwhile.
+    private var isStopping = false
     private(set) var lastHostLifecycleError: Error?
     private(set) var hostRepair: HostRepair? { didSet { publishHostView() } }
     private var hostIntake: HostIntakeSummary = .unknown
+    /// What a settled intake was checked against: the session, its MLS
+    /// operation count and the journal generation. Any later MLS operation or
+    /// generation change makes the summary unknown again.
+    private var hostIntakeOwner: (session: ObjectIdentifier, operations: UInt64, journal: Data)?
     private var hostViewRevision: UInt64 = 0
     private var pendingHostLifecycle: HostLifecycleRecord?
     private var historyRequestCycles = 0
@@ -335,6 +341,7 @@ public final class SyncEngine {
     var reservationHookForTesting: (@MainActor () async -> Void)?
     var reservationSendHookForTesting: (@MainActor () async -> Void)?
     var afterAddHookForTesting: (@MainActor () throws -> Void)?
+    var afterJoinHookForTesting: (@MainActor () async -> Void)?
     var beforeReservationRequestHookForTesting: (@MainActor () throws -> Void)?
     private var reconcileTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
@@ -485,7 +492,7 @@ public final class SyncEngine {
                         hostRepair = .lifecycleUnreadable
                     }
                     if erasePending, pendingHostLifecycle == nil {
-                        pendingHostLifecycle = HostLifecycleRecord(intent: .erase, journal: nil)
+                        pendingHostLifecycle = HostLifecycleRecord(intent: .erase, journal: nil, group: nil)
                     }
                     do {
                         session = try openSession()
@@ -608,9 +615,10 @@ public final class SyncEngine {
             linkEndedReason = notice
         }
         if let record = pendingHostLifecycle {
+            hostAdapter?.store?.fenceHost()
             hostLifecycle = .closing(record.intent)
             hostLifecycleTask = Task { [weak self] in
-                await self?.runHostClosing(record.intent)
+                await self?.runHostClosing(record)
             }
         } else if session != nil, hostRepair == nil {
             reconcileTask = Task { [weak self] in
@@ -1066,6 +1074,36 @@ public final class SyncEngine {
         }
     }
 
+    /// A cancelled host join may already be in the group, and its MLS state
+    /// then owns whatever arrived. Once the attempt ends, a joined session
+    /// becomes the link as at launch; only a join that never committed is
+    /// discarded with its journal and intent.
+    private func settleCancelledJoin(after attempt: Task<Void, Never>?) {
+        let previous = reconcileTask
+        reconcileTask = Task { [weak self] in
+            await previous?.value
+            await attempt?.value
+            guard let self, !Task.isCancelled, let session = self.session else { return }
+            let joined: Bool
+            do {
+                joined = try await session.group() != nil
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, self.session === session, self.pairingTask == nil, !self.isPaired else {
+                return
+            }
+            if joined {
+                await self.reconcileSession()
+                return
+            }
+            try? self.resetSession()
+            try? self.abandonHostJournal()
+            try? ReplicationCheckpoint.remove(at: self.joinIntentURL)
+            self.reconcileTask = nil
+        }
+    }
+
     private func scheduleReconcile() {
         guard session != nil, reconcileTask == nil else {
             return
@@ -1455,10 +1493,15 @@ public final class SyncEngine {
             return
         }
         let wasJoining = activePairingRole == .joiner
+        let attempt = pairingTask
         declinePeer()
         endPairingAttempt()
         if wasJoining && !isPaired {
-            try? resetSession()
+            if isHostMode {
+                settleCancelledJoin(after: attempt)
+            } else {
+                try? resetSession()
+            }
         } else if !isPaired {
             scheduleReconcile()
         }
@@ -1677,18 +1720,25 @@ public final class SyncEngine {
         resolveApproval(.rejected)
         cancelPresentationTasks()
         syncCycleRequested = false
-        let running = [
-            pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask,
-            syncLoopTask, syncCycleTask, backgroundFlushTask, departureTask, hostLifecycleTask,
-        ].compactMap { $0 }
-        for task in running {
-            task.cancel()
-        }
-        if let pairingConnection {
-            await pairingConnection.cancel()
-        }
-        for task in running {
-            await task.value
+        isStopping = true
+        defer { isStopping = false }
+        var settled: Set<Task<Void, Never>> = []
+        while true {
+            let running = Set([
+                pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask,
+                syncLoopTask, syncCycleTask, backgroundFlushTask, departureTask, hostLifecycleTask,
+            ].compactMap { $0 }).subtracting(settled)
+            guard !running.isEmpty else { break }
+            for task in running {
+                task.cancel()
+            }
+            if let pairingConnection {
+                await pairingConnection.cancel()
+            }
+            for task in running {
+                await task.value
+            }
+            settled.formUnion(running)
         }
         pairingTask = nil
         pairingExpiryTask = nil
@@ -2190,6 +2240,7 @@ public final class SyncEngine {
                 } catch let error where Self.isTransientTransportFailure(error) {}
                 try await Task.sleep(nanoseconds: pairingRetryDelayNanoseconds)
             }
+            await afterJoinHookForTesting?()
             pairingReaderTask?.cancel()
             pairingReaderTask = nil
             await connection.cancel()
@@ -2762,11 +2813,35 @@ public final class SyncEngine {
         }
         try await uploadLocalOperations(session: session)
         if isHostMode {
-            let held = try await session.inbox().count
-            try requireCurrent(session)
-            hostIntake = .settled(held: held)
-            publishHostView()
+            try await settleHostIntake(session: session)
         }
+    }
+
+    /// Counts the inbox messages the journal does not own, when no MLS
+    /// operation ran meanwhile and the checkpoint references the bound journal.
+    private func settleHostIntake(session: MLSSession) async throws {
+        let before = session.operationCount
+        let held = try await session.inbox().count
+        try requireCurrent(session)
+        if before == session.operationCount, before.isIdle, let journal = hostAdapter?.store?.view.journalID,
+           checkpoint?.hostJournal == journal {
+            hostIntake = .settled(held: held)
+            hostIntakeOwner = (ObjectIdentifier(session), before.started, journal)
+        } else {
+            hostIntake = .unknown
+            hostIntakeOwner = nil
+        }
+        publishHostView()
+    }
+
+    private var currentHostIntake: HostIntakeSummary {
+        guard case .settled = hostIntake, let owner = hostIntakeOwner, let session,
+              ObjectIdentifier(session) == owner.session, session.operationCount.started == owner.operations,
+              hostAdapter?.store?.view.journalID == owner.journal
+        else {
+            return .unknown
+        }
+        return hostIntake
     }
 
     /// `retriesDeferred` allows a retry of deferred operations with an empty
@@ -2952,17 +3027,18 @@ public final class SyncEngine {
     /// the whole history, while this device knows every claim and holds no
     /// operation it has not applied.
     private func sendReplies(session: MLSSession) async throws {
-        let unknownOrigins = isHostMode && replyObligation?.bootstrap != nil
-            ? try await admissionView(session: session).unknownOrigins : false
-        try requireCurrent(session)
+        let snapshot = isHostMode ? replication.helloVector : nil
         while var obligation = replyObligation, let current = checkpoint {
-            if let index = obligation.bootstrap?.firstIndex(where: { $0.cut == nil }), hostProviderEligible, !unknownOrigins {
+            if let index = obligation.bootstrap?.firstIndex(where: { $0.cut == nil }), try await hostMayCertify(session: session) {
                 let entry = obligation.bootstrap![index]
                 obligation.bootstrap![index].cut = replication.helloVector
                 obligation.merge(entry.from, provider: true)
                 obligation.retain(origins: replication.retainedOrigins)
             } else if obligation.own != nil || obligation.provided != nil {
-                if let reply = try replication.reply(for: obligation, uploadedThrough: uploadedLocalSequence(in: current)) {
+                let bound = snapshot.map { Self.replyBound(obligation.bootstrap, snapshot: $0) }
+                if let reply = try replication.reply(
+                    for: obligation, uploadedThrough: uploadedLocalSequence(in: current), bound: bound
+                ) {
                     await replyBatchHookForTesting?()
                     try await send(plaintext: reply.plaintext, session: session)
                     try requireCurrent(session)
@@ -2975,6 +3051,9 @@ public final class SyncEngine {
                 let roster = Set(try await session.members().map(\.fingerprint))
                 try requireCurrent(session)
                 if roster.contains(entry.member) {
+                    guard try await hostMayCertify(session: session) else {
+                        return
+                    }
                     try await send(plaintext: HostJournalMessage.complete(member: entry.member, through: cut).encoded(), session: session)
                     try requireCurrent(session)
                 }
@@ -2989,6 +3068,9 @@ public final class SyncEngine {
                     guard let latest = checkpoint, latest.reservationsVisible != false,
                           latest.membersWithUnknownHistory == nil, !isReplicaCapacityBlocked
                     else {
+                        return
+                    }
+                    if isHostMode, try await !hostMayCertify(session: session) {
                         return
                     }
                     try snapshotSendHookForTesting?()
@@ -3210,7 +3292,7 @@ public final class SyncEngine {
     }
 
     private func startDepartures() {
-        guard hasDurableIdentity, departureTask == nil, !departureSlots().isEmpty else { return }
+        guard hasDurableIdentity, !isStopping, departureTask == nil, !departureSlots().isEmpty else { return }
         let delays = departureRetryDelayNanoseconds
         departureTask = Task { [weak self] in
             var delayNanoseconds = delays.lowerBound
@@ -3646,7 +3728,7 @@ extension SyncEngine {
         }
         return HostEngineView(
             revision: hostViewRevision, journal: journal, uploadedThrough: uploaded,
-            intake: hostIntake, lifecycle: hostLifecycle, repair: hostRepair
+            intake: currentHostIntake, lifecycle: hostLifecycle, repair: hostRepair
         )
     }
 
@@ -3696,12 +3778,39 @@ extension SyncEngine {
     /// A provider may choose a completion cut only once its own history is
     /// complete, it declared readiness, and nothing it holds is unresolved.
     private var hostProviderEligible: Bool {
-        guard isHostMode, hostRepair == nil, let view = hostAdapter?.store?.view, let current = checkpoint else {
+        guard isHostMode, hostWorkAllowed, let view = hostAdapter?.store?.view, let current = checkpoint,
+              current.hostJournal == view.journalID, !view.isRetired
+        else {
             return false
         }
         return view.historyComplete && view.isReady && !view.controlRepair && view.pendingCount == 0
             && view.quarantineCount == 0 && !isInboxBackpressured
             && current.reservationsVisible != false && current.membersWithUnknownHistory == nil
+    }
+
+    /// Whether this provider may certify history or a reservations
+    /// snapshot right now. Checked again immediately before each send, so a
+    /// saved cut or snapshot request stays queued while control state is
+    /// incomplete.
+    private func hostMayCertify(session: MLSSession) async throws -> Bool {
+        guard hostProviderEligible else { return false }
+        let unknownOrigins = try await admissionView(session: session).unknownOrigins
+        try requireCurrent(session)
+        return !unknownOrigins && hostProviderEligible
+    }
+
+    /// The highest record a bootstrap reply may carry: every chosen cut, or
+    /// what this device held when the replies began while no cut is chosen.
+    private static func replyBound(_ bootstrap: [ReplyObligation.Bootstrap]?, snapshot: ReplicaVersionVector) -> ReplicaVersionVector {
+        let cuts = (bootstrap ?? []).compactMap(\.cut)
+        guard !cuts.isEmpty else { return snapshot }
+        var bound = ReplicaVersionVector()
+        for cut in cuts {
+            for origin in cut.origins {
+                bound.setSequence(max(bound[origin], cut[origin]), for: origin)
+            }
+        }
+        return bound
     }
 
     /// The journal of `group`, created when none is bound. A bound journal
@@ -3721,6 +3830,9 @@ extension SyncEngine {
     }
 
     private func bindHostJournal(_ store: HostJournalStore?) {
+        if let previous = hostAdapter?.store, previous !== store {
+            previous.fenceHost()
+        }
         store?.committed = { [weak self] in self?.publishHostView() }
         hostAdapter?.bind(store)
         publishHostView()
@@ -3761,7 +3873,7 @@ extension SyncEngine {
             case .journal(_, let view)? where view.isRetired:
                 if pendingHostLifecycle == nil {
                     pendingHostLifecycle = HostLifecycleRecord(
-                        intent: view.retirement == .unlink ? .unlink : .removed, journal: referenced
+                        intent: view.retirement == .unlink ? .unlink : .removed, journal: referenced, group: view.group
                     )
                 }
             case .journal?:
@@ -3828,11 +3940,14 @@ extension SyncEngine {
         if case .closing = hostLifecycle {
             return
         }
+        hostAdapter?.store?.fenceHost()
+        let record = HostLifecycleRecord(
+            intent: intent,
+            journal: hostAdapter?.store?.view.journalID ?? checkpoint?.hostJournal,
+            group: checkpoint?.group ?? hostAdapter?.store?.view.group
+        )
         do {
-            try ProtectedStorage.write(
-                ReplicaCanonicalJSON.encode(HostLifecycleRecord(intent: intent, journal: hostAdapter?.store?.view.journalID)),
-                to: hostLifecycleURL
-            )
+            try ProtectedStorage.write(ReplicaCanonicalJSON.encode(record), to: hostLifecycleURL)
         } catch {
             lastHostLifecycleError = error
             hostLifecycle = .failed(intent)
@@ -3849,38 +3964,38 @@ extension SyncEngine {
             for task in running {
                 await task.value
             }
-            await self?.runHostClosing(intent)
+            await self?.runHostClosing(record)
         }
     }
 
-    /// Unlink and removal copy the held inbox into the retiring journal,
-    /// then make MLS control-only before any other cleanup. Erase destroys
-    /// library-owned journals and link state.
-    private func runHostClosing(_ intent: HostLifecycleIntent) async {
+    /// Unlink and removal hand the held inbox to the closing generation's
+    /// journal, then make MLS control-only before any other cleanup. Erase
+    /// destroys library-owned journals and link state. Every step after a
+    /// suspension first checks for cancellation, so a stopped worker leaves
+    /// its durable intent for the next launch and starts nothing new.
+    private func runHostClosing(_ record: HostLifecycleRecord) async {
+        let intent = record.intent
         do {
             try await hostClosingHookForTesting?("start")
+            try Task.checkCancellation()
             switch intent {
             case .unlink, .removed:
-                guard hostRepair != .mlsUnreadable else { throw HostEngineError.mlsUnreadable }
-                if let store = hostAdapter?.store, !store.view.isRetired {
-                    guard let session else { throw SyncError.localStorageUnavailable }
-                    let held = try await session.inbox()
-                    try store.retire(
-                        intent == .unlink ? .unlink : .removed,
-                        heldInbox: held.map { HostJournalHeldMessage(sender: $0.sender, cursor: $0.cursor, plaintext: $0.plaintext) }
-                    )
-                }
+                try await handOffHostInbox(record)
                 try await hostClosingHookForTesting?("retired")
+                try Task.checkCancellation()
                 try await session?.setControlOnly()
                 try await hostClosingHookForTesting?("controlOnly")
+                try Task.checkCancellation()
                 try finishHostUnlink(departing: intent == .unlink)
             case .erase:
                 try Self.persistEraseMarker(at: eraseMarkerURL)
                 try await hostClosingHookForTesting?("marked")
+                try Task.checkCancellation()
                 if hostRepair != .mlsUnreadable {
                     try await session?.setControlOnly()
                 }
                 try await hostClosingHookForTesting?("controlOnly")
+                try Task.checkCancellation()
                 try finishHostErase()
             }
         } catch {
@@ -3896,6 +4011,43 @@ extension SyncEngine {
             linkEndedReason = .removedFromGroup
         }
         startDepartures()
+    }
+
+    /// Makes the closing generation's journal the owner of every message
+    /// in the MLS inbox: retires it with them, or finds it already retired
+    /// holding the same bytes. Anything else, including a missing, unreadable
+    /// or different journal, throws before any MLS or link state changes.
+    private func handOffHostInbox(_ record: HostLifecycleRecord) async throws {
+        if hostRepair == .mlsUnreadable {
+            throw HostEngineError.mlsUnreadable
+        }
+        guard hostRepair == nil, let session, let journalID = record.journal, let directory = hostAdapter?.directory else {
+            throw HostEngineError.handoffUnproven
+        }
+        if let current = checkpoint, current.hostJournal != journalID {
+            throw HostEngineError.handoffUnproven
+        }
+        let mlsGroup = try await session.group()
+        let inbox = try await session.inbox()
+        try requireCurrent(session)
+        let held = inbox.map { HostJournalHeldMessage(sender: $0.sender, cursor: $0.cursor, plaintext: $0.plaintext) }
+        let journal: HostJournalStore
+        if let bound = hostAdapter?.store, bound.view.journalID == journalID {
+            journal = bound
+        } else {
+            journal = try HostJournalStore.open(HostJournalStore.fileURL(in: directory, journalID: journalID), limits: hostJournalLimits)
+            journal.fenceHost()
+        }
+        let group = journal.view.group
+        guard record.group.map({ $0 == group }) ?? true, mlsGroup.map({ $0 == group }) ?? true else {
+            throw HostEngineError.handoffUnproven
+        }
+        if !journal.view.isRetired {
+            try journal.retire(record.intent == .unlink ? .unlink : .removed, heldInbox: held)
+        }
+        guard try journal.holdsInbox(held) else {
+            throw HostEngineError.handoffUnproven
+        }
     }
 
     private func finishHostUnlink(departing: Bool) throws {

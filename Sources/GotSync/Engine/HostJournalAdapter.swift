@@ -11,6 +11,9 @@ enum HostEngineError: Error, Equatable {
     case archiveLimit
     /// The MLS state cannot be read; its files are kept for a later retry.
     case mlsUnreadable
+    /// No journal of the closing generation can take over the MLS inbox, so
+    /// the link is kept as it is.
+    case handoffUnproven
 }
 
 enum HostLifecycleIntent: String, Codable, Sendable {
@@ -44,7 +47,9 @@ enum HostIntakeSummary: Equatable, Sendable {
 /// The durable closing intent, written before any cleanup starts.
 struct HostLifecycleRecord: Codable, Equatable, Sendable {
     let intent: HostLifecycleIntent
+    /// The generation whose journal takes over the MLS inbox, and its group.
     let journal: Data?
+    let group: Data?
 }
 
 /// Committed host state composed from the journal, the checkpoint, the
@@ -282,20 +287,26 @@ extension HostJournalAdapter: ReplicationData {
 
     /// Own records missing from the requester and already uploaded, and,
     /// for a provider request, every retained record missing from it,
-    /// including own records above the upload watermark.
-    func reply(for obligation: ReplyObligation, uploadedThrough: UInt64) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
+    /// including own records above the upload watermark. Nothing above
+    /// `bound` is chosen, so a reply loop ends however many records arrive
+    /// or are submitted while it runs.
+    func reply(
+        for obligation: ReplyObligation, uploadedThrough: UInt64, bound limit: ReplicaVersionVector?
+    ) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
         let store = try bound()
+        let ceiling = limit.map(Self.dictionary)
         var selected: [JournalRecordID: JournalEnvelope] = [:]
         if let provided = obligation.provided {
             for envelope in try store.records(
-                missingFrom: Self.dictionary(provided), through: nil, maxBytes: Self.replyBytes, maxCount: Self.replyRecords
+                missingFrom: Self.dictionary(provided), through: ceiling, maxBytes: Self.replyBytes, maxCount: Self.replyRecords
             ) {
                 selected[envelope.id] = envelope
             }
         }
         if let own = obligation.own, let origin = ownOrigin {
+            let last = min(uploadedThrough, ceiling.map { $0[origin.bytes] ?? 0 } ?? uploadedThrough)
             for envelope in try store.ownRecords(after: own[origin], maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
-            where envelope.sequence <= uploadedThrough {
+            where envelope.sequence <= last {
                 selected[envelope.id] = envelope
             }
         }

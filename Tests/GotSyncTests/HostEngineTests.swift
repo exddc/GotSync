@@ -9,14 +9,14 @@ import XCTest
 /// closing lifecycle.
 @MainActor
 final class HostEngineTests: XCTestCase {
-    private var root: URL!
-    private var relay: FakeMLSRelay!
-    private var rendezvous: FakePairingRendezvous!
-    private var stores: [String: MemorySecretStore] = [:]
-    private var engines: [SyncEngine] = []
-    private var provenances: [String: HostJournalProvenance] = [:]
-    private var captured: [String: UInt64] = [:]
-    private let profile = try! SyncGroupProfile(
+    var root: URL!
+    var relay: FakeMLSRelay!
+    var rendezvous: FakePairingRendezvous!
+    var stores: [String: MemorySecretStore] = [:]
+    var engines: [SyncEngine] = []
+    var provenances: [String: HostJournalProvenance] = [:]
+    var captured: [String: UInt64] = [:]
+    let profile = try! SyncGroupProfile(
         application: "org.gotsync.host", schema: .hostJournal(payload: "example.records", version: 1), memberLimit: 10
     )
 
@@ -37,7 +37,7 @@ final class HostEngineTests: XCTestCase {
 
     // MARK: - Harness
 
-    private func engine(_ name: String, limits: HostJournalLimits = .standard) -> SyncEngine {
+    func engine(_ name: String, limits: HostJournalLimits = .standard) -> SyncEngine {
         let store = stores[name] ?? MemorySecretStore()
         stores[name] = store
         let engine = SyncEngine(
@@ -61,15 +61,15 @@ final class HostEngineTests: XCTestCase {
         return engine
     }
 
-    private func directory(_ name: String) -> URL { root.appendingPathComponent(name) }
+    func directory(_ name: String) -> URL { root.appendingPathComponent(name) }
 
-    private func restart(_ engine: SyncEngine, _ name: String, limits: HostJournalLimits = .standard) async -> SyncEngine {
+    func restart(_ engine: SyncEngine, _ name: String, limits: HostJournalLimits = .standard) async -> SyncEngine {
         await engine.stop()
         engines.removeAll { $0 === engine }
         return self.engine(name, limits: limits)
     }
 
-    private func wait(
+    func wait(
         _ stage: String, timeout: Duration = .seconds(20), file: StaticString = #filePath, line: UInt = #line,
         until predicate: () async throws -> Bool
     ) async throws {
@@ -86,8 +86,8 @@ final class HostEngineTests: XCTestCase {
         }
     }
 
-    private func pair(_ host: SyncEngine, _ joiner: SyncEngine) async throws {
-        try await wait("host ready to invite") { !host.canCancelPairing }
+    func pair(_ host: SyncEngine, _ joiner: SyncEngine) async throws {
+        try await wait("host ready to invite") { !host.canCancelPairing && !host.awaitsReservationsForTesting }
         host.createPrivateSync()
         try await wait("invitation") { host.invitationURL != nil }
         joiner.joinPrivateSync(url: try XCTUnwrap(host.invitationURL))
@@ -96,30 +96,34 @@ final class HostEngineTests: XCTestCase {
         try await wait("paired") { host.isPaired && joiner.isPaired && !host.canCancelPairing }
     }
 
-    private func fingerprint(_ engine: SyncEngine) async throws -> Data {
+    func fingerprint(_ engine: SyncEngine) async throws -> Data {
         try await XCTUnwrapAsync(await engine.mlsSessionForTesting?.fingerprint())
     }
 
-    private func authorization(_ engine: SyncEngine) async throws -> Data {
+    func authorization(_ engine: SyncEngine) async throws -> Data {
         try await XCTUnwrapAsync(engine.mlsSessionForTesting).client.transportAuthorization()
     }
 
-    private func store(_ engine: SyncEngine) throws -> HostJournalStore {
+    func store(_ engine: SyncEngine) throws -> HostJournalStore {
         guard let journal = engine.hostJournal else { throw HostEngineError.journalUnbound }
         return journal
     }
 
-    private func enroll(_ engine: SyncEngine, _ name: String) throws {
+    func enroll(_ engine: SyncEngine, _ name: String) throws {
         let journal = try store(engine)
         if let stored = provenances[name] {
-            provenances[name] = try journal.resume(stored)
+            provenances[name] = try journal.resume(HostJournalProvenance(
+                journalID: stored.journalID, enrollmentID: stored.enrollmentID,
+                appliedThrough: max(stored.appliedThrough, journal.view.appliedThrough),
+                capturedThrough: captured[name] ?? stored.capturedThrough
+            ))
         } else {
             provenances[name] = try journal.resume(try journal.enroll())
         }
     }
 
     @discardableResult
-    private func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) throws -> [JournalRecordID] {
+    func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) throws -> [JournalRecordID] {
         captured[name, default: 0] += UInt64(payloads.count)
         return try store(engine).submit(
             payloads.map { HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data($0.utf8)) },
@@ -127,12 +131,12 @@ final class HostEngineTests: XCTestCase {
         )
     }
 
-    private func ready(_ engine: SyncEngine, _ name: String) throws {
+    func ready(_ engine: SyncEngine, _ name: String) throws {
         try store(engine).declareReady(capturedThrough: captured[name, default: 0])
     }
 
     @discardableResult
-    private func applyAll(_ engine: SyncEngine, _ name: String) throws -> [Data] {
+    func applyAll(_ engine: SyncEngine, _ name: String) throws -> [Data] {
         let journal = try store(engine)
         var payloads: [Data] = []
         while true {
@@ -143,11 +147,11 @@ final class HostEngineTests: XCTestCase {
         }
     }
 
-    private func send(_ message: HostJournalMessage, from session: MLSSession) async throws {
+    func send(_ message: HostJournalMessage, from session: MLSSession) async throws {
         guard case .accepted = try await session.send(message.encoded()) else { throw CancellationError() }
     }
 
-    private func inboxMessages(_ engine: SyncEngine) async throws -> [HostJournalMessage] {
+    func inboxMessages(_ engine: SyncEngine) async throws -> [HostJournalMessage] {
         let session = try XCTUnwrap(engine.mlsSessionForTesting)
         _ = try await session.synchronize()
         return try await session.inbox().compactMap { try? HostJournalMessage.decode($0.plaintext) }
@@ -155,7 +159,7 @@ final class HostEngineTests: XCTestCase {
 
     /// Links `a` and `b`; `a` enrolls, submits and declares ready, `b`
     /// enrolls and applies its completed history.
-    private func completedPair(
+    func completedPair(
         _ a: String = "a", _ b: String = "b", records: [String] = ["one", "two", "three"], limits: HostJournalLimits = .standard
     ) async throws -> (SyncEngine, SyncEngine) {
         let first = engine(a)
@@ -671,7 +675,7 @@ final class HostEngineTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func setUpRootForStep() {
+    func setUpRootForStep() {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         relay = FakeMLSRelay()
         rendezvous = FakePairingRendezvous()
@@ -680,7 +684,7 @@ final class HostEngineTests: XCTestCase {
         captured = [:]
     }
 
-    private static func tree(_ url: URL) throws -> [String: Data] {
+    static func tree(_ url: URL) throws -> [String: Data] {
         var result: [String: Data] = [:]
         guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey]) else { return result }
         for case let file as URL in enumerator where (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
@@ -689,7 +693,7 @@ final class HostEngineTests: XCTestCase {
         return result
     }
 
-    private static func journalFiles(_ url: URL) throws -> [String] {
+    static func journalFiles(_ url: URL) throws -> [String] {
         try FileManager.default.contentsOfDirectory(atPath: url.path).filter { $0.hasPrefix(HostJournalStore.filePrefix) }
     }
 }

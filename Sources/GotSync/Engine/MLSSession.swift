@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 import GotSyncMLS
 
 struct SecretStoreMLSStateKey: MLSStateKeyProvider {
@@ -37,6 +38,13 @@ enum MLSSessionError: Error, Equatable {
     case profileMismatch
 }
 
+struct MLSOperationCount: Equatable, Sendable {
+    var started: UInt64 = 0
+    var finished: UInt64 = 0
+
+    var isIdle: Bool { started == finished }
+}
+
 actor MLSSession {
     static let directoryName = "mls-v2"
     private static let maximumSubmitAttempts = 8
@@ -50,6 +58,7 @@ actor MLSSession {
     /// session.
     private var conditionalAppendSupported: Bool?
     private var tail: Task<Void, Never>?
+    private let operations = OSAllocatedUnfairLock(initialState: MLSOperationCount())
 
     init(
         directory: URL,
@@ -83,6 +92,11 @@ actor MLSSession {
         }
         try secretStore.delete(account: keyAccount)
     }
+
+    /// Operations that may fetch or process relay entries, counted when
+    /// they are queued and when they end. An owner that saw the inbox while
+    /// none ran knows it is unchanged for as long as this count is.
+    nonisolated var operationCount: MLSOperationCount { operations.withLock { $0 } }
 
     func fingerprint() async throws -> Data { try await client.fingerprint() }
     func group() async throws -> Data? { try await client.group() }
@@ -447,7 +461,9 @@ actor MLSSession {
         _ operation: @escaping @Sendable (isolated MLSSession) async throws -> T
     ) async throws -> T {
         let previous = tail
+        operations.withLock { $0.started &+= 1 }
         let task = Task {
+            defer { self.operations.withLock { $0.finished &+= 1 } }
             _ = await previous?.result
             return try await operation(self)
         }
