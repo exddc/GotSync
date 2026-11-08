@@ -1561,6 +1561,64 @@ def test_new_store_creation_requires_capacity_and_old_stores_open_preserved(harn
         store.want(ROUTE, [b"w" * 32])
 
 
+@pytest.mark.parametrize("pages", [2, 14])
+def test_fresh_schema_cannot_exceed_its_metadata_ceiling(tmp_path, monkeypatch, pages):
+    ceilings = []
+    connect = sqlite3.connect
+
+    class CreationConnection(sqlite3.Connection):
+        def executescript(self, script):
+            ceilings.append(self.execute("PRAGMA max_page_count").fetchone()[0])
+            return super().executescript(script)
+
+    def creation_connect(database, *args, **kwargs):
+        if str(database).endswith(".creating"):
+            kwargs["factory"] = CreationConnection
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", creation_connect)
+    limits = BlobLimits(metadata_database_bytes=pages * PAGE, metadata_emergency_bytes=PAGE,
+                        max_physical_bytes=metadata_reservation(pages), disk_reserve_bytes=0)
+    database = tmp_path / "blobs.sqlite3"
+    with pytest.raises(BlobStoreCapacity):
+        BlobStore(database, tmp_path / "blobs", limits=limits)
+    assert ceilings == [pages]
+    assert not database.exists()
+    assert list(tmp_path.iterdir()) == []
+    BlobStore(database, tmp_path / "blobs").close()
+
+
+def test_fresh_creation_full_after_schema_does_not_publish(tmp_path, monkeypatch):
+    connections = []
+    connect = sqlite3.connect
+
+    class FullInitialRow(sqlite3.Connection):
+        def execute(self, statement, parameters=()):
+            if statement.startswith("INSERT INTO blob_usage"):
+                error = sqlite3.OperationalError("database or disk is full")
+                error.sqlite_errorcode = sqlite3.SQLITE_FULL
+                raise error
+            return super().execute(statement, parameters)
+
+        def close(self):
+            super().close()
+            connections.append("closed")
+
+    def creation_connect(database, *args, **kwargs):
+        if str(database).endswith(".creating"):
+            kwargs["factory"] = FullInitialRow
+        return connect(database, *args, **kwargs)
+
+    database = tmp_path / "blobs.sqlite3"
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", creation_connect)
+        with pytest.raises(BlobStoreCapacity):
+            BlobStore(database, tmp_path / "blobs")
+    assert connections == ["closed"]
+    assert list(tmp_path.iterdir()) == []
+    BlobStore(database, tmp_path / "blobs").close()
+
+
 def test_connection_settings_and_sqlite_build_are_verified(harness, tmp_path, monkeypatch):
     store = harness.open()
     with store._lock:

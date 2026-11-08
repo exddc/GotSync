@@ -532,10 +532,7 @@ class BlobStore:
             if recovered:
                 self._inspect(db)
                 self.startup.recovered_journal = True
-            for pragma in ("journal_mode=DELETE", "synchronous=FULL", "fullfsync=ON", "secure_delete=ON",
-                           "foreign_keys=OFF", "cache_spill=OFF", "temp_store=MEMORY"):
-                db.execute(f"PRAGMA {pragma}")
-            self._verify_settings(db)
+            self._configure_database(db)
         except sqlite3.Error as error:
             db.close()
             raise BlobStoreCorrupt(f"blob database unreadable: {error}") from error
@@ -564,26 +561,41 @@ class BlobStore:
         if [row[1] for row in db.execute("PRAGMA database_list")] != ["main"]:
             raise BlobStoreUnsupported("blob database connection has attached databases")
 
-    @staticmethod
-    def _create_database(path: Path) -> None:
+    def _configure_database(self, db: sqlite3.Connection) -> None:
+        for pragma in ("journal_mode=DELETE", "synchronous=FULL", "fullfsync=ON", "secure_delete=ON",
+                       "foreign_keys=OFF", "cache_spill=OFF", "temp_store=MEMORY"):
+            db.execute(f"PRAGMA {pragma}")
+        self._verify_settings(db)
+
+    def _create_database(self, path: Path) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         staging = Path(f"{path}.creating")
         for leftover in (staging, Path(f"{staging}-journal")):
             if leftover.is_symlink() or leftover.exists():
                 leftover.unlink()
         os.close(os.open(staging, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600))
-        db = sqlite3.connect(staging, isolation_level=None)
         try:
-            db.execute(f"PRAGMA page_size = {PAGE_BYTES}")
-            db.execute("PRAGMA temp_store=MEMORY")
-            db.execute("PRAGMA journal_mode=DELETE")
-            db.execute("PRAGMA synchronous=FULL")
-            db.executescript(SCHEMA)
-            db.execute("INSERT INTO blob_usage VALUES (?, 0, 0, 0)", (GLOBAL_SCOPE,))
-            db.execute(f"PRAGMA application_id = {APPLICATION_ID}")
-            db.execute(f"PRAGMA user_version = {FORMAT_VERSION}")
-        finally:
-            db.close()
+            db = sqlite3.connect(staging, isolation_level=None)
+            try:
+                db.execute(f"PRAGMA page_size = {PAGE_BYTES}")
+                pages = self.limits.metadata_database_bytes // PAGE_BYTES
+                if db.execute(f"PRAGMA max_page_count = {pages}").fetchone()[0] != pages:
+                    raise BlobStoreCapacity("fresh blob metadata ceiling unavailable")
+                self._configure_database(db)
+                db.executescript(SCHEMA)
+                db.execute("INSERT INTO blob_usage VALUES (?, 0, 0, 0)", (GLOBAL_SCOPE,))
+                db.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+                db.execute(f"PRAGMA user_version = {FORMAT_VERSION}")
+                if db.execute("PRAGMA page_count").fetchone()[0] > pages:
+                    raise BlobStoreCapacity("fresh blob metadata ceiling exceeded")
+            finally:
+                db.close()
+        except BaseException as error:
+            for leftover in (staging, Path(f"{staging}-journal")):
+                leftover.unlink(missing_ok=True)
+            if isinstance(error, sqlite3.Error) and _full(error):
+                raise BlobStoreCapacity("fresh blob metadata ceiling reached") from error
+            raise
         descriptor = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW)
         try:
             os.fsync(descriptor)
