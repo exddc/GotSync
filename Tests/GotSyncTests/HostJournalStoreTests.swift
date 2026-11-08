@@ -62,11 +62,11 @@ final class HostJournalStoreTests: XCTestCase {
         let (store, _) = try enrolled()
         let url = store.url
         _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 3), cursor: 1)])
-        try JournalFixture.tamper(url, "PRAGMA user_version = 2")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 3")
         let unsupported = try JournalFixture.fileHash(url)
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(2)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(3)) }
         XCTAssertEqual(try JournalFixture.fileHash(url), unsupported)
-        try JournalFixture.tamper(url, "PRAGMA user_version = 1")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 2")
 
         for damage in [
             "UPDATE records SET envelope = randomblob(length(envelope)) WHERE position = 2",
@@ -89,10 +89,10 @@ final class HostJournalStoreTests: XCTestCase {
 
     func testUnsupportedWALStoreIsPreservedExactly() throws {
         let url = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 3, count: 16))
-        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=2", create: true)
+        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=3", create: true)
         let before = JournalFixture.storedState(url)
         XCTAssertEqual(Array(try XCTUnwrap(before[""])[18...19]), [2, 2])
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(2)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(3)) }
         XCTAssertEqual(JournalFixture.storedState(url), before)
     }
 

@@ -109,6 +109,14 @@ actor MLSSession {
         try await client.acknowledgeInbox(through: cursor)
     }
 
+    /// Stops keeping application plaintext for the rest of this session's
+    /// life, including a later departure from its slot.
+    func setControlOnly() async throws {
+        try await exclusive { session in try await session.client.setControlOnly() }
+    }
+
+    func isControlOnly() async throws -> Bool { try await client.isControlOnly() }
+
     func publishKeyPackage(pairingToken: Data, profile: Data?) async throws -> MLSPublishedKeyPackage {
         guard pairingToken.count == 32 else { throw MLSRelayError.invalidRequest }
         return try await exclusive { session in

@@ -193,3 +193,67 @@ final class TaskReplicationAdapter {
         self.replica = replica
     }
 }
+
+extension TaskReplicationAdapter: ReplicationData {
+    var ownOrigin: ReplicaDeviceID? { localOrigin }
+    var helloVector: ReplicaVersionVector { versionVector }
+    var retriesHeldWithoutMessages: Bool { retriesDeferredOperationsWithoutMessages }
+
+    func encode(_ control: ReplicationMessage) throws -> Data {
+        try control.encoded()
+    }
+
+    func decode(_ plaintext: Data) -> (control: ReplicationMessage?, decoded: ReplicationDecoded) {
+        guard let message = try? ReplicationMessage.decode(plaintext) else {
+            return (nil, .undecodable)
+        }
+        if message.kind == .operations {
+            return (nil, .taskOperations(message.operations ?? []))
+        }
+        return (message, .control)
+    }
+
+    /// The demo skips messages it cannot decode, as it always has.
+    func committedOrigins(in decoded: ReplicationDecoded, control: ReplicationMessage?) -> Set<ReplicaDeviceID>? {
+        if case .taskOperations(let operations) = decoded {
+            return Set(operations.map(\.originDeviceID))
+        }
+        return Set(control?.vector?.origins ?? [])
+    }
+
+    func verify(_ window: [ReplicationWindowItem]) throws {}
+
+    func chunks(of window: [ReplicationWindowItem]) -> [Range<Int>] {
+        [window.indices]
+    }
+
+    func intake(_ chunk: [ReplicationWindowItem]) throws -> ReplicationChunkIntake {
+        let arrivals = chunk.map { item -> [TaskOperation] in
+            guard !item.fromSelf, case .taskOperations(let operations) = item.decoded else { return [] }
+            return operations
+        }
+        let result = try intake(arrivals)
+        return ReplicationChunkIntake(
+            heldMessages: result.heldArrivals,
+            accepted: result.accepted,
+            requestsHello: (!result.waiting.isEmpty && result.heldArrivals > 0) || result.resumedDeferred
+        )
+    }
+
+    func reply(for obligation: ReplyObligation, uploadedThrough: UInt64) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
+        guard let batch = try OperationBatcher.batches(replyOperations(for: obligation, uploadedThrough: uploadedThrough)).first else {
+            return nil
+        }
+        return (try ReplicationMessage.operations(batch).encoded(), batch.map { ($0.originDeviceID, $0.originSequence) })
+    }
+
+    func joinAnnouncement() throws -> (vector: ReplicaVersionVector, messages: [Data]) {
+        let (vector, operations) = announcement
+        return (vector, try OperationBatcher.batches(operations).map { try ReplicationMessage.operations($0).encoded() })
+    }
+
+    func upload(after uploadedThrough: UInt64) throws -> (plaintext: Data, last: UInt64) {
+        let (batch, last) = try uploadBatch(after: uploadedThrough)
+        return (try ReplicationMessage.operations(batch).encoded(), last.originSequence)
+    }
+}
