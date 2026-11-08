@@ -23,7 +23,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import Executor
+from concurrent.futures import Executor, Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -272,11 +272,12 @@ class BlobFiles:
             os.close(directory)
 
     def status(self, file: str) -> tuple[str, int] | None:
-        """`("file", size)`, `("link", 0)` or `("other", 0)` for the entry at `route/name`; None when absent."""
+        """`("file", size)`, `("link", 0)` or `("other", 0)` for a `route/name` or `tmp/name` entry; None when absent."""
         self._unlocked()
         directory_name, name = _split(file)
+        temporary = directory_name == TEMP_DIRECTORY
         try:
-            directory = self._route_directory(directory_name, create=False)
+            directory = self._temp if temporary else self._route_directory(directory_name, create=False)
         except OSError:
             return None
         try:
@@ -284,7 +285,8 @@ class BlobFiles:
         except FileNotFoundError:
             return None
         finally:
-            os.close(directory)
+            if not temporary:
+                os.close(directory)
         if stat.S_ISREG(status.st_mode):
             return "file", status.st_size
         return ("link" if stat.S_ISLNK(status.st_mode) else "other"), 0
@@ -1052,24 +1054,27 @@ class BlobStore:
         return len(done), failed
 
     def _reconcile(self) -> None:
-        """Startup: clear temporaries, doom damaged rows and canonical orphans at their actual size, rebuild.
+        """Startup: inspect every owned path first, then clear temporaries, doom and recount at actual size, rebuild.
 
-        Every store-owned byte found on disk is recorded in `blob_doomed` before any unlink, so an unlink that
-        fails keeps counting until a later cleanup succeeds. A canonical part path that is neither a regular
-        file nor a link fails the open before any metadata or part file changes.
+        Every store-owned byte found on disk is recorded in `blob_doomed` at its actual size before any unlink,
+        so an unlink that fails keeps counting until a later cleanup succeeds. A part, doomed or canonical path
+        that is neither a regular file nor a link fails the open before any metadata or file changes.
         """
         report = self.startup
-        report.temporary_removed, unexpected = self._files.clear_temp()
-        report.unexpected += unexpected
         with self._lock:
             parts = self._db.execute("SELECT route, object, idx, file, size FROM blob_parts").fetchall()
-            referenced = {row[3] for row in parts}
-            referenced.update(row[0] for row in self._db.execute("SELECT file FROM blob_doomed"))
+            doomed = self._db.execute("SELECT file, size FROM blob_doomed").fetchall()
+        referenced = {row[3] for row in parts} | {file for file, _ in doomed}
         damaged = []
         for route, object_, index, file, size in parts:
             status = self._files.status(file)
             if status != ("file", size):
                 damaged.append((route, object_, index, file, _owned_bytes(file, status)))
+        recount = []
+        for file, size in doomed:
+            actual = _owned_bytes(file, self._files.status(file))
+            if actual != size:
+                recount.append((actual, file))
         orphans = []
         for directory, name in self._files.scan():
             file = f"{directory}/{name}"
@@ -1077,10 +1082,15 @@ class BlobStore:
                 report.unexpected.append(file.lstrip("/"))
             elif file not in referenced:
                 orphans.append((file, _owned_bytes(file, self._files.status(file))))
+        report.temporary_removed, unexpected = self._files.clear_temp()
+        report.unexpected += unexpected
         batch = self.limits.cleanup_batch
         for start in range(0, len(damaged), batch):
             with self._lock, self._transaction() as db:
                 self._drop_rows(db, damaged[start:start + batch], self._clock())
+        for start in range(0, len(recount), batch):
+            with self._lock, self._transaction() as db:
+                db.executemany("UPDATE blob_doomed SET size=? WHERE file=?", recount[start:start + batch])
         for start in range(0, len(orphans), batch):
             with self._lock, self._transaction() as db:
                 db.executemany("INSERT OR IGNORE INTO blob_doomed VALUES (?, ?)", orphans[start:start + batch])
@@ -1100,68 +1110,162 @@ class BlobStore:
         self._db.close()
 
 
+class _Handoff:
+    """Entry gate for one submitted blob job.
+
+    The state moves once, under `_lock`, from `pending` to `entered` (the submitted function took the work) or
+    to `closed` (it never will). Only winning `pending -> closed` proves non-entry and allows settling here;
+    entered work settles itself after it returns. Settling disposes an unstarted ticket and calls `on_return`
+    at most once. A failing `on_return` is reported to the loop's exception handler and changes nothing else.
+    """
+
+    def __init__(self, store: BlobStore, ticket: BlobTicket, work: Callable[[], Any],
+                 on_return: Callable[[], None] | None, loop: asyncio.AbstractEventLoop) -> None:
+        self._lock = threading.Lock()
+        self._state = "pending"
+        self._settled = False
+        self._work: Callable[[], Any] | None = work
+        self._store: BlobStore | None = store
+        self._ticket: BlobTicket | None = ticket
+        self._on_return = on_return
+        self._loop = loop
+        self.done: asyncio.Future[Any] = loop.create_future()
+        self.done.add_done_callback(lambda done: done.cancelled() or done.exception())
+
+    def run(self) -> None:
+        with self._lock:
+            if self._state != "pending":
+                return
+            self._state = "entered"
+            work, self._work = self._work, None
+        result: Any = None
+        error: BaseException | None = None
+        try:
+            result = work()
+        except BaseException as caught:
+            error = caught
+        finally:
+            del work
+            try:
+                self._settle(on_loop=False)
+            finally:
+                self._deliver(result, error)
+
+    def close(self) -> bool:
+        with self._lock:
+            if self._state != "pending":
+                return False
+            self._state = "closed"
+            self._work = None
+        return True
+
+    def close_and_settle(self, *, on_loop: bool, error: BaseException | None = None) -> bool:
+        if not self.close():
+            return False
+        try:
+            self._settle(on_loop=on_loop)
+        finally:
+            if error is not None:
+                self._deliver(None, error)
+        return True
+
+    def finished(self, future: Future[Any]) -> None:
+        """Executor future callback: a job that ended without entering is settled here."""
+        if future.cancelled():
+            error: BaseException = BlobCancelled()
+        else:
+            error = future.exception() or BlobCancelled()
+        self.close_and_settle(on_loop=False, error=error)
+
+    def _settle(self, *, on_loop: bool) -> None:
+        with self._lock:
+            if self._settled:
+                return
+            self._settled = True
+            store, ticket, on_return = self._store, self._ticket, self._on_return
+            self._store = self._ticket = self._on_return = None
+        try:
+            store._release_unstarted(ticket)
+        finally:
+            if on_return is not None:
+                self._call(on_return, on_loop=on_loop)
+
+    def _call(self, on_return: Callable[[], None], *, on_loop: bool) -> None:
+        loop = self._loop
+
+        def guarded() -> None:
+            try:
+                on_return()
+            except Exception as error:
+                if not loop.is_closed():
+                    loop.call_exception_handler({"message": "blob on_return failed", "exception": error})
+
+        if on_loop:
+            guarded()
+            return
+        try:
+            loop.call_soon_threadsafe(guarded)
+        except RuntimeError:
+            guarded()
+
+    def _deliver(self, result: Any, error: BaseException | None) -> None:
+        def publish() -> None:
+            if self.done.done():
+                return
+            if error is None:
+                self.done.set_result(result)
+            else:
+                self.done.set_exception(error)
+
+        try:
+            self._loop.call_soon_threadsafe(publish)
+        except RuntimeError:
+            pass
+
+
 async def run_blob_worker(
     store: BlobStore, ticket: BlobTicket, work: Callable[[], Any], *, executor: Executor, timeout: float,
     on_return: Callable[[], None] | None = None,
 ) -> Any:
     """Runs `work` for an admitted `ticket` on `executor` with a response deadline.
 
-    `work` must synchronously call exactly one of `put_part(ticket, ...)` or `get_part(ticket)`, which own the
-    ticket from their start until they return. Ownership of the ticket and the caller's permits passes:
+    `work` must synchronously call exactly one of `put_part(ticket, ...)` or `get_part(ticket)`. The call hands
+    `work`, the ticket and the caller's permits (`on_return`) to a `_Handoff` gate and keeps no other reference
+    to `work`. Outcomes:
 
-    - caller to this function at the call;
-    - to the executor once `submit` accepts the job (a rejected submission is settled here, before raising);
-    - to the queued job until it starts (a job cancelled while queued never runs and is settled by its
-      future's callback);
-    - to the running job, which settles after `work` returns or raises.
-
-    Settling happens exactly once: an unstarted ticket is disposed, then `on_return` is scheduled on the loop.
-    A deadline or task cancellation only cancels the ticket and tries to cancel the queued job; a job that is
-    already running keeps its files, reservation and the caller's permits until it returns.
+    - the job enters: it owns body, files, reservation and permits until `work` returns, then settles and
+      delivers its result, even when `submit` raised after queuing it;
+    - `submit` raises and the gate closes: no work can run; settled here, then the error is raised;
+    - the executor future ends without entry (cancelled, initializer failure): settled by its callback, and
+      the awaiter gets `BlobCancelled` or that exception;
+    - deadline or task cancellation: the ticket is cancelled and a still-pending job is closed and settled
+      at once; an entered job keeps everything until it returns.
     """
     loop = asyncio.get_running_loop()
-    once = threading.Lock()
-
-    def settle(*, on_loop: bool = False) -> None:
-        if not once.acquire(blocking=False):
-            return
-        store._release_unstarted(ticket)
-        if on_return is None:
-            return
-        if on_loop:
-            on_return()
-            return
-        try:
-            loop.call_soon_threadsafe(on_return)
-        except RuntimeError:
-            on_return()
-
-    def owned() -> Any:
-        try:
-            return work()
-        finally:
-            settle()
-
+    handoff = _Handoff(store, ticket, work, on_return, loop)
+    del work, on_return
+    submitted: Future[Any] | None
     try:
-        submitted = executor.submit(owned)
+        submitted = executor.submit(handoff.run)
     except BaseException:
-        settle(on_loop=True)
-        raise
-    submitted.add_done_callback(lambda done: done.cancelled() and settle())
-    future = asyncio.wrap_future(submitted, loop=loop)
-    future.add_done_callback(lambda done: done.cancelled() or done.exception())
+        if handoff.close_and_settle(on_loop=True):
+            raise
+        submitted = None
+    if submitted is not None:
+        submitted.add_done_callback(handoff.finished)
     try:
-        return await asyncio.wait_for(asyncio.shield(future), timeout)
+        return await asyncio.wait_for(asyncio.shield(handoff.done), timeout)
     except TimeoutError:
         store.cancel(ticket)
-        submitted.cancel()
+        handoff.close_and_settle(on_loop=True)
+        if submitted is not None:
+            submitted.cancel()
         raise BlobDeadline() from None
     except asyncio.CancelledError:
-        task = asyncio.current_task()
-        if submitted.cancelled() and not (task is not None and task.cancelling()):
-            raise BlobCancelled() from None
         store.cancel(ticket)
-        submitted.cancel()
+        handoff.close_and_settle(on_loop=True)
+        if submitted is not None:
+            submitted.cancel()
         raise
 
 
