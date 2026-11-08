@@ -579,8 +579,8 @@ def test_startup_reconciles_files_rows_and_ledgers(harness, tmp_path):
     (root / "notes.txt").write_text("operator file")
     store = harness.open()
     startup = store.startup
-    assert (startup.temporary_removed, startup.unreferenced_removed, startup.rows_dropped, startup.doomed_finished) == (
-        1, 1, 2, 3)
+    assert (startup.temporary_removed, startup.orphans_doomed, startup.rows_dropped, startup.doomed_finished) == (
+        1, 1, 2, 4)
     assert startup.unexpected == ["notes.txt"]
     assert (store.manifest(ROUTE, kept)["present"], store.manifest(ROUTE, kept)["complete"]) == ([0], False)
     assert store.manifest(ROUTE, lost)["present"] == []
@@ -588,6 +588,241 @@ def test_startup_reconciles_files_rows_and_ledgers(harness, tmp_path):
     expected = round_up(PART_BYTES)
     assert store.ledger()["committed"] == expected and store.ledger()["doomed"] == 0
     assert sorted(harness.stored_files()) == sorted(["notes.txt", next(n for n in files if kept.hex() + ".0." in n)])
+
+
+class RefuseUnlink(ProbeFiles):
+    def __init__(self, directory):
+        super().__init__(directory)
+        self.faults["unlink"] = lambda: PermissionError(errno.EPERM, "unlink refused")
+
+
+def test_orphans_that_cannot_be_unlinked_stay_owned_across_restarts(harness, tmp_path):
+    store = harness.open()
+    store.close()
+    route = tmp_path / "blobs" / ROUTE.hex()
+    route.mkdir()
+    orphan = route / f"{'ab' * 32}.0.{'00' * 8}"
+    orphan.write_bytes(b"x" * 17)
+    big = route / f"{'cd' * 32}.3.{'11' * 8}"
+    big.write_bytes(b"y" * (PART_BYTES + 5000))
+    for _ in range(2):
+        store = harness.open(files=RefuseUnlink)
+        assert store.startup.unexpected == []
+        assert store.startup.doomed_finished == 0
+        ledger = store.ledger()
+        assert (ledger["doomed"], ledger["doomedFiles"]) == (round_up(17) + round_up(PART_BYTES + 5000), 2)
+        object_, hashes, parts = make_object(17, b"new")
+        store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+        store.limits = BlobLimits(max_physical_bytes=ledger["database"] + ledger["doomed"] + round_up(17) - 1)
+        with pytest.raises(BlobCapacity):
+            store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+        store.limits = BlobLimits(doomed_max_files=1)
+        with pytest.raises(BlobCleanupBacklog):
+            store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+        store.limits = BlobLimits()
+        store.close()
+        assert orphan.exists() and big.exists()
+        harness.store = None
+    store = harness.open()
+    assert store.startup.orphans_doomed == 0 and store.startup.doomed_finished == 2
+    assert store.ledger()["doomed"] == 0 and not orphan.exists() and not big.exists()
+    store.close()
+    store = harness.open()
+    assert store.startup == type(store.startup)()
+    assert store.ledger()["doomed"] == 0
+
+
+def test_damaged_rows_are_doomed_at_their_actual_size(harness, tmp_path):
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"grown")
+    store.close()
+    path = tmp_path / "blobs" / harness.stored_files()[0]
+    path.write_bytes(b"z" * (PART_BYTES + 1))
+    store = harness.open(files=RefuseUnlink)
+    assert store.startup.rows_dropped == 1
+    assert store.ledger()["doomed"] == round_up(PART_BYTES + 1) and store.ledger()["committed"] == 0
+    store.close()
+    store = harness.open()
+    assert store.startup.doomed_finished == 1 and not path.exists()
+    del object_
+
+
+def test_canonical_part_paths_that_are_not_files_fail_the_open_unchanged(harness, tmp_path):
+    store = harness.open()
+    store.close()
+    route = tmp_path / "blobs" / ROUTE.hex()
+    route.mkdir()
+    (route / f"{'ab' * 32}.0.{'00' * 8}").mkdir()
+    link = route / f"{'cd' * 32}.0.{'11' * 8}"
+    link.symlink_to(tmp_path / "elsewhere")
+    before = (tmp_path / "blobs.sqlite3").read_bytes()
+    with pytest.raises(BlobStoreCorrupt):
+        harness.open()
+    assert (tmp_path / "blobs.sqlite3").read_bytes() == before and link.is_symlink()
+    (route / f"{'ab' * 32}.0.{'00' * 8}").rmdir()
+    store = harness.open()
+    assert store.startup.orphans_doomed == 1 and store.startup.doomed_finished == 1 and not link.is_symlink()
+
+
+def settle_counter():
+    calls = []
+    return calls, lambda: calls.append(threading.get_ident())
+
+
+def test_rejected_submission_settles_the_ticket_and_permits_once(harness):
+    store = harness.open()
+    object_, hashes, parts = make_object(17)
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    ticket = store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    pool.shutdown(wait=True)
+    calls, on_return = settle_counter()
+
+    async def main():
+        with pytest.raises(RuntimeError, match="after shutdown"):
+            await run_blob_worker(store, ticket, lambda: store.put_part(ticket, parts[0]), executor=pool, timeout=WAIT,
+                                  on_return=on_return)
+        assert len(calls) == 1
+        await asyncio.sleep(0)
+
+    asyncio.run(main())
+    assert len(calls) == 1 and ticket.state == "returned"
+    assert store.ledger()["outstanding"] == 0 and store.ledger()["liveTickets"] == 0
+    store.close()
+    harness.store = None
+
+
+def test_work_failing_before_the_store_operation_settles_once(harness):
+    store = harness.open()
+    object_, hashes, parts = make_object(17)
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    ticket = store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+    calls, on_return = settle_counter()
+
+    def work():
+        raise OSError(errno.EIO, "failed before put_part")
+
+    async def main():
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            with pytest.raises(OSError, match="before put_part"):
+                await run_blob_worker(store, ticket, work, executor=pool, timeout=WAIT, on_return=on_return)
+        await asyncio.sleep(0)
+
+    asyncio.run(main())
+    assert len(calls) == 1 and ticket.state == "returned"
+    assert store.ledger()["outstanding"] == 0 and store.ledger()["liveTickets"] == 0
+    with pytest.raises(RuntimeError):
+        store.put_part(ticket, parts[0])
+    assert store.admit_put(ROUTE, object_, 0, 17, writer=WRITER).reservation == round_up(17)
+
+
+@pytest.mark.parametrize("cancel_by", ["deadline", "shutdown"])
+def test_queued_job_cancelled_before_it_runs_settles_immediately(harness, cancel_by):
+    store = harness.open()
+    object_, hashes, parts = make_object(17)
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    ticket = store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+    calls, on_return = settle_counter()
+    blocker_started, blocker_release = threading.Event(), threading.Event()
+    ran = []
+
+    def work():
+        ran.append(True)
+        return store.put_part(ticket, parts[0])
+
+    async def main():
+        pool = concurrent.futures.ThreadPoolExecutor(1)
+        blocker = pool.submit(lambda: (blocker_started.set(), blocker_release.wait(WAIT)))
+        assert await asyncio.to_thread(blocker_started.wait, WAIT)
+        if cancel_by == "deadline":
+            with pytest.raises(BlobDeadline):
+                await run_blob_worker(store, ticket, work, executor=pool, timeout=0.05, on_return=on_return)
+        else:
+            task = asyncio.ensure_future(
+                run_blob_worker(store, ticket, work, executor=pool, timeout=WAIT, on_return=on_return))
+            await asyncio.sleep(0)
+            pool.shutdown(wait=False, cancel_futures=True)
+            with pytest.raises(BlobCancelled):
+                await task
+        await asyncio.sleep(0)
+        settled = len(calls), store.ledger(), blocker.done()
+        blocker_release.set()
+        await asyncio.to_thread(pool.shutdown, wait=True)
+        return settled
+
+    (count, ledger, blocker_done) = asyncio.run(main())
+    assert count == 1 and not blocker_done
+    assert ledger["outstanding"] == 0 and ledger["liveTickets"] == 0
+    assert ran == [] and len(calls) == 1 and ticket.state == "returned"
+    assert "write_temp" not in harness.files.calls
+
+
+def test_settlement_stays_single_with_a_nonconforming_executor(harness):
+    class RunsThenReportsCancelled(concurrent.futures.Executor):
+        def submit(self, fn, /, *args, **kwargs):
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                pass
+            future = concurrent.futures.Future()
+            future.cancel()
+            return future
+
+    store = harness.open()
+    object_, hashes, parts = make_object(17)
+    store.begin(ROUTE, object_, 17, hashes, writer=WRITER)
+    ticket = store.admit_put(ROUTE, object_, 0, 17, writer=WRITER)
+    calls, on_return = settle_counter()
+
+    async def main():
+        with pytest.raises(BlobCancelled):
+            await run_blob_worker(store, ticket, lambda: store.put_part(ticket, parts[0]),
+                                  executor=RunsThenReportsCancelled(), timeout=WAIT, on_return=on_return)
+        await asyncio.sleep(0)
+
+    asyncio.run(main())
+    assert len(calls) == 1 and store.ledger()["outstanding"] == 0 and store.ledger()["liveTickets"] == 0
+
+
+def test_cancelled_get_keeps_retention_and_permits_until_return(harness, tmp_path):
+    store = harness.open()
+    object_, *_ = harness.upload(17, b"get")
+    store.release(ROUTE, [object_])
+
+    def retention():
+        with sqlite3.connect(tmp_path / "blobs.sqlite3") as db:
+            return db.execute("SELECT touched_at, expires_at, released FROM blob_objects").fetchone()
+
+    before = retention()
+    harness.clock.now += 3600
+    ticket = store.admit_get(ROUTE, object_, 0)
+    entered, release = harness.files.pause("read")
+    outcome = []
+
+    def work():
+        try:
+            return store.get_part(ticket)
+        except BlobCancelled:
+            outcome.append("cancelled")
+            raise
+
+    async def interrupt(task):
+        assert await asyncio.to_thread(entered.wait, WAIT)
+        task.cancel()
+
+    (during, returned_during, state), returned = await_worker(
+        store, ticket, work, timeout=WAIT, interrupt=interrupt)(release.set)
+    assert state == "cancelled" and returned_during == [] and during["liveTickets"] == 1
+    assert outcome == ["cancelled"] and returned == [True] and ticket.state == "returned"
+    assert retention() == before and store.ledger()["liveTickets"] == 0
+
+    async def normal():
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            fresh = store.admit_get(ROUTE, object_, 0)
+            return await run_blob_worker(store, fresh, lambda: store.get_part(fresh), executor=pool, timeout=WAIT)
+
+    assert len(asyncio.run(normal())) == 17
+    assert retention() == (harness.clock.now, harness.clock.now + 30 * DAY, 0)
 
 
 def child(tmp_path, body):

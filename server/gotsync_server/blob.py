@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import quote
 
-from .blob_format import ID_BYTES, PART_BYTES, Manifest, identifier
+from .blob_format import ID_BYTES, Manifest, identifier
 from .http import RequestError
 
 FORMAT_VERSION = 1
@@ -271,8 +271,8 @@ class BlobFiles:
         finally:
             os.close(directory)
 
-    def size(self, file: str) -> int | None:
-        """Size of a regular file at `route/name`, else None."""
+    def status(self, file: str) -> tuple[str, int] | None:
+        """`("file", size)`, `("link", 0)` or `("other", 0)` for the entry at `route/name`; None when absent."""
         self._unlocked()
         directory_name, name = _split(file)
         try:
@@ -285,7 +285,9 @@ class BlobFiles:
             return None
         finally:
             os.close(directory)
-        return status.st_size if stat.S_ISREG(status.st_mode) else None
+        if stat.S_ISREG(status.st_mode):
+            return "file", status.st_size
+        return ("link" if stat.S_ISLNK(status.st_mode) else "other"), 0
 
     def clear_temp(self) -> tuple[int, list[str]]:
         self._unlocked()
@@ -414,8 +416,8 @@ class ExpiryReport:
 class StartupReport:
     recovered_journal: bool = False
     temporary_removed: int = 0
-    unreferenced_removed: int = 0
     rows_dropped: int = 0
+    orphans_doomed: int = 0
     doomed_finished: int = 0
     unexpected: list[str] = field(default_factory=list)
 
@@ -811,11 +813,15 @@ class BlobStore:
             _, name = _split(ticket.file)
             data = self._files.read(ticket.route.hex(), name, ticket.size)
             if data is None or len(data) != ticket.size or hashlib.sha256(data).digest() != ticket.part_hash:
-                if self._drop_part(ticket.route, ticket.object, ticket.index, ticket.file):
-                    self._unlink_doomed([(ticket.file, ticket.size)])
+                status = self._files.status(ticket.file)
+                owned = ticket.size if status is not None and status[0] == "other" else _owned_bytes(ticket.file, status)
+                if self._drop_part(ticket.route, ticket.object, ticket.index, ticket.file, owned):
+                    self._unlink_doomed([(ticket.file, owned)])
                 raise BlobPartMissing("blob part missing")
             now = self._clock()
             with self._lock:
+                if ticket.state == "cancelled":
+                    raise BlobCancelled()
                 row = self._db.execute("SELECT complete, touched_at, released FROM blob_objects WHERE route=? AND object=?",
                                        (ticket.route, ticket.object)).fetchone()
                 if row is not None and row[0] and (row[2] or now - row[1] >= self.limits.touch_resolution_seconds):
@@ -836,12 +842,18 @@ class BlobStore:
 
     def abandon(self, ticket: BlobTicket) -> None:
         """Releases a ticket whose worker never started, such as after a failed body read."""
+        if not self._release_unstarted(ticket):
+            raise RuntimeError("ticket worker already started")
+
+    def _release_unstarted(self, ticket: BlobTicket) -> bool:
+        """Disposes `ticket` if no store worker ever started it. The caller guarantees none can start later."""
         with self._lock:
-            if ticket.started or ticket.state == "returned":
-                raise RuntimeError("ticket worker already started")
+            if ticket.started:
+                return False
             ticket.started = True
             ticket.state = "cancelled"
         self._dispose(ticket)
+        return True
 
     def cancel_all(self) -> None:
         with self._lock:
@@ -909,8 +921,8 @@ class BlobStore:
                                (route, object_, index)).fetchone()
         return row[0] if row else None
 
-    def _drop_part(self, route: bytes, object_: bytes, index: int, file: str) -> bool:
-        """Moves a damaged part row to the doomed ledger. True when the caller now owns its unlink."""
+    def _drop_part(self, route: bytes, object_: bytes, index: int, file: str, owned: int) -> bool:
+        """Moves a damaged part row to the doomed ledger at `owned` bytes. True when the caller now owns its unlink."""
         now = self._clock()
         with self._lock:
             row = self._db.execute("SELECT size FROM blob_parts WHERE route=? AND object=? AND idx=? AND file=?",
@@ -918,9 +930,9 @@ class BlobStore:
             if row is None:
                 return False
             with self._transaction() as db:
-                self._drop_rows(db, [(route, object_, index, file, row[0])], now)
+                self._drop_rows(db, [(route, object_, index, file, owned)], now)
             self._committed -= round_up(row[0])
-            self._doomed += round_up(row[0])
+            self._doomed += round_up(owned)
             self._doomed_files += 1
             if file in self._cleaning:
                 return False
@@ -1040,6 +1052,12 @@ class BlobStore:
         return len(done), failed
 
     def _reconcile(self) -> None:
+        """Startup: clear temporaries, doom damaged rows and canonical orphans at their actual size, rebuild.
+
+        Every store-owned byte found on disk is recorded in `blob_doomed` before any unlink, so an unlink that
+        fails keeps counting until a later cleanup succeeds. A canonical part path that is neither a regular
+        file nor a link fails the open before any metadata or part file changes.
+        """
         report = self.startup
         report.temporary_removed, unexpected = self._files.clear_temp()
         report.unexpected += unexpected
@@ -1047,24 +1065,26 @@ class BlobStore:
             parts = self._db.execute("SELECT route, object, idx, file, size FROM blob_parts").fetchall()
             referenced = {row[3] for row in parts}
             referenced.update(row[0] for row in self._db.execute("SELECT file FROM blob_doomed"))
-        damaged = [row for row in parts if self._files.size(row[3]) != row[4]]
+        damaged = []
+        for route, object_, index, file, size in parts:
+            status = self._files.status(file)
+            if status != ("file", size):
+                damaged.append((route, object_, index, file, _owned_bytes(file, status)))
+        orphans = []
+        for directory, name in self._files.scan():
+            file = f"{directory}/{name}"
+            if not directory or not _PART_NAME.fullmatch(name):
+                report.unexpected.append(file.lstrip("/"))
+            elif file not in referenced:
+                orphans.append((file, _owned_bytes(file, self._files.status(file))))
         batch = self.limits.cleanup_batch
         for start in range(0, len(damaged), batch):
             with self._lock, self._transaction() as db:
                 self._drop_rows(db, damaged[start:start + batch], self._clock())
-        report.rows_dropped = len(damaged)
-        for directory, name in self._files.scan():
-            file = f"{directory}/{name}"
-            if not directory or not _PART_NAME.fullmatch(name) or file in referenced:
-                if not directory or not _PART_NAME.fullmatch(name):
-                    report.unexpected.append(file.lstrip("/"))
-                continue
-            try:
-                self._files.unlink(file)
-            except OSError:
-                report.unexpected.append(file)
-            else:
-                report.unreferenced_removed += 1
+        for start in range(0, len(orphans), batch):
+            with self._lock, self._transaction() as db:
+                db.executemany("INSERT OR IGNORE INTO blob_doomed VALUES (?, ?)", orphans[start:start + batch])
+        report.rows_dropped, report.orphans_doomed = len(damaged), len(orphans)
         with self._lock:
             self._committed = sum(round_up(row[0]) for row in self._db.execute("SELECT size FROM blob_parts"))
             doomed = self._db.execute("SELECT size FROM blob_doomed").fetchall()
@@ -1084,35 +1104,73 @@ async def run_blob_worker(
     store: BlobStore, ticket: BlobTicket, work: Callable[[], Any], *, executor: Executor, timeout: float,
     on_return: Callable[[], None] | None = None,
 ) -> Any:
-    """Runs `work` for `ticket` on `executor` with a response deadline.
+    """Runs `work` for an admitted `ticket` on `executor` with a response deadline.
 
-    The deadline or task cancellation only cancels the ticket. The ticket's
-    files and reservation are released by the worker itself, and `on_return`
-    (for the caller's permits) is scheduled on the loop only after the
-    executor function has returned.
+    `work` must synchronously call exactly one of `put_part(ticket, ...)` or `get_part(ticket)`, which own the
+    ticket from their start until they return. Ownership of the ticket and the caller's permits passes:
+
+    - caller to this function at the call;
+    - to the executor once `submit` accepts the job (a rejected submission is settled here, before raising);
+    - to the queued job until it starts (a job cancelled while queued never runs and is settled by its
+      future's callback);
+    - to the running job, which settles after `work` returns or raises.
+
+    Settling happens exactly once: an unstarted ticket is disposed, then `on_return` is scheduled on the loop.
+    A deadline or task cancellation only cancels the ticket and tries to cancel the queued job; a job that is
+    already running keeps its files, reservation and the caller's permits until it returns.
     """
     loop = asyncio.get_running_loop()
+    once = threading.Lock()
+
+    def settle(*, on_loop: bool = False) -> None:
+        if not once.acquire(blocking=False):
+            return
+        store._release_unstarted(ticket)
+        if on_return is None:
+            return
+        if on_loop:
+            on_return()
+            return
+        try:
+            loop.call_soon_threadsafe(on_return)
+        except RuntimeError:
+            on_return()
 
     def owned() -> Any:
         try:
             return work()
         finally:
-            if on_return is not None:
-                try:
-                    loop.call_soon_threadsafe(on_return)
-                except RuntimeError:
-                    on_return()
+            settle()
 
-    future = loop.run_in_executor(executor, owned)
+    try:
+        submitted = executor.submit(owned)
+    except BaseException:
+        settle(on_loop=True)
+        raise
+    submitted.add_done_callback(lambda done: done.cancelled() and settle())
+    future = asyncio.wrap_future(submitted, loop=loop)
     future.add_done_callback(lambda done: done.cancelled() or done.exception())
     try:
         return await asyncio.wait_for(asyncio.shield(future), timeout)
     except TimeoutError:
         store.cancel(ticket)
+        submitted.cancel()
         raise BlobDeadline() from None
     except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if submitted.cancelled() and not (task is not None and task.cancelling()):
+            raise BlobCancelled() from None
         store.cancel(ticket)
+        submitted.cancel()
         raise
+
+
+def _owned_bytes(file: str, status: tuple[str, int] | None) -> int:
+    if status is None or status[0] == "link":
+        return 0
+    if status[0] == "other":
+        raise BlobStoreCorrupt(f"unexpected entry at blob part path {file}")
+    return status[1]
 
 
 def _usage(db: sqlite3.Connection, scope: bytes) -> tuple[int, int, int]:
@@ -1191,7 +1249,7 @@ def _validate_contents(db: sqlite3.Connection) -> None:
             _split(file)
         except (ValueError, AttributeError):
             raise corrupt("doomed file name") from None
-        if type(size) is not int or not 1 <= size <= PART_BYTES:
+        if type(size) is not int or size < 0:
             raise corrupt("doomed size")
     for route, object_, _wanted_at in db.execute("SELECT * FROM blob_wanted"):
         if type(route) is not bytes or len(route) != ID_BYTES or type(object_) is not bytes or len(object_) != ID_BYTES:
