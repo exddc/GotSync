@@ -96,6 +96,8 @@ struct ClientRecord: Codable {
     /// Current members that sent this member an authenticated application
     /// message, kept after the message leaves the inbox.
     var spoke: [Data]?
+    /// Application plaintext is no longer kept; see `setControlOnly()`.
+    var controlOnly: Bool?
 }
 
 struct IdentityRecord: Codable {
@@ -312,8 +314,10 @@ public actor MLSClient {
                     record.departures = Array(((record.departures ?? []) + [departed]).suffix(Self.memberCeiling))
                 }
                 if let sender = transition.sender {
-                    guard record.inbox.count < 1000 else { throw MLSClientError.capacityReached }
-                    record.inbox.append(MLSInboxMessage(cursor: cursor, sender: sender, plaintext: transition.output))
+                    if record.controlOnly != true {
+                        guard record.inbox.count < 1000 else { throw MLSClientError.capacityReached }
+                        record.inbox.append(MLSInboxMessage(cursor: cursor, sender: sender, plaintext: transition.output))
+                    }
                     if !(record.spoke ?? []).contains(sender) {
                         record.spoke = Array(((record.spoke ?? []) + [sender]).suffix(Self.memberCeiling))
                     }
@@ -395,6 +399,19 @@ public actor MLSClient {
     public func acknowledgeInbox(through cursor: UInt64) throws {
         try mutate(allowRemoved: true) { record in record.inbox.removeAll { $0.cursor <= cursor } }
     }
+
+    /// From now on, processing an application message advances the group
+    /// state, cursor and speaker evidence but keeps no plaintext. The inbox
+    /// is cleared in the same update, so its messages must already have
+    /// another durable owner.
+    public func setControlOnly() throws {
+        try mutate(allowRemoved: true) { record in
+            record.controlOnly = true
+            record.inbox = []
+        }
+    }
+
+    public func isControlOnly() throws -> Bool { try store.read().controlOnly == true }
 
     public func confirmRemovalAcknowledged() throws {
         try mutate(allowRemoved: true) { record in record.removalAuthorization = nil }

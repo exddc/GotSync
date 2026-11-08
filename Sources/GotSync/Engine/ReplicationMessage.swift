@@ -228,6 +228,8 @@ struct ReplicationCheckpoint: Codable, Equatable, Sendable {
     /// Members added while the founding claims file could not be read. Their
     /// history counts as unknown until each sends a hello.
     var membersWithUnknownHistory: [Data]? = nil
+    /// The host journal generation this link belongs to; absent for task groups.
+    var hostJournal: Data? = nil
 
     var memberDeviceIDs: [Data] { members.map(\.deviceID) }
 
@@ -323,8 +325,34 @@ struct ReplyObligation: Codable, Equatable, Sendable {
     /// Members whose hello named this device as provider and that still wait
     /// for a reservations snapshot, in the order they asked.
     var recipients: [Data]?
+    /// Host-journal members waiting for a completion message; absent for task groups.
+    var bootstrap: [Bootstrap]? = nil
 
-    var isEmpty: Bool { own == nil && provided == nil && (recipients ?? []).isEmpty }
+    /// A member's history request. `cut` is chosen once this provider may
+    /// certify its history and never changes afterwards.
+    struct Bootstrap: Codable, Equatable, Sendable {
+        let member: Data
+        let from: ReplicaVersionVector
+        var cut: ReplicaVersionVector?
+    }
+
+    var isEmpty: Bool { own == nil && provided == nil && (recipients ?? []).isEmpty && (bootstrap ?? []).isEmpty }
+
+    /// Adds a request unless `member` already has one; a repeated hello does
+    /// not replace its cut.
+    mutating func addBootstrap(_ member: Data, from vector: ReplicaVersionVector) {
+        var entries = bootstrap ?? []
+        guard !entries.contains(where: { $0.member == member }) else { return }
+        entries.append(Bootstrap(member: member, from: vector, cut: nil))
+        bootstrap = Array(entries.suffix(SyncGroupProfile.supportedMemberCeiling))
+    }
+
+    mutating func removeBootstrap(_ member: Data) {
+        bootstrap?.removeAll { $0.member == member }
+        if bootstrap?.isEmpty == true {
+            bootstrap = nil
+        }
+    }
 
     mutating func addRecipient(_ member: Data) {
         var members = recipients ?? []
@@ -363,6 +391,15 @@ struct ReplyObligation: Codable, Equatable, Sendable {
         }
     }
 
+    /// Records that these records, a prefix of the answer in origin and
+    /// sequence order, were delivered.
+    mutating func advance(past records: [(origin: ReplicaDeviceID, sequence: UInt64)]) {
+        for record in records {
+            own?.raise(record.origin, to: record.sequence)
+            provided?.raise(record.origin, to: record.sequence)
+        }
+    }
+
     /// Drops entries for origins this device holds no operations from. They
     /// never select an operation to send, and keeping them could exceed the
     /// origin limit that loading enforces.
@@ -384,7 +421,9 @@ struct ReplyObligation: Codable, Equatable, Sendable {
     static func load(from url: URL) throws -> ReplyObligation? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let stored = try ReplicaCanonicalJSON.decode(ReplyObligation.self, from: Data(contentsOf: url))
-        guard stored.version == version, (stored.recipients ?? []).count <= SyncGroupProfile.supportedMemberCeiling else {
+        guard stored.version == version, (stored.recipients ?? []).count <= SyncGroupProfile.supportedMemberCeiling,
+              (stored.bootstrap ?? []).count <= SyncGroupProfile.supportedMemberCeiling
+        else {
             throw ReplicaError.corruptArchive("The reply obligation is unreadable.")
         }
         return stored.isEmpty ? nil : stored
@@ -408,6 +447,10 @@ struct ReplyObligation: Codable, Equatable, Sendable {
 private extension ReplicaVersionVector {
     mutating func raise(_ operation: TaskOperation) {
         setSequence(max(self[operation.originDeviceID], operation.originSequence), for: operation.originDeviceID)
+    }
+
+    mutating func raise(_ origin: ReplicaDeviceID, to sequence: UInt64) {
+        setSequence(max(self[origin], sequence), for: origin)
     }
 
     func retaining(_ kept: Set<ReplicaDeviceID>) -> ReplicaVersionVector {
