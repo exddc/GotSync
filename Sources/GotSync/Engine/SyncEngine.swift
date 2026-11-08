@@ -2294,6 +2294,10 @@ public final class SyncEngine {
             try ReplicationCheckpoint.remove(at: joinIntentURL)
             finishPairing(attemptID: attemptID)
         } catch {
+            if isHostMode {
+                pairingFailed(error, attemptID: attemptID)
+                return
+            }
             let admitted = (try? await self.session?.group()) != nil
             pairingFailed(error, attemptID: attemptID, admitted: admitted)
         }
@@ -2555,18 +2559,17 @@ public final class SyncEngine {
         guard pairingAttemptID == attemptID, !(error is CancellationError) else {
             return
         }
+        let attempt = pairingTask
         pairingTask = nil
         let wasJoining = activePairingRole == .joiner
         declinePeer()
         endPairingAttempt()
-        if wasJoining && !isPaired && !admitted {
-            try? resetSession()
+        if wasJoining && !isPaired {
             if isHostMode {
-                try? abandonHostJournal()
-                try? ReplicationCheckpoint.remove(at: joinIntentURL)
+                settleCancelledJoin(after: attempt)
+            } else if !admitted {
+                try? resetSession()
             }
-        } else if wasJoining && !isPaired && isHostMode {
-            scheduleReconcile()
         }
         if !wasJoining && !isPaired {
             scheduleReconcile()
