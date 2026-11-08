@@ -3279,6 +3279,10 @@ public final class SyncEngine {
     }
 
     private func handleRemoval() {
+        if isHostMode {
+            beginHostClosing(.removed)
+            return
+        }
         guard isPaired || checkpoint != nil else {
             try? resetSession()
             return
