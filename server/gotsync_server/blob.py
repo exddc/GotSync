@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import hashlib
 import math
 import os
@@ -1309,25 +1310,33 @@ class BlobStore:
         self._db.close()
 
 
+Offload = Callable[[Callable[[], None], bool], None]
+"""Runs a store-touching callable off the event loop. With `required` true the offload owner must run it once or
+retain it; with `required` false (a cancellation request) it may drop it."""
+
+
 class _Handoff:
     """Entry gate for one submitted blob job.
 
     The state moves once, under `_lock`, from `pending` to `entered` (the submitted function took the work) or
     to `closed` (it never will). Only winning `pending -> closed` proves non-entry and allows settling here;
-    entered work settles itself after it returns. Settling disposes an unstarted ticket and calls `on_return`
-    at most once. A failing `on_return` is reported to the loop's exception handler and changes nothing else.
+    entered work settles itself after it returns. Settling runs `release_unstarted` (if any) and calls
+    `on_return` at most once. A failing `on_return` is reported to the loop's exception handler and changes
+    nothing else. With `offload`, settling never runs `release_unstarted` on the event loop thread.
     """
 
-    def __init__(self, store: BlobStore, ticket: BlobTicket, work: Callable[[], Any],
-                 on_return: Callable[[], None] | None, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, release_unstarted: Callable[[], None] | None, work: Callable[[], Any],
+                 on_return: Callable[[], None] | None, loop: asyncio.AbstractEventLoop,
+                 offload: Offload | None = None) -> None:
         self._lock = threading.Lock()
         self._state = "pending"
         self._settled = False
         self._work: Callable[[], Any] | None = work
-        self._store: BlobStore | None = store
-        self._ticket: BlobTicket | None = ticket
+        self._release: Callable[[], None] | None = release_unstarted
         self._on_return = on_return
         self._loop = loop
+        self._offload = offload
+        self._loop_thread = threading.get_ident()
         self.done: asyncio.Future[Any] = loop.create_future()
         self.done.add_done_callback(lambda done: done.cancelled() or done.exception())
 
@@ -1362,7 +1371,10 @@ class _Handoff:
         if not self.close():
             return False
         try:
-            self._settle(on_loop=on_loop)
+            if self._offload is not None and self._release is not None and threading.get_ident() == self._loop_thread:
+                self._offload(lambda: self._settle(on_loop=False), True)
+            else:
+                self._settle(on_loop=on_loop)
         finally:
             if error is not None:
                 self._deliver(None, error)
@@ -1381,10 +1393,11 @@ class _Handoff:
             if self._settled:
                 return
             self._settled = True
-            store, ticket, on_return = self._store, self._ticket, self._on_return
-            self._store = self._ticket = self._on_return = None
+            release, on_return = self._release, self._on_return
+            self._release = self._on_return = None
         try:
-            store._release_unstarted(ticket)
+            if release is not None:
+                release()
         finally:
             if on_return is not None:
                 self._call(on_return, on_loop=on_loop)
@@ -1424,7 +1437,7 @@ class _Handoff:
 
 async def run_blob_worker(
     store: BlobStore, ticket: BlobTicket, work: Callable[[], Any], *, executor: Executor, timeout: float,
-    on_return: Callable[[], None] | None = None,
+    on_return: Callable[[], None] | None = None, offload: Offload | None = None,
 ) -> Any:
     """Runs `work` for an admitted `ticket` on `executor` with a response deadline.
 
@@ -1439,9 +1452,14 @@ async def run_blob_worker(
       the awaiter gets `BlobCancelled` or that exception;
     - deadline or task cancellation: the ticket is cancelled and a still-pending job is closed and settled
       at once; an entered job keeps everything until it returns.
+
+    Without `offload` the cancellation and the unstarted release run on the event loop, as before. With
+    `offload` the loop only closes the gate: a proven non-entry is settled through `offload(..., True)`, and
+    an entered job receives `store.cancel(ticket)` through `offload(..., False)`. A cancellation that reaches
+    the store after the worker committed loses: that outcome is committed and uncertain to the client.
     """
     loop = asyncio.get_running_loop()
-    handoff = _Handoff(store, ticket, work, on_return, loop)
+    handoff = _Handoff(functools.partial(store._release_unstarted, ticket), work, on_return, loop, offload)
     del work, on_return
     submitted: Future[Any] | None
     try:
@@ -1455,17 +1473,150 @@ async def run_blob_worker(
     try:
         return await asyncio.wait_for(asyncio.shield(handoff.done), timeout)
     except TimeoutError:
-        store.cancel(ticket)
-        handoff.close_and_settle(on_loop=True)
-        if submitted is not None:
-            submitted.cancel()
+        _cancel(store, ticket, handoff, submitted, offload)
         raise BlobDeadline() from None
     except asyncio.CancelledError:
+        _cancel(store, ticket, handoff, submitted, offload)
+        raise
+
+
+def _cancel(store: BlobStore, ticket: BlobTicket, handoff: _Handoff, submitted: Future[Any] | None,
+            offload: Offload | None) -> None:
+    if offload is None:
         store.cancel(ticket)
         handoff.close_and_settle(on_loop=True)
         if submitted is not None:
             submitted.cancel()
+        return
+    if not handoff.close_and_settle(on_loop=True):
+        offload(functools.partial(store.cancel, ticket), False)
+
+
+class _OwnedHandoff(_Handoff):
+    """Entry gate plus a result slot: a resource-bearing result always has exactly one owner.
+
+    `delivered` results belong to the slot until the waiter adopts them or departs. A departed waiter's result is
+    disposed off the event loop (by the job itself, or through `offload(..., True)`); the job's holds
+    (`on_return`) are released only after that disposal returns. A failing disposal keeps its holds: in the job's
+    own thread it is passed to `retain`; through `offload` the exception reaches the offload owner.
+    """
+
+    def __init__(self, work: Callable[[], Any], dispose: Callable[[Any], None] | None,
+                 retain: Callable[[Any, BaseException], None] | None, on_return: Callable[[], None] | None,
+                 loop: asyncio.AbstractEventLoop, offload: Offload) -> None:
+        super().__init__(None, work, on_return, loop, offload)
+        self._dispose = dispose
+        self._retain = retain
+        self._slot = "none"
+        self._result: Any = None
+        self._departed = False
+
+    def run(self) -> None:
+        with self._lock:
+            if self._state != "pending":
+                return
+            self._state = "entered"
+            work, self._work = self._work, None
+        result: Any = None
+        error: BaseException | None = None
+        try:
+            result = work()
+        except BaseException as caught:
+            error = caught
+        finally:
+            del work
+        if error is not None:
+            with self._lock:
+                self._slot = "failed"
+            try:
+                self._settle(on_loop=False)
+            finally:
+                self._deliver(None, error)
+            return
+        with self._lock:
+            departed = self._departed
+            if not departed:
+                self._slot, self._result = "delivered", result
+        if departed:
+            try:
+                self._dispose_and_settle(result)
+            except BaseException as error:
+                if self._retain is not None:
+                    self._retain(result, error)
+            return
+        self._deliver(result, None)
+
+    def adopt(self) -> Any:
+        """Takes the delivered result for the waiter and releases the job's holds."""
+        with self._lock:
+            if self._slot != "delivered":
+                raise RuntimeError("no delivered result to adopt")
+            self._slot = "adopted"
+            result, self._result = self._result, None
+        self._settle(on_loop=True)
+        return result
+
+    def depart(self) -> None:
+        """The waiter gave up: close a pending gate, or move a delivered result to off-loop cleanup."""
+        if self.close_and_settle(on_loop=True):
+            return
+        with self._lock:
+            self._departed = True
+            if self._slot != "delivered":
+                return
+            self._slot = "cleanupPending"
+            result, self._result = self._result, None
+        self._offload(functools.partial(self._dispose_and_settle, result), True)
+
+    def _dispose_and_settle(self, result: Any) -> None:
+        try:
+            if self._dispose is not None:
+                self._dispose(result)
+        except BaseException:
+            with self._lock:
+                self._slot = "retainedFailed"
+            raise
+        with self._lock:
+            self._slot = "disposed"
+        self._settle(on_loop=False)
+
+
+async def run_owned_job(
+    executor: Executor, job: Callable[[], Any], *, offload: Offload, timeout: float | None,
+    dispose: Callable[[Any], None] | None = None, retain: Callable[[Any, BaseException], None] | None = None,
+    on_return: Callable[[], None] | None = None,
+) -> Any:
+    """Runs `job` on `executor`; its result, if any, has one owner at every instant (see `_OwnedHandoff`).
+
+    Returns the adopted result. A deadline raises `BlobDeadline` and a cancellation re-raises, after the waiter
+    departs. A submit error is raised only once the gate proves non-entry; if the job already entered, its real
+    result is awaited instead, and a proven non-entry raises `BlobCancelled` chained to the submit error. A job
+    that never enters (executor cancellation, initializer failure) raises `BlobCancelled` or that exception, after
+    `on_return`. A job's own `TimeoutError` is re-raised, not mistaken for the deadline.
+    """
+    loop = asyncio.get_running_loop()
+    handoff = _OwnedHandoff(job, dispose, retain, on_return, loop, offload)
+    del job, on_return
+    submitted: Future[Any] | None
+    try:
+        submitted = executor.submit(handoff.run)
+    except BaseException as error:
+        if handoff.close_and_settle(on_loop=True):
+            raise BlobCancelled("blob job was not accepted") from error
+        submitted = None
+    if submitted is not None:
+        submitted.add_done_callback(handoff.finished)
+    try:
+        await asyncio.wait_for(asyncio.shield(handoff.done), timeout)
+    except TimeoutError:
+        if handoff.done.done() and not handoff.done.cancelled():
+            raise
+        handoff.depart()
+        raise BlobDeadline() from None
+    except asyncio.CancelledError:
+        handoff.depart()
         raise
+    return handoff.adopt()
 
 
 def _full(error: sqlite3.Error) -> bool:
