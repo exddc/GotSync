@@ -23,10 +23,14 @@ from gotsync_server.server import (
     MAX_FORWARD_QUEUE_BYTES,
     MAX_FORWARD_QUEUE_FRAMES,
     MAX_REGISTRATION_BYTES,
+    DEFAULT_BLOB_DATABASE_PATH,
+    DEFAULT_BLOB_DIRECTORY,
     BoundedOutboundQueue,
     Metrics,
     RegistrationError,
     RelayServer,
+    _argument_parser,
+    blob_config_from_arguments,
     main,
     parse_registration,
     server_tls_context,
@@ -114,6 +118,64 @@ class RegistrationTests(unittest.TestCase):
             with self.subTest(message_type=type(message).__name__):
                 with self.assertRaises(RegistrationError):
                     parse_registration(message)
+
+
+class BlobConfigurationTests(unittest.TestCase):
+    BLOB_ENVIRONMENT = (
+        "GOTSYNC_ENABLE_BLOBS",
+        "GOTSYNC_BLOB_DIRECTORY",
+        "GOTSYNC_BLOB_DATABASE",
+        "GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER",
+    )
+
+    def parse(self, arguments: list[str], environment: dict[str, str]):
+        clean = {name: value for name, value in os.environ.items() if name not in self.BLOB_ENVIRONMENT}
+        with patch.dict(os.environ, {**clean, **environment}, clear=True):
+            return _argument_parser().parse_args(arguments)
+
+    def test_blobs_are_off_without_deliberate_opt_in(self) -> None:
+        for value in (None, "", "0", "true", "yes", " 1"):
+            with self.subTest(value=value):
+                environment = {} if value is None else {
+                    name: value for name in ("GOTSYNC_ENABLE_BLOBS", "GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER")
+                }
+                args = self.parse([], environment)
+                self.assertFalse(args.enable_blobs)
+                self.assertFalse(args.blob_require_route_header)
+                self.assertIsNone(blob_config_from_arguments(args))
+
+    def test_environment_configures_the_blob_lane(self) -> None:
+        args = self.parse([], {
+            "GOTSYNC_ENABLE_BLOBS": "1",
+            "GOTSYNC_BLOB_DIRECTORY": "/data/blobs/v1",
+            "GOTSYNC_BLOB_DATABASE": "/data/blobs.sqlite3",
+            "GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER": "1",
+        })
+        config = blob_config_from_arguments(args)
+        assert config is not None
+        self.assertEqual(str(config.directory), "/data/blobs/v1")
+        self.assertEqual(str(config.database), "/data/blobs.sqlite3")
+        self.assertTrue(config.require_route_header)
+
+    def test_empty_paths_and_absent_paths_use_defaults(self) -> None:
+        for environment in ({}, {"GOTSYNC_BLOB_DIRECTORY": "", "GOTSYNC_BLOB_DATABASE": ""}):
+            with self.subTest(environment=environment):
+                args = self.parse(["--enable-blobs"], environment)
+                self.assertEqual(args.blob_directory, DEFAULT_BLOB_DIRECTORY)
+                self.assertEqual(args.blob_database, DEFAULT_BLOB_DATABASE_PATH)
+                self.assertFalse(args.blob_require_route_header)
+
+    def test_explicit_flags_override_the_environment(self) -> None:
+        args = self.parse(
+            ["--enable-blobs", "--blob-directory", "/flag/v1", "--blob-database", "/flag/blobs.sqlite3",
+             "--blob-require-route-header"],
+            {"GOTSYNC_BLOB_DIRECTORY": "/env/v1", "GOTSYNC_BLOB_DATABASE": "/env/blobs.sqlite3"},
+        )
+        config = blob_config_from_arguments(args)
+        assert config is not None
+        self.assertEqual(str(config.directory), "/flag/v1")
+        self.assertEqual(str(config.database), "/flag/blobs.sqlite3")
+        self.assertTrue(config.require_route_header)
 
 
 class MetricsTests(unittest.TestCase):

@@ -189,6 +189,28 @@ No build truncates or evicts members to fit a smaller limit. To move a large
 group back, remove members until eight remain, then downgrade, or unlink every
 device and pair again under the earlier build.
 
+## Optional blob parts
+
+The relay's blob lane (`/v2/mls/blob/`, see
+[PROTOCOL.md](PROTOCOL.md#blob-parts)) is off by default and optional within
+version 2. A client may use it only after `capabilities` returns the `blobs`
+object with `version: 1`. The capability is extra data in an existing answer,
+so clients that do not know it keep decoding it. No client uses the lane yet.
+
+| Relay | `capabilities` | Blob paths |
+| --- | --- | --- |
+| Earlier relay, or lane off | no `blobs` key | `400 invalidRequest` |
+| Lane on, reached through the blob route | `blobs` object | served |
+| Lane on with the route tag required, reached through the delivery route | `blobs` object | `404 notFound` |
+| Proxy override kept, lane turned off | no `blobs` key | `400 invalidRequest` |
+
+A client must treat a missing capability, `400` on a blob path, or `404 notFound`
+as an unsupported relay. It keeps MLS delivery working and stores nothing on
+the relay. Turning the lane off or rolling back the relay does not touch MLS
+state. Stored parts stay on the volume until they expire or the operator
+deletes them, and they cannot be read while the lane is off. Turning the lane
+on again serves the parts that have not expired.
+
 ## Future changes
 
 Within version 2, preserve required fields, hash and HKDF labels, canonical

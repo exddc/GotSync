@@ -438,6 +438,63 @@ deleted group. The client then stops with `SyncError.syncHistoryExpired`. The
 [server README](../server/README.md#retention) lists the full retention
 policy.
 
+### Blob parts
+
+A relay can offer an optional blob lane under `/v2/mls/blob/`. It is off by
+default, and no client uses it yet. When the lane is on, `capabilities`
+answers a current writer with an extra object:
+
+```json
+"blobs": {"version": 1, "partBytes": 524304, "maxObjectBytes": 10486080, "maxParts": 20,
+          "groupQuotaBytes": 201326592, "retentionSeconds": 2592000, "incompleteSeconds": 86400}
+```
+
+A relay without the key does not store blobs. The relay stores encrypted
+parts (format GSB1). It checks each part's SHA-256 and that the object
+identifier is the SHA-256 of `GSB1-object`, the group ID, the length and part
+count as big-endian 64-bit and 32-bit integers, and the part hashes. A part is
+524,304 bytes except the last, which holds 17 to 524,304 bytes.
+
+Every request is a `POST` without a query string or `Content-Encoding`. It
+carries the writer token as `Authorization: Bearer <token>` and an exact
+`Content-Length`. JSON bodies hold `version: 2` and canonical base64url
+values, are at most 4,096 bytes, and are fully validated before the relay
+checks the token.
+
+| Endpoint | Request | Answer |
+| --- | --- | --- |
+| `begin` | `group`, `object`, `length`, `parts` (1 to 20 part hashes) | `complete`, `present` (stored part indexes), `leasedByOther` |
+| `put/<group>/<object>/<index>` | `application/octet-stream` body of the part's exact size | `stored`, `complete`; `stored: true` also for a part already stored |
+| `get/<group>/<object>/<index>` | empty body | `200 application/octet-stream`, the exact part, `Cache-Control: no-store` |
+| `manifest` | `group`, `object` | `length`, `parts`, `present`, `complete` |
+| `want` | `group`, `objects` (1 to 16) | `accepted` |
+| `wanted` | `group` | `objects` (up to 64) |
+| `release` | `group`, `objects` (1 to 16) | empty; the objects expire after 24 hours unless used again |
+
+In binary paths, the group and object are canonical base64url and the index
+is a decimal from 0 to 19. Only an active writer of the group is admitted. A
+writer removed by a commit or proposal is refused at once, without the
+24-hour read grace of `fetch`.
+
+| HTTP | `error` | Meaning |
+| --- | --- | --- |
+| 400 | `invalidRequest` | Malformed request; on a relay without the lane, every blob path |
+| 403 | `unauthorized` | Not an active writer of the group |
+| 404 | `objectMissing`, `partMissing` | Not stored, expired, or a damaged part was dropped |
+| 404 | `notFound` | Unknown blob endpoint, or a request that did not arrive through the blob route |
+| 409 | `partMismatch` | Part bytes do not match their hash |
+| 410 | `historyExpired` | The group does not exist or has expired |
+| 413 | `requestTooLarge` | Body larger than the part or 4,096 bytes |
+| 429 | `blobBusy`, `rateLimited` | Retry after `Retry-After` |
+| 503 | `blobAuthBusy` | The delivery store was busy; retry |
+| 507 | `blobGroupQuota`, `blobCapacity`, `blobCleanupBacklog` | No space for now; retry later |
+
+A relay deployed behind a proxy can require the proxy to tag requests with
+`X-GotSync-Route: blob`. The proxy overwrites that header on every route, so a
+blob path that reached the relay through the delivery route gets `404
+notFound`. The [server README](../server/README.md#encrypted-blob-parts-optional)
+lists the limits, retention, and deployment.
+
 ## Replicated task model
 
 ```text

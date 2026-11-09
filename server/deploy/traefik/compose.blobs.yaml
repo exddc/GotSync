@@ -1,0 +1,25 @@
+services:
+  relay:
+    environment:
+      GOTSYNC_ENABLE_BLOBS: "1"
+      GOTSYNC_BLOB_DIRECTORY: /data/blobs/v1
+      GOTSYNC_BLOB_DATABASE: /data/blobs.sqlite3
+      GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER: "1"
+    labels:
+      - traefik.http.routers.gotsync-mls.priority=100
+      - traefik.http.routers.gotsync-mls.middlewares=gotsync-hsts@file,gotsync-mls-rate@file,gotsync-mls-inflight@file,gotsync-mls-body@file,gotsync-control-tag@docker
+      - traefik.http.middlewares.gotsync-control-tag.headers.customrequestheaders.X-GotSync-Route=control
+      - traefik.http.routers.gotsync-blob.rule=Host(`${GOTSYNC_RELAY_HOST:?}`) && PathPrefix(`/v2/mls/blob/`)
+      - traefik.http.routers.gotsync-blob.priority=200
+      - traefik.http.routers.gotsync-blob.entrypoints=${TRAEFIK_ENTRYPOINT:-https}
+      - traefik.http.routers.gotsync-blob.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
+      - traefik.http.routers.gotsync-blob.tls.options=gotsync@file
+      - traefik.http.routers.gotsync-blob.observability.accesslogs=false
+      - traefik.http.routers.gotsync-blob.middlewares=gotsync-hsts@file,gotsync-blob-rate@docker,gotsync-blob-inflight@docker,gotsync-blob-body@docker,gotsync-blob-tag@docker
+      - traefik.http.routers.gotsync-blob.service=gotsync-mls
+      - traefik.http.middlewares.gotsync-blob-rate.ratelimit.average=8
+      - traefik.http.middlewares.gotsync-blob-rate.ratelimit.burst=32
+      - traefik.http.middlewares.gotsync-blob-inflight.inflightreq.amount=4
+      - traefik.http.middlewares.gotsync-blob-inflight.inflightreq.sourcecriterion.ipstrategy.depth=0
+      - traefik.http.middlewares.gotsync-blob-body.buffering.maxRequestBodyBytes=1048576
+      - traefik.http.middlewares.gotsync-blob-tag.headers.customrequestheaders.X-GotSync-Route=blob
