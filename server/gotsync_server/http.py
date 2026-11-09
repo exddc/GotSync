@@ -219,6 +219,32 @@ async def write_http_response(
         pass
 
 
+async def write_http_bytes(writer: asyncio.StreamWriter, body: bytes) -> None:
+    """A 200 `application/octet-stream` response with an exact length that is never cached."""
+    head = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+    writer.write(head + body)
+    try:
+        await writer.drain()
+    except ConnectionError:
+        pass
+
+
+async def read_http_exact(reader: asyncio.StreamReader, length: int, *, timeout: float) -> bytes:
+    try:
+        return await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+    except TimeoutError as error:
+        raise RequestError("request body timed out") from error
+    except asyncio.IncompleteReadError as error:
+        raise RequestError("incomplete request body") from error
+
+
 def encode_json_document(document: dict[str, Any]) -> bytes:
     return json.dumps(
         document,
