@@ -188,6 +188,20 @@ class GuardTests(unittest.TestCase):
                                       str(Path(directory) / "g.jsonl"), "--repo", directory, "--", "true"])
         self.assertEqual(code, 2)
 
+    def test_main_refuses_to_start_setup_before_the_assigned_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assigned = Path(directory) / "windows.json"
+            assigned.write_text(guardian.json.dumps([
+                {"id": "w", "start": guardian.stamp(1001), "end": guardian.stamp(1200)}]))
+            with mock.patch.object(guardian.time, "time", return_value=1000), \
+                    mock.patch.object(guardian, "guard", return_value={
+                        "started": True, "exitCode": 0, "cleanupProven": True}) as start, \
+                    mock.patch("sys.stderr"):
+                code = guardian.main(["--window", "w", "--assigned", str(assigned), "--log",
+                                      str(Path(directory) / "g.jsonl"), "--repo", directory, "--", "true"])
+        self.assertEqual(code, 2)
+        start.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

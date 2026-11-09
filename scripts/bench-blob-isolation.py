@@ -84,8 +84,8 @@ def parse_time(value: str) -> float:
 
 def preflight(mode: str, window: str, assigned: list[dict[str, str]], processes: list[tuple[int, int, int, str]],
               now: float, own_group: int, ancestors: frozenset[int] = frozenset()) -> list[str]:
-    """Reasons this slot cannot be used. Nothing is stopped or waited for. The caller's own process group and its
-    ancestors (the coordinator that launched it) are not peers; every other process is judged by what it runs."""
+    """Reasons this slot cannot be used. Nothing is stopped or waited for. Coordinator ancestors are exempt from
+    the benchmark-name check; heavy jobs are refused even when they are ancestors."""
     reasons = []
     if RESERVED_WINDOWS.get(window, ("",))[0] != mode:
         reasons.append(f"{window!r} is not the reserved {mode} window")
@@ -98,10 +98,10 @@ def preflight(mode: str, window: str, assigned: list[dict[str, str]], processes:
         if entry["id"] != window and parse_time(entry["start"]) <= now < parse_time(entry["end"]):
             reasons.append(f"assigned window {entry['id']!r} is active")
     for pid, _, group, command in processes:
-        if group == own_group or pid in ancestors or not command:
+        if group == own_group or not command:
             continue
         name = os.path.basename(command.split()[0])
-        if name in HEAVY_JOBS or "bench-blob-isolation" in command:
+        if name in HEAVY_JOBS or (pid not in ancestors and "bench-blob-isolation" in command):
             reasons.append(f"coordinated job running: pid {pid} {name}")
     return reasons
 
@@ -334,9 +334,13 @@ def exchange(sock: socket.socket, payload: bytes, end: float, clock: Callable[[]
             raise TimeoutError("request time limit reached")
         return remaining
 
-    for offset in range(0, len(payload), 65536):
+    offset = 0
+    while offset < len(payload):
         sock.settimeout(left())
-        sock.sendall(payload[offset:offset + 65536])
+        sent = sock.send(payload[offset:offset + 65536])
+        if sent == 0:
+            raise ConnectionError("request socket closed during send")
+        offset += sent
     received = bytearray()
     head_end = length = None
     while True:

@@ -332,6 +332,27 @@ class ExchangeTests(unittest.TestCase):
         self.addCleanup(server.close)
         return client, server
 
+    def test_partial_tls_sends_recheck_the_absolute_deadline(self):
+        now = [0.0]
+
+        class PartialTLS:
+            _sslobj = object()
+            sendall = bench.ssl.SSLSocket.sendall
+
+            def _checkClosed(self):
+                pass
+
+            def settimeout(self, seconds):
+                self.timeout = seconds
+
+            def send(self, data):
+                now[0] += 1
+                return 1
+
+        with self.assertRaises(TimeoutError):
+            bench.exchange(PartialTLS(), b"data", 2.0, lambda: now[0])
+        self.assertEqual(now[0], 2.0)
+
     def test_a_slow_trickle_cannot_renew_the_request_limit(self):
         client, server = self.pair()
         stop = bench.threading.Event()
@@ -444,6 +465,14 @@ class GuardTests(unittest.TestCase):
     def test_ancestors_stop_at_a_parent_cycle_or_unknown_parent(self):
         self.assertEqual(bench.ancestors([(5, 6, 5, "a"), (6, 5, 6, "b")], 5), {6})
         self.assertEqual(bench.ancestors([(5, 99, 5, "a")], 5), {99})
+
+    def test_preflight_still_refuses_heavy_jobs_in_its_parent_chain(self):
+        processes = [(40, 1, 40, "/usr/bin/xcodebuild test"),
+                     (41, 40, 41, "python3 scripts/bench-guardian.py"),
+                     (42, 41, 42, "python3 scripts/bench-blob-isolation.py direct")]
+        reasons = bench.preflight("direct", "l3a2b-direct-1", SLOT, processes, INSIDE, 42,
+                                  bench.ancestors(processes, 42))
+        self.assertEqual(reasons, ["coordinated job running: pid 40 xcodebuild"])
 
 
 class CleanupTests(unittest.TestCase):

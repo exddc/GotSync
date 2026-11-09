@@ -302,6 +302,9 @@ def main(argv: list[str] | None = None) -> int:
     if len(slot) != 1:
         print(f"no single assigned slot {args.window!r}", file=sys.stderr)
         return 2
+    if time.time() < utc(slot[0]["start"]):
+        print(f"the assigned slot {args.window!r} has not started", file=sys.stderr)
+        return 2
     log_path = Path(args.log)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
