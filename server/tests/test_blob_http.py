@@ -12,7 +12,7 @@ from contextlib import contextmanager
 import pytest
 
 from gotsync_server.admission import parse_network
-from gotsync_server.blob import BlobLimits, BlobStore, BlobStoreCorrupt
+from gotsync_server.blob import BlobDeadline, BlobLimits, BlobStore, BlobStoreCorrupt
 from gotsync_server.blob_format import PART_BYTES
 from gotsync_server.blob_http import BlobLaneConfig, ControlDispatcher
 from gotsync_server.http import encode_base64url
@@ -172,6 +172,103 @@ async def begin_object(relay, length, seed=b""):
 
 def run(coroutine):
     return asyncio.run(coroutine)
+
+
+@pytest.mark.parametrize("stage", ["auth", "owned", "put", "get"])
+def test_expired_job_deadline_keeps_no_unowned_permit_or_ticket(tmp_path, stage):
+    async def main():
+        async with Relay(tmp_path) as relay:
+            ticket = None
+            if stage in ("put", "get"):
+                object_, _, parts = await begin_object(relay, 17, b"expired")
+                if stage == "get":
+                    assert (await put(relay.port, object_, 0, parts[0])).status == 200
+                    ticket = relay.store.admit_get(GROUP, object_, 0)
+                else:
+                    ticket = relay.store.admit_put(GROUP, object_, 0, len(parts[0]), writer=B_DIGEST)
+            permits = relay.lane._permits.acquire_request("expired")
+            deadline = asyncio.get_running_loop().time() - 1
+            try:
+                with pytest.raises(BlobDeadline):
+                    if stage == "auth":
+                        await relay.lane._authorize(permits, GROUP, b64(B_TOKEN), deadline)
+                    elif stage == "owned":
+                        await relay.lane._owned(permits, lambda: None, deadline)
+                    else:
+                        await relay.lane._worker(permits, ticket, lambda: None, deadline)
+                await relay.lane._dispatcher.idle()
+                await asyncio.sleep(0)
+                assert permits._holds == 1
+                ledger = await relay.ledger()
+                assert ledger["liveTickets"] == ledger["pinnedFiles"] == ledger["outstanding"] == 0
+            finally:
+                if ticket is not None and not ticket.started:
+                    await asyncio.to_thread(relay.store.abandon, ticket)
+                while permits._holds:
+                    permits.release()
+    run(main())
+
+
+@pytest.mark.parametrize("operation", ["wanted", "get", "unauthorized"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_handler_deadline_covers_response_backpressure(tmp_path, operation, cancel):
+    class BlockedWriter:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.transport = self
+            self.aborted = False
+
+        def abort(self):
+            self.aborted = True
+
+        def get_extra_info(self, name):
+            return ("127.0.0.1", 12345) if name == "peername" else None
+
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            self.entered.set()
+            await self.release.wait()
+
+    async def main():
+        async with Relay(tmp_path, handler_seconds=5 if cancel else 0.1) as relay:
+            writer = BlockedWriter()
+            reader = asyncio.StreamReader()
+            token = B_TOKEN
+            if operation == "get":
+                object_, _, parts = await begin_object(relay, 17, b"blocked")
+                assert (await put(relay.port, object_, 0, parts[0])).status == 200
+                path = f"/v2/mls/blob/get/{b64(GROUP)}/{b64(object_)}/0"
+                body = b""
+            else:
+                path = "/v2/mls/blob/wanted"
+                body = json.dumps({"version": 2, "group": b64(GROUP)}).encode()
+                if operation == "unauthorized":
+                    token = b"x" * 32
+            reader.feed_data(body)
+            reader.feed_eof()
+            headers = {"content-length": str(len(body)), "content-type": "application/json",
+                       "authorization": f"Bearer {b64(token)}"}
+            task = asyncio.create_task(relay.lane.handle(
+                reader, writer, "POST", path, headers, control_slot=None, release_control=lambda _: None))
+            try:
+                await asyncio.wait_for(writer.entered.wait(), WAIT)
+                if cancel:
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(asyncio.shield(task), 0.5)
+                else:
+                    await asyncio.wait_for(asyncio.shield(task), 0.5)
+                assert writer.aborted
+                assert relay.permits() == {"global": 0, "sets": 0, "sources": 0, "writers": 0}
+                assert relay.lane.counters["deadline"] == (0 if cancel else 1)
+            finally:
+                writer.release.set()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, WAIT)
+    run(main())
 
 
 # Disabled behavior and capabilities

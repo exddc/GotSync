@@ -526,30 +526,42 @@ class BlobLane:
         task = asyncio.current_task()
         self._handlers.add(task)
         permits: PermitSet | None = None
+        deadline = asyncio.get_running_loop().time() + self.config.handler_seconds
+        timeout = asyncio.timeout_at(deadline)
         try:
-            try:
-                peer = writer.get_extra_info("peername")
-                permits = self._admit(method, target, headers, peer)
-            finally:
-                if control_slot is not None:
-                    release_control(control_slot)
-            if any(self._dispatcher.retained()):
-                self._dispatcher.retry()
-                raise BlobCleanupPending("blob cleanup pending")
-            deadline = asyncio.get_running_loop().time() + self.config.handler_seconds
-            operation, path = _parse_target(target)
-            token = _bearer(headers)
-            if operation in ("put", "get"):
-                await self._binary(operation, path, headers, token, reader, writer, permits, deadline)
-            else:
-                await self._metadata(operation, headers, token, reader, writer, permits, deadline)
-        except BlobDeadline:
+            async with timeout:
+                try:
+                    try:
+                        peer = writer.get_extra_info("peername")
+                        permits = self._admit(method, target, headers, peer)
+                    finally:
+                        if control_slot is not None:
+                            release_control(control_slot)
+                    if any(self._dispatcher.retained()):
+                        self._dispatcher.retry()
+                        raise BlobCleanupPending("blob cleanup pending")
+                    operation, path = _parse_target(target)
+                    token = _bearer(headers)
+                    if operation in ("put", "get"):
+                        await self._binary(operation, path, headers, token, reader, writer, permits, deadline)
+                    else:
+                        await self._metadata(operation, headers, token, reader, writer, permits, deadline)
+                except BlobDeadline:
+                    self.counters["deadline"] += 1
+                    writer.transport.abort()
+                except _Rejected as rejection:
+                    await _respond(writer, rejection.status, rejection.code, rejection.retry_after)
+                except RequestError as error:
+                    self.counters[f"error_{error.code}"] += 1
+                    await _respond(writer, error.status, error.code, _retry_after(error))
+        except TimeoutError:
+            if not timeout.expired():
+                raise
             self.counters["deadline"] += 1
-        except _Rejected as rejection:
-            await _respond(writer, rejection.status, rejection.code, rejection.retry_after)
-        except RequestError as error:
-            self.counters[f"error_{error.code}"] += 1
-            await _respond(writer, error.status, error.code, _retry_after(error))
+            writer.transport.abort()
+        except asyncio.CancelledError:
+            writer.transport.abort()
+            raise
         finally:
             if permits is not None:
                 permits.release()
@@ -582,10 +594,11 @@ class BlobLane:
             except TimeoutError as error:
                 raise BlobAuthBusy("delivery store busy") from error
 
+        remaining = _remaining(deadline)
         permits.hold()
         try:
             digest = await run_owned_job(
-                self._auth, authorize, offload=self._dispatcher.dispatch, timeout=_remaining(deadline),
+                self._auth, authorize, offload=self._dispatcher.dispatch, timeout=remaining,
                 dispose=self._permits.release_writer, retain=self._dispatcher.retain_failed,
                 on_return=permits.release)
         except (BlobCancelled, BrokenExecutor) as error:
@@ -595,18 +608,24 @@ class BlobLane:
 
     async def _owned(self, permits: PermitSet, job: Callable[[], Any], deadline: float,
                      dispose: Callable[[Any], None] | None = None) -> Any:
+        remaining = _remaining(deadline)
         permits.hold()
         try:
             return await run_owned_job(
-                self._io, job, offload=self._dispatcher.dispatch, timeout=_remaining(deadline), dispose=dispose,
+                self._io, job, offload=self._dispatcher.dispatch, timeout=remaining, dispose=dispose,
                 retain=self._dispatcher.retain_failed, on_return=permits.release)
         except (BlobCancelled, BrokenExecutor) as error:
             raise BlobBusy("blob work not accepted") from error
 
     async def _worker(self, permits: PermitSet, ticket: BlobTicket, work: Callable[[], Any], deadline: float) -> Any:
+        try:
+            remaining = _remaining(deadline)
+        except BlobDeadline:
+            self._abandon_off_loop(ticket, permits)
+            raise
         permits.hold()
         try:
-            return await run_blob_worker(self.store, ticket, work, executor=self._io, timeout=_remaining(deadline),
+            return await run_blob_worker(self.store, ticket, work, executor=self._io, timeout=remaining,
                                          on_return=permits.release, offload=self._dispatcher.dispatch)
         except (BlobCancelled, BrokenExecutor, RuntimeError) as error:
             raise BlobBusy("blob part worker not accepted") from error
