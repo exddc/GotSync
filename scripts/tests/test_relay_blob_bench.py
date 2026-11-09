@@ -170,6 +170,212 @@ class AggregateReportTests(unittest.TestCase):
         self.assertIn("| 1 | pass |", text)
 
 
+class FakeClock:
+    def __init__(self, on_wait=None):
+        self.now = 0.0
+        self.on_wait = on_wait
+
+    def __call__(self):
+        return self.now
+
+    def wait(self, event, seconds):
+        if self.on_wait is not None:
+            self.on_wait()
+        self.now += seconds
+        return event.is_set()
+
+
+def answer(status, retry_after=None, at=0.0):
+    headers = {} if retry_after is None else {"retry-after": str(retry_after)}
+    return bench.Response(status, headers, b"", 0.0, at, at)
+
+
+class DeadlineTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        self.budget = bench.Budget(10.0, clock=self.clock, waiter=self.clock.wait)
+        self.starts, self.recorded = [], []
+
+    def call(self, status=429, retry_after=120, then=None):
+        def call():
+            self.starts.append(self.clock.now)
+            if then is not None:
+                then()
+            return answer(status, retry_after, self.clock.now)
+        return call
+
+    def test_retry_after_beyond_the_deadline_allows_only_the_first_attempt(self):
+        result = bench.with_retries(bench.threading.Event(), self.budget, self.call(), self.recorded.append)
+        self.assertEqual(self.starts, [0.0])
+        self.assertEqual((result.status, len(self.recorded), self.clock.now), (429, 1, 10.0))
+
+    def test_short_retries_stop_at_the_deadline(self):
+        bench.with_retries(bench.threading.Event(), self.budget, self.call(retry_after=3), self.recorded.append)
+        self.assertEqual((self.starts, self.clock.now), ([0.0, 3.0, 6.0, 9.0], 10.0))
+
+    def test_an_already_stopped_writer_starts_nothing(self):
+        writer = bench.Writer("B9")
+        writer.stop.set()
+        load = bench.BlobLoad(None, None, self.budget)
+        result = bench.with_retries(writer.stop, self.budget, load.paced(writer, self.call()), self.recorded.append)
+        self.assertEqual((result, self.starts, self.recorded), (None, [], []))
+
+    def test_stop_during_pacing_prevents_the_request(self):
+        writer = bench.Writer("B8")
+        self.clock.on_wait = writer.stop.set
+        writer.next_upload = 5.0
+        load = bench.BlobLoad(None, None, self.budget)
+        result = bench.with_retries(writer.stop, self.budget, load.paced(writer, self.call()), self.recorded.append)
+        self.assertEqual((result, self.starts), (None, []))
+
+    def test_pacing_is_capped_by_the_deadline(self):
+        writer = bench.Writer("A")
+        writer.next_upload = 100.0
+        load = bench.BlobLoad(None, None, self.budget)
+        result = bench.with_retries(writer.stop, self.budget, load.paced(writer, self.call()), self.recorded.append)
+        self.assertEqual((result, self.starts, self.clock.now), (None, [], 10.0))
+
+    def test_a_response_that_arrives_after_stop_is_still_recorded(self):
+        stop = bench.threading.Event()
+        result = bench.with_retries(stop, self.budget, self.call(status=200, then=stop.set), self.recorded.append)
+        self.assertEqual((result.status, len(self.recorded), self.starts), (200, 1, [0.0]))
+
+    def test_an_expired_budget_refuses_a_new_request_before_connecting(self):
+        client = bench.Client("direct", "127.0.0.1", 9, "localhost", None)
+        client.budget = bench.Budget(9.0, clock=self.clock)
+        self.clock.now = 9.0
+        with patch.object(bench.socket, "create_connection") as connect, self.assertRaises(bench.BudgetExpired):
+            client.request("/v2/mls/fetch")
+        connect.assert_not_called()
+
+    def test_a_phase_longer_than_the_budget_stops_at_the_deadline(self):
+        with self.assertRaises(bench.BudgetExpired):
+            self.budget.phase(15, "warm-up")
+        self.assertEqual(self.clock.now, 10.0)
+        self.assertFalse(self.budget.wait(0))
+
+    def test_writer_verification_stops_at_the_deadline(self):
+        calls = []
+
+        class Stub:
+            def blob(stub, operation, token, **values):
+                calls.append(self.clock.now)
+                return answer(429, 120)
+
+        group = bench.Group(b"g" * 32, [bench.Writer("A"), bench.Writer("B1")])
+        with self.assertRaises(bench.BudgetExpired):
+            bench.verify_writers(Stub(), group, [], self.budget)
+        self.assertEqual(calls, [0.0])
+
+    def test_slow_preparation_prevents_every_later_phase(self):
+        class SlowPreparation(bench.BlobLoad):
+            def prepare(self, writer, lengths):
+                writer.stop.wait(5)
+
+        budget = bench.Budget(time.monotonic() + 0.3)
+        load = SlowPreparation(None, bench.Group(b"g" * 32, [bench.Writer("A"), bench.Writer("B1")]), budget)
+        started = time.monotonic()
+        with patch.object(bench, "control_workload") as control, self.assertRaises(bench.BudgetExpired):
+            bench.measured_run(None, None, load.group, [load], {}, started, budget)
+        control.assert_not_called()
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(any(thread.is_alive() for writer in load.group.writers for thread in writer.threads))
+
+    def test_a_failed_preparation_stops_before_later_phases(self):
+        class FailedPreparation(bench.BlobLoad):
+            def prepare(self, writer, lengths):
+                raise RuntimeError(f"{writer.name} could not upload its pool")
+
+        budget = bench.Budget(time.monotonic() + 5)
+        load = FailedPreparation(None, bench.Group(b"g" * 32, [bench.Writer("A")]), budget)
+        with patch.object(bench, "control_workload") as control, self.assertRaisesRegex(RuntimeError, "pool"):
+            bench.measured_run(None, None, load.group, [load], {}, time.monotonic(), budget)
+        control.assert_not_called()
+        self.assertTrue(budget.expired())
+
+    def test_cancelled_load_workers_start_no_request_after_the_deadline(self):
+        starts, lock = [], bench.threading.Lock()
+
+        class Stub:
+            def request(stub):
+                with lock:
+                    starts.append(time.monotonic())
+                return answer(429, 120, time.monotonic())
+
+            def blob(stub, *args, **values):
+                return stub.request()
+
+            def part(stub, *args):
+                return stub.request()
+
+        budget = bench.Budget(time.monotonic() + 0.6)
+        writers = [bench.Writer("A"), bench.Writer("B1")]
+        load = bench.BlobLoad(Stub(), bench.Group(b"g" * 32, writers), budget)
+        item = bench.BlobObject(b"o" * 32, 17, [b"x" * 17], [b"h" * 32])
+        load.pool = [item]
+        with patch.object(bench, "UPLOAD_INTERVAL_SECONDS", 0.02), patch.object(bench, "GET_INTERVAL_SECONDS", 0.02):
+            for writer in writers:
+                writer.pool = [item]
+                load.start(writer, {})
+            time.sleep(1.0)
+            bench.stop_loads([load])
+        self.assertTrue(starts)
+        self.assertTrue(all(start < budget.deadline for start in starts), (budget.deadline, max(starts)))
+        with self.assertRaises(bench.BudgetExpired):
+            load.start(bench.Writer("E"), {})
+
+
+class ExchangeTests(unittest.TestCase):
+    def pair(self):
+        client, server = bench.socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+        return client, server
+
+    def test_a_slow_trickle_cannot_renew_the_request_limit(self):
+        client, server = self.pair()
+        stop = bench.threading.Event()
+
+        def trickle():
+            server.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\n")
+            while not stop.wait(0.05):
+                try:
+                    server.sendall(b"x")
+                except OSError:
+                    return
+
+        thread = bench.threading.Thread(target=trickle)
+        thread.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError):
+                bench.exchange(client, b"POST / HTTP/1.1\r\n\r\n", started + 0.5)
+        finally:
+            stop.set()
+            thread.join()
+        self.assertLess(time.monotonic() - started, 0.9)
+
+    def test_a_complete_response_returns_without_waiting_for_close(self):
+        client, server = self.pair()
+        server.sendall(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 4\r\n\r\nbusy")
+        status, headers, body = bench.parse_response(bench.exchange(client, b"x", time.monotonic() + 5))
+        self.assertEqual((status, headers["retry-after"], body), (429, "2", b"busy"))
+
+    def test_chunked_bodies_are_decoded(self):
+        raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbusy\r\n2\r\n!!\r\n0\r\n\r\n"
+        self.assertEqual(bench.parse_response(raw)[2], b"busy!!")
+
+    def test_a_silent_server_is_bounded_by_the_remaining_run_time(self):
+        listener = bench.socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        client = bench.Client("direct", "127.0.0.1", listener.getsockname()[1], "localhost", None)
+        client.budget = bench.Budget(time.monotonic() + 0.5)
+        started = time.monotonic()
+        response = client.request("/v2/mls/fetch", b"{}")
+        self.assertEqual(response.status, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+
+
 class GuardTests(unittest.TestCase):
     def test_destinations_are_loopback_or_the_owned_test_network(self):
         bench.check_destination("direct", "127.0.0.1", "localhost")
@@ -206,18 +412,38 @@ class GuardTests(unittest.TestCase):
 
     def test_preflight_rejects_coordinated_jobs_and_ignores_idle_simulators_and_itself(self):
         processes = [
-            (10, 10, "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test -scheme GotDone"),
-            (11, 11, "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Xcode/Agents/xctest"),
-            (12, 12, "/usr/bin/python3 scripts/bench-blob-isolation.py direct --window other"),
-            (20, 20, "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/launchd_sim"),
-            (21, 21, "/usr/bin/simctl list"),
-            (30, 99, "/bin/bash scripts/bench-blob-isolation.sh direct --window l3a2b-direct-1"),
-            (31, 31, ""),
+            (10, 1, 10, "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test -scheme GotDone"),
+            (11, 1, 11, "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Xcode/Agents/xctest"),
+            (12, 1, 12, "/usr/bin/python3 scripts/bench-blob-isolation.py direct --window other"),
+            (20, 1, 20, "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/launchd_sim"),
+            (21, 1, 21, "/usr/bin/simctl list"),
+            (30, 1, 99, "/bin/bash scripts/bench-blob-isolation.sh direct --window l3a2b-direct-1"),
+            (31, 1, 31, ""),
         ]
         reasons = bench.preflight("direct", "l3a2b-direct-1", SLOT, processes, INSIDE, 99)
         self.assertEqual(reasons, ["coordinated job running: pid 10 xcodebuild",
                                    "coordinated job running: pid 11 xctest",
                                    "coordinated job running: pid 12 python3"])
+
+    def test_preflight_excuses_only_its_own_coordinator_ancestors(self):
+        processes = [
+            (40, 1, 40, "/bin/zsh -c scripts/bench-blob-isolation.sh direct --window l3a2b-direct-1"),
+            (41, 40, 40, "python3 -I scripts/bench-guardian.py -- bash scripts/bench-blob-isolation.sh guarded-direct"),
+            (42, 41, 42, "python -I scripts/bench-blob-isolation.py direct --window l3a2b-direct-1"),
+            (50, 1, 50, "python3 scripts/bench-blob-isolation.py direct --window l3a2b-direct-1"),
+            (51, 40, 51, "/bin/bash scripts/bench-blob-isolation.sh traefik --window other"),
+            (52, 41, 52, "/usr/bin/xctest"),
+        ]
+        chain = bench.ancestors(processes, 42)
+        self.assertEqual(chain, {1, 40, 41})
+        reasons = bench.preflight("direct", "l3a2b-direct-1", SLOT, processes, INSIDE, 42, chain)
+        self.assertEqual(reasons, ["coordinated job running: pid 50 python3",
+                                   "coordinated job running: pid 51 bash",
+                                   "coordinated job running: pid 52 xctest"])
+
+    def test_ancestors_stop_at_a_parent_cycle_or_unknown_parent(self):
+        self.assertEqual(bench.ancestors([(5, 6, 5, "a"), (6, 5, 6, "b")], 5), {6})
+        self.assertEqual(bench.ancestors([(5, 99, 5, "a")], 5), {99})
 
 
 class CleanupTests(unittest.TestCase):
@@ -279,6 +505,18 @@ class CleanupTests(unittest.TestCase):
     def assert_group_gone(self, group):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
+            if sys.platform == "linux":
+                active = []
+                for path in Path("/proc").glob("[0-9]*/stat"):
+                    try:
+                        record = path.read_text()
+                        fields = record[record.rfind(")") + 2:].split()
+                        if int(fields[2]) == group and fields[0] != "Z":
+                            active.append(path.parent.name)
+                    except (OSError, ValueError, IndexError):
+                        continue
+                if not active:
+                    return
             try:
                 os.killpg(group, 0)
             except ProcessLookupError:

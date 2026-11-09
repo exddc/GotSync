@@ -6,6 +6,7 @@ cd "$GOTSYNC_REPO_ROOT"
 
 mode=${1:?usage: bench-blob-isolation.sh direct|traefik --window ID --assigned FILE --out DIR [--sensitivity]}
 shift
+arguments=("$@")
 window= assigned= out= extra=()
 while [ $# -gt 0 ]; do
     case $1 in
@@ -18,20 +19,33 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$window" ] && [ -f "$assigned" ] && [ -n "$out" ] || { echo "--window, --assigned FILE and --out are required" >&2; exit 64; }
 bench=scripts/bench-blob-isolation.py
+
+case $mode in
+    direct|traefik)
+        mkdir -p "$out"
+        docker_flag=()
+        [ "$mode" = traefik ] && docker_flag=(--docker)
+        exec python3 -I scripts/bench-guardian.py --window "$window" --assigned "$assigned" \
+            --log "$out/$window-guardian.jsonl" --repo "$GOTSYNC_REPO_ROOT" ${docker_flag[@]+"${docker_flag[@]}"} \
+            -- bash scripts/bench-blob-isolation.sh "guarded-$mode" "${arguments[@]}" ;;
+    guarded-direct|guarded-traefik)
+        mode=${mode#guarded-}
+        [ -n "${GOTSYNC_BENCH_STOP_AT:-}" ] || { echo "run $mode through the guardian" >&2; exit 64; } ;;
+    *) echo "mode must be direct or traefik" >&2; exit 64 ;;
+esac
+stop_at=$GOTSYNC_BENCH_STOP_AT
 revision="$(git rev-parse HEAD)$(git diff --quiet HEAD -- && echo || echo -dirty)"
 
 if [ "$mode" = direct ]; then
     uv sync --project server --locked --no-editable --reinstall-package gotsync-server --quiet
     exec "$UV_PROJECT_ENVIRONMENT/bin/python" -I "$bench" direct --window "$window" --assigned "$assigned" \
-        --out "$out" --revision "$revision" ${extra[@]+"${extra[@]}"}
+        --out "$out" --revision "$revision" --stop-at "$stop_at" ${extra[@]+"${extra[@]}"}
 fi
-[ "$mode" = traefik ] || { echo "mode must be direct or traefik" >&2; exit 64; }
 
 preflight="$(python3 -I "$bench" preflight --mode traefik --window "$window" --assigned "$assigned")" || {
     echo "$preflight"
     exit 2
 }
-slot_end="$(printf '%s' "$preflight" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["slotEnd"])')"
 
 project="gotsync-blob-bench-$$-$RANDOM"
 traefik_image=traefik:v3.7
@@ -145,7 +159,7 @@ mkdir -p "$out"
 status=0
 docker exec "$project-client" python -I /bench/bench-blob-isolation.py run --window "$window" \
     --via 198.51.100.2 --host relay.example.test --ca /check/ca.crt --samples /out/samples.jsonl \
-    --slot-end "$slot_end" --out /out --revision "$revision" ${extra[@]+"${extra[@]}"} || status=$?
+    --stop-at "$stop_at" --out /out --revision "$revision" ${extra[@]+"${extra[@]}"} || status=$?
 kill "$sampler" && wait "$sampler" 2>/dev/null || true
 sampler=
 

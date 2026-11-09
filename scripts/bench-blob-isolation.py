@@ -9,7 +9,6 @@ import argparse
 import base64
 import contextlib
 import hashlib
-import http.client
 import ipaddress
 import json
 import math
@@ -83,9 +82,10 @@ def parse_time(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
-def preflight(mode: str, window: str, assigned: list[dict[str, str]], processes: list[tuple[int, int, str]],
-              now: float, own_group: int) -> list[str]:
-    """Reasons this slot cannot be used. Nothing is stopped or waited for."""
+def preflight(mode: str, window: str, assigned: list[dict[str, str]], processes: list[tuple[int, int, int, str]],
+              now: float, own_group: int, ancestors: frozenset[int] = frozenset()) -> list[str]:
+    """Reasons this slot cannot be used. Nothing is stopped or waited for. The caller's own process group and its
+    ancestors (the coordinator that launched it) are not peers; every other process is judged by what it runs."""
     reasons = []
     if RESERVED_WINDOWS.get(window, ("",))[0] != mode:
         reasons.append(f"{window!r} is not the reserved {mode} window")
@@ -97,8 +97,8 @@ def preflight(mode: str, window: str, assigned: list[dict[str, str]], processes:
     for entry in assigned:
         if entry["id"] != window and parse_time(entry["start"]) <= now < parse_time(entry["end"]):
             reasons.append(f"assigned window {entry['id']!r} is active")
-    for pid, group, command in processes:
-        if group == own_group or not command:
+    for pid, _, group, command in processes:
+        if group == own_group or pid in ancestors or not command:
             continue
         name = os.path.basename(command.split()[0])
         if name in HEAVY_JOBS or "bench-blob-isolation" in command:
@@ -110,14 +110,31 @@ def own_slot_end(window: str, assigned: list[dict[str, str]]) -> float:
     return min(parse_time(entry["end"]) for entry in assigned if entry["id"] == window)
 
 
-def host_processes() -> list[tuple[int, int, str]]:
-    output = subprocess.run(["ps", "-axo", "pid=,pgid=,command="], capture_output=True, text=True, check=True).stdout
+def host_processes() -> list[tuple[int, int, int, str]]:
+    output = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,command="], capture_output=True, text=True,
+                            check=True, timeout=10).stdout
     processes = []
     for line in output.splitlines():
-        fields = line.split(None, 2)
-        if len(fields) >= 2:
-            processes.append((int(fields[0]), int(fields[1]), fields[2] if len(fields) == 3 else ""))
+        fields = line.split(None, 3)
+        if len(fields) >= 3:
+            processes.append((int(fields[0]), int(fields[1]), int(fields[2]), fields[3] if len(fields) == 4 else ""))
     return processes
+
+
+def ancestors(processes: list[tuple[int, int, int, str]], pid: int) -> frozenset[int]:
+    """The parent chain of `pid` in one process snapshot."""
+    parents = {process[0]: process[1] for process in processes}
+    chain: set[int] = set()
+    current = parents.get(pid)
+    while current and current not in chain and current != pid:
+        chain.add(current)
+        current = parents.get(current)
+    return frozenset(chain)
+
+
+def host_preflight(mode: str, window: str, assigned: list[dict[str, str]]) -> list[str]:
+    processes = host_processes()
+    return preflight(mode, window, assigned, processes, time.time(), os.getpgid(0), ancestors(processes, os.getpid()))
 
 
 def host_load() -> dict[str, Any]:
@@ -262,6 +279,116 @@ def overall(evaluations: list[dict[str, Any]]) -> str:
     return "fail" if "fail" in verdicts else "invalid" if verdicts != {"pass"} else "pass"
 
 
+# Deadlines
+
+
+class BudgetExpired(Exception):
+    """No new phase, worker or request may start: the run's deadline passed or it was cancelled."""
+
+
+def event_wait(event: threading.Event, seconds: float) -> bool:
+    return event.wait(seconds)
+
+
+class Budget:
+    """One monotonic deadline for a whole run. Waits are capped by it, and nothing new starts once it has passed
+    or the run was cancelled."""
+
+    def __init__(self, deadline: float, clock: Callable[[], float] = time.monotonic,
+                 waiter: Callable[[threading.Event, float], bool] = event_wait) -> None:
+        self.deadline, self.clock, self.waiter = deadline, clock, waiter
+        self.cancelled = threading.Event()
+
+    def remaining(self) -> float:
+        return self.deadline - self.clock()
+
+    def expired(self) -> bool:
+        return self.cancelled.is_set() or self.remaining() <= 0
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+
+    def check(self, what: str) -> None:
+        if self.expired():
+            raise BudgetExpired(what)
+
+    def wait(self, seconds: float, stop: threading.Event | None = None) -> bool:
+        """Waits up to `seconds`, never past the deadline. True when the caller may start more work."""
+        event = self.cancelled if stop is None else stop
+        duration = min(seconds, self.remaining())
+        if duration > 0 and not event.is_set():
+            self.waiter(event, duration)
+        return not event.is_set() and not self.expired()
+
+    def phase(self, seconds: float, name: str) -> None:
+        if not self.wait(seconds):
+            raise BudgetExpired(name)
+
+
+def exchange(sock: socket.socket, payload: bytes, end: float, clock: Callable[[], float] = time.monotonic) -> bytes:
+    """Sends a request and reads its response before the absolute monotonic `end`. Every socket wait gets only the
+    time that remains, so a slow trickle cannot renew the limit."""
+    def left() -> float:
+        remaining = end - clock()
+        if remaining <= 0:
+            raise TimeoutError("request time limit reached")
+        return remaining
+
+    for offset in range(0, len(payload), 65536):
+        sock.settimeout(left())
+        sock.sendall(payload[offset:offset + 65536])
+    received = bytearray()
+    head_end = length = None
+    while True:
+        sock.settimeout(left())
+        try:
+            chunk = sock.recv(65536)
+        except (ssl.SSLEOFError, ConnectionResetError):
+            if head_end is not None and length is None:
+                break
+            raise
+        if not chunk:
+            break
+        received += chunk
+        if head_end is None and b"\r\n\r\n" in received:
+            head_end = received.index(b"\r\n\r\n") + 4
+            for line in bytes(received[:head_end]).split(b"\r\n")[1:]:
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value.strip())
+        if length is not None and len(received) - head_end >= length:
+            break
+    return bytes(received)
+
+
+def parse_response(raw: bytes) -> tuple[int, dict[str, str], bytes]:
+    head, separator, body = raw.partition(b"\r\n\r\n")
+    if not separator:
+        raise ValueError("incomplete response head")
+    lines = head.decode("latin-1").split("\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    if "content-length" in headers:
+        body = body[:int(headers["content-length"])]
+    elif headers.get("transfer-encoding", "").lower() == "chunked":
+        body = dechunk(body)
+    return status, headers, body
+
+
+def dechunk(body: bytes) -> bytes:
+    decoded, offset = bytearray(), 0
+    while True:
+        line_end = body.index(b"\r\n", offset)
+        size = int(body[offset:line_end].split(b";")[0], 16)
+        if size == 0:
+            return bytes(decoded)
+        decoded += body[line_end + 2:line_end + 2 + size]
+        offset = line_end + 2 + size + 2
+
+
 # HTTP clients
 
 
@@ -288,30 +415,41 @@ class Response:
 
 
 class Client:
-    def __init__(self, mode: str, via: str, port: int, host: str, ca_file: str) -> None:
+    def __init__(self, mode: str, via: str, port: int, host: str, ca_file: str | None) -> None:
         check_destination(mode, via, host)
         self.via, self.port, self.host = via, port, host
         self.context = ssl.create_default_context(cafile=ca_file)
+        self.budget: Budget | None = None
 
     def request(self, path: str, body: bytes = b"", token: bytes | None = None,
                 content_type: str | None = "application/json") -> Response:
+        """One request within REQUEST_TIMEOUT and the run's remaining time, measured from its start. Raises
+        BudgetExpired instead of starting once the run's deadline has passed."""
         lines = [f"POST {path} HTTP/1.1", f"Host: {self.host}", "Connection: close", f"Content-Length: {len(body)}"]
         if content_type is not None:
             lines.append(f"Content-Type: {content_type}")
         if token is not None:
             lines.append(f"Authorization: Bearer {b64(token)}")
+        budget = self.budget
         start = time.monotonic()
+        limit = REQUEST_TIMEOUT
+        if budget is not None:
+            if budget.expired():
+                raise BudgetExpired(path)
+            limit = min(limit, budget.remaining())
+        end = start + limit
         try:
-            raw = socket.create_connection((self.via, self.port), timeout=REQUEST_TIMEOUT)
-            with self.context.wrap_socket(raw, server_hostname=self.host) as sock:
-                sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
-                response = http.client.HTTPResponse(sock)
-                response.begin()
-                data = response.read()
-                headers = {name.lower(): value for name, value in response.getheaders()}
-                finished = time.monotonic()
-                return Response(response.status, headers, data, finished - start, start, finished)
-        except (OSError, http.client.HTTPException):
+            raw = socket.create_connection((self.via, self.port), timeout=max(0.001, end - time.monotonic()))
+            try:
+                raw.settimeout(max(0.001, end - time.monotonic()))
+                with self.context.wrap_socket(raw, server_hostname=self.host) as sock:
+                    status, headers, data = parse_response(
+                        exchange(sock, ("\r\n".join(lines) + "\r\n\r\n").encode() + body, end))
+            finally:
+                raw.close()
+            finished = time.monotonic()
+            return Response(status, headers, data, finished - start, start, finished)
+        except (OSError, ValueError, IndexError):
             finished = time.monotonic()
             return Response(0, {}, b"", finished - start, start, finished)
 
@@ -421,21 +559,30 @@ def jittered(seconds: float) -> float:
     return seconds * random.uniform(0.5, 1.5)
 
 
-def with_retries(stop: threading.Event, deadline: float, call: Callable[[], Response],
-                 record: Callable[[Response], None]) -> Response:
-    """Retries refusals after Retry-After. Status 0 is retried too: the relay may refuse a part before reading its
-    body, and the reset can arrive before its response."""
-    while True:
-        response = call()
+def with_retries(stop: threading.Event, budget: Budget, call: Callable[[], Response | None],
+                 record: Callable[[Response], None]) -> Response | None:
+    """Retries refusals after Retry-After, waiting never past the deadline. Status 0 is retried too: the relay may
+    refuse a part before reading its body, and the reset can arrive before its response. No attempt starts after
+    `stop` or the deadline; a response that arrives afterwards is still recorded. `call` returns None when it
+    declined to start."""
+    response = None
+    while not stop.is_set() and not budget.expired():
+        try:
+            attempt = call()
+        except BudgetExpired:
+            break
+        if attempt is None:
+            break
+        response = attempt
         record(response)
-        if response.status not in RETRY_STATUSES or stop.is_set() or time.monotonic() > deadline:
-            return response
-        stop.wait(response.retry_after())
+        if response.status not in RETRY_STATUSES or not budget.wait(response.retry_after(), stop):
+            break
+    return response
 
 
 class BlobLoad:
-    def __init__(self, client: Client, group: Group, deadline: float) -> None:
-        self.client, self.group, self.deadline = client, group, deadline
+    def __init__(self, client: Client, group: Group, budget: Budget) -> None:
+        self.client, self.group, self.budget = client, group, budget
         self.lock = threading.Lock()
         self.statuses: Counter[str] = Counter()
         self.after_transition: Counter[str] = Counter()
@@ -463,9 +610,10 @@ class BlobLoad:
         """Starts about one upload request per writer every UPLOAD_INTERVAL_SECONDS, jittered so writers do not
         fire together, without catch-up. With the paced GETs, ten writers offer about 9 requests/s against the
         8/s per-source blob budget."""
-        def request() -> Response:
-            writer.stop.wait(max(0.0, writer.next_upload - time.monotonic()))
-            writer.next_upload = time.monotonic() + jittered(UPLOAD_INTERVAL_SECONDS)
+        def request() -> Response | None:
+            if not self.budget.wait(writer.next_upload - self.budget.clock(), writer.stop):
+                return None
+            writer.next_upload = self.budget.clock() + jittered(UPLOAD_INTERVAL_SECONDS)
             return call()
         return request
 
@@ -473,18 +621,18 @@ class BlobLoad:
         """Begins the object and PUTs the parts the relay reports missing: all of a fresh object, normally none
         of a reused pool object."""
         group = self.group.route
-        begin = with_retries(writer.stop, self.deadline, self.paced(writer, lambda: self.client.blob(
+        begin = with_retries(writer.stop, self.budget, self.paced(writer, lambda: self.client.blob(
             "begin", writer.token, group=b64(group), object=b64(item.id), length=item.length,
             parts=[b64(value) for value in item.hashes])), self.record(writer, "begin"))
-        if begin.status != 200:
+        if begin is None or begin.status != 200:
             return False
         present = set(begin.json().get("present", []))
         for index in range(len(item.parts)):
             if index in present:
                 continue
-            response = with_retries(writer.stop, self.deadline, self.paced(writer, lambda index=index: self.client.part(
+            response = with_retries(writer.stop, self.budget, self.paced(writer, lambda index=index: self.client.part(
                 "put", writer.token, group, item.id, index, item.parts[index])), self.record(writer, "put"))
-            if response.status != 200:
+            if response is None or response.status != 200:
                 return False
             with self.lock:
                 self.put_times.append(response.finished)
@@ -496,10 +644,13 @@ class BlobLoad:
         return True
 
     def prepare(self, writer: Writer, lengths: dict[str, int]) -> None:
-        writer.next_upload = time.monotonic() + jittered(UPLOAD_INTERVAL_SECONDS)
-        writer.pool = [synthetic_object(self.group.route, lengths[kind]) for kind in POOL_LENGTHS]
-        for item in writer.pool:
-            if not self.upload(writer, item, fresh=False):
+        writer.next_upload = self.budget.clock() + jittered(UPLOAD_INTERVAL_SECONDS)
+        writer.pool = []
+        for kind in POOL_LENGTHS:
+            self.budget.check("pool preparation")
+            writer.pool.append(synthetic_object(self.group.route, lengths[kind]))
+            if not self.upload(writer, writer.pool[-1], fresh=False):
+                self.budget.check("pool preparation")
                 raise RuntimeError(f"{writer.name} could not upload its pool")
         with self.lock:
             self.pool += writer.pool
@@ -507,7 +658,7 @@ class BlobLoad:
     def upload_loop(self, writer: Writer, lengths: dict[str, int]) -> None:
         """Resumes an unfinished fresh object before starting another, as a client would."""
         turn, pending = 0, None
-        while not writer.stop.is_set():
+        while not writer.stop.is_set() and not self.budget.expired():
             if pending is not None:
                 item, fresh = pending, True
             elif self.fresh_open and writer.fresh_left > 0:
@@ -518,19 +669,19 @@ class BlobLoad:
                 turn += 1
             uploaded = self.upload(writer, item, fresh)
             pending = item if fresh and not uploaded else None
-            if not uploaded:
-                writer.stop.wait(1)
+            if not uploaded and not self.budget.wait(1, writer.stop):
+                return
 
     def download_loop(self, writer: Writer) -> None:
         """One GET every GET_INTERVAL_SECONDS per writer, without catch-up."""
-        next_start = time.monotonic() + jittered(GET_INTERVAL_SECONDS)
-        while not writer.stop.wait(max(0.0, next_start - time.monotonic())):
-            next_start = time.monotonic() + jittered(GET_INTERVAL_SECONDS)
+        next_start = self.budget.clock() + jittered(GET_INTERVAL_SECONDS)
+        while self.budget.wait(next_start - self.budget.clock(), writer.stop):
+            next_start = self.budget.clock() + jittered(GET_INTERVAL_SECONDS)
             item = random.choice(self.pool)
             index = random.randrange(len(item.parts))
-            response = with_retries(writer.stop, self.deadline, lambda item=item, index=index: self.client.part(
+            response = with_retries(writer.stop, self.budget, lambda item=item, index=index: self.client.part(
                 "get", writer.token, self.group.route, item.id, index), self.record(writer, "get"))
-            if response.status == 200:
+            if response is not None and response.status == 200:
                 with self.lock:
                     self.get_times.append(response.finished)
                     self.bytes_down += len(response.data)
@@ -538,7 +689,8 @@ class BlobLoad:
                     self.mismatches += response.data != item.parts[index]
 
     def start(self, writer: Writer, lengths: dict[str, int]) -> None:
-        writer.next_upload = time.monotonic() + jittered(UPLOAD_INTERVAL_SECONDS)
+        self.budget.check(f"start {writer.name}")
+        writer.next_upload = self.budget.clock() + jittered(UPLOAD_INTERVAL_SECONDS)
         writer.threads = [threading.Thread(target=self.upload_loop, args=(writer, lengths), daemon=True),
                           threading.Thread(target=self.download_loop, args=(writer,), daemon=True)]
         for thread in writer.threads:
@@ -644,17 +796,13 @@ def timed(call: Callable[[], Response]) -> dict[str, Any]:
     return {"status": response.status, "seconds": response.seconds}
 
 
-def control_workload(client: Client, group: Group, deadline: float, load: BlobLoad | None = None,
+def control_workload(client: Client, group: Group, budget: Budget, load: BlobLoad | None = None,
                      lengths: dict[str, int] | None = None) -> dict[str, Any]:
     samples: list[tuple[str, int, float]] = []
     owner = group.owner
     start = next_start = time.monotonic()
     for _ in range(CYCLES):
-        if time.monotonic() > deadline:
-            break
-        delay = next_start - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
+        budget.phase(next_start - time.monotonic(), "control cycle")
         cycle = time.monotonic()
         refresh_head(client, group, samples)
         response = client.mls("append", owner.token, group=b64(group.route), epoch=group.epoch, kind="application",
@@ -687,14 +835,14 @@ def control_workload(client: Client, group: Group, deadline: float, load: BlobLo
             "inactive": [removed, leaving]}
 
 
-def verify_writers(client: Client, group: Group, inactive: list[Writer]) -> dict[str, Any]:
+def verify_writers(client: Client, group: Group, inactive: list[Writer], budget: Budget) -> dict[str, Any]:
     statuses = {}
     for writer in group.writers:
         for _ in range(10):
             response = client.blob("wanted", writer.token, group=b64(group.route))
             if response.status not in RETRY_STATUSES:
                 break
-            time.sleep(response.retry_after())
+            budget.phase(response.retry_after(), "writer verification")
         statuses[writer.name] = response.status
     return {
         "statuses": statuses,
@@ -705,21 +853,26 @@ def verify_writers(client: Client, group: Group, inactive: list[Writer]) -> dict
     }
 
 
-def run_once(client: Client, mode: str, extra_groups: int = 0) -> dict[str, Any]:
+def run_once(client: Client, mode: str, budget: Budget, extra_groups: int = 0) -> dict[str, Any]:
+    """One run inside `budget`. Whatever ends it, every owned worker is cancelled and drained before it returns."""
     started = time.monotonic()
-    deadline = started + RUN_SECONDS[mode]
-    lengths = object_lengths()
-    unloaded_group, loaded_group = setup_group(client), setup_group(client)
-    loads = [BlobLoad(client, group, deadline) for group in [loaded_group] + [setup_group(client)
-                                                                             for _ in range(extra_groups)]]
+    client.budget = budget
+    loads: list[BlobLoad] = []
     try:
-        return measured_run(client, unloaded_group, loaded_group, loads, lengths, started, deadline)
+        lengths = object_lengths()
+        unloaded_group, loaded_group = setup_group(client), setup_group(client)
+        loads += [BlobLoad(client, group, budget) for group in [loaded_group] + [setup_group(client)
+                                                                                for _ in range(extra_groups)]]
+        return measured_run(client, unloaded_group, loaded_group, loads, lengths, started, budget)
     finally:
+        budget.cancel()
         stop_loads(loads)
+        client.budget = None
 
 
-def measured_run(client: Client, unloaded_group: Group, loaded_group: Group, loads: list[BlobLoad],
-                 lengths: dict[str, int], started: float, deadline: float) -> dict[str, Any]:
+def prepare_loads(loads: list[BlobLoad], lengths: dict[str, int], budget: Budget) -> None:
+    """Uploads every writer's pool in owned threads joined within the run's remaining time; on expiry or error the
+    writers are stopped and drained, and no later phase starts."""
     errors: list[BaseException] = []
 
     def prepare(load: BlobLoad, writer: Writer) -> None:
@@ -728,41 +881,52 @@ def measured_run(client: Client, unloaded_group: Group, loaded_group: Group, loa
         except BaseException as error:
             errors.append(error)
 
-    preparers = [threading.Thread(target=prepare, args=(load, writer))
-                 for load in loads for writer in load.group.writers]
-    for thread in preparers:
-        thread.start()
-    for thread in preparers:
-        thread.join()
-    if errors:
-        raise errors[0]
+    for load in loads:
+        for writer in load.group.writers:
+            writer.threads = [threading.Thread(target=prepare, args=(load, writer), daemon=True)]
+            writer.threads[0].start()
+    for load in loads:
+        for writer in load.group.writers:
+            writer.threads[0].join(max(0.0, budget.remaining()))
+    if errors or budget.expired() or any(writer.threads[0].is_alive() for load in loads
+                                         for writer in load.group.writers):
+        budget.cancel()
+        stop_loads(loads)
+        if errors and not isinstance(errors[0], BudgetExpired):
+            raise errors[0]
+        raise BudgetExpired("pool preparation")
+
+
+def measured_run(client: Client, unloaded_group: Group, loaded_group: Group, loads: list[BlobLoad],
+                 lengths: dict[str, int], started: float, budget: Budget) -> dict[str, Any]:
+    prepare_loads(loads, lengths, budget)
     setup_seconds = time.monotonic() - started
 
-    time.sleep(RECOVERY_SECONDS)
-    unloaded = control_workload(client, unloaded_group, deadline)
-    unloaded["membership"]["writers"] = verify_writers(client, unloaded_group, unloaded.pop("inactive"))
+    budget.phase(RECOVERY_SECONDS, "recovery")
+    unloaded = control_workload(client, unloaded_group, budget)
+    unloaded["membership"]["writers"] = verify_writers(client, unloaded_group, unloaded.pop("inactive"), budget)
 
     for load in loads:
         for writer in load.group.writers:
             load.start(writer, lengths)
-    time.sleep(WARMUP_SECONDS)
+    budget.phase(WARMUP_SECONDS, "warm-up")
     for load in loads:
         load.fresh_open = True
     window_start = time.monotonic()
-    loaded = control_workload(client, loaded_group, deadline, loads[0], lengths)
+    loaded = control_workload(client, loaded_group, budget, loads[0], lengths)
     window_end = time.monotonic()
     for load in loads:
         load.fresh_open = False
-    time.sleep(TAIL_SECONDS)
+    budget.phase(TAIL_SECONDS, "tail")
     stop_loads(loads)
-    loaded["membership"]["writers"] = verify_writers(client, loaded_group, loaded.pop("inactive"))
+    loaded["membership"]["writers"] = verify_writers(client, loaded_group, loaded.pop("inactive"), budget)
     return {
         "setupSeconds": setup_seconds, "unloaded": unloaded, "loaded": loaded,
         "blob": loads[0].snapshot(window_start, window_end),
         "otherGroups": [load.snapshot(window_start, window_end) for load in loads[1:]],
         "phaseTimes": {"loadedStart": time.time() - (time.monotonic() - window_start),
                        "loadedEnd": time.time() - (time.monotonic() - window_end)},
-        "seconds": time.monotonic() - started, "overran": time.monotonic() > deadline,
+        "seconds": time.monotonic() - started, "overran": budget.expired(),
     }
 
 
@@ -880,16 +1044,20 @@ def write_report(report: dict[str, Any], out: Path) -> None:
     (out / f"{report['window']}-summary.md").write_text(markdown(report))
 
 
-def measure(client: Client, args: argparse.Namespace, samples_path: Path, slot_end: float) -> dict[str, Any]:
+def measure(client: Client, args: argparse.Namespace, samples_path: Path, stop_at: float) -> dict[str, Any]:
+    """Runs until `stop_at` (UTC epoch, when the guardian starts stopping the mode), converted once to a monotonic
+    deadline that reserves teardown time. A run starts only when its full budget fits."""
+    mode_deadline = time.monotonic() + (stop_at - TEARDOWN_SECONDS - time.time())
     report: dict[str, Any] = {"window": args.window, "mode": args.mode, "revision": args.revision,
-                              "host": host_info(), "started": time.time(), "runs": []}
+                              "host": host_info(), "started": time.time(), "stopAt": stop_at, "runs": []}
     plans = [0] * args.runs + ([1] if args.sensitivity else [])
     for extra_groups in plans:
-        if time.time() + RUN_SECONDS[args.mode] + TEARDOWN_SECONDS > slot_end:
+        if time.monotonic() + RUN_SECONDS[args.mode] > mode_deadline:
             report["stoppedEarly"] = "the next run would leave insufficient time for teardown inside the assigned slot"
             break
+        budget = Budget(min(time.monotonic() + RUN_SECONDS[args.mode], mode_deadline))
         try:
-            run = compact(run_once(client, args.mode, extra_groups))
+            run = compact(run_once(client, args.mode, budget, extra_groups))
         except Exception as error:
             report["runs"].append({"sensitivity": bool(extra_groups), "error": repr(error), "evaluation": {
                 "verdict": "invalid", "fail": [], "invalid": [f"the run stopped: {error!r}"]}})
@@ -913,7 +1081,7 @@ def measure(client: Client, args: argparse.Namespace, samples_path: Path, slot_e
 
 def command_preflight(args: argparse.Namespace) -> int:
     assigned = json.loads(Path(args.assigned).read_text())
-    reasons = preflight(args.mode, args.window, assigned, host_processes(), time.time(), os.getpgid(0))
+    reasons = host_preflight(args.mode, args.window, assigned)
     slot_end = None if reasons else own_slot_end(args.window, assigned)
     print(json.dumps({"window": args.window, "host": host_load(), "refused": reasons, "slotEnd": slot_end}))
     return 2 if reasons else 0
@@ -921,7 +1089,7 @@ def command_preflight(args: argparse.Namespace) -> int:
 
 def command_direct(args: argparse.Namespace) -> int:
     assigned = json.loads(Path(args.assigned).read_text())
-    reasons = preflight("direct", args.window, assigned, host_processes(), time.time(), os.getpgid(0))
+    reasons = host_preflight("direct", args.window, assigned)
     if reasons:
         print(json.dumps({"refused": reasons, "host": host_load()}))
         return 2
@@ -953,7 +1121,7 @@ def command_direct(args: argparse.Namespace) -> int:
                 port = int(line.split(":")[1].split("/")[0])
         sampler = ProcessSampler(relay.process.pid, directory / "samples.jsonl")
         client = Client("direct", "127.0.0.1", port, "localhost", str(directory / "tls.crt"))
-        report = measure(client, args, directory / "samples.jsonl", own_slot_end(args.window, assigned))
+        report = measure(client, args, directory / "samples.jsonl", min(args.stop_at, own_slot_end(args.window, assigned)))
         sampler.close()
         sampler = None
         report["disk"] = {"blobBytes": sum(path.stat().st_size for path in (directory / "blobs").rglob("*")
@@ -977,7 +1145,7 @@ def command_direct(args: argparse.Namespace) -> int:
 
 def command_run(args: argparse.Namespace) -> int:
     client = Client(args.mode, args.via, args.port, args.host, args.ca)
-    report = measure(client, args, Path(args.samples), args.slot_end)
+    report = measure(client, args, Path(args.samples), args.stop_at)
     write_report(report, Path(args.out))
     return 0 if report["verdict"] == "pass" else 1
 
@@ -1020,6 +1188,8 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--sensitivity", action="store_true")
             command.add_argument("--revision", default="unknown")
             command.add_argument("--out", required=True)
+            command.add_argument("--stop-at", type=float, required=True,
+                                 help="UTC epoch at which the guardian starts stopping this mode")
     run = commands.choices["run"]
     run.add_argument("--mode", default="traefik", choices=("traefik",))
     run.add_argument("--via", required=True)
@@ -1027,7 +1197,6 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--host", required=True)
     run.add_argument("--ca", required=True)
     run.add_argument("--samples", required=True)
-    run.add_argument("--slot-end", type=float, required=True)
     annotate = commands.add_parser("annotate")
     annotate.add_argument("--report", required=True)
     annotate.add_argument("--values", default="{}")

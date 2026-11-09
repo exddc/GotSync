@@ -288,7 +288,14 @@ scripts/uv.sh python server/benchmark.py --iterations 1000 --payload-bytes 256
 with and without blob load, using synthetic clients on loopback or on its own
 Docker networks. It runs only inside a window assigned in the JSON file passed
 with `--assigned`. It refuses to start while another window is active or while
-`xcodebuild`, `xctest`, or another benchmark runs, and it stops nothing.
+`xcodebuild`, `xctest`, or another benchmark runs, and it stops nothing outside
+its own run. `scripts/bench-guardian.py` runs each mode, from dependency sync
+and stack build to teardown. It asks the mode to stop 90 seconds before the
+window ends and kills only processes it started that are still running 30
+seconds before the end. It then checks that none of its processes, containers,
+networks, or volumes remain, and exits 3 if cleanup is incomplete. Every
+request, retry, and phase also stops at one run deadline that leaves time for
+teardown.
 
 Local development uses plain HTTP and `ws://` on loopback only. A deployed
 version needs HTTPS and `wss://`, the perimeter controls in
