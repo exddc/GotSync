@@ -116,6 +116,56 @@ before it reads the request body. Requests are limited to 1 MiB.
 [PROTOCOL.md](../docs/PROTOCOL.md) lists the operations, authorization rules,
 and limits.
 
+## Encrypted blob parts (optional)
+
+The relay can store encrypted blob parts under `/v2/mls/blob/`. This lane is
+off by default. While it is off, the relay creates no blob files, advertises
+no `blobs` capability, and answers blob paths like any unknown delivery
+operation, with `400 invalidRequest`.
+
+| Setting | Argument | Environment | Default |
+| --- | --- | --- | --- |
+| Enable the lane | `--enable-blobs` | `GOTSYNC_ENABLE_BLOBS=1` | off |
+| Part directory | `--blob-directory` | `GOTSYNC_BLOB_DIRECTORY` | `relay-data/blobs/v1` |
+| Metadata database | `--blob-database` | `GOTSYNC_BLOB_DATABASE` | `relay-data/blobs.sqlite3` |
+| Require the proxy route tag | `--blob-require-route-header` | `GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER=1` | off |
+
+Only the exact value `1` turns on an environment switch. An empty path
+variable selects the default, and an argument overrides its variable. Keep
+the part directory and the database on the same persistent volume as the
+delivery database.
+
+The relay stores parts that clients have already encrypted. It checks each
+part's SHA-256 and the object identifier, and it never decrypts.
+[PROTOCOL.md](../docs/PROTOCOL.md#blob-parts) lists the endpoints and errors.
+
+| Limit | Value |
+| --- | --- |
+| Part | 524,304 bytes |
+| Object | 20 parts, 10,486,080 bytes |
+| Group | 201,326,592 bytes (192 MiB), 1,200 objects, 8 incomplete objects |
+| Writer | 2 incomplete objects, 2 concurrent blob requests |
+| Relay | 8 GiB of objects, 8 concurrent blob requests; 1 GiB of the volume is kept free |
+| Source | 8 requests/s with burst 32, 4 concurrent requests, separate from the delivery limits |
+
+A complete object is kept for 30 days after it was last begun or downloaded,
+measured to the hour. An incomplete object, or one that a client released, is
+kept for 24 hours. A `release` therefore does not return quota at once. Only active writers of a
+group can read or write its blobs; a removed writer is refused at once, with
+no grace period.
+
+With `--blob-require-route-header`, the relay serves a blob request only when
+the TCP peer is a `--trusted-proxy` and the request carries
+`X-GotSync-Route: blob`. Any other blob request gets `404 notFound`. The
+proxy must overwrite this header on every route that reaches the delivery
+listener, so a client cannot choose it.
+
+The blob lane shares these resources with MLS delivery: the 64 delivery
+connections and their 2-second header phase, TLS, the proxy process, CPU,
+disk, and fsync bandwidth. A proxy that buffers bodies holds up to 1 MiB per
+request before the relay authenticates it. The limits bound this sharing;
+they do not protect against a distributed flood.
+
 ## Admission and rate limits
 
 The relay limits work per client source before it parses a request body or
@@ -233,6 +283,12 @@ Run the loopback forwarding benchmark with:
 ```sh
 scripts/uv.sh python server/benchmark.py --iterations 1000 --payload-bytes 256
 ```
+
+`scripts/bench-blob-isolation.sh direct|traefik` measures MLS delivery latency
+with and without blob load, using synthetic clients on loopback or on its own
+Docker networks. It runs only inside a window assigned in the JSON file passed
+with `--assigned`. It refuses to start while another window is active or while
+`xcodebuild`, `xctest`, or another benchmark runs, and it stops nothing.
 
 Local development uses plain HTTP and `ws://` on loopback only. A deployed
 version needs HTTPS and `wss://`, the perimeter controls in
@@ -379,6 +435,35 @@ address, unless its entry point sets `forwardedHeaders.insecure` or
 `forwardedHeaders.trustedIPs`. The container runs with a read-only root
 filesystem, no Linux capabilities, `no-new-privileges`, and limits of 512 MB of
 memory and 128 processes.
+
+### Opt-in blob routing
+
+`compose.blobs.yaml` turns on the blob lane behind Traefik. It is not part of
+the default deployment, and production does not use it:
+
+```sh
+docker compose -f compose.yaml -f compose.blobs.yaml up -d --wait
+```
+
+The override sets the blob environment variables, with parts under
+`/data/blobs/v1` and the database at `/data/blobs.sqlite3`, and requires the
+route tag. It adds a `gotsync-blob` router for `/v2/mls/blob/` with
+priority 200. That router has its own per-source limits (8 requests/s with
+burst 32, 4 concurrent) and 1 MiB body buffering, and it sets
+`X-GotSync-Route: blob`. The existing `gotsync-mls` router gets priority 100
+and an extra middleware that sets `X-GotSync-Route: control`; its other
+middlewares stay. Traefik's default priority is the length of the rule, so
+without these explicit values a long host name would let the control router
+take blob paths. Neither router writes access logs.
+
+The transport in `setup-host.sh` waits 15 seconds for response headers. The
+relay allows a blob request 30 seconds, so a stalled blob request can end
+with a Traefik `504`. Such a request may or may not have taken effect.
+
+To roll back, deploy without the override. Stored blobs stay in `/data` until
+you delete `/data/blobs/v1` and `/data/blobs.sqlite3*`. A relay started with
+the override but with `GOTSYNC_ENABLE_BLOBS` unset keeps the blob router and
+answers blob paths with `400 invalidRequest`, without the capability.
 
 ### Tagged releases
 
