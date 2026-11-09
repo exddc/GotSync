@@ -125,16 +125,39 @@ class EvaluatorTests(unittest.TestCase):
 class AggregateReportTests(unittest.TestCase):
     def test_window_counts_every_blob_request_and_transfer_inside_the_loaded_phase(self):
         load = bench.BlobLoad(None, None, 0)
-        load.events = [(1.0, "begin", "200"), (2.0, "put", "200"), (3.0, "put", "429 rateLimited"),
-                       (4.0, "get", "0"), (5.0, "get", "200"), (6.0, "get", "afterTransition 403"),
-                       (30.0, "put", "200")]
+        load.events = [(1.0, 1.0, "begin", "200"), (2.0, 2.0, "put", "200"), (3.0, 3.0, "put", "429 rateLimited"),
+                       (4.0, 4.0, "get", "0"), (5.0, 5.0, "get", "200"), (6.0, 6.0, "get", "afterTransition 403"),
+                       (30.0, 30.0, "put", "200")]
         load.transfers = [(2.0, "put", 524304), (5.0, "get", 17), (30.0, "put", 17)]
         window = load.window(0.0, 10.0)
         self.assertEqual((window["offeredPerSecond"], window["acceptedPerSecond"], window["resets"]), (0.6, 0.3, 1))
-        self.assertEqual(window["operations"]["put"], {"offered": 2, "accepted": 1,
+        self.assertEqual(window["operations"]["put"], {"offered": 2, "completed": 2, "accepted": 1,
                                                        "statuses": {"200": 1, "429 rateLimited": 1}})
         self.assertEqual(window["operations"]["get"]["statuses"], {"0": 1, "200": 1, "afterTransition 403": 1})
         self.assertEqual((window["putBytes"], window["getBytes"]), (524304, 17))
+
+    def test_offered_requests_and_completed_transfers_use_their_own_times(self):
+        load = bench.BlobLoad(None, None, 0)
+        writer = bench.Writer("A")
+        load.record(writer, "put")(bench.Response(200, {}, b"", 2.0, 9.0, 11.0))
+        load.record(writer, "get")(bench.Response(200, {}, b"", 2.0, -1.0, 1.0))
+        load.record(writer, "begin")(bench.Response(429, {}, b"", 1.0, 10.0, 11.0))
+        load.transfers = [(11.0, "put", 524304), (1.0, "get", 17)]
+        window = load.window(0.0, 10.0)
+        self.assertEqual((window["offeredPerSecond"], window["completedPerSecond"],
+                          window["acceptedPerSecond"]), (0.1, 0.1, 0.1))
+        self.assertIn("put", window["operations"])
+        self.assertIn("get", window["operations"])
+        self.assertEqual(window["operations"]["put"],
+                         {"offered": 1, "completed": 0, "accepted": 0, "statuses": {}})
+        self.assertEqual(window["operations"]["get"],
+                         {"offered": 0, "completed": 1, "accepted": 1, "statuses": {"200": 1}})
+        self.assertNotIn("begin", window["operations"])
+        self.assertEqual((window["putBytes"], window["getBytes"]), (0, 17))
+
+    def test_quarter_boundary_is_counted_in_only_one_interval(self):
+        rate, empty = bench.sustained([5.0, 10.0, 15.0, 20.0], 0.0, 20.0)
+        self.assertEqual((rate, empty), (0.15, 1))
 
     def test_summary_reports_aggregate_rates_and_disclaims_saturation(self):
         sample = run()

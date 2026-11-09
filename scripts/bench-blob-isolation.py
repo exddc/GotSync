@@ -205,10 +205,10 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
 
 
 def sustained(times: list[float], start: float, end: float) -> tuple[float, int]:
-    inside = [value for value in times if start <= value <= end]
+    inside = [value for value in times if start <= value < end]
     quarter = (end - start) / 4
     empty = sum(1 for index in range(4)
-                if not any(start + index * quarter <= value <= start + (index + 1) * quarter for value in inside))
+                if not any(start + index * quarter <= value < start + (index + 1) * quarter for value in inside))
     return len(inside) / (end - start), empty
 
 
@@ -270,6 +270,8 @@ class Response:
     headers: dict[str, str]
     data: bytes
     seconds: float
+    started: float
+    finished: float
 
     def json(self) -> dict[str, Any]:
         try:
@@ -297,7 +299,7 @@ class Client:
             lines.append(f"Content-Type: {content_type}")
         if token is not None:
             lines.append(f"Authorization: Bearer {b64(token)}")
-        start = time.perf_counter()
+        start = time.monotonic()
         try:
             raw = socket.create_connection((self.via, self.port), timeout=REQUEST_TIMEOUT)
             with self.context.wrap_socket(raw, server_hostname=self.host) as sock:
@@ -306,9 +308,11 @@ class Client:
                 response.begin()
                 data = response.read()
                 headers = {name.lower(): value for name, value in response.getheaders()}
-                return Response(response.status, headers, data, time.perf_counter() - start)
+                finished = time.monotonic()
+                return Response(response.status, headers, data, finished - start, start, finished)
         except (OSError, http.client.HTTPException):
-            return Response(0, {}, b"", time.perf_counter() - start)
+            finished = time.monotonic()
+            return Response(0, {}, b"", finished - start, start, finished)
 
     def mls(self, operation: str, token: bytes, **values: Any) -> Response:
         return self.request(f"/v2/mls/{operation}", json.dumps({"version": 2, **values}).encode(), token)
@@ -437,7 +441,7 @@ class BlobLoad:
         self.put_times: list[float] = []
         self.get_times: list[float] = []
         self.bytes_up = self.bytes_down = self.mismatches = self.fresh_objects = 0
-        self.events: list[tuple[float, str, str]] = []
+        self.events: list[tuple[float, float, str, str]] = []
         self.transfers: list[tuple[float, str, int]] = []
         self.fresh_open = False
         self.pool: list[BlobObject] = []
@@ -451,7 +455,7 @@ class BlobLoad:
                 else:
                     key = f"{response.status}{refusal(response)}"
                     self.statuses[f"{operation} {key}"] += 1
-                self.events.append((time.monotonic(), operation, key))
+                self.events.append((response.started, response.finished, operation, key))
         return record
 
     def paced(self, writer: Writer, call: Callable[[], Response]) -> Callable[[], Response]:
@@ -482,7 +486,7 @@ class BlobLoad:
             if response.status != 200:
                 return False
             with self.lock:
-                self.put_times.append(time.monotonic())
+                self.put_times.append(response.finished)
                 self.bytes_up += len(item.parts[index])
                 self.transfers.append((self.put_times[-1], "put", len(item.parts[index])))
         if fresh:
@@ -527,7 +531,7 @@ class BlobLoad:
                 "get", writer.token, self.group.route, item.id, index), self.record(writer, "get"))
             if response.status == 200:
                 with self.lock:
-                    self.get_times.append(time.monotonic())
+                    self.get_times.append(response.finished)
                     self.bytes_down += len(response.data)
                     self.transfers.append((self.get_times[-1], "get", len(response.data)))
                     self.mismatches += response.data != item.parts[index]
@@ -552,21 +556,26 @@ class BlobLoad:
     def window(self, start: float, end: float) -> dict[str, Any]:
         """Aggregate blob traffic of all writers inside the loaded measured phase, metadata included."""
         seconds = end - start
-        events = [event for event in self.events if start <= event[0] <= end]
-        transfers = [transfer for transfer in self.transfers if start <= transfer[0] <= end]
+        offered = [event for event in self.events if start <= event[0] < end]
+        completed = [event for event in self.events if start <= event[1] < end]
+        transfers = [transfer for transfer in self.transfers if start <= transfer[0] < end]
         operations: dict[str, dict[str, Any]] = {}
-        for _, operation, key in events:
-            counts = operations.setdefault(operation, {"offered": 0, "accepted": 0, "statuses": Counter()})
+        for _, _, operation, _ in offered:
+            counts = operations.setdefault(operation, {"offered": 0, "completed": 0, "accepted": 0, "statuses": Counter()})
             counts["offered"] += 1
+        for _, _, operation, key in completed:
+            counts = operations.setdefault(operation, {"offered": 0, "completed": 0, "accepted": 0, "statuses": Counter()})
+            counts["completed"] += 1
             counts["accepted"] += key == "200"
             counts["statuses"][key] += 1
         for counts in operations.values():
             counts["statuses"] = dict(counts["statuses"])
         return {
             "seconds": seconds,
-            "offeredPerSecond": len(events) / seconds,
-            "acceptedPerSecond": sum(1 for event in events if event[2] == "200") / seconds,
-            "resets": sum(1 for event in events if event[2] == "0"),
+            "offeredPerSecond": len(offered) / seconds,
+            "completedPerSecond": len(completed) / seconds,
+            "acceptedPerSecond": sum(1 for event in completed if event[3] == "200") / seconds,
+            "resets": sum(1 for event in completed if event[3] == "0"),
             "operations": operations,
             "putBytes": sum(size for _, kind, size in transfers if kind == "put"),
             "getBytes": sum(size for _, kind, size in transfers if kind == "get"),
@@ -807,6 +816,8 @@ def markdown(report: dict[str, Any]) -> str:
              "Synthetic HTTP clients with opaque random bytes; no MLS cryptography, AES-GCM, Swift or app client.",
              "Blob load is aggregate pressure on one source's shared 8 requests/s budget with sustained transfers; "
              "it is not per-writer saturation or a maximum-throughput result.",
+             "Offered counts use request starts; accepted counts, statuses and transferred bytes use completions. "
+             "The intervals include their start and exclude their end.",
              "", "| Run | Verdict | Unloaded p95/p99 (ms) | Loaded p95/p99 (ms) | Control rps | Blob offered/accepted rps "
              "| PUT/GET ok/s | PUT/GET MB | Resets |",
              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
