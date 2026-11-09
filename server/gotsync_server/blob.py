@@ -1608,8 +1608,8 @@ async def run_owned_job(
         submitted.add_done_callback(handoff.finished)
     try:
         await asyncio.wait_for(asyncio.shield(handoff.done), timeout)
-    except TimeoutError:
-        if handoff.done.done() and not handoff.done.cancelled():
+    except TimeoutError as error:
+        if handoff.done.done() and not handoff.done.cancelled() and handoff.done.exception() is error:
             raise
         handoff.depart()
         raise BlobDeadline() from None

@@ -1157,6 +1157,80 @@ def test_owned_job_result_delivered_but_not_adopted_is_disposed_once_off_the_loo
     run(main())
 
 
+def test_owned_job_deadline_keeps_ownership_when_success_is_published_during_shield_cancellation(monkeypatch):
+    from gotsync_server.blob import _OwnedHandoff, run_owned_job
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        delivery_ready = asyncio.Event()
+        deliveries, disposals, offloaded, returned = [], [], [], []
+        deliver = _OwnedHandoff._deliver
+        shield = asyncio.shield
+
+        def hold_delivery(handoff, result, error):
+            deliveries.append((handoff, result, error))
+            loop.call_soon_threadsafe(delivery_ready.set)
+
+        def publish_during_cancellation(future):
+            protected = shield(future)
+
+            def publish(cancelled):
+                if cancelled.cancelled() and deliveries:
+                    handoff, result, error = deliveries[0]
+                    if handoff.done is future:
+                        deliver(handoff, result, error)
+
+            protected.add_done_callback(publish)
+            return protected
+
+        monkeypatch.setattr(_OwnedHandoff, "_deliver", hold_delivery)
+        monkeypatch.setattr(asyncio, "shield", publish_during_cancellation)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            running = asyncio.create_task(run_owned_job(
+                pool, lambda: "resource", offload=lambda fn, required: offloaded.append((fn, required)),
+                timeout=0.1, dispose=lambda result: disposals.append((result, threading.get_ident())),
+                on_return=lambda: returned.append(True)))
+            try:
+                await asyncio.wait_for(delivery_ready.wait(), WAIT)
+                with pytest.raises(BlobDeadline):
+                    await running
+                assert len(offloaded) == 1 and offloaded[0][1] is True
+                await asyncio.to_thread(offloaded[0][0])
+                await asyncio.sleep(0)
+                assert deliveries[0][0]._slot == "disposed"
+                assert [result for result, _ in disposals] == ["resource"]
+                assert disposals[0][1] != threading.get_ident()
+                assert returned == [True]
+            finally:
+                if deliveries and deliveries[0][0]._slot in ("delivered", "cleanupPending"):
+                    if deliveries[0][0]._slot == "delivered":
+                        deliveries[0][0].depart()
+                    for cleanup, _ in offloaded:
+                        await asyncio.to_thread(cleanup)
+                    await asyncio.sleep(0)
+    run(main())
+
+
+@pytest.mark.parametrize("timeout", [None, WAIT])
+def test_owned_job_propagates_the_jobs_timeout_error_unchanged(timeout):
+    from gotsync_server.blob import run_owned_job
+
+    async def main():
+        error = TimeoutError("job timeout")
+        returned = []
+
+        def job():
+            raise error
+
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            with pytest.raises(TimeoutError) as caught:
+                await run_owned_job(pool, job, offload=lambda fn, required: pytest.fail("unexpected cleanup"),
+                                    timeout=timeout, on_return=lambda: returned.append(True))
+            assert caught.value is error
+            assert returned == [True]
+    run(main())
+
+
 def test_owned_job_ambiguous_submit_after_entry_returns_the_real_result():
     from gotsync_server.blob import run_owned_job
 
