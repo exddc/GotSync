@@ -7,6 +7,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("bench", Path(__file__).parents[1] / "bench-blob-isolation.py")
 bench = importlib.util.module_from_spec(SPEC)
@@ -219,6 +221,61 @@ class GuardTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_surviving_load_thread_refuses_a_clean_stop(self):
+        class SurvivingThread:
+            def join(self, timeout):
+                self.timeout = timeout
+
+            def is_alive(self):
+                return True
+
+        writer = bench.Writer("A")
+        writer.threads = [SurvivingThread(), SurvivingThread()]
+        with self.assertRaisesRegex(RuntimeError, "blob load threads did not stop"):
+            bench.BlobLoad(None, None, 0).stop([writer])
+        self.assertTrue(writer.stop.is_set())
+        self.assertTrue(all(0 <= thread.timeout <= bench.REQUEST_TIMEOUT + 5 for thread in writer.threads))
+
+    def test_all_groups_are_halted_and_drained_after_one_group_fails(self):
+        calls = []
+
+        class Load:
+            def __init__(self, name):
+                self.name = name
+                self.group = SimpleNamespace(writers=[])
+
+            def halt(self, writers):
+                calls.append(("halt", self.name))
+
+            def stop(self, writers, deadline):
+                calls.append(("stop", self.name))
+                if self.name == "first":
+                    raise RuntimeError("surviving worker")
+
+        with self.assertRaisesRegex(RuntimeError, "surviving worker"):
+            bench.stop_loads([Load("first"), Load("second")])
+        self.assertEqual(calls, [("halt", "first"), ("halt", "second"), ("stop", "first"), ("stop", "second")])
+
+    def test_measure_reserves_teardown_time_before_starting_a_run(self):
+        args = SimpleNamespace(mode="direct", window="w", revision="test", runs=1, sensitivity=False)
+        with patch.object(bench, "host_info", return_value={}), patch.object(bench.time, "time", return_value=100), \
+                patch.object(bench, "run_once") as run_once:
+            report = bench.measure(None, args, Path("unused"),
+                                   100 + bench.RUN_SECONDS["direct"] + bench.TEARDOWN_SECONDS - 1)
+        run_once.assert_not_called()
+        self.assertEqual(report["verdict"], "invalid")
+        self.assertIn("teardown", report["stoppedEarly"])
+
+    def test_surviving_load_stops_the_mode_before_another_run(self):
+        args = SimpleNamespace(mode="direct", window="w", revision="test", runs=3, sensitivity=False)
+        with patch.object(bench, "host_info", return_value={}), patch.object(bench.time, "time", return_value=100), \
+                patch.object(bench, "run_once", side_effect=RuntimeError("blob load threads did not stop")) as run_once:
+            report = bench.measure(None, args, Path("unused"), 1000)
+        self.assertEqual(run_once.call_count, 1)
+        self.assertEqual(report["verdict"], "invalid")
+        self.assertEqual(len(report["runs"]), 1)
+        self.assertIn("blob load threads did not stop", report["runs"][0]["error"])
+
     def assert_group_gone(self, group):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:

@@ -48,6 +48,7 @@ P95_DELTA_SECONDS = 0.25
 P99_DELTA_SECONDS = 1.0
 MIN_TRANSFERS_PER_SECOND = 1.0
 RUN_SECONDS = {"direct": 240, "traefik": 300}
+TEARDOWN_SECONDS = 60
 RESERVED_WINDOWS = {"l3a2b-direct-1": ("direct", 15 * 60), "l3a2b-traefik-1": ("traefik", 25 * 60)}
 HEAVY_JOBS = frozenset({"xcodebuild", "xctest", "swift-test", "swiftpm-xctest-helper"})
 TEST_NETWORK = ipaddress.ip_network("198.51.100.0/24")
@@ -547,11 +548,16 @@ class BlobLoad:
         for writer in writers:
             writer.stop.set()
 
-    def stop(self, writers: list[Writer]) -> None:
+    def stop(self, writers: list[Writer], deadline: float | None = None) -> None:
         self.halt(writers)
+        if deadline is None:
+            deadline = time.monotonic() + REQUEST_TIMEOUT + 5
         for writer in writers:
             for thread in writer.threads:
-                thread.join(REQUEST_TIMEOUT + 5)
+                thread.join(max(0.0, deadline - time.monotonic()))
+        survivors = [writer.name for writer in writers if any(thread.is_alive() for thread in writer.threads)]
+        if survivors:
+            raise RuntimeError(f"blob load threads did not stop: {survivors}")
 
     def window(self, start: float, end: float) -> dict[str, Any]:
         """Aggregate blob traffic of all writers inside the loaded measured phase, metadata included."""
@@ -587,6 +593,20 @@ class BlobLoad:
                 "putTimes": self.put_times, "getTimes": self.get_times, "windowStart": start, "windowEnd": end,
                 "bytesUp": self.bytes_up, "bytesDown": self.bytes_down, "mismatches": self.mismatches,
                 "freshObjects": self.fresh_objects, "poolObjects": len(self.pool)}
+
+
+def stop_loads(loads: list[BlobLoad]) -> None:
+    for load in loads:
+        load.halt(load.group.writers)
+    deadline = time.monotonic() + REQUEST_TIMEOUT + 5
+    errors = []
+    for load in loads:
+        try:
+            load.stop(load.group.writers, deadline)
+        except RuntimeError as error:
+            errors.append(str(error))
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def refresh_head(client: Client, group: Group, samples: list | None = None) -> None:
@@ -695,8 +715,7 @@ def run_once(client: Client, mode: str, extra_groups: int = 0) -> dict[str, Any]
     try:
         return measured_run(client, unloaded_group, loaded_group, loads, lengths, started, deadline)
     finally:
-        for load in loads:
-            load.stop(load.group.writers)
+        stop_loads(loads)
 
 
 def measured_run(client: Client, unloaded_group: Group, loaded_group: Group, loads: list[BlobLoad],
@@ -735,8 +754,7 @@ def measured_run(client: Client, unloaded_group: Group, loaded_group: Group, loa
     for load in loads:
         load.fresh_open = False
     time.sleep(TAIL_SECONDS)
-    for load in loads:
-        load.stop(load.group.writers)
+    stop_loads(loads)
     loaded["membership"]["writers"] = verify_writers(client, loaded_group, loaded.pop("inactive"))
     return {
         "setupSeconds": setup_seconds, "unloaded": unloaded, "loaded": loaded,
@@ -867,8 +885,8 @@ def measure(client: Client, args: argparse.Namespace, samples_path: Path, slot_e
                               "host": host_info(), "started": time.time(), "runs": []}
     plans = [0] * args.runs + ([1] if args.sensitivity else [])
     for extra_groups in plans:
-        if time.time() + RUN_SECONDS[args.mode] > slot_end:
-            report["stoppedEarly"] = "the next run would end after the assigned slot"
+        if time.time() + RUN_SECONDS[args.mode] + TEARDOWN_SECONDS > slot_end:
+            report["stoppedEarly"] = "the next run would leave insufficient time for teardown inside the assigned slot"
             break
         try:
             run = compact(run_once(client, args.mode, extra_groups))
