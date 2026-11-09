@@ -10,6 +10,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from .http import (
@@ -175,6 +176,45 @@ class MLSDeliveryStore:
     def expire(self) -> None:
         with self._lock:
             self._expire_committed()
+
+    def authorize_active(self, route: bytes, token: object, *, timeout: float,
+                         admit: Callable[[bytes], None]) -> bytes:
+        """Read-only blob authorization: the writer must be active (no removal grace).
+
+        One `SELECT` pair under the delivery lock, acquired within `timeout` (else `TimeoutError`); no expiry, no
+        activity write and no commit. `admit(digest)` runs under the same lock, so a writer permit taken there is
+        ordered before any removal commit. Returns the writer digest.
+        """
+        try:
+            digest = hashlib.sha256(decode_canonical_base64url(token, field="authorization", exact_bytes=32)).digest()
+        except RequestError as error:
+            raise DeliveryUnauthorized("writer token required") from error
+        if not self._lock.acquire(timeout=timeout):
+            raise TimeoutError("delivery store busy")
+        try:
+            if self._db.execute("SELECT 1 FROM mls_groups WHERE route=?", (route,)).fetchone() is None:
+                raise HistoryExpired("group expired")
+            row = self._db.execute("SELECT removal FROM mls_writers WHERE route=? AND digest=?", (route, digest)).fetchone()
+            if row is None or row[0] is not None:
+                raise DeliveryUnauthorized("writer not authorized")
+            admit(digest)
+            return digest
+        finally:
+            self._lock.release()
+
+    def live_routes(self, routes: list[bytes], *, timeout: float) -> set[bytes]:
+        """Read-only: which of `routes` still have a delivery group."""
+        live: set[bytes] = set()
+        for start in range(0, len(routes), 512):
+            batch = routes[start:start + 512]
+            if not self._lock.acquire(timeout=timeout):
+                raise TimeoutError("delivery store busy")
+            try:
+                live.update(row[0] for row in self._db.execute(
+                    f"SELECT route FROM mls_groups WHERE route IN ({','.join('?' * len(batch))})", batch))
+            finally:
+                self._lock.release()
+        return live
 
     def _expire_committed(self) -> None:
         with self._db:
@@ -414,8 +454,9 @@ class MLSDeliveryStore:
 
 
 class MLSDeliveryServer:
-    def __init__(self, store: MLSDeliveryStore) -> None:
+    def __init__(self, store: MLSDeliveryStore, *, capability_extras: dict[str, Any] | None = None) -> None:
         self.store = store
+        self.capability_extras = capability_extras
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task] = set()
         self._expiry: asyncio.Task | None = None
@@ -494,7 +535,10 @@ class MLSDeliveryServer:
             scheme, _, token = authorization.partition(" ")
             if scheme.lower() == "bearer":
                 document["authorization"] = token
-            result = await asyncio.to_thread(self.store.request, target.removeprefix("/v2/mls/"), document)
+            operation = target.removeprefix("/v2/mls/")
+            result = await asyncio.to_thread(self.store.request, operation, document)
+            if operation == "capabilities" and self.capability_extras and "error" not in result:
+                result = {**result, **self.capability_extras}
             await write_http_response(writer, 409 if "error" in result else 200, result)
         except RequestError as error:
             await write_http_response(writer, error.status, error.body())

@@ -11,9 +11,10 @@ import os
 import signal
 import ssl
 import time
+from pathlib import Path
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
@@ -47,11 +48,16 @@ from .http import (
     write_http_response,
 )
 from .mls import DEFAULT_RETENTION_SECONDS, MLSDeliveryServer, MLSDeliveryStore
+
+if TYPE_CHECKING:
+    from .blob_http import BlobLane, BlobLaneConfig
 from .protocol import PROTOCOL_VERSION, SUPPORTED_VERSIONS
 
 WEBSOCKET_PATH = "/v2/pairing"
 DELIVERY_PATH_PREFIX = "/v2/mls/"
 DEFAULT_DELIVERY_DATABASE_PATH = "relay-data/mls.sqlite3"
+DEFAULT_BLOB_DATABASE_PATH = "relay-data/blobs.sqlite3"
+DEFAULT_BLOB_DIRECTORY = "relay-data/blobs/v1"
 MAX_DELIVERY_REQUEST_BYTES = 1024 * 1024
 MAX_REGISTRATION_BYTES = 512
 MAX_BINARY_MESSAGE_BYTES = 512 * 1024
@@ -624,6 +630,7 @@ class RelayServer:
         tls: ssl.SSLContext | None = None,
         admission: AdmissionConfig | None = None,
         admission_clock: Callable[[], float] | None = None,
+        blob: BlobLaneConfig | None = None,
     ) -> None:
         _require_loopback(metrics_host, label="metrics host")
         if tls is None:
@@ -654,8 +661,16 @@ class RelayServer:
             waiting_room_ttl=waiting_room_ttl,
             admission=self.admission,
         )
+        delivery_store = MLSDeliveryStore(delivery_database_path, retention_seconds=delivery_retention_seconds)
+        self.blob: BlobLane | None = None
+        self.blob_closed = True
+        if blob is not None:
+            from .blob_http import BlobLane
+
+            self.blob = BlobLane(blob, mls=delivery_store, admission=self.admission,
+                                 clock=admission_clock or time.monotonic)
         self.mls = MLSDeliveryServer(
-            MLSDeliveryStore(delivery_database_path, retention_seconds=delivery_retention_seconds)
+            delivery_store, capability_extras=self.blob.capabilities() if self.blob is not None else None
         )
         self._websocket_server: Any | None = None
         self._metrics_server: asyncio.Server | None = None
@@ -692,6 +707,12 @@ class RelayServer:
         ):
             raise RuntimeError("relay is already running")
         handshake_timeout = TLS_HANDSHAKE_TIMEOUT_SECONDS if self.tls else None
+        if self.blob is not None:
+            try:
+                await self.blob.start()
+            except BaseException:
+                self.mls.store.close()
+                raise
         try:
             self._websocket_server = await serve(
                 self.service.handle,
@@ -739,6 +760,8 @@ class RelayServer:
                 self._websocket_server.close()
                 await self._websocket_server.wait_closed()
                 self._websocket_server = None
+            if self.blob is not None:
+                await self.blob.close()
             self.mls.store.close()
             raise
 
@@ -752,7 +775,11 @@ class RelayServer:
 
         if delivery_server is not None:
             delivery_server.close()
+            if self.blob is not None:
+                await self.blob.stop_requests()
             await delivery_server.wait_closed()
+        if self.blob is not None:
+            self.blob_closed = await self.blob.close()
         current_task = asyncio.current_task()
         delivery_tasks = [
             task for task in self._delivery_tasks if task is not current_task
@@ -886,6 +913,13 @@ class RelayServer:
         try:
             try:
                 method, target, headers = await read_http_head(reader)
+                if self.blob is not None and self.blob.classifies(target):
+                    control_slot, held_source = held_source, None
+                    await self.blob.handle(
+                        reader, writer, method, target, headers, control_slot=control_slot,
+                        release_control=self.admission.http_in_flight.release,
+                    )
+                    return
                 rejection, held_source = self._screen_http_request(
                     writer, headers, held_source
                 )
@@ -975,6 +1009,7 @@ class RelayServer:
                     )
                 except TimeoutError:
                     ready = False
+                ready = ready and (self.blob is None or self.blob.is_ready())
                 await write_http_response(
                     writer,
                     200 if ready else 503,
@@ -1171,7 +1206,32 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WAITING_ROOM_TTL_SECONDS,
         type=float,
     )
+    parser.add_argument(
+        "--enable-blobs",
+        action="store_true",
+        default=os.getenv("GOTSYNC_ENABLE_BLOBS") == "1",
+        help="serve encrypted blob parts under /v2/mls/blob/ (also GOTSYNC_ENABLE_BLOBS=1); off by default",
+    )
+    parser.add_argument("--blob-directory", default=DEFAULT_BLOB_DIRECTORY)
+    parser.add_argument("--blob-database", default=DEFAULT_BLOB_DATABASE_PATH)
+    parser.add_argument(
+        "--blob-require-route-header",
+        action="store_true",
+        help="answer blob requests only when a trusted proxy tagged them X-GotSync-Route: blob",
+    )
     return parser
+
+
+def blob_config_from_arguments(args: argparse.Namespace) -> BlobLaneConfig | None:
+    if not args.enable_blobs:
+        return None
+    from .blob_http import BlobLaneConfig
+
+    return BlobLaneConfig(
+        database=Path(args.blob_database),
+        directory=Path(args.blob_directory),
+        require_route_header=args.blob_require_route_header,
+    )
 
 
 async def _run_until_stopped(
@@ -1194,6 +1254,7 @@ async def _run_until_stopped(
         waiting_room_ttl=args.waiting_room_ttl,
         tls=tls,
         admission=admission,
+        blob=blob_config_from_arguments(args),
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1223,6 +1284,8 @@ async def _run_until_stopped(
             "MLS delivery ready on "
             f"{relay.delivery_host}:{relay.bound_delivery_port}/v2/mls"
         )
+        if relay.blob is not None:
+            print(f"encrypted blob parts enabled on {relay.delivery_host}:{relay.bound_delivery_port}/v2/mls/blob/")
         await stop.wait()
     finally:
         await relay.close()
