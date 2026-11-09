@@ -14,7 +14,7 @@ extension HostEngineTests {
             var limits = HostJournalLimits.standard
             limits.historyRecords = 3
             let (a, b) = try await completedPair(limits: limits)
-            try submit(a, "a", ["held original"])
+            try await submit(a, "a", ["held original"])
             try await wait("held") {
                 if case .settled(let held) = b.hostView?.intake { return held > 0 }
                 return false
@@ -36,8 +36,9 @@ extension HostEngineTests {
             }
             for launch in 1...2 {
                 let reopened = engine("b", limits: limits)
+                await opened(reopened)
                 XCTAssertNotNil(reopened.hostRepair, "\(damage) launch \(launch)")
-                try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) }
+                try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) && reopened.hostLifecycle != .opening }
                 XCTAssertEqual(reopened.hostLifecycle, .failed(.unlink), "\(damage) launch \(launch)")
                 XCTAssertTrue(reopened.isPaired, "\(damage): the MLS owner was discarded")
                 let remaining = try await XCTUnwrapAsync(reopened.mlsSessionForTesting).inbox()
@@ -66,7 +67,7 @@ extension HostEngineTests {
         var limits = HostJournalLimits.standard
         limits.historyRecords = 3
         let (a, b) = try await completedPair(limits: limits)
-        try submit(a, "a", ["held original"])
+        try await submit(a, "a", ["held original"])
         try await wait("held") {
             if case .settled(let held) = b.hostView?.intake { return held > 0 }
             return false
@@ -82,7 +83,7 @@ extension HostEngineTests {
             ReplicaCanonicalJSON.encode(record), to: directory("b").appendingPathComponent(SyncEngine.hostLifecycleFilename)
         )
         let reopened = engine("b", limits: limits)
-        try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) }
+        try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) && reopened.hostLifecycle != .opening }
         XCTAssertEqual(reopened.hostLifecycle, .failed(.unlink))
         XCTAssertTrue(reopened.isPaired)
         let remaining = try await XCTUnwrapAsync(reopened.mlsSessionForTesting).inbox()
@@ -97,7 +98,7 @@ extension HostEngineTests {
         try await wait("retired, then stopped") { b.hostLifecycle == .failed(.unlink) }
         await b.stop()
         engines.removeAll { $0 === b }
-        try submit(a, "a", ["after retirement"])
+        try await submit(a, "a", ["after retirement"])
         let session = try XCTUnwrap(b.mlsSessionForTesting)
         try await wait("a later message reached the MLS inbox") {
             _ = try await session.synchronize()
@@ -105,7 +106,7 @@ extension HostEngineTests {
         }
         let late = try await session.inbox()
         let reopened = engine("b")
-        try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) }
+        try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) && reopened.hostLifecycle != .opening }
         XCTAssertEqual(reopened.hostLifecycle, .failed(.unlink), "an archive without the later bytes proved the handoff")
         XCTAssertTrue(reopened.isPaired)
         let remaining = try await XCTUnwrapAsync(reopened.mlsSessionForTesting).inbox()
@@ -114,12 +115,12 @@ extension HostEngineTests {
 
     // MARK: - Finite bootstrap delivery
 
-    func testProviderReplyStopsAtItsPersistedCut() throws {
+    func testProviderReplyStopsAtItsPersistedCut() async throws {
         let directory = try JournalFixture.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try HostJournalStore.create(in: directory, group: JournalFixture.group, founder: true)
-        _ = try store.resume(try store.enroll())
-        _ = try store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data("cut".utf8))], capturedThrough: 1)
+        let store = try await HostJournal.create(in: directory, group: JournalFixture.group, founder: true)
+        _ = try await store.resume(try await store.enroll())
+        _ = try await store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data("cut".utf8))], capturedThrough: 1)
         let adapter = HostJournalAdapter(directory: directory, limits: .standard)
         adapter.bind(store)
         let cut = adapter.helloVector
@@ -127,12 +128,15 @@ extension HostEngineTests {
         obligation.merge(ReplicaVersionVector(), provider: true)
         obligation.addBootstrap(Data(repeating: 0xAA, count: 32), from: ReplicaVersionVector())
         obligation.bootstrap![0].cut = cut
-        _ = try store.submit([HostJournalMutation(id: JournalFixture.mutationID(2), payload: Data("after cut".utf8))], capturedThrough: 2)
-        let selected = try XCTUnwrap(adapter.reply(for: obligation, uploadedThrough: 0, bound: cut))
+        _ = try await store.submit([HostJournalMutation(id: JournalFixture.mutationID(2), payload: Data("after cut".utf8))], capturedThrough: 2)
+        let selected = try await XCTUnwrapAsync(try await adapter.reply(for: obligation, uploadedThrough: 0, bound: cut))
         XCTAssertEqual(selected.records.map(\.1), [1])
         obligation.advance(past: selected.records)
-        XCTAssertNil(try adapter.reply(for: obligation, uploadedThrough: 0, bound: cut))
-        XCTAssertEqual(try adapter.reply(for: obligation, uploadedThrough: 0, bound: nil)?.records.map(\.1), [2])
+        let none = try await adapter.reply(for: obligation, uploadedThrough: 0, bound: cut)
+        XCTAssertNil(none)
+        let unbounded = try await adapter.reply(for: obligation, uploadedThrough: 0, bound: nil)
+        XCTAssertEqual(unbounded?.records.map(\.1), [2])
+        await store.shutdown()
     }
 
     func testOngoingEditsDoNotDelayFiniteCompletion() async throws {
@@ -150,7 +154,7 @@ extension HostEngineTests {
         var sends = 0
         a.replyBatchHookForTesting = {
             sends += 1
-            try? self.submit(a, "a", ["edit after cut \(sends)"])
+            _ = try? await self.submit(a, "a", ["edit after cut \(sends)"])
         }
         try await a.sendRepliesForTesting()
         a.replyBatchHookForTesting = nil
@@ -164,7 +168,7 @@ extension HostEngineTests {
         let bRestarted = await restart(b, "b")
         _ = await restart(a, "a")
         try await wait("later edits arrive as ordinary traffic") {
-            try self.store(bRestarted).receivedVector()[aOrigin] == 4
+            try self.store(bRestarted).receivedVector[aOrigin] == 4
         }
     }
 
@@ -172,7 +176,7 @@ extension HostEngineTests {
         let (a, b) = try await completedPair()
         let c = engine("c")
         try await pair(a, c)
-        try enroll(c, "c")
+        try await enroll(c, "c")
         try await wait("third member complete") { (try? self.store(c).view.historyComplete) == true }
         for engine in [a, b, c] { await engine.stop() }
         let aFingerprint = try await fingerprint(a)
@@ -194,7 +198,7 @@ extension HostEngineTests {
         var sends = 0
         a.replyBatchHookForTesting = {
             sends += 1
-            try? self.submit(a, "a", ["edit \(sends)"])
+            _ = try? await self.submit(a, "a", ["edit \(sends)"])
         }
         try await a.sendRepliesForTesting()
         a.replyBatchHookForTesting = nil
@@ -221,7 +225,7 @@ extension HostEngineTests {
             XCTFail("replies were sent while appends are unavailable")
         } catch {}
         let cut = try XCTUnwrap(a.replyObligationForTesting?.bootstrap?.first?.cut)
-        try submit(a, "a", ["after the saved cut"])
+        try await submit(a, "a", ["after the saved cut"])
         await relay.setAppendsUnavailable(false)
         let reopened = await restart(a, "a")
         let bFingerprint = try await fingerprint(b)
@@ -318,15 +322,15 @@ extension HostEngineTests {
             }
             XCTAssertNil(cached.view.retirement, path)
             let before = try JournalFixture.fileHash(cached.url)
-            let refusals: [(String, () throws -> Void)] = [
-                ("submit", { _ = try cached.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data("x".utf8))], capturedThrough: 99) }),
-                ("markApplied", { try cached.markApplied(through: 0) }),
-                ("declareReady", { try cached.declareReady(capturedThrough: 99) }),
-                ("enroll", { _ = try cached.enroll() }),
-                ("resume", { _ = try cached.resume(provenance) }),
+            let refusals: [(String, () async throws -> Void)] = [
+                ("submit", { _ = try await cached.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data("x".utf8))], capturedThrough: 99) }),
+                ("markApplied", { try await cached.markApplied(through: 0) }),
+                ("declareReady", { try await cached.declareReady(capturedThrough: 99) }),
+                ("enroll", { _ = try await cached.enroll() }),
+                ("resume", { _ = try await cached.resume(provenance) }),
             ]
             for (name, refusal) in refusals {
-                XCTAssertThrowsError(try refusal(), "\(path): \(name)") { XCTAssertEqual($0 as? HostJournalError, .fenced, "\(path): \(name)") }
+                await XCTAssertThrowsErrorAsync(try await refusal(), "\(path): \(name)") { XCTAssertEqual($0 as? HostJournalError, .fenced, "\(path): \(name)") }
             }
             XCTAssertEqual(try JournalFixture.fileHash(cached.url), before, path)
             XCTAssertNil(b.hostJournal)
@@ -336,7 +340,7 @@ extension HostEngineTests {
                 try await wait("closed") { b.hostLifecycle == .active && !b.isPaired }
                 if path == "unlink" {
                     XCTAssertEqual(try HostJournalStore.open(cached.url).view.retirement, .unlink)
-                    XCTAssertThrowsError(try refusals[0].1()) { XCTAssertEqual($0 as? HostJournalError, .retired) }
+                    await XCTAssertThrowsErrorAsync(try await refusals[0].1()) { XCTAssertEqual($0 as? HostJournalError, .retired) }
                 } else {
                     XCTAssertFalse(FileManager.default.fileExists(atPath: cached.url.path))
                 }
@@ -475,12 +479,13 @@ extension HostEngineTests {
         let group = try await XCTUnwrapAsync(b.mlsSessionForTesting).group()
         XCTAssertEqual(group, intent.group)
         XCTAssertEqual(b.hostView?.journal?.journalID, intent.hostJournal)
-        try enroll(a, "a")
-        try submit(a, "a", ["after the cancelled join"])
-        try ready(a, "a")
-        try enroll(b, "b")
+        try await enroll(a, "a")
+        try await submit(a, "a", ["after the cancelled join"])
+        try await ready(a, "a")
+        try await enroll(b, "b")
         try await wait("history complete") { (try? self.store(b).view.historyComplete) == true }
-        XCTAssertEqual(try applyAll(b, "b"), [Data("after the cancelled join".utf8)])
+        let applied = try await applyAll(b, "b")
+        XCTAssertEqual(applied, [Data("after the cancelled join".utf8)])
     }
 
     // MARK: - Named schedules
@@ -501,13 +506,13 @@ extension HostEngineTests {
         let jFingerprint = try await fingerprint(j)
         let aOrigin = try store(a).view.origin
         let weak = try XCTUnwrap(b.replyObligationForTesting?.bootstrap?.first?.cut)
-        try submit(a, "a", ["four", "five"])
-        let strong = HostJournalAdapter.vector(try store(a).receivedVector())
+        try await submit(a, "a", ["four", "five"])
+        let strong = HostJournalAdapter.vector(try store(a).receivedVector)
         XCTAssertEqual(HostJournalAdapter.dictionary(weak)[aOrigin], 3)
         XCTAssertEqual(HostJournalAdapter.dictionary(strong)[aOrigin], 5)
         try await send(.complete(member: jFingerprint, through: strong), from: try XCTUnwrap(a.mlsSessionForTesting))
         let joiner = await restart(j, "j")
-        try enroll(joiner, "j")
+        try await enroll(joiner, "j")
         try await wait("strong target stored") { joiner.hostView?.journal?.completionTarget?[aOrigin] == 5 }
         gate?.resume()
         gate = nil
@@ -521,7 +526,8 @@ extension HostEngineTests {
         XCTAssertEqual(view.completionTarget?[aOrigin], 5)
         _ = await restart(a, "a")
         try await wait("complete through the stored target") { joiner.hostView?.journal?.historyComplete == true }
-        XCTAssertEqual(try applyAll(joiner, "j").map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three", "four", "five"])
+        let applied = try await applyAll(joiner, "j")
+        XCTAssertEqual(applied.map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three", "four", "five"])
         XCTAssertEqual(joiner.hostView?.journal?.historyApplied, true)
     }
 
@@ -531,7 +537,7 @@ extension HostEngineTests {
         try await wait("second member may invite") { !b.awaitsReservationsForTesting }
         await b.stop()
         await relay.dropNextAppendResponse(thenUnavailable: true)
-        try submit(a, "a", ["accepted before the add"])
+        try await submit(a, "a", ["accepted before the add"])
         try await wait("upload landed without an answer") { await self.relay.rejectedAppends > 0 }
         await a.stop()
         let aSession = try XCTUnwrap(a.mlsSessionForTesting)
@@ -601,8 +607,9 @@ extension HostEngineTests {
         XCTAssertEqual(received.completionTarget?[aOrigin], 4)
         XCTAssertEqual(received.delivered, 4)
         XCTAssertFalse(received.historyApplied, "history counted as applied before the host applied it")
-        try enroll(j, "j")
-        XCTAssertEqual(try applyAll(j, "j").map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three", "accepted before the add"])
+        try await enroll(j, "j")
+        let applied = try await applyAll(j, "j")
+        XCTAssertEqual(applied.map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three", "accepted before the add"])
         XCTAssertEqual(try store(j).view.historyApplied, true)
         gate?.resume()
         gate = nil
@@ -616,21 +623,22 @@ extension HostEngineTests {
         await b.stop()
         try await wait("history uploaded") { a.hostView?.unuploaded == 0 }
         await relay.dropNextAppendResponse(thenUnavailable: true)
-        try submit(a, "a", ["landed before the add"])
+        try await submit(a, "a", ["landed before the add"])
         try await wait("upload landed without an answer") { await self.relay.rejectedAppends > 0 }
         XCTAssertEqual(a.hostView?.unuploaded, 1, "the watermark advanced although the answer was lost")
         await a.stop()
         await relay.setAppendsUnavailable(false)
         let provider = await restart(a, "a")
-        try enroll(provider, "a")
+        try await enroll(provider, "a")
         try await wait("duplicate upload settled") { provider.hostView?.unuploaded == 0 }
         let j = engine("j")
         try await pair(provider, j)
-        try enroll(j, "j")
+        try await enroll(j, "j")
         try await wait("joiner complete") { (try? self.store(j).view.historyComplete) == true }
         let aOrigin = try store(provider).view.origin
         XCTAssertEqual(try store(j).view.completionTarget?[aOrigin], 4)
-        XCTAssertEqual(try applyAll(j, "j").map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three", "landed before the add"])
+        let applied = try await applyAll(j, "j")
+        XCTAssertEqual(applied.map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three", "landed before the add"])
         XCTAssertEqual(try store(j).view.historyApplied, true)
     }
 }

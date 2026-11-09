@@ -62,11 +62,11 @@ final class HostJournalStoreTests: XCTestCase {
         let (store, _) = try enrolled()
         let url = store.url
         _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 3), cursor: 1)])
-        try JournalFixture.tamper(url, "PRAGMA user_version = 3")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 4")
         let unsupported = try JournalFixture.fileHash(url)
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(3)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(4)) }
         XCTAssertEqual(try JournalFixture.fileHash(url), unsupported)
-        try JournalFixture.tamper(url, "PRAGMA user_version = 2")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 3")
 
         for damage in [
             "UPDATE records SET envelope = randomblob(length(envelope)) WHERE position = 2",
@@ -89,10 +89,10 @@ final class HostJournalStoreTests: XCTestCase {
 
     func testUnsupportedWALStoreIsPreservedExactly() throws {
         let url = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 3, count: 16))
-        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=3", create: true)
+        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=4", create: true)
         let before = JournalFixture.storedState(url)
         XCTAssertEqual(Array(try XCTUnwrap(before[""])[18...19]), [2, 2])
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(3)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(4)) }
         XCTAssertEqual(JournalFixture.storedState(url), before)
     }
 
@@ -423,7 +423,7 @@ final class HostJournalStoreTests: XCTestCase {
         XCTAssertEqual(reopened.view.pendingCount, 2)
         XCTAssertEqual(reopened.view.retainedBytes, pendingBytes)
         _ = try reopened.resume(XCTUnwrap(host.provenance))
-        _ = try reopened.intake([JournalFixture.arrival(Array(run[..<2]), cursor: 2)])
+        _ = try reopened.intakeAndPromote([JournalFixture.arrival(Array(run[..<2]), cursor: 2)])
         XCTAssertEqual(reopened.view.pendingCount, 0)
         XCTAssertEqual(reopened.view.recordCount, 4)
         XCTAssertEqual(reopened.view.retainedBytes, UInt64(run.map(\.bytes.count).reduce(0, +)))

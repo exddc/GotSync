@@ -3357,7 +3357,7 @@ extension SyncEngineMLSTests {
         host.approveSafetyCode()
         try await wait("Add refused") { host.lastPairingFailure != nil }
         let pending = try await XCTUnwrapAsync(host.mlsSessionForTesting).pendingDelivery()
-        XCTAssertNil(pending)
+        XCTAssertNil(pending?.addWriter)
         let writers = await relay.activeWriterCount(group: group)
         XCTAssertEqual(writers, 2)
         XCTAssertTrue(host.addTask(title: "Inviter still syncs"))

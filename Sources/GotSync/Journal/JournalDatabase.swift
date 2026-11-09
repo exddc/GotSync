@@ -15,10 +15,11 @@ final class JournalDatabase {
     /// `SQLITE_READONLY_ROLLBACK`: a read-only connection found a hot
     /// rollback journal that only a read-write connection may roll back.
     static let hotJournalCode = SQLITE_READONLY | (3 << 8)
+    static let defaultBusyTimeoutMilliseconds: Int32 = 5_000
     private var handle: OpaquePointer?
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    init(url: URL, readOnly: Bool, create: Bool = false) throws {
+    init(url: URL, readOnly: Bool, create: Bool = false, busyTimeoutMilliseconds: Int32 = defaultBusyTimeoutMilliseconds) throws {
         var flags = SQLITE_OPEN_NOFOLLOW | SQLITE_OPEN_FULLMUTEX
         flags |= readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE
         if create {
@@ -38,12 +39,43 @@ final class JournalDatabase {
         }
         handle = database
         sqlite3_extended_result_codes(database, 1)
-        sqlite3_busy_timeout(database, 5_000)
+        sqlite3_busy_timeout(database, busyTimeoutMilliseconds)
+    }
+
+    /// Replaces any busy handler with a plain timeout.
+    func setBusyTimeout(_ milliseconds: Int32) {
+        sqlite3_busy_timeout(handle, milliseconds)
+    }
+
+    /// Whether the file this connection opened is no longer at its path.
+    func hasMoved() throws -> Bool {
+        var moved: Int32 = 0
+        let code = sqlite3_file_control(handle, "main", SQLITE_FCNTL_HAS_MOVED, &moved)
+        guard code == SQLITE_OK else { throw error(code) }
+        return moved != 0
+    }
+
+    /// Makes long statements and lock waits give up once `cancellation` is
+    /// set. It must outlive this connection.
+    func observe(_ cancellation: HostJournalCancellation) {
+        let context = Unmanaged.passUnretained(cancellation).toOpaque()
+        sqlite3_progress_handler(handle, 1_000, { context in
+            Unmanaged<HostJournalCancellation>.fromOpaque(context!).takeUnretainedValue().isCancelled ? 1 : 0
+        }, context)
+        sqlite3_busy_handler(handle, { context, attempts in
+            let cancellation = Unmanaged<HostJournalCancellation>.fromOpaque(context!).takeUnretainedValue()
+            guard !cancellation.isCancelled, attempts < 500 else { return 0 }
+            usleep(10_000)
+            return 1
+        }, context)
     }
 
     deinit {
         sqlite3_close_v2(handle)
     }
+
+    /// Whether a transaction is open on this connection.
+    var isInTransaction: Bool { sqlite3_get_autocommit(handle) == 0 }
 
     static func integer(_ value: UInt64) throws -> JournalValue {
         guard value <= UInt64(Int64.max) else {

@@ -4,6 +4,17 @@ import SQLite3
 import XCTest
 @testable import GotSync
 
+extension HostJournalStore {
+    /// Intake followed by every bounded promotion step, for tests that check
+    /// the promoted end state.
+    @discardableResult
+    func intakeAndPromote(_ arrivals: [HostJournalArrival]) throws -> HostJournalIntake {
+        let result = try intake(arrivals)
+        while try promote() > 0 {}
+        return result
+    }
+}
+
 enum JournalFixture {
     static let group = Data(repeating: 0x5A, count: 32)
     static let sender = Data(repeating: 0xC0, count: 32)
@@ -172,6 +183,32 @@ final class HostStandIn {
         return records
     }
 
+    /// Submits the outbox in capture order, in chunks of at most `maxBytes`
+    /// encoded bytes, saving after each accepted chunk; an error leaves the
+    /// rest of the outbox for a later retry.
+    func submitOutbox(_ store: HostJournalStore, maxBytes: Int) throws -> [JournalRecordID] {
+        var records: [JournalRecordID] = []
+        var entries = state.outbox.sorted { $0.key < $1.key }
+        while !entries.isEmpty {
+            var chunk: [(key: String, value: Data)] = []
+            var bytes = 0
+            for entry in entries {
+                let size = JournalEnvelope.headerLength + entry.value.count
+                guard chunk.count < 256, bytes + size <= maxBytes else { break }
+                chunk.append(entry)
+                bytes += size
+            }
+            records += try store.submit(
+                chunk.map { HostJournalMutation(id: Data(base64Encoded: $0.key)!, payload: $0.value) },
+                capturedThrough: state.capturedThrough
+            )
+            for entry in chunk { state.outbox[entry.key] = nil }
+            try write()
+            entries.removeFirst(chunk.count)
+        }
+        return records
+    }
+
     func applyAll(_ store: HostJournalStore) throws {
         while true {
             let batch = try store.incoming(after: state.appliedThrough, limit: 64)
@@ -192,5 +229,18 @@ final class HostStandIn {
 
     private func write() throws {
         try JSONEncoder().encode(state).write(to: url, options: .atomic)
+    }
+}
+
+@MainActor
+func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T, _ message: String = "",
+    file: StaticString = #filePath, line: UInt = #line, _ handler: (Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("did not throw. \(message)", file: file, line: line)
+    } catch {
+        handler(error)
     }
 }

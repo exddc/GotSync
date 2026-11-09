@@ -132,6 +132,32 @@ public actor MLSClient {
         }
     }
 
+    /// Closes the client's store once; later calls fail with `storageUnavailable`.
+    package func close() throws {
+        try store.close()
+    }
+
+    /// Makes the next store close fail without closing, for tests of an
+    /// uncertain close.
+    package static func failNextCloseForTesting(_ fails: Bool) {
+        MLSStore.failNextCloseForTesting.withLock { $0 = fails }
+    }
+
+    /// Reads the final state and closes the store in one actor turn, so no
+    /// operation runs between them. `closed` is true only when the close
+    /// itself succeeded, whatever the read returned.
+    package func close<T: Sendable>(
+        after read: @Sendable (isolated MLSClient) throws -> T
+    ) -> (result: Result<T, any Error>, closed: Bool) {
+        let result = Result { try read(self) }
+        do {
+            try store.close()
+            return (result, true)
+        } catch {
+            return (result, false)
+        }
+    }
+
     /// A KeyPackage for joining a group with `profile`, or a legacy group
     /// when `profile` is `nil`.
     public func joiningIdentity(profile: Data? = nil) throws -> MLSJoiningIdentity {

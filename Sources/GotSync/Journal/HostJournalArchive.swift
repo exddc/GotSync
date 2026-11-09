@@ -52,7 +52,7 @@ enum HostJournalArchive {
     /// New links are refused while this many retired or unreadable journals exist.
     static let linkAdmissionLimit = 4
 
-    static func discover(in directory: URL) throws -> [HostJournalListing] {
+    nonisolated static func discover(in directory: URL) throws -> [HostJournalListing] {
         let names = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
         var listings: [HostJournalListing] = []
         for name in names where name.hasPrefix(HostJournalStore.filePrefix) {
@@ -172,7 +172,7 @@ enum HostJournalArchive {
         )
     }
 
-    private static func read<T>(_ url: URL, _ body: (JournalDatabase) throws -> T) throws -> T {
+    nonisolated private static func read<T>(_ url: URL, _ body: (JournalDatabase) throws -> T) throws -> T {
         try HostJournalStore.requireRegularFile(url)
         let database = try JournalDatabase(url: url, readOnly: true)
         try database.execute("PRAGMA query_only=1")

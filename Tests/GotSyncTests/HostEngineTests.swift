@@ -66,7 +66,16 @@ final class HostEngineTests: XCTestCase {
     func restart(_ engine: SyncEngine, _ name: String, limits: HostJournalLimits = .standard) async -> SyncEngine {
         await engine.stop()
         engines.removeAll { $0 === engine }
-        return self.engine(name, limits: limits)
+        let restarted = self.engine(name, limits: limits)
+        await opened(restarted)
+        return restarted
+    }
+
+    /// Waits until a launch has validated and installed its journal.
+    func opened(_ engine: SyncEngine) async {
+        for _ in 0..<2_000 where engine.hostLifecycle == .opening {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
     }
 
     func wait(
@@ -104,46 +113,52 @@ final class HostEngineTests: XCTestCase {
         try await XCTUnwrapAsync(engine.mlsSessionForTesting).client.transportAuthorization()
     }
 
-    func store(_ engine: SyncEngine) throws -> HostJournalStore {
-        guard let journal = engine.hostJournal else { throw HostEngineError.journalUnbound }
+    /// The engine's journal; after `stop`, the closed one, whose view stays
+    /// readable and whose calls are refused.
+    func store(_ engine: SyncEngine) throws -> HostJournal {
+        guard let journal = engine.hostJournal ?? engine.stoppedHostJournalForTesting else { throw HostEngineError.journalUnbound }
         return journal
     }
 
-    func enroll(_ engine: SyncEngine, _ name: String) throws {
+    func enroll(_ engine: SyncEngine, _ name: String) async throws {
+        try await engine.reopenStoppedHostJournalForTesting()
         let journal = try store(engine)
         if let stored = provenances[name] {
-            provenances[name] = try journal.resume(HostJournalProvenance(
+            provenances[name] = try await journal.resume(HostJournalProvenance(
                 journalID: stored.journalID, enrollmentID: stored.enrollmentID,
                 appliedThrough: max(stored.appliedThrough, journal.view.appliedThrough),
                 capturedThrough: captured[name] ?? stored.capturedThrough
             ))
         } else {
-            provenances[name] = try journal.resume(try journal.enroll())
+            provenances[name] = try await journal.resume(try await journal.enroll())
         }
     }
 
     @discardableResult
-    func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) throws -> [JournalRecordID] {
+    func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) async throws -> [JournalRecordID] {
+        try await engine.reopenStoppedHostJournalForTesting()
         captured[name, default: 0] += UInt64(payloads.count)
-        return try store(engine).submit(
+        return try await store(engine).submit(
             payloads.map { HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data($0.utf8)) },
             capturedThrough: captured[name, default: 0]
         )
     }
 
-    func ready(_ engine: SyncEngine, _ name: String) throws {
-        try store(engine).declareReady(capturedThrough: captured[name, default: 0])
+    func ready(_ engine: SyncEngine, _ name: String) async throws {
+        try await engine.reopenStoppedHostJournalForTesting()
+        try await store(engine).declareReady(capturedThrough: captured[name, default: 0])
     }
 
     @discardableResult
-    func applyAll(_ engine: SyncEngine, _ name: String) throws -> [Data] {
+    func applyAll(_ engine: SyncEngine, _ name: String) async throws -> [Data] {
+        try await engine.reopenStoppedHostJournalForTesting()
         let journal = try store(engine)
         var payloads: [Data] = []
         while true {
-            let batch = try journal.incoming(after: journal.view.appliedThrough, limit: 64)
+            let batch = try await journal.incoming(after: journal.view.appliedThrough, limit: 64)
             guard let last = batch.last else { return payloads }
             payloads += batch.map(\.payload)
-            try journal.markApplied(through: last.position)
+            try await journal.markApplied(through: last.position)
         }
     }
 
@@ -165,13 +180,13 @@ final class HostEngineTests: XCTestCase {
         let first = engine(a)
         let second = engine(b, limits: limits)
         try await pair(first, second)
-        try enroll(first, a)
-        try submit(first, a, records)
-        try ready(first, a)
-        try enroll(second, b)
+        try await enroll(first, a)
+        try await submit(first, a, records)
+        try await ready(first, a)
+        try await enroll(second, b)
         try await wait("history complete") { (try? self.store(second).view.historyComplete) == true }
-        try applyAll(second, b)
-        try ready(second, b)
+        try await applyAll(second, b)
+        try await ready(second, b)
         return (first, second)
     }
 
@@ -190,15 +205,16 @@ final class HostEngineTests: XCTestCase {
         XCTAssertFalse(joiner.view.historyComplete)
         XCTAssertEqual(try XCTUnwrap(b.hostView).journal?.journalID, joiner.view.journalID)
 
-        try enroll(a, "a")
-        try submit(a, "a", ["one", "two", "three"])
-        try ready(a, "a")
-        try enroll(b, "b")
+        try await enroll(a, "a")
+        try await submit(a, "a", ["one", "two", "three"])
+        try await ready(a, "a")
+        try await enroll(b, "b")
         try await wait("history complete") { joiner.view.historyComplete && joiner.view.delivered == 3 }
         XCTAssertFalse(joiner.view.historyApplied)
-        XCTAssertEqual(try applyAll(b, "b").map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three"])
+        let applied = try await applyAll(b, "b")
+        XCTAssertEqual(applied.map { String(decoding: $0, as: UTF8.self) }, ["one", "two", "three"])
         XCTAssertTrue(joiner.view.historyApplied)
-        try ready(b, "b")
+        try await ready(b, "b")
         try await wait("both quiescent") { a.hostView?.isQuiescent == true && b.hostView?.isQuiescent == true }
     }
 
@@ -206,11 +222,11 @@ final class HostEngineTests: XCTestCase {
         let a = engine("a")
         let b = engine("b")
         try await pair(a, b)
-        try enroll(a, "a")
+        try await enroll(a, "a")
         a.inviteToGroup()
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertNil(a.invitationURL)
-        try ready(a, "a")
+        try await ready(a, "a")
         a.inviteToGroup()
         try await wait("invitation") { a.invitationURL != nil }
     }
@@ -219,14 +235,14 @@ final class HostEngineTests: XCTestCase {
         let a = engine("a")
         let b = engine("b")
         try await pair(a, b)
-        try enroll(a, "a")
-        try submit(a, "a", ["one", "two"])
-        try enroll(b, "b")
+        try await enroll(a, "a")
+        try await submit(a, "a", ["one", "two"])
+        try await enroll(b, "b")
         try await wait("records delivered") { try self.store(b).view.delivered == 2 }
         try await Task.sleep(for: .seconds(1))
         XCTAssertFalse(try store(b).view.historyComplete, "a provider certified history before readiness")
         XCTAssertEqual(a.replyObligationForTesting?.bootstrap?.first?.cut, nil)
-        try ready(a, "a")
+        try await ready(a, "a")
         try await wait("history complete") { try self.store(b).view.historyComplete }
     }
 
@@ -234,10 +250,10 @@ final class HostEngineTests: XCTestCase {
         let a = engine("a")
         var p = engine("p")
         try await pair(a, p)
-        try enroll(a, "a")
-        try submit(a, "a", ["deletion barrier"])
-        try enroll(p, "p")
-        try ready(p, "p")
+        try await enroll(a, "a")
+        try await submit(a, "a", ["deletion barrier"])
+        try await enroll(p, "p")
+        try await ready(p, "p")
         try await wait("provider asked") { p.hostView?.journal?.historyProvider != nil && a.replyObligationForTesting?.bootstrap != nil }
         await a.stop()
         let checkpointURL = directory("p").appendingPathComponent(ReplicationCheckpoint.filename)
@@ -248,7 +264,7 @@ final class HostEngineTests: XCTestCase {
         try visible.save(to: checkpointURL)
         p = await restart(p, "p")
         await p.stop()
-        XCTAssertFalse(try store(p).view.historyComplete)
+        XCTAssertEqual(p.hostView?.journal?.historyComplete, false)
         XCTAssertFalse(p.awaitsReservationsForTesting)
         let aFingerprint = try await fingerprint(a)
         let pFingerprint = try await fingerprint(p)
@@ -264,7 +280,7 @@ final class HostEngineTests: XCTestCase {
         let early = try await inboxMessages(a).filter { $0.kind == .complete }
         XCTAssertTrue(early.isEmpty)
 
-        try ready(a, "a")
+        try await ready(a, "a")
         try await a.sendRepliesForTesting()
         _ = try await XCTUnwrapAsync(p.mlsSessionForTesting).synchronize()
         try await p.drainInboxForTesting()
@@ -310,7 +326,7 @@ final class HostEngineTests: XCTestCase {
         try await send(try HostJournalMessage(control: .hello(vector: ReplicaVersionVector(), provider: aFingerprint)), from: bSession)
         _ = try await aSession.synchronize()
         try await a.drainInboxForTesting()
-        let firstCut = try store(a).receivedVector()
+        let firstCut = try store(a).receivedVector
         await relay.setAppendsUnavailable(true)
         do {
             try await a.sendRepliesForTesting()
@@ -318,7 +334,7 @@ final class HostEngineTests: XCTestCase {
         } catch {}
         await relay.setAppendsUnavailable(false)
         XCTAssertEqual(a.replyObligationForTesting?.bootstrap?.first?.cut.map(HostJournalAdapter.dictionary), firstCut)
-        try submit(a, "a", ["after the cut"])
+        try await submit(a, "a", ["after the cut"])
         try await send(try HostJournalMessage(control: .hello(vector: ReplicaVersionVector(), provider: aFingerprint)), from: bSession)
         _ = try await aSession.synchronize()
         try await a.drainInboxForTesting()
@@ -333,7 +349,7 @@ final class HostEngineTests: XCTestCase {
         let (a, b) = try await completedPair()
         await a.stop()
         await b.stop()
-        try submit(a, "a", ["not uploaded"])
+        try await submit(a, "a", ["not uploaded"])
         let journal = try store(a)
         XCTAssertLessThan(a.hostView?.uploadedThrough ?? 0, journal.view.ownHead)
         let bSession = try XCTUnwrap(b.mlsSessionForTesting)
@@ -342,7 +358,7 @@ final class HostEngineTests: XCTestCase {
             try await bSession.acknowledgeInbox(through: last.cursor)
         }
         try await send(
-            try HostJournalMessage(control: .hello(vector: HostJournalAdapter.vector(try store(b).receivedVector()), provider: try await fingerprint(a))),
+            try HostJournalMessage(control: .hello(vector: HostJournalAdapter.vector(try store(b).receivedVector), provider: try await fingerprint(a))),
             from: bSession
         )
         _ = try await XCTUnwrapAsync(a.mlsSessionForTesting).synchronize()
@@ -362,10 +378,10 @@ final class HostEngineTests: XCTestCase {
         var limits = HostJournalLimits.standard
         limits.historyRecords = 3
         let (a, b) = try await completedPair(records: ["one", "two"], limits: limits)
-        try submit(a, "a", ["three"])
+        try await submit(a, "a", ["three"])
         try await wait("third applied") { try self.store(b).view.delivered == 3 }
-        try applyAll(b, "b")
-        try submit(a, "a", ["four"])
+        try await applyAll(b, "b")
+        try await submit(a, "a", ["four"])
         try await wait("held") {
             if case .settled(let held) = b.hostView?.intake { return held > 0 }
             return false
@@ -378,7 +394,7 @@ final class HostEngineTests: XCTestCase {
     func testIdleUploadPublishesQuiescenceAfterTheCheckpointSave() async throws {
         let (a, b) = try await completedPair()
         try await wait("quiescent") { a.hostView?.isQuiescent == true }
-        try submit(a, "a", ["idle"])
+        try await submit(a, "a", ["idle"])
         XCTAssertEqual(a.hostView?.unuploaded, 1)
         let revision = a.hostView?.revision ?? 0
         try await wait("uploaded") { a.hostView?.unuploaded == 0 && a.hostView?.isQuiescent == true }
@@ -402,6 +418,7 @@ final class HostEngineTests: XCTestCase {
         let conflicting = try JournalEnvelope(origin: origin, sequence: 1, prior: JournalEnvelope.zeroDigest, payload: Data("fork".utf8))
         try await send(.records([conflicting.bytes]), from: aSession)
         _ = try await bSession.synchronize()
+        try await b.reopenStoppedHostJournalForTesting()
         let journal = try store(b)
         let before = journal.view
         let inbox = try await bSession.inbox().count
@@ -446,7 +463,7 @@ final class HostEngineTests: XCTestCase {
         var limits = HostJournalLimits.standard
         limits.historyRecords = 3
         let (a, b) = try await completedPair(limits: limits)
-        try submit(a, "a", ["four", "five"])
+        try await submit(a, "a", ["four", "five"])
         try await wait("held") {
             if case .settled(let held) = b.hostView?.intake { return held > 0 }
             return false
@@ -472,7 +489,7 @@ final class HostEngineTests: XCTestCase {
         var limits = HostJournalLimits.standard
         limits.historyRecords = 3
         let (a, b) = try await completedPair(limits: limits)
-        try submit(a, "a", ["four"])
+        try await submit(a, "a", ["four"])
         try await wait("held") {
             if case .settled(let held) = b.hostView?.intake { return held > 0 }
             return false
@@ -482,13 +499,13 @@ final class HostEngineTests: XCTestCase {
         let journalID = stale.view.journalID
         b.unlinkAndKeepTasks()
         try await wait("unlinked") { !b.isPaired && b.hostLifecycle == .active }
-        XCTAssertThrowsError(try stale.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data())], capturedThrough: 9)) {
+        await XCTAssertThrowsErrorAsync(try await stale.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data())], capturedThrough: 9)) {
             XCTAssertEqual($0 as? HostJournalError, .retired)
         }
         let url = HostJournalStore.fileURL(in: directory("b"), journalID: journalID)
         let exported = try JournalFixture.exportAll(url)
         XCTAssertEqual(exported.compactMap { if case .held(_, _, let plaintext) = $0 { plaintext } else { nil } }, held.map(\.plaintext))
-        try submit(a, "a", ["after the cut"])
+        try await submit(a, "a", ["after the cut"])
         try await wait("departed") { a.linkedMemberCount == 1 }
         XCTAssertEqual(try HostJournalStore.open(url).view.heldCount, UInt64(held.count))
     }
@@ -536,6 +553,7 @@ final class HostEngineTests: XCTestCase {
         let before = try Self.tree(mls)
         try stores["b"]?.write(Data(repeating: 0x42, count: 32), account: SecretStoreMLSStateKey.account)
         let reopened = engine("b")
+        await opened(reopened)
         XCTAssertEqual(reopened.hostRepair, .mlsUnreadable)
         XCTAssertEqual(try Self.tree(mls), before)
         XCTAssertTrue(reopened.isPaired)
@@ -575,6 +593,7 @@ final class HostEngineTests: XCTestCase {
         engines.removeAll { $0 === b }
         try Data("not a checkpoint".utf8).write(to: directory("b").appendingPathComponent(ReplicationCheckpoint.filename))
         let reopened = engine("b")
+        await opened(reopened)
         XCTAssertEqual(reopened.hostView?.journal?.journalID, journalID)
         XCTAssertEqual(reopened.hostView?.journal?.controlRepair, true)
         XCTAssertTrue(reopened.isTaskHistoryAtCapacity)
@@ -598,6 +617,7 @@ final class HostEngineTests: XCTestCase {
         try intent.save(to: directory("b").appendingPathComponent(ReplicationCheckpoint.joinIntentFilename))
         try FileManager.default.removeItem(at: checkpointURL)
         let reopened = engine("b")
+        await opened(reopened)
         XCTAssertEqual(reopened.hostView?.journal?.journalID, journalID)
         XCTAssertEqual(reopened.hostView?.journal?.controlRepair, false)
         try await wait("rebuilt") { reopened.isPaired }
@@ -667,8 +687,8 @@ final class HostEngineTests: XCTestCase {
         XCTAssertEqual(try c.hostJournalArchives().count, 4)
         let url = HostJournalStore.fileURL(in: directory("c"), journalID: retired[0])
         XCTAssertNotNil(try c.exportHostJournal(url, after: nil, limit: 10))
-        XCTAssertThrowsError(try c.discardRetiredHostJournal(retired[0], confirming: retired[1]))
-        try c.discardRetiredHostJournal(retired[0], confirming: retired[0])
+        await XCTAssertThrowsErrorAsync(try await c.discardRetiredHostJournal(retired[0], confirming: retired[1]))
+        try await c.discardRetiredHostJournal(retired[0], confirming: retired[0])
         a.cancelPairing()
         try await pair(a, c)
     }

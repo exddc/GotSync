@@ -3,10 +3,10 @@ import GotSyncMLS
 import XCTest
 @testable import GotSync
 
-/// Measures the synchronous main-actor work of host intake: the whole-window
-/// verify and each chunk commit the engine runs between suspension points,
-/// plus a cold open. The results are printed as measurements; the plan's
-/// thresholds are exposure gates, not assertions here.
+/// Measures host intake through the writer: each proof step and chunk
+/// commit as the engine awaits it, which now runs off the main actor, plus a
+/// cold open. The results are printed as wall-time measurements; main-actor
+/// segments are measured in `HostWriterSegmentMeasurementTests`.
 @MainActor
 final class HostEnginePerformanceTests: XCTestCase {
     private var directory: URL!
@@ -23,28 +23,28 @@ final class HostEnginePerformanceTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    func testLargeArrivals() throws {
-        let adapter = try adapterWithStore()
+    func testLargeArrivals() async throws {
+        let adapter = try await adapterWithStore()
         let run = try JournalFixture.chain(JournalFixture.origin(3), count: 64, payload: { _ in Data(count: 65_000) })
-        try drain(adapter, run.map { [$0] }, label: "64x64KiB")
+        try await drain(adapter, run.map { [$0] }, label: "64x64KiB")
         report()
     }
 
-    func testRetainedStoreOf24MiB() throws {
-        let adapter = try adapterWithStore()
+    func testRetainedStoreOf24MiB() async throws {
+        let adapter = try await adapterWithStore()
         let filler = try JournalFixture.chain(JournalFixture.origin(4), count: 380, payload: { _ in Data(count: 65_000) })
-        try drain(adapter, filler.map { [$0] }, label: "fill")
+        try await drain(adapter, filler.map { [$0] }, label: "fill")
         XCTAssertGreaterThanOrEqual(adapter.store?.view.recordBytes ?? 0, 23 * 1_048_576 + 524_288)
         samples = [:]
         let run = try JournalFixture.chain(JournalFixture.origin(5), count: 512, payload: { _ in Data(count: 120) })
-        try drain(adapter, stride(from: 0, to: run.count, by: 2).map { Array(run[$0..<$0 + 2]) }, label: "24MiB")
+        try await drain(adapter, stride(from: 0, to: run.count, by: 2).map { Array(run[$0..<$0 + 2]) }, label: "24MiB")
         report()
     }
 
-    func testFullInboxOf1000Messages() throws {
-        let adapter = try adapterWithStore()
+    func testFullInboxOf1000Messages() async throws {
+        let adapter = try await adapterWithStore()
         let run = try JournalFixture.chain(JournalFixture.origin(6), count: 4_000, payload: { _ in Data(count: 120) })
-        try drain(adapter, stride(from: 0, to: run.count, by: 4).map { Array(run[$0..<$0 + 4]) }, label: "1000msg")
+        try await drain(adapter, stride(from: 0, to: run.count, by: 4).map { Array(run[$0..<$0 + 4]) }, label: "1000msg")
         report()
     }
 
@@ -70,15 +70,15 @@ final class HostEnginePerformanceTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func adapterWithStore() throws -> HostJournalAdapter {
+    private func adapterWithStore() async throws -> HostJournalAdapter {
         let adapter = HostJournalAdapter(directory: directory, limits: .standard)
-        adapter.bind(try HostJournalStore.create(in: directory, group: JournalFixture.group))
+        adapter.bind(try await HostJournal.create(in: directory, group: JournalFixture.group))
         return adapter
     }
 
     /// Verifies the whole window once, then commits it chunk by chunk, as
     /// the engine's drain does.
-    private func drain(_ adapter: HostJournalAdapter, _ messages: [[JournalEnvelope]], label: String) throws {
+    private func drain(_ adapter: HostJournalAdapter, _ messages: [[JournalEnvelope]], label: String) async throws {
         let window = try messages.map { envelopes -> ReplicationWindowItem in
             let plaintext = try HostJournalMessage.records(envelopes.map(\.bytes)).encoded()
             let decoded = adapter.decode(plaintext)
@@ -88,12 +88,16 @@ final class HostEnginePerformanceTests: XCTestCase {
                 control: decoded.control, decoded: decoded.decoded
             )
         }
-        try measure("\(label).verify[\(window.count)]") { try adapter.verify(window) }
+        try await adapter.beginWindowProof(window)
+        var proven = false
+        while !proven {
+            try await measure("\(label).proofStep") { proven = try await adapter.extendWindowProof() }
+        }
         let chunks = adapter.chunks(of: window)
         samples["\(label).chunks", default: []].append(Double(chunks.count))
         for range in chunks {
-            try measure("\(label).chunk") {
-                let intake = try adapter.intake(Array(window[range]))
+            try await measure("\(label).chunk") {
+                let intake = try await adapter.intake(Array(window[range]))
                 XCTAssertEqual(intake.heldMessages, range.count)
             }
         }
@@ -109,6 +113,13 @@ final class HostEnginePerformanceTests: XCTestCase {
     private func measure(_ name: String, _ body: () throws -> Void) rethrows {
         let start = ContinuousClock.now
         try body()
+        let elapsed = ContinuousClock.now - start
+        samples[name, default: []].append(Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1e3)
+    }
+
+    private func measure(_ name: String, _ body: () async throws -> Void) async rethrows {
+        let start = ContinuousClock.now
+        try await body()
         let elapsed = ContinuousClock.now - start
         samples[name, default: []].append(Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1e3)
     }
