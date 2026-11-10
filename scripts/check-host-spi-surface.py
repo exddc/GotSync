@@ -47,6 +47,17 @@ SURFACE_TYPES = {
     "HostArchiveCursor",
     "HostArchivePage",
     "HostSubmissionLimits",
+    "HostSnapshotSchema",
+    "HostSnapshotID",
+    "HostSnapshotLimits",
+    "HostSnapshotCut",
+    "HostSnapshotExport",
+    "HostSnapshotExportResult",
+    "HostSnapshotInstall",
+    "HostSnapshotInstallOutcome",
+    "HostSnapshotHooks",
+    "HostSnapshotRefusal",
+    "HostSnapshotBootstrap",
 }
 
 BLOB_SURFACE_TYPES = {
@@ -98,6 +109,8 @@ SURFACE_MEMBERS = {
         "exportHostJournal(_:after:limit:)",
         "discardRetiredHostJournal(_:confirmingJournalID:)",
         "blobTransfers()",
+        "registerSnapshotHost(_:)",
+        "declineSnapshotBootstrap()",
     },
     "SyncPayloadSchema": {"hostJournal(payload:version:)"},
     "Invitation": {"phraseWordCount"},
@@ -111,6 +124,7 @@ REQUIRED_HOST_CALLS = {
     "submit(_:capturedThrough:)",
     "incoming(after:limit:)",
     "markApplied(through:)",
+    "coveredThrough(after:)",
     "declareReady(capturedThrough:)",
     "submissionLimits",
 }
@@ -121,7 +135,8 @@ FORBIDDEN_NAMES = re.compile(
     r"HostJournalExport|HostJournalProvenance|OpaquePointer|SQLite|sqlite3|MLSSession|MLSClient|"
     r"MLSStore|ForTesting|forTesting|BlobStateStore|BlobFiles|BlobRelayClient|BlobRelayError|BlobCipher|"
     r"BlobSealedObject|BlobManifest|BlobPartLayout|\bBlobDescriptor\b|\bBlobBinding\b|BlobWorkGate|BlobSignal|"
-    r"BlobCodecError|BlobImageValidator"
+    r"BlobCodecError|BlobImageValidator|HostJournalBootstrapState|HostSnapshotOffer|HostSnapshotAnchor|HostSnapshotPhase|"
+    r"HostSnapshotRefusalReason|HostSnapshotExportLedger|HostSnapshotAdmission|HostSnapshotBounds"
 )
 FORBIDDEN_MODULE_PREFIXES = ("s:10GotSyncMLS", "s:18GotSyncMLSBindings", "c:@")
 

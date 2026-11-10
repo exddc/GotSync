@@ -332,6 +332,36 @@ HEIC, HEIF, GIF, TIFF or WebP, at most 64 frames, 8,192 pixels per side and 40
 million pixels per frame. These limits are policy, not a measured memory
 ceiling. Files live under `blob-v1/` in the storage directory.
 
+### Snapshot bootstrap
+
+A joining host can install a peer's compact state instead of applying every
+record. Register `HostSnapshotHooks` with `engine.registerSnapshotHost(_:)`
+before pairing; without hooks, bootstrap keeps full history.
+
+**Joiner:**
+- A fresh journal asks its provider for a snapshot of the hooks' `HostSnapshotSchema`.
+- `HostJournalState.bootstrap` shows `requested` through `installing`. While it does, delivery is held: `incoming` returns nothing and `markApplied` throws `bootstrapPending`. Capture and `submit` continue.
+- The library checks the offer's per-origin anchors against records the joiner received and chain-checked itself, then fetches and verifies the content.
+- `install(HostSnapshotInstall)` receives a library-owned file, the provider, the covered `[origin: sequence]` and a recipient-local `appliedThrough`. Merge in one transaction that also saves that application mark and snapshot ID, never replacing local data, unsent outbox rows or drafts, then return `.installed`. A repeated ID must return `.installed` without changes.
+- After installation, `journal.coveredThrough(after:)` identifies a following contiguous run already represented by the snapshot. Save that mark in the host store before calling `markApplied`. `markApplied` records exactly the saved mark; it never silently advances past it.
+- After the install, `incoming` skips covered records and delivers the tail; `completed` reports that the library released its copy.
+
+**Provider:**
+- `export(HostSnapshotCut)` writes state that reflects exactly the remote records applied through `appliedThrough` and every submitted record, read in one transaction at the cut's capture counter.
+- Return the markers read, or `.notAtCut`, for example while outbox rows are unsent.
+
+**Refusals and fallback:**
+- A refusal (`HostSnapshotRefusal`) keeps the offer and delivers every record. It covers:
+  - a schema mismatch;
+  - an export over `HostSnapshotLimits.maxBytes` (32 MiB), refused after Add;
+  - a mismatched anchor;
+  - missing or rejected content;
+  - a host refusal;
+  - no remaining provider.
+- `declineSnapshotBootstrap()` ends a held bootstrap.
+
+**Retention:** every record stays retained and byte-checked. A snapshot changes only delivery, never retention.
+
 ## Deferred API refinements
 
 Main-actor isolation preserves the existing serial recovery behavior. MLS

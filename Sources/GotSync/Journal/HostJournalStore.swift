@@ -48,6 +48,8 @@ enum JournalStoreError: Error, Equatable {
     case exportRevisionChanged
     case notArchived
     case confirmationMismatch
+    /// Delivery is held while a snapshot bootstrap is unresolved.
+    case bootstrapPending
 }
 
 struct HostJournalLimits: Equatable, Sendable {
@@ -200,8 +202,11 @@ struct HostJournalCoreView: Equatable, Sendable {
     /// Control metadata for this generation was lost; admission, completion
     /// and destructive membership cleanup stay blocked.
     let controlRepair: Bool
+    /// A snapshot bootstrap this journal requested; nil keeps full history.
+    let bootstrap: HostJournalBootstrapState?
 
     var isRetired: Bool { retirement != nil }
+    var isDeliveryHeld: Bool { bootstrap?.phase.holdsDelivery == true }
     /// The host applied every record of its completed history.
     var historyApplied: Bool { historyComplete && appliedThrough >= completionPosition }
     var undelivered: UInt64 { delivered - appliedThrough }
@@ -752,19 +757,45 @@ final class HostJournalStore {
 
     // MARK: - Application
 
-    /// Remote records after `position`, in position order.
+    /// Remote records after `position`, in position order. Nothing while a
+    /// snapshot bootstrap holds delivery; records an installed snapshot
+    /// covers are skipped.
     func incoming(after position: UInt64, limit: Int) throws -> [HostJournalIncoming] {
         try requireResumed()
         guard limit > 0, limit <= limits.batch else { throw JournalStoreError.invalidArgument("limit") }
+        let bootstrap = view.bootstrap
+        guard bootstrap?.phase.holdsDelivery != true else { return [] }
+        let (uncovered, coveredValues) = try Self.uncoveredClause(bootstrap?.coverage)
         var result: [HostJournalIncoming] = []
         try database.rows(
-            "SELECT position, envelope FROM records WHERE position > ? ORDER BY position LIMIT ?",
-            [try JournalDatabase.integer(position), .integer(Int64(limit))]
+            "SELECT position, envelope FROM records WHERE position > ?\(uncovered) ORDER BY position LIMIT ?",
+            [try JournalDatabase.integer(position)] + coveredValues + [.integer(Int64(limit))]
         ) { row in
             let envelope = try Self.stored(try row.blob(1))
             result.append(HostJournalIncoming(position: try row.unsigned(0), record: envelope.id, payload: envelope.payload))
         }
         return result
+    }
+
+    /// An SQL condition excluding records `coverage` covers, with its values.
+    nonisolated private static func uncoveredClause(_ coverage: [Data: UInt64]?) throws -> (String, [JournalValue]) {
+        guard let coverage, !coverage.isEmpty else { return ("", []) }
+        var values: [JournalValue] = []
+        var terms: [String] = []
+        for (origin, sequence) in coverage.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
+            terms.append("(origin = ? AND sequence <= ?)")
+            values += [.blob(origin), try JournalDatabase.integer(sequence)]
+        }
+        return (" AND NOT (" + terms.joined(separator: " OR ") + ")", values)
+    }
+
+    func coveredThrough(after position: UInt64) throws -> UInt64? {
+        try requireResumed()
+        let meta = try readMeta()
+        guard meta.bootstrap?.phase.holdsDelivery != true else { throw JournalStoreError.bootstrapPending }
+        guard position < meta.nextPosition else { throw JournalStoreError.positionOutOfRange(position) }
+        let covered = try Self.pastCovered(position, coverage: meta.bootstrap?.coverage, in: database, next: meta.nextPosition)
+        return covered > position ? covered : nil
     }
 
     /// Records that the host committed its business state through `position`.
@@ -776,9 +807,23 @@ final class HostJournalStore {
             guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard position < meta.nextPosition else { throw JournalStoreError.positionOutOfRange(position) }
             guard position > meta.appliedThrough else { return }
+            guard meta.bootstrap?.phase.holdsDelivery != true else { throw JournalStoreError.bootstrapPending }
             try applyThrough(position, from: meta.appliedThrough)
             try bumpRevision(meta)
         }
+    }
+
+    /// The end of the following contiguous covered run.
+    nonisolated private static func pastCovered(
+        _ position: UInt64, coverage: [Data: UInt64]?, in database: JournalDatabase, next nextPosition: UInt64
+    ) throws -> UInt64 {
+        guard let coverage, !coverage.isEmpty else { return position }
+        let (uncovered, values) = try uncoveredClause(coverage)
+        let firstUncovered = try database.first(
+            "SELECT MIN(position) FROM records WHERE position > ?\(uncovered)",
+            [try JournalDatabase.integer(position)] + values, { $0.isNull(0) ? nil : try $0.unsigned(0) }
+        ) ?? nil
+        return (firstUncovered ?? nextPosition) - 1
     }
 
     /// Positions of one origin rise with its sequences, so only origins with
@@ -1081,9 +1126,13 @@ final class HostJournalStore {
     }
 
     /// Stores a provider's completion target. A target lower than the stored
-    /// one in any origin, or any target after completion, is ignored.
+    /// one in any origin, or any target after completion, is ignored. A
+    /// requested bootstrap takes the snapshot offer, or the refusal, that
+    /// came with the accepted target.
     @discardableResult
-    func recordCompletionTarget(provider: Data, through target: [Data: UInt64]) throws -> Bool {
+    func recordCompletionTarget(
+        provider: Data, through target: [Data: UInt64], offer: HostSnapshotOffer? = nil, refusal: HostSnapshotRefusalReason? = nil
+    ) throws -> Bool {
         guard provider.count == 32 else { throw JournalStoreError.invalidArgument("provider") }
         let encoded = try Self.encodeVector(target)
         return try transaction("recordCompletionTarget") {
@@ -1095,10 +1144,141 @@ final class HostJournalStore {
             }
             try setMeta("completionProvider", .blob(provider))
             try setMeta("completionTarget", .blob(encoded))
+            if meta.bootstrap?.phase == .requested {
+                if let offer, offer.isWellFormed, offer.anchors.allSatisfy({ target[$0.origin] ?? 0 >= $0.sequence }) {
+                    try setSnapshotMeta("snapshotOffer", .blob(try ReplicaCanonicalJSON.encode(offer)))
+                    try setSnapshotMeta("snapshotPhase", .text(HostSnapshotPhase.offered.rawValue))
+                } else {
+                    let reason: HostSnapshotRefusalReason = offer != nil ? .malformedOffer
+                        : refusal.flatMap { HostSnapshotRefusalReason.providerReasons.contains($0) ? $0 : nil } ?? .notOffered
+                    try setSnapshotRefusal(reason)
+                }
+            }
             try evaluateCompletion(target)
             try bumpRevision(meta)
             return true
         }
+    }
+
+    // MARK: - Snapshot bootstrap
+
+    /// Requests a snapshot for a fresh journal: nothing applied, history
+    /// incomplete and no earlier request. Delivery is held from now on.
+    @discardableResult
+    func requestSnapshot(schema: String) throws -> Bool {
+        guard HostSnapshotSchemaName.isValid(schema) else { throw JournalStoreError.invalidArgument("schema") }
+        return try transaction("requestSnapshot") {
+            let meta = try readMeta()
+            guard meta.retirement == nil, meta.bootstrap == nil, meta.appliedThrough == 0, !meta.historyComplete else { return false }
+            try setSnapshotMeta("snapshotSchema", .text(schema))
+            try setSnapshotMeta("snapshotPhase", .text(HostSnapshotPhase.requested.rawValue))
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    /// Refuses the bootstrap while it is in one of `phases`, keeping any
+    /// offer; delivery returns to full history.
+    @discardableResult
+    func refuseSnapshot(_ reason: HostSnapshotRefusalReason, in phases: Set<HostSnapshotPhase>, id: Data? = nil) throws -> Bool {
+        try transaction("refuseSnapshot") {
+            let meta = try readMeta()
+            guard meta.retirement == nil, let bootstrap = meta.bootstrap, phases.contains(bootstrap.phase),
+                  id.map({ $0 == bootstrap.offer?.id }) ?? true
+            else { return false }
+            try setSnapshotRefusal(reason)
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    /// Moves the bootstrap of snapshot `id` from `from` to `to`, a phase
+    /// that keeps delivery held; false when another step got there first.
+    @discardableResult
+    func advanceSnapshot(id: Data, from: HostSnapshotPhase, to: HostSnapshotPhase) throws -> Bool {
+        guard to.holdsDelivery || to == .completed else { throw JournalStoreError.invalidArgument("phase") }
+        return try transaction("advanceSnapshot") {
+            let meta = try readMeta()
+            guard meta.retirement == nil, let bootstrap = meta.bootstrap, bootstrap.phase == from, bootstrap.offer?.id == id else {
+                return false
+            }
+            try setSnapshotMeta("snapshotPhase", .text(to.rawValue))
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    /// Every anchor names a record this journal received and retains with
+    /// exactly that digest. Its chain to sequence one was checked on intake,
+    /// so the covered records are the ones the snapshot was exported from.
+    func verifySnapshotAnchors() throws -> Bool {
+        let meta = try readMeta()
+        guard meta.historyComplete, let offer = meta.bootstrap?.offer else { return false }
+        for anchor in offer.anchors {
+            let digest = try database.first(
+                "SELECT digest FROM records WHERE origin = ? AND sequence = ?",
+                [.blob(anchor.origin), try JournalDatabase.integer(anchor.sequence)], { try $0.blob(0) }
+            )
+            guard digest == anchor.digest else { return false }
+        }
+        return true
+    }
+
+    /// The cut a provider export must reflect: remote records applied
+    /// through `appliedThrough` or covered by an installed snapshot, and
+    /// every own record, each origin with its retained head digest.
+    func snapshotExportCut() throws -> HostSnapshotExportCut {
+        let meta = try readMeta()
+        var vector: [Data: UInt64] = [:]
+        try database.rows("SELECT origin, applied FROM origins WHERE applied > 0") { vector[try $0.blob(0)] = try $0.unsigned(1) }
+        for (origin, sequence) in meta.bootstrap?.coverage ?? [:] {
+            vector[origin] = max(vector[origin] ?? 0, sequence)
+        }
+        vector[meta.origin] = meta.ownHead
+        var anchors: [HostSnapshotAnchor] = []
+        for (origin, sequence) in vector.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) where sequence > 0 {
+            guard let digest = try retainedDigest(JournalRecordID(origin: origin, sequence: sequence)) else {
+                throw JournalStoreError.retainedRecordMissing(origin: origin, sequence: sequence)
+            }
+            anchors.append(HostSnapshotAnchor(origin: origin, sequence: sequence, digest: digest))
+        }
+        return HostSnapshotExportCut(
+            journalID: meta.journalID, appliedThrough: meta.appliedThrough, capturedThrough: meta.capturedThrough, anchors: anchors
+        )
+    }
+
+    func snapshotInstallPosition(id: Data) throws -> UInt64? {
+        let meta = try readMeta()
+        guard meta.retirement == nil, let bootstrap = meta.bootstrap, bootstrap.phase == .installing,
+              let offer = bootstrap.offer, offer.id == id else { return nil }
+        return try Self.pastCovered(meta.appliedThrough, coverage: offer.coverage, in: database, next: meta.nextPosition)
+    }
+
+    /// Records that the host installed snapshot `id`: its coverage is
+    /// stored and the application mark moves over covered records.
+    @discardableResult
+    func commitSnapshotInstall(id: Data, appliedThrough: UInt64) throws -> Bool {
+        try transaction("commitSnapshotInstall") {
+            let meta = try readMeta()
+            guard meta.retirement == nil, let bootstrap = meta.bootstrap, bootstrap.phase == .installing,
+                  let offer = bootstrap.offer, offer.id == id
+            else { return false }
+            let coverage = offer.coverage
+            let advanced = try Self.pastCovered(meta.appliedThrough, coverage: coverage, in: database, next: meta.nextPosition)
+            guard advanced == appliedThrough else { throw JournalStoreError.invalidArgument("snapshot application mark") }
+            try setSnapshotMeta("snapshotCoverage", .blob(try Self.encodeVector(coverage)))
+            try setSnapshotMeta("snapshotPhase", .text(HostSnapshotPhase.installed.rawValue))
+            if advanced > meta.appliedThrough {
+                try applyThrough(advanced, from: meta.appliedThrough)
+            }
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    private func setSnapshotRefusal(_ reason: HostSnapshotRefusalReason) throws {
+        try setSnapshotMeta("snapshotRefusal", .text(reason.rawValue))
+        try setSnapshotMeta("snapshotPhase", .text(HostSnapshotPhase.refused.rawValue))
     }
 
     func setHistoryProvider(_ member: Data) throws {
@@ -1267,6 +1447,7 @@ final class HostJournalStore {
         "enroll": .none, "resume": .none, "submit": .none, "markApplied": .none, "markEstablished": .none,
         "declareReady": .none, "recordCompletionTarget": .none, "setHistoryProvider": .none,
         "enterControlRepair": .none, "intake": .intake, "promote": .intake, "retire": .generation,
+        "requestSnapshot": .none, "refuseSnapshot": .none, "advanceSnapshot": .none, "commitSnapshotInstall": .none,
     ]
 
     /// Builds the snapshot this commit leaves before COMMIT, so nothing
@@ -1318,6 +1499,12 @@ final class HostJournalStore {
 
     private func setMeta(_ key: String, _ value: JournalValue) throws {
         try database.run("UPDATE meta SET value = ? WHERE key = ?", [value, .text(key)])
+    }
+
+    /// Snapshot keys exist only once a bootstrap was requested.
+    private func setSnapshotMeta(_ key: String, _ value: JournalValue) throws {
+        precondition(key.hasPrefix("snapshot"))
+        try database.run("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [.text(key), value])
     }
 
     private func writeCounters(_ counters: Counters) throws {
@@ -1442,6 +1629,7 @@ final class HostJournalStore {
         let completionPosition: UInt64
         let historyProvider: Data?
         let controlRepair: Bool
+        let bootstrap: HostJournalBootstrapState?
 
         var view: HostJournalCoreView {
             HostJournalCoreView(
@@ -1455,7 +1643,7 @@ final class HostJournalStore {
                 established: established, isReady: isReady, readyThrough: readyThrough,
                 historyComplete: historyComplete, completionProvider: completionProvider,
                 completionTarget: completionTarget, completionPosition: completionPosition,
-                historyProvider: historyProvider, controlRepair: controlRepair
+                historyProvider: historyProvider, controlRepair: controlRepair, bootstrap: bootstrap
             )
         }
     }
@@ -1519,6 +1707,7 @@ final class HostJournalStore {
         }
         let target = try blob("completionTarget", nil)
         let historyComplete = try flag("historyComplete")
+        let bootstrap = try readBootstrap(texts: texts, blobs: blobs)
         return Meta(
             journalID: try blob("journalID", 16), group: try blob("group", 32), origin: try blob("origin", 16),
             retirement: retirement, revision: try integer("revision"), enrollment: enrollment,
@@ -1528,8 +1717,29 @@ final class HostJournalStore {
             historyComplete: historyComplete, completionProvider: try member("completionProvider"),
             completionTarget: target.isEmpty ? nil : try decodeVector(target),
             completionPosition: completionPosition, historyProvider: try member("historyProvider"),
-            controlRepair: try flag("controlRepair")
+            controlRepair: try flag("controlRepair"), bootstrap: bootstrap
         )
+    }
+
+    /// Absent keys mean no bootstrap was requested. Present ones must be
+    /// complete and consistent with their phase.
+    nonisolated private static func readBootstrap(texts: [String: String], blobs: [String: Data]) throws -> HostJournalBootstrapState? {
+        guard let rawPhase = texts["snapshotPhase"] else { return nil }
+        guard let phase = HostSnapshotPhase(rawValue: rawPhase), let schema = texts["snapshotSchema"],
+              HostSnapshotSchemaName.isValid(schema)
+        else { throw JournalStoreError.storeCorrupt("snapshot") }
+        let offer = try blobs["snapshotOffer"].map { try ReplicaCanonicalJSON.decode(HostSnapshotOffer.self, from: $0) }
+        let refusal = try texts["snapshotRefusal"].map { raw in
+            guard let reason = HostSnapshotRefusalReason(rawValue: raw) else { throw JournalStoreError.storeCorrupt("snapshot") }
+            return reason
+        }
+        let coverage = try blobs["snapshotCoverage"].map(decodeVector)
+        let needsOffer = phase != .requested && phase != .refused
+        guard offer.map(\.isWellFormed) ?? true, !needsOffer || offer != nil, (refusal != nil) == (phase == .refused),
+              (coverage != nil) == (phase == .installed || phase == .completed),
+              coverage.map({ $0 == offer?.coverage }) ?? true
+        else { throw JournalStoreError.storeCorrupt("snapshot") }
+        return HostJournalBootstrapState(phase: phase, schema: schema, offer: offer, refusal: refusal, coverage: coverage)
     }
 
     private static func configure(_ database: JournalDatabase) throws {
@@ -1708,6 +1918,11 @@ final class HostJournalStore {
             }
         }
         guard meta.readyThrough <= meta.capturedThrough else { throw JournalStoreError.storeCorrupt("ready") }
+        if let coverage = meta.bootstrap?.coverage {
+            guard coverage.allSatisfy({ (heads[$0.key]?.received ?? 0) >= $0.value }) else {
+                throw JournalStoreError.storeCorrupt("snapshot coverage")
+            }
+        }
         return meta.view
     }
 

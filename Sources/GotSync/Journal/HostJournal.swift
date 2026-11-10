@@ -166,7 +166,17 @@ public final class HostJournal {
         return records.compactMap(IncomingRecord.init)
     }
 
-    /// Records that the host committed its business state through `position`.
+    /// The following contiguous run already installed by a snapshot. Save
+    /// the returned mark in the host store before calling `markApplied`.
+    public func coveredThrough(after position: JournalPosition?) async throws -> JournalPosition? {
+        let after = position?.rawValue ?? 0
+        let covered = try await surfacing {
+            try await perform("coveredThrough", .host) { try $0.coveredThrough(after: after) }
+        }
+        return covered.flatMap(JournalPosition.init(rawValue:))
+    }
+
+    /// Records exactly the mark the host saved; never advances past it.
     public func markApplied(through position: JournalPosition) async throws {
         let through = position.rawValue
         try await surfacing { try await perform("markApplied", .host) { try $0.markApplied(through: through) } }
@@ -220,8 +230,46 @@ public final class HostJournal {
         try await perform("markEstablished", .engine) { try $0.markEstablished() }
     }
 
-    func recordCompletionTarget(provider: Data, through target: [Data: UInt64]) async throws {
-        try await perform("recordCompletionTarget", .engine) { _ = try $0.recordCompletionTarget(provider: provider, through: target) }
+    func recordCompletionTarget(
+        provider: Data, through target: [Data: UInt64], offer: HostSnapshotOffer? = nil, refusal: HostSnapshotRefusalReason? = nil
+    ) async throws {
+        try await perform("recordCompletionTarget", .engine) {
+            _ = try $0.recordCompletionTarget(provider: provider, through: target, offer: offer, refusal: refusal)
+        }
+    }
+
+    // MARK: - Snapshot bootstrap
+
+    @discardableResult
+    func requestSnapshot(schema: String) async throws -> Bool {
+        try await perform("requestSnapshot", .engine) { try $0.requestSnapshot(schema: schema) }
+    }
+
+    @discardableResult
+    func refuseSnapshot(_ reason: HostSnapshotRefusalReason, in phases: Set<HostSnapshotPhase>, id: Data? = nil) async throws -> Bool {
+        try await perform("refuseSnapshot", .engine) { try $0.refuseSnapshot(reason, in: phases, id: id) }
+    }
+
+    @discardableResult
+    func advanceSnapshot(id: Data, from: HostSnapshotPhase, to: HostSnapshotPhase) async throws -> Bool {
+        try await perform("advanceSnapshot", .engine) { try $0.advanceSnapshot(id: id, from: from, to: to) }
+    }
+
+    func verifySnapshotAnchors() async throws -> Bool {
+        try await perform("verifySnapshotAnchors", .engine) { try $0.verifySnapshotAnchors() }
+    }
+
+    func snapshotExportCut() async throws -> HostSnapshotExportCut {
+        try await perform("snapshotExportCut", .engine) { try $0.snapshotExportCut() }
+    }
+
+    func snapshotInstallPosition(id: Data) async throws -> UInt64? {
+        try await perform("snapshotInstallPosition", .engine) { try $0.snapshotInstallPosition(id: id) }
+    }
+
+    @discardableResult
+    func commitSnapshotInstall(id: Data, appliedThrough: UInt64) async throws -> Bool {
+        try await perform("commitSnapshotInstall", .engine) { try $0.commitSnapshotInstall(id: id, appliedThrough: appliedThrough) }
     }
 
     func setHistoryProvider(_ member: Data) async throws {
