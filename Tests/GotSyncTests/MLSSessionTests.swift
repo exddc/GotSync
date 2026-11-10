@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class MLSSessionTests: XCTestCase {
     private var root: URL!

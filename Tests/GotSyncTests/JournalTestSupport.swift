@@ -2,7 +2,18 @@ import CryptoKit
 import Foundation
 import SQLite3
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
+
+extension HostJournalStore {
+    /// Intake followed by every bounded promotion step, for tests that check
+    /// the promoted end state.
+    @discardableResult
+    func intakeAndPromote(_ arrivals: [HostJournalArrival]) throws -> HostJournalIntake {
+        let result = try intake(arrivals)
+        while try promote() > 0 {}
+        return result
+    }
+}
 
 enum JournalFixture {
     static let group = Data(repeating: 0x5A, count: 32)
@@ -50,11 +61,11 @@ enum JournalFixture {
         var database: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0)
         guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK else {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         defer { sqlite3_close_v2(database) }
         guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
-            throw HostJournalError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
+            throw JournalStoreError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
         }
     }
 
@@ -65,7 +76,7 @@ enum JournalFixture {
     static func hotImage(of url: URL, into directory: URL) throws -> URL {
         var database: OpaquePointer?
         guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         defer { sqlite3_close_v2(database) }
         let spill = """
@@ -75,7 +86,7 @@ enum JournalFixture {
             INSERT INTO heldInbox(sender, cursor, plaintext, digest) SELECT randomblob(32), i, zeroblob(20000), randomblob(32) FROM n;
             """
         guard sqlite3_exec(database, spill, nil, nil, nil) == SQLITE_OK else {
-            throw HostJournalError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
+            throw JournalStoreError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let copy = directory.appendingPathComponent(url.lastPathComponent)
@@ -102,7 +113,7 @@ enum JournalFixture {
         var items: [HostJournalExportItem] = []
         var cursor: HostJournalExportCursor?
         repeat {
-            let page = try HostJournalArchive.export(url, after: cursor, limit: pageSize)
+            let page = try HostJournalFiles.export(url, after: cursor, limit: pageSize)
             items += page.items
             cursor = page.next
         } while cursor != nil
@@ -172,6 +183,32 @@ final class HostStandIn {
         return records
     }
 
+    /// Submits the outbox in capture order, in chunks of at most `maxBytes`
+    /// encoded bytes, saving after each accepted chunk; an error leaves the
+    /// rest of the outbox for a later retry.
+    func submitOutbox(_ store: HostJournalStore, maxBytes: Int) throws -> [JournalRecordID] {
+        var records: [JournalRecordID] = []
+        var entries = state.outbox.sorted { $0.key < $1.key }
+        while !entries.isEmpty {
+            var chunk: [(key: String, value: Data)] = []
+            var bytes = 0
+            for entry in entries {
+                let size = JournalEnvelope.headerLength + entry.value.count
+                guard chunk.count < 256, bytes + size <= maxBytes else { break }
+                chunk.append(entry)
+                bytes += size
+            }
+            records += try store.submit(
+                chunk.map { HostJournalMutation(id: Data(base64Encoded: $0.key)!, payload: $0.value) },
+                capturedThrough: state.capturedThrough
+            )
+            for entry in chunk { state.outbox[entry.key] = nil }
+            try write()
+            entries.removeFirst(chunk.count)
+        }
+        return records
+    }
+
     func applyAll(_ store: HostJournalStore) throws {
         while true {
             let batch = try store.incoming(after: state.appliedThrough, limit: 64)
@@ -192,5 +229,18 @@ final class HostStandIn {
 
     private func write() throws {
         try JSONEncoder().encode(state).write(to: url, options: .atomic)
+    }
+}
+
+@MainActor
+func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure @MainActor () async throws -> T, _ message: String = "",
+    file: StaticString = #filePath, line: UInt = #line, _ handler: (Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("did not throw. \(message)", file: file, line: line)
+    } catch {
+        handler(error)
     }
 }

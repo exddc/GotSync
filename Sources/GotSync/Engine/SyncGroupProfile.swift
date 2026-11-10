@@ -20,8 +20,8 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
     static let hostJournalPrefix = "gotsync.journal1."
 
     /// Opaque host records of `payload` at `version`, carried by the host
-    /// journal. Internal until the preview SPI exists.
-    static func hostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
+    /// journal.
+    @_spi(HostJournalPreview) public static func hostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
         let identifier = hostJournalPrefix + payload
         guard version > 0, !payload.hasPrefix("gotsync."), SyncGroupProfile.isLabel(payload),
               SyncGroupProfile.isLabel(identifier)

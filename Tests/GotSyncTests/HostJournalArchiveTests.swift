@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 @MainActor
 final class HostJournalArchiveTests: XCTestCase {
@@ -74,22 +74,22 @@ final class HostJournalArchiveTests: XCTestCase {
     func testExportCursorsAreBoundToTheirJournalAndRevision() throws {
         let (store, _) = try enrolled()
         _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 4), cursor: 1)])
-        let first = try HostJournalArchive.export(store.url, after: nil, limit: 2)
+        let first = try HostJournalFiles.export(store.url, after: nil, limit: 2)
         let cursor = try XCTUnwrap(first.next)
-        XCTAssertEqual(try HostJournalArchive.export(store.url, after: cursor, limit: 2).items.count, 2)
+        XCTAssertEqual(try HostJournalFiles.export(store.url, after: cursor, limit: 2).items.count, 2)
         let other = try HostJournalStore.create(in: directory, group: JournalFixture.group)
-        XCTAssertThrowsError(try HostJournalArchive.export(other.url, after: cursor, limit: 2)) {
-            XCTAssertEqual($0 as? HostJournalError, .exportCursorMismatch)
+        XCTAssertThrowsError(try HostJournalFiles.export(other.url, after: cursor, limit: 2)) {
+            XCTAssertEqual($0 as? JournalStoreError, .exportCursorMismatch)
         }
         _ = try store.intake([JournalFixture.raw(Data("x".utf8), cursor: 2)])
-        XCTAssertThrowsError(try HostJournalArchive.export(store.url, after: cursor, limit: 2)) {
-            XCTAssertEqual($0 as? HostJournalError, .exportRevisionChanged)
+        XCTAssertThrowsError(try HostJournalFiles.export(store.url, after: cursor, limit: 2)) {
+            XCTAssertEqual($0 as? JournalStoreError, .exportRevisionChanged)
         }
         try store.retire(.orphaned, heldInbox: [])
-        let frozen = try XCTUnwrap(try HostJournalArchive.export(store.url, after: nil, limit: 2).next)
+        let frozen = try XCTUnwrap(try HostJournalFiles.export(store.url, after: nil, limit: 2).next)
         let reopened = try HostJournalStore.open(store.url)
         XCTAssertTrue(reopened.view.isRetired)
-        XCTAssertEqual(try HostJournalArchive.export(store.url, after: frozen, limit: 10).items.count, 3)
+        XCTAssertEqual(try HostJournalFiles.export(store.url, after: frozen, limit: 10).items.count, 3)
     }
 
     func testDiscoveryCountsRetiredAndUnreadableButNotActiveOrIncomplete() throws {
@@ -102,27 +102,27 @@ final class HostJournalArchiveTests: XCTestCase {
         }
         let incomplete = URL(fileURLWithPath: HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 7, count: 16)).path + ".creating")
         try Data("partial".utf8).write(to: incomplete)
-        var listings = try HostJournalArchive.discover(in: directory)
+        var listings = try HostJournalFiles.discover(in: directory)
         XCTAssertEqual(listings.count, 5)
         XCTAssertTrue(listings.contains(.journal(url: active.url, view: active.view)))
         XCTAssertTrue(listings.contains(.incomplete(url: incomplete)))
-        XCTAssertTrue(HostJournalArchive.admitsNewLink(listings))
+        XCTAssertTrue(HostJournalFiles.admitsNewLink(listings))
 
         let garbage = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 8, count: 16))
         try Data(repeating: 0x33, count: 4_096).write(to: garbage)
-        listings = try HostJournalArchive.discover(in: directory)
+        listings = try HostJournalFiles.discover(in: directory)
         XCTAssertTrue(listings.contains { if case .unreadable(garbage, _) = $0 { true } else { false } })
-        XCTAssertFalse(HostJournalArchive.admitsNewLink(listings))
+        XCTAssertFalse(HostJournalFiles.admitsNewLink(listings))
         XCTAssertEqual(try Data(contentsOf: garbage), Data(repeating: 0x33, count: 4_096))
         try FileManager.default.removeItem(at: garbage)
 
         let fourth = try HostJournalStore.create(in: directory, group: JournalFixture.group)
         fourth.faultHookForTesting = { if $0 == .beforeCommit("retire") { throw CancellationError() } }
         XCTAssertThrowsError(try fourth.retire(.removed, heldInbox: [HostJournalHeldMessage(sender: JournalFixture.sender, cursor: 1, plaintext: Data("h".utf8))]))
-        XCTAssertTrue(HostJournalArchive.admitsNewLink(try HostJournalArchive.discover(in: directory)))
+        XCTAssertTrue(HostJournalFiles.admitsNewLink(try HostJournalFiles.discover(in: directory)))
         fourth.faultHookForTesting = nil
         try fourth.retire(.removed, heldInbox: [])
-        XCTAssertFalse(HostJournalArchive.admitsNewLink(try HostJournalArchive.discover(in: directory)))
+        XCTAssertFalse(HostJournalFiles.admitsNewLink(try HostJournalFiles.discover(in: directory)))
     }
 
     func testDiscardNeedsTheMatchingIDAndARetiredJournal() throws {
@@ -132,18 +132,18 @@ final class HostJournalArchiveTests: XCTestCase {
         let keep = try HostJournalStore.create(in: directory, group: JournalFixture.group)
         try keep.retire(.unlink, heldInbox: [])
         let id = retired.view.journalID
-        XCTAssertThrowsError(try HostJournalArchive.discard(in: directory, journalID: id, confirming: keep.view.journalID)) {
-            XCTAssertEqual($0 as? HostJournalError, .confirmationMismatch)
+        XCTAssertThrowsError(try HostJournalFiles.discard(in: directory, journalID: id, confirming: keep.view.journalID)) {
+            XCTAssertEqual($0 as? JournalStoreError, .confirmationMismatch)
         }
-        XCTAssertThrowsError(try HostJournalArchive.discard(in: directory, journalID: active.view.journalID, confirming: active.view.journalID)) {
-            XCTAssertEqual($0 as? HostJournalError, .notArchived)
+        XCTAssertThrowsError(try HostJournalFiles.discard(in: directory, journalID: active.view.journalID, confirming: active.view.journalID)) {
+            XCTAssertEqual($0 as? JournalStoreError, .notArchived)
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: retired.url.path))
         let garbage = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 9, count: 16))
         try Data(repeating: 0x44, count: 4_096).write(to: garbage)
-        XCTAssertThrowsError(try HostJournalArchive.discard(in: directory, journalID: Data(repeating: 9, count: 16), confirming: Data(repeating: 9, count: 16)))
+        XCTAssertThrowsError(try HostJournalFiles.discard(in: directory, journalID: Data(repeating: 9, count: 16), confirming: Data(repeating: 9, count: 16)))
         XCTAssertTrue(FileManager.default.fileExists(atPath: garbage.path))
-        try HostJournalArchive.discard(in: directory, journalID: id, confirming: id)
+        try HostJournalFiles.discard(in: directory, journalID: id, confirming: id)
         XCTAssertFalse(FileManager.default.fileExists(atPath: retired.url.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: keep.url.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: active.url.path))
@@ -172,7 +172,7 @@ final class HostJournalCapacityTests: XCTestCase {
     }
 
     private func report(_ name: String, _ store: HostJournalStore, peakSidecar: UInt64 = 0) throws {
-        let accounting = try HostJournalArchive.accounting(store.url)
+        let accounting = try HostJournalFiles.accounting(store.url)
         let logical = accounting.categories.sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value.rows)/\($0.value.bytes)" }.joined(separator: " ")
         print("JOURNAL_ACCOUNTING \(name) database=\(accounting.databaseBytes) allocated=\(accounting.allocatedBytes) free=\(accounting.freeBytes) sidecar=\(accounting.sidecarBytes) peakSidecar=\(peakSidecar) \(logical)")
@@ -208,7 +208,7 @@ final class HostJournalCapacityTests: XCTestCase {
             index += batch.count
         }
         XCTAssertThrowsError(try store.submit([HostJournalMutation(id: JournalFixture.mutationID(40_001), payload: Data())], capturedThrough: 40_001)) {
-            XCTAssertEqual($0 as? HostJournalError, .capacity(.submitBudget))
+            XCTAssertEqual($0 as? JournalStoreError, .capacity(.submitBudget))
         }
         XCTAssertEqual(store.view.ownHead, 40_000)
         try report("submissions.max-count", store)
@@ -264,7 +264,7 @@ final class HostJournalCapacityTests: XCTestCase {
         let held = (0..<1_000).map {
             HostJournalHeldMessage(sender: JournalFixture.sender, cursor: UInt64($0 + 1), plaintext: Data(repeating: UInt8($0 % 251), count: 23_000))
         }
-        let before = try HostJournalArchive.accounting(store.url).databaseBytes
+        let before = try HostJournalFiles.accounting(store.url).databaseBytes
         var peak: UInt64 = 0
         store.faultHookForTesting = { point in
             guard point == .beforeCommit("retire") else { return }

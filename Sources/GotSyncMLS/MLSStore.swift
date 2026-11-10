@@ -1,6 +1,7 @@
 import CryptoKit
-import SQLite3
 import Foundation
+import os
+import SQLite3
 
 final class MLSStore {
     private var database: OpaquePointer?
@@ -78,7 +79,23 @@ final class MLSStore {
         }
     }
 
+    /// Makes the next `close` fail without closing, for tests of an
+    /// uncertain close.
+    static let failNextCloseForTesting = OSAllocatedUnfairLock(initialState: false)
+
+    /// Closes the database; every later operation fails with
+    /// `storageUnavailable`. A second close does nothing.
+    func close() throws {
+        if Self.failNextCloseForTesting.withLock({ state in defer { state = false }; return state }) {
+            throw MLSClientError.storageUnavailable
+        }
+        guard let open = database else { return }
+        guard sqlite3_close_v2(open) == SQLITE_OK else { throw MLSClientError.storageUnavailable }
+        database = nil
+    }
+
     private func optionalRecord() throws -> ClientRecord? {
+        guard database != nil else { throw MLSClientError.storageUnavailable }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "SELECT record FROM client WHERE id=1", -1, &statement, nil) == SQLITE_OK else { throw MLSClientError.storageUnavailable }
         defer { sqlite3_finalize(statement) }
@@ -107,6 +124,6 @@ final class MLSStore {
     }
 
     private func execute(_ sql: String) throws {
-        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else { throw MLSClientError.storageUnavailable }
+        guard database != nil, sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else { throw MLSClientError.storageUnavailable }
     }
 }

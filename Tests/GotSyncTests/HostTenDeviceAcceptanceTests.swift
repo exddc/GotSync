@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Ten host-journal devices share one group on the real relay that
 /// `scripts/test-integration.sh` starts, each with its own identity,
@@ -14,10 +14,10 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
     private var metricsURL: URL!
     private var stores: [String: MemorySecretStore] = [:]
     private var engines: [String: SyncEngine] = [:]
-    private var provenances: [String: HostJournalProvenance] = [:]
+    private var provenances: [String: HostProvenance] = [:]
     private var captured: [String: UInt64] = [:]
     private var applied: [String: [String]] = [:]
-    private var appliedThrough: [String: UInt64] = [:]
+    private var appliedThrough: [String: JournalPosition] = [:]
     private let profile = try! SyncGroupProfile(
         application: "org.gotsync.host-acceptance", schema: .hostJournal(payload: "example.records", version: 1),
         memberLimit: SyncGroupProfile.supportedMemberCeiling
@@ -52,8 +52,8 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
             let joiner = start(name)
             let inviter = linked[(index - 1) / 2]
             try await pair(inviter, joiner, usePhrase: index.isMultiple(of: 2))
-            try prepare(inviter, names[(index - 1) / 2])
-            try prepare(joiner, name)
+            try await prepare(inviter, names[(index - 1) / 2])
+            try await prepare(joiner, name)
             names.append(name)
             linked.append(joiner)
         }
@@ -65,13 +65,13 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
 
         await linked[3].stop()
         await linked[7].stop()
-        try submit(linked[5], names[5], ["while two were stopped"])
+        try await submit(linked[5], names[5], ["while two were stopped"])
         linked[3] = start(names[3])
         linked[7] = start(names[7])
         XCTAssertTrue(linked[3].isPaired && linked[7].isPaired)
-        try resume(linked[3], names[3])
-        try resume(linked[7], names[7])
-        try submit(linked[7], names[7], ["after restart"])
+        try await resume(linked[3], names[3])
+        try await resume(linked[7], names[7])
+        try await submit(linked[7], names[7], ["after restart"])
         try await converge("restarted hosts", names)
 
         let removed = linked.remove(at: 5)
@@ -88,7 +88,7 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
 
         let replacement = start("host-10")
         try await pair(linked[2], replacement, usePhrase: true)
-        try prepare(replacement, "host-10")
+        try await prepare(replacement, "host-10")
         linked.append(replacement)
         names.append("host-10")
         try await converge("replacement", names)
@@ -129,37 +129,38 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
 
     /// Enrolls once, submits one record named after the device and declares
     /// readiness, so the device may invite and provide history.
-    private func prepare(_ engine: SyncEngine, _ name: String) throws {
+    private func prepare(_ engine: SyncEngine, _ name: String) async throws {
         guard provenances[name] == nil else { return }
         let journal = try XCTUnwrap(engine.hostJournal)
-        provenances[name] = try journal.resume(try journal.enroll())
-        try submit(engine, name, [name])
-        try journal.declareReady(capturedThrough: captured[name, default: 0])
+        provenances[name] = try await journal.resume(try await journal.enroll())
+        try await submit(engine, name, [name])
+        try await journal.declareReady(capturedThrough: captured[name, default: 0])
     }
 
-    private func resume(_ engine: SyncEngine, _ name: String) throws {
+    private func resume(_ engine: SyncEngine, _ name: String) async throws {
+        try await wait("\(name) opened") { engine.hostLifecycle != .opening }
         let stored = try XCTUnwrap(provenances[name])
-        provenances[name] = try XCTUnwrap(engine.hostJournal).resume(HostJournalProvenance(
+        provenances[name] = try await XCTUnwrap(engine.hostJournal).resume(HostProvenance(
             journalID: stored.journalID, enrollmentID: stored.enrollmentID,
-            appliedThrough: appliedThrough[name, default: 0], capturedThrough: captured[name, default: 0]
+            appliedThrough: appliedThrough[name], capturedThrough: captured[name, default: 0]
         ))
     }
 
-    private func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) throws {
+    private func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) async throws {
         captured[name, default: 0] += UInt64(payloads.count)
-        _ = try XCTUnwrap(engine.hostJournal).submit(
-            payloads.map { HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data($0.utf8)) },
+        _ = try await XCTUnwrap(engine.hostJournal).submit(
+            payloads.map { HostMutation(id: HostMutationID(UUID()), payload: Data($0.utf8)) },
             capturedThrough: captured[name, default: 0]
         )
     }
 
     /// Applies what has arrived, as a host would, and reports whether the
     /// device holds every other device's records with complete history.
-    private func settled(_ name: String, expecting count: Int) -> Bool {
+    private func settled(_ name: String, expecting count: Int) async -> Bool {
         guard let engine = engines[name], let journal = engine.hostJournal else { return false }
-        while let batch = try? journal.incoming(after: journal.view.appliedThrough, limit: 64), let last = batch.last {
+        while let batch = try? await journal.incoming(after: JournalPosition(rawValue: journal.view.appliedThrough), limit: 64), let last = batch.last {
             applied[name, default: []] += batch.map { String(decoding: $0.payload, as: UTF8.self) }
-            guard (try? journal.markApplied(through: last.position)) != nil else { return false }
+            guard (try? await journal.markApplied(through: last.position)) != nil else { return false }
             appliedThrough[name] = last.position
         }
         let view = journal.view
@@ -170,9 +171,12 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
     private func converge(_ stage: String, _ names: [String]) async throws {
         let expected = captured.values.reduce(0) { $0 + Int($1) }
         try await wait(stage) {
-            names.allSatisfy { self.settled($0, expecting: expected) && self.engines[$0]?.linkedMemberCount == names.count }
+            for name in names {
+                guard await self.settled(name, expecting: expected), self.engines[name]?.linkedMemberCount == names.count else { return false }
+            }
+            return true
         }
-        let heads = Set(names.compactMap { try? self.engines[$0]?.hostJournal?.receivedVector() })
+        let heads = Set(names.compactMap { self.engines[$0]?.hostJournal?.receivedVector })
         XCTAssertEqual(heads.count, 1, "\(stage): devices hold different journals")
     }
 
@@ -202,9 +206,9 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
         return try XCTUnwrap(snapshot?["counters"] as? [String: Int])
     }
 
-    private func wait(_ stage: String, file: StaticString = #filePath, line: UInt = #line, until predicate: () -> Bool) async throws {
+    private func wait(_ stage: String, file: StaticString = #filePath, line: UInt = #line, until predicate: () async -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(90))
-        while !predicate() {
+        while await !predicate() {
             guard ContinuousClock.now < deadline else {
                 let details = engines.sorted { $0.key < $1.key }.map {
                     let view = $0.value.hostJournal?.view

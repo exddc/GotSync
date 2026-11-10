@@ -2,7 +2,7 @@ import Foundation
 import GotSyncMLS
 import SQLite3
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 extension HostEngineTests {
     func testUnreadableJoinedOwnerSurvivesReplacementJoinAndRestart() async throws {
@@ -25,9 +25,9 @@ extension HostEngineTests {
         let owner = try XCTUnwrap(b.mlsSessionForTesting)
         let originalGroup = try await owner.group()
         let payload = "transient lock must preserve owner"
-        try enroll(a, "a")
-        try submit(a, "a", [payload])
-        try ready(a, "a")
+        try await enroll(a, "a")
+        try await submit(a, "a", [payload])
+        try await ready(a, "a")
         try await wait("held application bytes") {
             _ = try await owner.synchronize()
             return try await owner.inbox().contains { (try? HostJournalMessage.decode($0.plaintext).kind) == .records }
@@ -83,10 +83,11 @@ extension HostEngineTests {
         let reopenedGroup = try await XCTUnwrap(reopened.mlsSessionForTesting).group()
         XCTAssertEqual(reopenedGroup, originalGroup)
         XCTAssertEqual(reopened.hostView?.journal?.journalID, intent.hostJournal)
-        try enroll(reopened, "b")
+        try await enroll(reopened, "b")
         a.applicationDidBecomeActive()
         try await wait("history complete") { reopened.hostView?.journal?.historyComplete == true }
-        XCTAssertEqual(try applyAll(reopened, "b"), [Data(payload.utf8)])
+        let applied = try await applyAll(reopened, "b")
+        XCTAssertEqual(applied, [Data(payload.utf8)])
         c.cancelPairing()
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 @MainActor
 final class HostJournalStoreTests: XCTestCase {
@@ -48,25 +48,25 @@ final class HostJournalStoreTests: XCTestCase {
 
     func testMissingUnreadableUnsupportedAndCorruptFilesStopWithoutWriting() throws {
         let missing = HostJournalStore.fileURL(in: directory, journalID: Data(count: 16))
-        XCTAssertThrowsError(try HostJournalStore.open(missing)) { XCTAssertEqual($0 as? HostJournalError, .storeMissing) }
+        XCTAssertThrowsError(try HostJournalStore.open(missing)) { XCTAssertEqual($0 as? JournalStoreError, .storeMissing) }
         XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
 
         let garbage = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 1, count: 16))
         try Data(repeating: 0x42, count: 8_192).write(to: garbage)
         let garbageHash = try JournalFixture.fileHash(garbage)
         XCTAssertThrowsError(try HostJournalStore.open(garbage)) {
-            guard case .storeUnreadable = $0 as? HostJournalError else { return XCTFail("\($0)") }
+            guard case .storeUnreadable = $0 as? JournalStoreError else { return XCTFail("\($0)") }
         }
         XCTAssertEqual(try JournalFixture.fileHash(garbage), garbageHash)
 
         let (store, _) = try enrolled()
         let url = store.url
         _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 3), cursor: 1)])
-        try JournalFixture.tamper(url, "PRAGMA user_version = 3")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 4")
         let unsupported = try JournalFixture.fileHash(url)
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(3)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(4)) }
         XCTAssertEqual(try JournalFixture.fileHash(url), unsupported)
-        try JournalFixture.tamper(url, "PRAGMA user_version = 2")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 3")
 
         for damage in [
             "UPDATE records SET envelope = randomblob(length(envelope)) WHERE position = 2",
@@ -81,7 +81,7 @@ final class HostJournalStoreTests: XCTestCase {
             try JournalFixture.tamper(copy, damage)
             let before = try JournalFixture.fileHash(copy)
             XCTAssertThrowsError(try HostJournalStore.open(copy), damage) {
-                guard case .storeCorrupt = $0 as? HostJournalError else { return XCTFail("\(damage): \($0)") }
+                guard case .storeCorrupt = $0 as? JournalStoreError else { return XCTFail("\(damage): \($0)") }
             }
             XCTAssertEqual(try JournalFixture.fileHash(copy), before, damage)
         }
@@ -89,10 +89,10 @@ final class HostJournalStoreTests: XCTestCase {
 
     func testUnsupportedWALStoreIsPreservedExactly() throws {
         let url = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 3, count: 16))
-        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=3", create: true)
+        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=4", create: true)
         let before = JournalFixture.storedState(url)
         XCTAssertEqual(Array(try XCTUnwrap(before[""])[18...19]), [2, 2])
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(3)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(4)) }
         XCTAssertEqual(JournalFixture.storedState(url), before)
     }
 
@@ -105,7 +105,7 @@ final class HostJournalStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: withIndex.path + "-shm"))
         let indexed = JournalFixture.storedState(withIndex)
         XCTAssertEqual(Array(try XCTUnwrap(indexed[""])[18...19]), [2, 2])
-        XCTAssertThrowsError(try HostJournalStore.open(withIndex)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("journal mode wal")) }
+        XCTAssertThrowsError(try HostJournalStore.open(withIndex)) { XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt("journal mode wal")) }
         XCTAssertEqual(JournalFixture.storedState(withIndex), indexed)
 
         let withoutIndex = directory.appendingPathComponent("wal-bare.sqlite3")
@@ -115,7 +115,7 @@ final class HostJournalStoreTests: XCTestCase {
         let bare = JournalFixture.storedState(withoutIndex)
         XCTAssertEqual(Array(try XCTUnwrap(bare[""])[18...19]), [2, 2])
         XCTAssertThrowsError(try HostJournalStore.open(withoutIndex)) {
-            guard case .storeUnreadable(let reason) = $0 as? HostJournalError, reason.hasPrefix("14:") else { return XCTFail("\($0)") }
+            guard case .storeUnreadable(let reason) = $0 as? JournalStoreError, reason.hasPrefix("14:") else { return XCTFail("\($0)") }
         }
         XCTAssertEqual(JournalFixture.storedState(withoutIndex), bare)
         XCTAssertFalse(FileManager.default.fileExists(atPath: withoutIndex.path + "-shm"))
@@ -146,7 +146,7 @@ final class HostJournalStoreTests: XCTestCase {
             UPDATE records SET position = 1 WHERE position = 2; UPDATE records SET position = 2 WHERE position = 3; COMMIT
             """)
         let before = JournalFixture.storedState(store.url)
-        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("position order")) }
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt("position order")) }
         XCTAssertEqual(JournalFixture.storedState(store.url), before)
     }
 
@@ -168,7 +168,7 @@ final class HostJournalStoreTests: XCTestCase {
         _ = try store.intake([JournalFixture.raw(Data("raw".utf8), cursor: 1)])
         try JournalFixture.tamper(store.url, "UPDATE quarantine SET cursor = -1")
         let quarantine = JournalFixture.storedState(store.url)
-        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("quarantine")) }
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt("quarantine")) }
         XCTAssertEqual(JournalFixture.storedState(store.url), quarantine)
 
         directory = root.appendingPathComponent("held", isDirectory: true)
@@ -177,7 +177,7 @@ final class HostJournalStoreTests: XCTestCase {
         try retired.retire(.unlink, heldInbox: [HostJournalHeldMessage(sender: JournalFixture.sender, cursor: 4, plaintext: Data("h".utf8))])
         try JournalFixture.tamper(retired.url, "UPDATE heldInbox SET cursor = -4")
         let held = JournalFixture.storedState(retired.url)
-        XCTAssertThrowsError(try HostJournalStore.open(retired.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("heldInbox")) }
+        XCTAssertThrowsError(try HostJournalStore.open(retired.url)) { XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt("heldInbox")) }
         XCTAssertEqual(JournalFixture.storedState(retired.url), held)
     }
 
@@ -186,7 +186,7 @@ final class HostJournalStoreTests: XCTestCase {
         let link = directory.appendingPathComponent("host-journal-link.sqlite3")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: store.url)
         XCTAssertThrowsError(try HostJournalStore.open(link)) {
-            guard case .storeUnreadable = $0 as? HostJournalError else { return XCTFail("\($0)") }
+            guard case .storeUnreadable = $0 as? JournalStoreError else { return XCTFail("\($0)") }
         }
     }
 
@@ -196,11 +196,11 @@ final class HostJournalStoreTests: XCTestCase {
         let (store, _) = try enrolled()
         let reopened = try reopen(store)
         let before = try JournalFixture.fileHash(reopened.url)
-        XCTAssertThrowsError(try reopened.enroll()) { XCTAssertEqual($0 as? HostJournalError, .hostProvenanceMissing) }
+        XCTAssertThrowsError(try reopened.enroll()) { XCTAssertEqual($0 as? JournalStoreError, .hostProvenanceMissing) }
         XCTAssertEqual(try JournalFixture.fileHash(reopened.url), before)
         XCTAssertFalse(reopened.isResumed)
         XCTAssertThrowsError(try reopened.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data())], capturedThrough: 1)) {
-            XCTAssertEqual($0 as? HostJournalError, .notResumed)
+            XCTAssertEqual($0 as? JournalStoreError, .notResumed)
         }
     }
 
@@ -210,7 +210,7 @@ final class HostJournalStoreTests: XCTestCase {
         let reopened = try reopen(store)
         let host = try HostStandIn(url: directory.appendingPathComponent("host.json"))
         try host.save(try reopened.enroll())
-        XCTAssertThrowsError(try reopened.resume(lost)) { XCTAssertEqual($0 as? HostJournalError, .hostProvenanceMismatch) }
+        XCTAssertThrowsError(try reopened.resume(lost)) { XCTAssertEqual($0 as? JournalStoreError, .hostProvenanceMismatch) }
         XCTAssertNoThrow(try reopened.resume(XCTUnwrap(host.provenance)))
         XCTAssertEqual(reopened.view.enrollment, .confirmed(try XCTUnwrap(host.state.enrollmentID)))
     }
@@ -238,7 +238,7 @@ final class HostJournalStoreTests: XCTestCase {
         XCTAssertEqual(host.provenance?.appliedThrough, reopened.view.appliedThrough)
         let before = try JournalFixture.fileHash(reopened.url)
         XCTAssertThrowsError(try reopened.resume(XCTUnwrap(host.provenance))) {
-            XCTAssertEqual($0 as? HostJournalError, .hostCaptureRegressed)
+            XCTAssertEqual($0 as? JournalStoreError, .hostCaptureRegressed)
         }
         XCTAssertEqual(try JournalFixture.fileHash(reopened.url), before)
         XCTAssertFalse(reopened.isResumed)
@@ -296,13 +296,13 @@ final class HostJournalStoreTests: XCTestCase {
         let reopened = try reopen(store)
         let provenance = try XCTUnwrap(host.provenance)
         let before = try JournalFixture.fileHash(reopened.url)
-        XCTAssertThrowsError(try reopened.resume(provenance)) { XCTAssertEqual($0 as? HostJournalError, .hostApplicationRegressed) }
+        XCTAssertThrowsError(try reopened.resume(provenance)) { XCTAssertEqual($0 as? JournalStoreError, .hostApplicationRegressed) }
         let stale = HostJournalProvenance(journalID: Data(count: 16), enrollmentID: provenance.enrollmentID, appliedThrough: 2, capturedThrough: 0)
-        XCTAssertThrowsError(try reopened.resume(stale)) { XCTAssertEqual($0 as? HostJournalError, .staleJournal) }
+        XCTAssertThrowsError(try reopened.resume(stale)) { XCTAssertEqual($0 as? JournalStoreError, .staleJournal) }
         let mismatched = HostJournalProvenance(journalID: provenance.journalID, enrollmentID: Data(count: 16), appliedThrough: 2, capturedThrough: 0)
-        XCTAssertThrowsError(try reopened.resume(mismatched)) { XCTAssertEqual($0 as? HostJournalError, .hostProvenanceMismatch) }
+        XCTAssertThrowsError(try reopened.resume(mismatched)) { XCTAssertEqual($0 as? JournalStoreError, .hostProvenanceMismatch) }
         let beyond = HostJournalProvenance(journalID: provenance.journalID, enrollmentID: provenance.enrollmentID, appliedThrough: 3, capturedThrough: 0)
-        XCTAssertThrowsError(try reopened.resume(beyond)) { XCTAssertEqual($0 as? HostJournalError, .positionOutOfRange(3)) }
+        XCTAssertThrowsError(try reopened.resume(beyond)) { XCTAssertEqual($0 as? JournalStoreError, .positionOutOfRange(3)) }
         XCTAssertEqual(try JournalFixture.fileHash(reopened.url), before)
         XCTAssertFalse(reopened.isResumed)
     }
@@ -319,7 +319,7 @@ final class HostJournalStoreTests: XCTestCase {
         let before = try JournalFixture.fileHash(store.url)
         let decomposed = HostJournalMutation(id: first.id, payload: Data("e\u{301}".utf8))
         XCTAssertThrowsError(try store.submit([HostJournalMutation(id: JournalFixture.mutationID(2), payload: Data()), decomposed], capturedThrough: 2)) {
-            XCTAssertEqual($0 as? HostJournalError, .hostMutationConflict(first.id))
+            XCTAssertEqual($0 as? JournalStoreError, .hostMutationConflict(first.id))
         }
         XCTAssertEqual(try JournalFixture.fileHash(store.url), before)
         XCTAssertEqual(store.view.revision, revision)
@@ -337,21 +337,21 @@ final class HostJournalStoreTests: XCTestCase {
         let (store, _) = try enrolled(limits: limits)
         let before = try JournalFixture.fileHash(store.url)
         XCTAssertThrowsError(try store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data(count: 65_537))], capturedThrough: 1)) {
-            XCTAssertEqual($0 as? HostJournalError, .payloadTooLarge(65_537))
+            XCTAssertEqual($0 as? JournalStoreError, .payloadTooLarge(65_537))
         }
         XCTAssertThrowsError(try store.submit([], capturedThrough: 1))
         XCTAssertThrowsError(try store.submit((0..<257).map { HostJournalMutation(id: JournalFixture.mutationID($0), payload: Data()) }, capturedThrough: 1))
         XCTAssertThrowsError(try store.submit([HostJournalMutation(id: Data(count: 15), payload: Data())], capturedThrough: 1))
         XCTAssertThrowsError(try store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data())], capturedThrough: UInt64.max)) {
-            XCTAssertEqual($0 as? HostJournalError, .valueOutOfRange)
+            XCTAssertEqual($0 as? JournalStoreError, .valueOutOfRange)
         }
         XCTAssertThrowsError(try store.submit((1...4).map { HostJournalMutation(id: JournalFixture.mutationID($0), payload: Data()) }, capturedThrough: 1)) {
-            XCTAssertEqual($0 as? HostJournalError, .capacity(.submitBudget))
+            XCTAssertEqual($0 as? JournalStoreError, .capacity(.submitBudget))
         }
         XCTAssertEqual(try JournalFixture.fileHash(store.url), before)
         _ = try store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data(count: 65_536))], capturedThrough: 5)
         XCTAssertThrowsError(try store.submit([HostJournalMutation(id: JournalFixture.mutationID(2), payload: Data())], capturedThrough: 4)) {
-            XCTAssertEqual($0 as? HostJournalError, .hostCaptureRegressed)
+            XCTAssertEqual($0 as? JournalStoreError, .hostCaptureRegressed)
         }
         XCTAssertEqual(store.view.ownHead, 1)
     }
@@ -394,7 +394,7 @@ final class HostJournalStoreTests: XCTestCase {
         let otherFork = try JournalEnvelope(origin: other[0].origin, sequence: 1, prior: JournalEnvelope.zeroDigest, payload: Data("x".utf8))
         let predecessor = try JournalEnvelope(origin: origin, sequence: 3, prior: Data(repeating: 1, count: 32), payload: Data())
         let hidden = try JournalEnvelope(origin: origin, sequence: 3, prior: run[1].digest, payload: Data())
-        let cases: [(String, [HostJournalArrival], HostJournalError)] = [
+        let cases: [(String, [HostJournalArrival], JournalStoreError)] = [
             ("retained", [JournalFixture.arrival(other, cursor: 4), JournalFixture.arrival([retainedFork], cursor: 5)],
              .fork(origin: origin, sequence: 2)),
             ("pending", [JournalFixture.arrival(other, cursor: 4), JournalFixture.arrival([pendingFork], cursor: 5)],
@@ -407,7 +407,7 @@ final class HostJournalStoreTests: XCTestCase {
              .fork(origin: origin, sequence: 4)),
         ]
         for (name, arrivals, expected) in cases {
-            XCTAssertThrowsError(try store.intake(arrivals), name) { XCTAssertEqual($0 as? HostJournalError, expected, name) }
+            XCTAssertThrowsError(try store.intake(arrivals), name) { XCTAssertEqual($0 as? JournalStoreError, expected, name) }
             XCTAssertEqual(try JournalFixture.fileHash(store.url), before, name)
             XCTAssertEqual(store.view.revision, revision, name)
         }
@@ -423,7 +423,7 @@ final class HostJournalStoreTests: XCTestCase {
         XCTAssertEqual(reopened.view.pendingCount, 2)
         XCTAssertEqual(reopened.view.retainedBytes, pendingBytes)
         _ = try reopened.resume(XCTUnwrap(host.provenance))
-        _ = try reopened.intake([JournalFixture.arrival(Array(run[..<2]), cursor: 2)])
+        _ = try reopened.intakeAndPromote([JournalFixture.arrival(Array(run[..<2]), cursor: 2)])
         XCTAssertEqual(reopened.view.pendingCount, 0)
         XCTAssertEqual(reopened.view.recordCount, 4)
         XCTAssertEqual(reopened.view.retainedBytes, UInt64(run.map(\.bytes.count).reduce(0, +)))
@@ -445,7 +445,7 @@ final class HostJournalStoreTests: XCTestCase {
         let before = try JournalFixture.fileHash(store.url)
         let foreign = try JournalEnvelope(origin: store.view.origin, sequence: 2, prior: try JournalEnvelope(parsing: own).digest, payload: Data())
         XCTAssertThrowsError(try store.intake([JournalFixture.arrival([foreign], cursor: 2)])) {
-            XCTAssertEqual($0 as? HostJournalError, .foreignOwnOrigin(sequence: 2))
+            XCTAssertEqual($0 as? JournalStoreError, .foreignOwnOrigin(sequence: 2))
         }
         XCTAssertEqual(try JournalFixture.fileHash(store.url), before)
     }
@@ -469,11 +469,11 @@ final class HostJournalStoreTests: XCTestCase {
         XCTAssertEqual(store.view.revision, revision + 1)
         let before = try JournalFixture.fileHash(store.url)
         XCTAssertThrowsError(try store.intake([JournalFixture.raw(Data("changed".utf8), cursor: 1)])) {
-            XCTAssertEqual($0 as? HostJournalError, .quarantineConflict(sender: JournalFixture.sender, cursor: 1))
+            XCTAssertEqual($0 as? JournalStoreError, .quarantineConflict(sender: JournalFixture.sender, cursor: 1))
         }
         XCTAssertEqual(try JournalFixture.fileHash(store.url), before)
         XCTAssertThrowsError(try store.intake([JournalFixture.raw(Data(), cursor: UInt64.max)])) {
-            XCTAssertEqual($0 as? HostJournalError, .valueOutOfRange)
+            XCTAssertEqual($0 as? JournalStoreError, .valueOutOfRange)
         }
         XCTAssertThrowsError(try store.intake([HostJournalArrival(sender: Data(count: 31), cursor: 9, plaintext: Data(), envelopes: nil)]))
     }
@@ -512,7 +512,7 @@ final class HostJournalStoreTests: XCTestCase {
         var origins = HostJournalLimits.standard
         origins.origins = 3
         let gap = Array(run[2...])
-        let cases: [(HostJournalLimits, [HostJournalArrival], HostJournalCapacity, Int)] = [
+        let cases: [(HostJournalLimits, [HostJournalArrival], JournalCapacity, Int)] = [
             (history, run.map { JournalFixture.arrival([$0], cursor: $0.sequence) }, .history, 3),
             (pending, gap.map { JournalFixture.arrival([$0], cursor: $0.sequence) }, .pending, 2),
             (pendingBytes, gap.map { JournalFixture.arrival([$0], cursor: $0.sequence) }, .pending, 2),
@@ -626,7 +626,7 @@ final class HostJournalStoreTests: XCTestCase {
         let conflicting = held + [HostJournalHeldMessage(sender: JournalFixture.sender, cursor: 7, plaintext: Data("other".utf8))]
         let before = try JournalFixture.fileHash(store.url)
         XCTAssertThrowsError(try store.retire(.removed, heldInbox: conflicting)) {
-            XCTAssertEqual($0 as? HostJournalError, .heldInboxConflict(sender: JournalFixture.sender, cursor: 7))
+            XCTAssertEqual($0 as? JournalStoreError, .heldInboxConflict(sender: JournalFixture.sender, cursor: 7))
         }
         XCTAssertEqual(try JournalFixture.fileHash(store.url), before)
         XCTAssertFalse(store.view.isRetired)
@@ -640,7 +640,7 @@ final class HostJournalStoreTests: XCTestCase {
             { try store.retire(.unlink, heldInbox: []) },
             { _ = try store.enroll() },
         ] {
-            XCTAssertThrowsError(try operation()) { XCTAssertEqual($0 as? HostJournalError, .retired) }
+            XCTAssertThrowsError(try operation()) { XCTAssertEqual($0 as? JournalStoreError, .retired) }
         }
         XCTAssertEqual(try reopen(store).view, store.view)
     }
@@ -688,7 +688,7 @@ final class HostJournalStoreTests: XCTestCase {
     }
 
     private func enrollmentID(_ store: HostJournalStore) throws -> Data {
-        guard case .confirmed(let id) = store.view.enrollment else { throw HostJournalError.enrollmentRequired }
+        guard case .confirmed(let id) = store.view.enrollment else { throw JournalStoreError.enrollmentRequired }
         return id
     }
 }

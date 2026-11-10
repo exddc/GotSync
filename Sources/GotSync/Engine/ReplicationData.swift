@@ -29,10 +29,11 @@ struct ReplicationChunkIntake {
     let requestsHello: Bool
 }
 
-/// The data-specific part of replication: coding, intake, origin inventory
-/// and the choice of what to send. `SyncEngine` keeps membership, pairing,
-/// reservations, reply obligations, checkpoints and acknowledgement. Every
-/// member is synchronous, so engine suspension points are unchanged.
+/// The data-specific part of replication: coding, origin inventory and
+/// chunking. `SyncEngine` keeps membership, pairing, reservations, reply
+/// obligations, checkpoints and acknowledgement. Every member is
+/// synchronous. The task demo's intake and selection stay synchronous on
+/// `TaskReplicationAdapter`; the host journal's are `HostReplicationData`.
 @MainActor
 protocol ReplicationData: AnyObject {
     /// Origin of this device's own data, if any exists yet.
@@ -50,20 +51,27 @@ protocol ReplicationData: AnyObject {
     /// Origins a not yet drained message commits the group to. Nil when the
     /// message cannot be read, so its origins are unknown.
     func committedOrigins(in decoded: ReplicationDecoded, control: ReplicationMessage?) -> Set<ReplicaDeviceID>?
-
-    /// Checks the whole window before any of it is written.
-    func verify(_ window: [ReplicationWindowItem]) throws
     /// Index ranges of the window committed one after another.
     func chunks(of window: [ReplicationWindowItem]) -> [Range<Int>]
-    func intake(_ chunk: [ReplicationWindowItem]) throws -> ReplicationChunkIntake
+}
 
+/// The host journal's intake and selection, which read and write the
+/// journal file on its writer and so suspend the engine.
+@MainActor
+protocol HostReplicationData: ReplicationData {
+    /// Starts the proof of a whole frozen window; nothing of it is written
+    /// before `extendWindowProof` reports it complete.
+    func beginWindowProof(_ window: [ReplicationWindowItem]) async throws
+    /// One bounded proof step. Returns whether the window is proven.
+    func extendWindowProof() async throws -> Bool
+    func intake(_ chunk: [ReplicationWindowItem]) async throws -> ReplicationChunkIntake
     /// The next reply message for `obligation` and the records it carries,
     /// none above `bound` when one is given.
     func reply(
         for obligation: ReplyObligation, uploadedThrough: UInt64, bound: ReplicaVersionVector?
-    ) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])?
+    ) async throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])?
     /// A joiner's hello vector and the data messages announced after it.
-    func joinAnnouncement() throws -> (vector: ReplicaVersionVector, messages: [Data])
+    func joinAnnouncement() async throws -> (vector: ReplicaVersionVector, messages: [Data])
     /// The next local batch after `uploadedThrough` and its last sequence.
-    func upload(after uploadedThrough: UInt64) throws -> (plaintext: Data, last: UInt64)
+    func upload(after uploadedThrough: UInt64) async throws -> (plaintext: Data, last: UInt64)
 }

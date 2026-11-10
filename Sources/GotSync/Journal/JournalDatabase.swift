@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-enum JournalValue: Hashable, Sendable {
+enum JournalValue: Hashable, Codable, Sendable {
     case integer(Int64)
     case blob(Data)
     case text(String)
@@ -15,17 +15,18 @@ final class JournalDatabase {
     /// `SQLITE_READONLY_ROLLBACK`: a read-only connection found a hot
     /// rollback journal that only a read-write connection may roll back.
     static let hotJournalCode = SQLITE_READONLY | (3 << 8)
+    static let defaultBusyTimeoutMilliseconds: Int32 = 5_000
     private var handle: OpaquePointer?
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    init(url: URL, readOnly: Bool, create: Bool = false) throws {
+    init(url: URL, readOnly: Bool, create: Bool = false, busyTimeoutMilliseconds: Int32 = defaultBusyTimeoutMilliseconds) throws {
         var flags = SQLITE_OPEN_NOFOLLOW | SQLITE_OPEN_FULLMUTEX
         flags |= readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE
         if create {
             flags |= SQLITE_OPEN_CREATE
         }
         guard let parent = realpath(url.deletingLastPathComponent().path, nil) else {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         defer { free(parent) }
         let path = URL(fileURLWithPath: String(cString: parent)).appendingPathComponent(url.lastPathComponent).path
@@ -34,20 +35,51 @@ final class JournalDatabase {
         guard code == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "open failed"
             sqlite3_close_v2(database)
-            throw HostJournalError.storage(code: code, message: message)
+            throw JournalStoreError.storage(code: code, message: message)
         }
         handle = database
         sqlite3_extended_result_codes(database, 1)
-        sqlite3_busy_timeout(database, 5_000)
+        sqlite3_busy_timeout(database, busyTimeoutMilliseconds)
+    }
+
+    /// Replaces any busy handler with a plain timeout.
+    func setBusyTimeout(_ milliseconds: Int32) {
+        sqlite3_busy_timeout(handle, milliseconds)
+    }
+
+    /// Whether the file this connection opened is no longer at its path.
+    func hasMoved() throws -> Bool {
+        var moved: Int32 = 0
+        let code = sqlite3_file_control(handle, "main", SQLITE_FCNTL_HAS_MOVED, &moved)
+        guard code == SQLITE_OK else { throw error(code) }
+        return moved != 0
+    }
+
+    /// Makes long statements and lock waits give up once `cancellation` is
+    /// set. It must outlive this connection.
+    func observe(_ cancellation: HostJournalCancellation) {
+        let context = Unmanaged.passUnretained(cancellation).toOpaque()
+        sqlite3_progress_handler(handle, 1_000, { context in
+            Unmanaged<HostJournalCancellation>.fromOpaque(context!).takeUnretainedValue().isCancelled ? 1 : 0
+        }, context)
+        sqlite3_busy_handler(handle, { context, attempts in
+            let cancellation = Unmanaged<HostJournalCancellation>.fromOpaque(context!).takeUnretainedValue()
+            guard !cancellation.isCancelled, attempts < 500 else { return 0 }
+            usleep(10_000)
+            return 1
+        }, context)
     }
 
     deinit {
         sqlite3_close_v2(handle)
     }
 
+    /// Whether a transaction is open on this connection.
+    var isInTransaction: Bool { sqlite3_get_autocommit(handle) == 0 }
+
     static func integer(_ value: UInt64) throws -> JournalValue {
         guard value <= UInt64(Int64.max) else {
-            throw HostJournalError.valueOutOfRange
+            throw JournalStoreError.valueOutOfRange
         }
         return .integer(Int64(value))
     }
@@ -126,7 +158,7 @@ final class JournalDatabase {
         try body(statement)
     }
 
-    private func error(_ code: Int32) -> HostJournalError {
+    private func error(_ code: Int32) -> JournalStoreError {
         .storage(code: code, message: String(cString: sqlite3_errmsg(handle)))
     }
 }
@@ -140,7 +172,7 @@ struct JournalRow {
 
     func int64(_ column: Int32) throws -> Int64 {
         guard sqlite3_column_type(statement, column) == SQLITE_INTEGER else {
-            throw HostJournalError.storeCorrupt("column \(column) is not an integer")
+            throw JournalStoreError.storeCorrupt("column \(column) is not an integer")
         }
         return sqlite3_column_int64(statement, column)
     }
@@ -148,14 +180,14 @@ struct JournalRow {
     func unsigned(_ column: Int32) throws -> UInt64 {
         let value = try int64(column)
         guard value >= 0 else {
-            throw HostJournalError.storeCorrupt("column \(column) is negative")
+            throw JournalStoreError.storeCorrupt("column \(column) is negative")
         }
         return UInt64(value)
     }
 
     func blob(_ column: Int32) throws -> Data {
         guard sqlite3_column_type(statement, column) == SQLITE_BLOB else {
-            throw HostJournalError.storeCorrupt("column \(column) is not a blob")
+            throw JournalStoreError.storeCorrupt("column \(column) is not a blob")
         }
         let count = Int(sqlite3_column_bytes(statement, column))
         guard count > 0, let pointer = sqlite3_column_blob(statement, column) else {
@@ -166,7 +198,7 @@ struct JournalRow {
 
     func text(_ column: Int32) throws -> String {
         guard sqlite3_column_type(statement, column) == SQLITE_TEXT, let pointer = sqlite3_column_text(statement, column) else {
-            throw HostJournalError.storeCorrupt("column \(column) is not text")
+            throw JournalStoreError.storeCorrupt("column \(column) is not text")
         }
         return String(cString: pointer)
     }

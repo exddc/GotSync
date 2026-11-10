@@ -19,7 +19,7 @@ enum HostJournalExportItem: Equatable, Sendable {
 
 /// Where the next export page starts. A cursor belongs to one journal and
 /// one committed revision; a continuation after any commit is refused.
-struct HostJournalExportCursor: Hashable, Sendable {
+struct HostJournalExportCursor: Hashable, Codable, Sendable {
     let journalID: Data
     let revision: UInt64
     let section: Int
@@ -48,11 +48,11 @@ struct HostJournalAccounting: Equatable, Sendable {
 /// Read-only access to journal files, whether or not a journal is active or
 /// enrolled, plus the one explicit destructive operation on a retired file.
 @MainActor
-enum HostJournalArchive {
+enum HostJournalFiles {
     /// New links are refused while this many retired or unreadable journals exist.
     static let linkAdmissionLimit = 4
 
-    static func discover(in directory: URL) throws -> [HostJournalListing] {
+    nonisolated static func discover(in directory: URL) throws -> [HostJournalListing] {
         let names = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
         var listings: [HostJournalListing] = []
         for name in names where name.hasPrefix(HostJournalStore.filePrefix) {
@@ -84,12 +84,12 @@ enum HostJournalArchive {
     /// One page of every owned class, in a fixed order: own records, remote
     /// records, pending records, quarantined messages, held inbox messages.
     static func export(_ url: URL, after cursor: HostJournalExportCursor?, limit: Int) throws -> HostJournalExportPage {
-        guard limit > 0, limit <= 1_024 else { throw HostJournalError.invalidArgument("limit") }
+        guard limit > 0, limit <= 1_024 else { throw JournalStoreError.invalidArgument("limit") }
         return try read(url) { database in
             let meta = try HostJournalStore.readMeta(database)
             if let cursor {
-                guard cursor.journalID == meta.journalID else { throw HostJournalError.exportCursorMismatch }
-                guard cursor.revision == meta.revision else { throw HostJournalError.exportRevisionChanged }
+                guard cursor.journalID == meta.journalID else { throw JournalStoreError.exportCursorMismatch }
+                guard cursor.revision == meta.revision else { throw JournalStoreError.exportRevisionChanged }
             }
             var items: [(Int, [JournalValue], HostJournalExportItem)] = []
             var section = cursor?.section ?? 0
@@ -122,13 +122,13 @@ enum HostJournalArchive {
 
     /// Deletes one retired journal file. `confirming` must repeat its ID.
     static func discard(in directory: URL, journalID: Data, confirming: Data) throws {
-        guard confirming == journalID else { throw HostJournalError.confirmationMismatch }
+        guard confirming == journalID else { throw JournalStoreError.confirmationMismatch }
         let url = HostJournalStore.fileURL(in: directory, journalID: journalID)
         let view = try read(url) { try HostJournalStore.readMeta($0).view }
-        guard view.journalID == journalID, view.isRetired else { throw HostJournalError.notArchived }
+        guard view.journalID == journalID, view.isRetired else { throw JournalStoreError.notArchived }
         let sidecar = URL(fileURLWithPath: url.path + "-journal")
         if FileManager.default.fileExists(atPath: sidecar.path) {
-            throw HostJournalError.storeUnreadable("unrecovered transaction")
+            throw JournalStoreError.storeUnreadable("unrecovered transaction")
         }
         try FileManager.default.removeItem(at: url)
     }
@@ -172,7 +172,7 @@ enum HostJournalArchive {
         )
     }
 
-    private static func read<T>(_ url: URL, _ body: (JournalDatabase) throws -> T) throws -> T {
+    nonisolated private static func read<T>(_ url: URL, _ body: (JournalDatabase) throws -> T) throws -> T {
         try HostJournalStore.requireRegularFile(url)
         let database = try JournalDatabase(url: url, readOnly: true)
         try database.execute("PRAGMA query_only=1")

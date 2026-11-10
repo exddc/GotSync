@@ -1,15 +1,20 @@
 import CryptoKit
 import Foundation
+import os
+import SQLite3
 
-enum HostJournalCapacity: Equatable, Sendable {
+enum JournalCapacity: Equatable, Sendable {
     case submitBudget
+    /// One `submit` call's encoded envelopes, headers included and repeated
+    /// mutation IDs counted, exceed `limit` bytes.
+    case submitCallTooLarge(limit: Int)
     case history
     case pending
     case quarantine
     case origins
 }
 
-enum HostJournalError: Error, Equatable {
+enum JournalStoreError: Error, Equatable {
     case storage(code: Int32, message: String)
     case valueOutOfRange
     case invalidArgument(String)
@@ -21,6 +26,8 @@ enum HostJournalError: Error, Equatable {
     case retired
     /// The engine stopped host work on this handle; only the handoff remains.
     case fenced
+    /// A window proof no longer matches this journal's intake state.
+    case proofStale
     case notResumed
     case enrollmentRequired
     case staleJournal
@@ -31,7 +38,7 @@ enum HostJournalError: Error, Equatable {
     case positionOutOfRange(UInt64)
     case payloadTooLarge(Int)
     case hostMutationConflict(Data)
-    case capacity(HostJournalCapacity)
+    case capacity(JournalCapacity)
     case fork(origin: Data, sequence: UInt64)
     case retainedRecordMissing(origin: Data, sequence: UInt64)
     case foreignOwnOrigin(sequence: UInt64)
@@ -56,6 +63,8 @@ struct HostJournalLimits: Equatable, Sendable {
     var quarantineItems: UInt64 = 1_024
     var origins: UInt64 = UInt64(ReplicaLimits.maxOrigins)
     var batch = 256
+    /// Encoded envelope bytes, headers included, one `submit` call may carry.
+    var submitCallBytes = 262_144
 
     static let standard = HostJournalLimits()
 }
@@ -112,7 +121,42 @@ struct HostJournalIncoming: Equatable, Sendable {
 /// may be acknowledged; the rest stay with their previous owner.
 struct HostJournalIntake: Equatable, Sendable {
     let ownedArrivals: Int
-    let refusal: HostJournalCapacity?
+    let refusal: JournalCapacity?
+}
+
+/// A frozen window's fork, predecessor and own-origin proof, built in
+/// bounded steps by `HostJournalStore.extendProof` and bound to one
+/// writer generation's intake state.
+struct HostWindowProof: Sendable {
+    enum Phase: Equatable {
+        case parse(Int)
+        case check(arrival: Int, envelope: Int)
+        /// Walks the touched origins' chains; `sequence` 0 starts an origin.
+        case walk(origin: Int, sequence: UInt64, prior: Data)
+        case complete
+    }
+
+    let id = UUID()
+    let generation: UUID
+    let journalID: Data
+    fileprivate(set) var epoch: UInt64
+    let arrivals: [HostJournalArrival]
+    fileprivate(set) var parsed: [[JournalEnvelope]?] = []
+    fileprivate var incoming: [JournalRecordID: JournalEnvelope] = [:]
+    fileprivate var touched: Set<Data> = []
+    fileprivate var walkOrder: [Data] = []
+    fileprivate(set) var phase: Phase = .parse(0)
+    /// Arrivals already taken by `intake(next:of:)`.
+    fileprivate(set) var consumed = 0
+
+    var isComplete: Bool { phase == .complete }
+
+    fileprivate init(generation: UUID, journalID: Data, epoch: UInt64, arrivals: [HostJournalArrival]) {
+        self.generation = generation
+        self.journalID = journalID
+        self.epoch = epoch
+        self.arrivals = arrivals
+    }
 }
 
 enum HostJournalCommitPoint: Hashable, Sendable {
@@ -165,18 +209,43 @@ struct HostJournalCoreView: Equatable, Sendable {
     var retainedBytes: UInt64 { recordBytes + pendingBytes }
 }
 
-/// A durable host record journal for one group generation. Every mutation is
-/// one SQLite transaction; `view` changes only after its commit succeeds.
-@MainActor
+/// What one commit left: the core view, the complete origin inventory and
+/// the proof epoch. Built inside the transaction before COMMIT; it holds no
+/// record history, only per-origin heads.
+struct HostJournalSnapshot: Equatable, Sendable {
+    /// The connection generation that committed it.
+    let generation: UUID
+    /// Rises with every commit of this generation.
+    let commitSequence: UInt64
+    let view: HostJournalCoreView
+    /// Every origin row in byte order: the own origin, received heads and
+    /// origins with only pending records.
+    let origins: [Data]
+    /// Origins with a received head above zero, the own origin at its head.
+    let received: [Data: UInt64]
+    /// Some pending row continues its origin's received head.
+    let hasPromotable: Bool
+    let intakeEpoch: UInt64
+}
+
+/// A durable host record journal for one group generation on one SQLite
+/// connection. Every mutation is one SQLite transaction; `view` changes only
+/// after its commit succeeds. Not thread-safe: the engine reaches it only
+/// through the `HostJournalWriter` that owns it.
 final class HostJournalStore {
     static let filePrefix = "host-journal-"
     static let fileSuffix = ".sqlite3"
     static let creatingSuffix = ".creating"
-    static let formatVersion: Int64 = 2
+    nonisolated static let formatVersion: Int64 = 3
+    /// Full validations run on the main thread, for tests of cold opening.
+    nonisolated static let mainThreadValidations = OSAllocatedUnfairLock(initialState: 0)
 
     let url: URL
     let limits: HostJournalLimits
-    private(set) var view: HostJournalCoreView
+    /// Identifies this connection; window proofs and snapshots carry it.
+    let generation = UUID()
+    private(set) var snapshot: HostJournalSnapshot
+    var view: HostJournalCoreView { snapshot.view }
     /// Set by a successful `resume` in this process; submission, enumeration
     /// and application require it.
     private(set) var isResumed = false
@@ -184,9 +253,16 @@ final class HostJournalStore {
     /// enrollment, submission, application and readiness are refused from then
     /// on, while the handoff and export stay available.
     private(set) var isHostFenced = false
+    /// Advanced by every commit that changes what a window proof read:
+    /// intake, promotion and retirement. Host submission and application
+    /// leave it alone; see `proofEffects`.
+    var intakeEpoch: UInt64 { snapshot.intakeEpoch }
+    /// Whether some pending row continues its origin's received head and
+    /// waits for `promote`.
+    var hasPromotable: Bool { snapshot.hasPromotable }
     var faultHookForTesting: ((HostJournalCommitPoint) throws -> Void)?
-    /// Called after every commit, once `view` shows it.
-    var committed: (@MainActor () -> Void)?
+    /// The window proof the engine builds through its writer.
+    private var activeProof: HostWindowProof?
     private let database: JournalDatabase
 
     static func fileURL(in directory: URL, journalID: Data) -> URL {
@@ -199,14 +275,14 @@ final class HostJournalStore {
         in directory: URL, group: Data, founder: Bool = false, limits: HostJournalLimits = .standard
     ) throws -> HostJournalStore {
         guard group.count == 32 else {
-            throw HostJournalError.invalidArgument("group")
+            throw JournalStoreError.invalidArgument("group")
         }
         let journalID = randomBytes(16)
         let url = fileURL(in: directory, journalID: journalID)
         let staging = URL(fileURLWithPath: url.path + creatingSuffix)
         let manager = FileManager.default
         guard !manager.fileExists(atPath: url.path), !manager.fileExists(atPath: staging.path) else {
-            throw HostJournalError.storeExists
+            throw JournalStoreError.storeExists
         }
         do {
             let database = try JournalDatabase(url: staging, readOnly: false, create: true)
@@ -238,19 +314,59 @@ final class HostJournalStore {
         var inspected: HostJournalCoreView?
         do {
             inspected = try inspect(JournalDatabase(url: url, readOnly: true))
-        } catch HostJournalError.storage(let code, _) where code == JournalDatabase.hotJournalCode {
+        } catch JournalStoreError.storage(let code, _) where code == JournalDatabase.hotJournalCode {
             inspected = nil
-        } catch HostJournalError.storage(let code, let message) {
-            throw HostJournalError.storeUnreadable("\(code): \(message)")
+        } catch JournalStoreError.storage(let code, let message) {
+            throw JournalStoreError.storeUnreadable("\(code): \(message)")
         }
         do {
             let database = try JournalDatabase(url: url, readOnly: false)
             let view = try inspected ?? inspect(database)
             try configure(database)
-            return HostJournalStore(url: url, limits: limits, database: database, view: view)
-        } catch HostJournalError.storage(let code, let message) {
-            throw HostJournalError.storeUnreadable("\(code): \(message)")
+            return try HostJournalStore(url: url, limits: limits, database: database, view: view)
+        } catch JournalStoreError.storage(let code, let message) {
+            throw JournalStoreError.storeUnreadable("\(code): \(message)")
         }
+    }
+
+    /// Opens a journal that `HostJournalPreparation` validated, after
+    /// checking under the write lock that the file and its contents are the
+    /// ones prepared. Never validates again and never waits for the lock;
+    /// the connection then waits as ordinary connections do. Returns nil when
+    /// anything changed or is busy; the caller prepares again.
+    static func install(_ prepared: PreparedHostJournal, limits: HostJournalLimits = .standard) throws -> HostJournalStore? {
+        let url = prepared.url
+        for suffix in ["-journal", "-wal", "-shm"] where FileManager.default.fileExists(atPath: url.path + suffix) {
+            return nil
+        }
+        try requireRegularFile(url)
+        let database: JournalDatabase
+        do {
+            database = try JournalDatabase(url: url, readOnly: false, busyTimeoutMilliseconds: 0)
+            try database.execute("BEGIN IMMEDIATE")
+        } catch JournalStoreError.storage(let code, _) where code & 0xFF == SQLITE_BUSY {
+            return nil
+        } catch JournalStoreError.storage(let code, let message) {
+            throw JournalStoreError.storeUnreadable("\(code): \(message)")
+        }
+        do {
+            try checkFormat(database)
+            guard try database.first("PRAGMA journal_mode", [], { try $0.text(0) }) == "delete",
+                  try readMeta(database).view == prepared.view,
+                  try HostJournalPreparation.fileToken(url, database) == prepared.token
+            else {
+                try? database.execute("ROLLBACK")
+                return nil
+            }
+            try database.execute("COMMIT")
+            try configure(database)
+            guard try !database.hasMoved() else { return nil }
+        } catch {
+            try? database.execute("ROLLBACK")
+            return nil
+        }
+        database.setBusyTimeout(JournalDatabase.defaultBusyTimeoutMilliseconds)
+        return try HostJournalStore(url: url, limits: limits, database: database, view: prepared.view)
     }
 
     private static func inspect(_ database: JournalDatabase) throws -> HostJournalCoreView {
@@ -259,16 +375,19 @@ final class HostJournalStore {
         try checkFormat(database)
         let mode = try database.first("PRAGMA journal_mode", [], { try $0.text(0) }) ?? ""
         guard mode == "delete" else {
-            throw HostJournalError.storeCorrupt("journal mode \(mode)")
+            throw JournalStoreError.storeCorrupt("journal mode \(mode)")
         }
         return try validate(database)
     }
 
-    private init(url: URL, limits: HostJournalLimits, database: JournalDatabase, view: HostJournalCoreView) {
+    private init(url: URL, limits: HostJournalLimits, database: JournalDatabase, view: HostJournalCoreView) throws {
         self.url = url
         self.limits = limits
         self.database = database
-        self.view = view
+        snapshot = HostJournalSnapshot(
+            generation: generation, commitSequence: 0, view: view, origins: [], received: [:], hasPromotable: false, intakeEpoch: 0
+        )
+        snapshot = try makeSnapshot(view: view, sequence: 0, epoch: 0)
     }
 
     // MARK: - Enrollment
@@ -280,8 +399,8 @@ final class HostJournalStore {
         try requireHostOpen()
         return try transaction("enroll") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
-            if case .confirmed = meta.enrollment { throw HostJournalError.hostProvenanceMissing }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            if case .confirmed = meta.enrollment { throw JournalStoreError.hostProvenanceMissing }
             let enrollmentID = Self.randomBytes(16)
             try setMeta("enrollment", .text("pending"))
             try setMeta("enrollmentID", .blob(enrollmentID))
@@ -300,14 +419,14 @@ final class HostJournalStore {
         try requireHostOpen()
         let result = try transaction("resume") { () -> HostJournalProvenance in
             let meta = try readMeta()
-            guard stored.journalID == meta.journalID else { throw HostJournalError.staleJournal }
-            guard meta.retirement == nil else { throw HostJournalError.retired }
+            guard stored.journalID == meta.journalID else { throw JournalStoreError.staleJournal }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
             switch meta.enrollment {
             case .none:
-                throw HostJournalError.enrollmentRequired
+                throw JournalStoreError.enrollmentRequired
             case .pending(let enrollmentID):
                 guard stored.enrollmentID == enrollmentID, stored.appliedThrough == 0 else {
-                    throw HostJournalError.hostProvenanceMismatch
+                    throw JournalStoreError.hostProvenanceMismatch
                 }
                 try setMeta("enrollment", .text("confirmed"))
                 try bumpRevision(meta)
@@ -316,11 +435,11 @@ final class HostJournalStore {
                     appliedThrough: 0, capturedThrough: stored.capturedThrough
                 )
             case .confirmed(let enrollmentID):
-                guard stored.enrollmentID == enrollmentID else { throw HostJournalError.hostProvenanceMismatch }
-                guard stored.capturedThrough >= meta.capturedThrough else { throw HostJournalError.hostCaptureRegressed }
-                guard stored.appliedThrough >= meta.appliedThrough else { throw HostJournalError.hostApplicationRegressed }
+                guard stored.enrollmentID == enrollmentID else { throw JournalStoreError.hostProvenanceMismatch }
+                guard stored.capturedThrough >= meta.capturedThrough else { throw JournalStoreError.hostCaptureRegressed }
+                guard stored.appliedThrough >= meta.appliedThrough else { throw JournalStoreError.hostApplicationRegressed }
                 guard stored.appliedThrough < meta.nextPosition else {
-                    throw HostJournalError.positionOutOfRange(stored.appliedThrough)
+                    throw JournalStoreError.positionOutOfRange(stored.appliedThrough)
                 }
                 if stored.appliedThrough > meta.appliedThrough {
                     try applyThrough(stored.appliedThrough, from: meta.appliedThrough)
@@ -343,20 +462,24 @@ final class HostJournalStore {
     /// batch is all or nothing. `capturedThrough` is the host's capture
     /// counter as saved before this call.
     func submit(_ batch: [HostJournalMutation], capturedThrough: UInt64) throws -> [JournalRecordID] {
-        guard !batch.isEmpty, batch.count <= limits.batch else { throw HostJournalError.invalidArgument("batch") }
+        guard !batch.isEmpty, batch.count <= limits.batch else { throw JournalStoreError.invalidArgument("batch") }
         for mutation in batch {
-            guard mutation.id.count == 16 else { throw HostJournalError.invalidArgument("mutation id") }
+            guard mutation.id.count == 16 else { throw JournalStoreError.invalidArgument("mutation id") }
             guard mutation.payload.count <= JournalEnvelope.maxPayloadLength else {
-                throw HostJournalError.payloadTooLarge(mutation.payload.count)
+                throw JournalStoreError.payloadTooLarge(mutation.payload.count)
             }
+        }
+        let encoded = batch.reduce(0) { $0 + JournalEnvelope.headerLength + $1.payload.count }
+        guard encoded <= limits.submitCallBytes else {
+            throw JournalStoreError.capacity(.submitCallTooLarge(limit: limits.submitCallBytes))
         }
         try requireResumed()
         _ = try JournalDatabase.integer(capturedThrough)
         return try transaction("submit") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
-            guard case .confirmed = meta.enrollment else { throw HostJournalError.enrollmentRequired }
-            guard capturedThrough >= meta.capturedThrough else { throw HostJournalError.hostCaptureRegressed }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            guard case .confirmed = meta.enrollment else { throw JournalStoreError.enrollmentRequired }
+            guard capturedThrough >= meta.capturedThrough else { throw JournalStoreError.hostCaptureRegressed }
             var counters = meta.counters
             var ownHead = meta.ownHead
             var records: [JournalRecordID] = []
@@ -366,19 +489,19 @@ final class HostJournalStore {
                     "SELECT sequence, payloadDigest FROM submissions WHERE id = ?", [.blob(mutation.id)],
                     { (try $0.unsigned(0), try $0.blob(1)) }
                 ) {
-                    guard existing.1 == payloadDigest else { throw HostJournalError.hostMutationConflict(mutation.id) }
+                    guard existing.1 == payloadDigest else { throw JournalStoreError.hostMutationConflict(mutation.id) }
                     records.append(JournalRecordID(origin: meta.origin, sequence: existing.0))
                     continue
                 }
                 let head = try originHead(meta.origin)
-                guard head.received == ownHead else { throw HostJournalError.storeCorrupt("own head") }
+                guard head.received == ownHead else { throw JournalStoreError.storeCorrupt("own head") }
                 let envelope = try JournalEnvelope(
                     origin: meta.origin, sequence: ownHead + 1, prior: head.digest, payload: mutation.payload
                 )
                 let length = UInt64(envelope.bytes.count)
                 guard counters.retainedCount + 1 <= limits.submitRecords,
                       counters.retainedBytes + length <= limits.submitBytes
-                else { throw HostJournalError.capacity(.submitBudget) }
+                else { throw JournalStoreError.capacity(.submitBudget) }
                 try insertRecord(envelope, position: nil)
                 try database.run(
                     "INSERT INTO submissions(id, sequence, payloadDigest) VALUES (?, ?, ?)",
@@ -403,15 +526,35 @@ final class HostJournalStore {
     /// checked against retained, pending and other incoming records before
     /// anything is written; a conflict stops the whole call with no write. An
     /// arrival is owned completely or not at all, and intake stops at the
-    /// first one that does not fit.
+    /// first one that does not fit. Pending records the arrivals make
+    /// contiguous stay pending until `promote` moves them.
     func intake(_ arrivals: [HostJournalArrival]) throws -> HostJournalIntake {
         for arrival in arrivals {
-            guard arrival.sender.count == 32 else { throw HostJournalError.invalidArgument("sender") }
+            guard arrival.sender.count == 32 else { throw JournalStoreError.invalidArgument("sender") }
             _ = try JournalDatabase.integer(arrival.cursor)
         }
         guard !arrivals.isEmpty else { return HostJournalIntake(ownedArrivals: 0, refusal: nil) }
+        return try intakeChecked(arrivals, parsed: arrivals.map(Self.parse), proven: false)
+    }
+
+    /// Takes the next `count` arrivals of a complete window proof without
+    /// proving them again, and moves the proof to the state this commit
+    /// leaves. Any other change since the proof throws `proofStale`.
+    func intake(next count: Int, of proof: inout HostWindowProof) throws -> HostJournalIntake {
+        try requireProofCurrent(proof)
+        guard proof.isComplete, count > 0, proof.consumed + count <= proof.arrivals.count else {
+            throw JournalStoreError.invalidArgument("proof range")
+        }
+        let range = proof.consumed..<(proof.consumed + count)
+        let result = try intakeChecked(Array(proof.arrivals[range]), parsed: Array(proof.parsed[range]), proven: true)
+        proof.epoch = intakeEpoch
+        proof.consumed += result.ownedArrivals
+        return result
+    }
+
+    private func intakeChecked(_ arrivals: [HostJournalArrival], parsed: [[JournalEnvelope]?], proven: Bool) throws -> HostJournalIntake {
         do {
-            return try intakeTransaction(arrivals)
+            return try intakeTransaction(arrivals, parsed: parsed, proven: proven)
         } catch let refused as NothingOwned {
             return HostJournalIntake(ownedArrivals: 0, refusal: refused.refusal)
         }
@@ -419,19 +562,22 @@ final class HostJournalStore {
 
     /// Rolls back an intake that owns no arrival, so a refusal leaves the file untouched.
     private struct NothingOwned: Error {
-        let refusal: HostJournalCapacity?
+        let refusal: JournalCapacity?
     }
 
-    private func intakeTransaction(_ arrivals: [HostJournalArrival]) throws -> HostJournalIntake {
+    private func intakeTransaction(
+        _ arrivals: [HostJournalArrival], parsed: [[JournalEnvelope]?], proven: Bool
+    ) throws -> HostJournalIntake {
         try transaction("intake") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
-            let parsed = arrivals.map(Self.parse)
-            try preflight(parsed, meta: meta)
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            if !proven {
+                try preflight(parsed, meta: meta)
+            }
             var counters = meta.counters
             var nextPosition = meta.nextPosition
             var owned = 0
-            var refusal: HostJournalCapacity?
+            var refusal: JournalCapacity?
             for (arrival, envelopes) in zip(arrivals, parsed) {
                 try database.execute("SAVEPOINT arrival")
                 let before = (counters, nextPosition)
@@ -495,25 +641,25 @@ final class HostJournalStore {
         for envelope in parsed.compactMap({ $0 }).joined() {
             if let earlier = incoming[envelope.id] {
                 guard earlier.digest == envelope.digest else {
-                    throw HostJournalError.fork(origin: envelope.origin, sequence: envelope.sequence)
+                    throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
                 }
                 continue
             }
             incoming[envelope.id] = envelope
             let received = try originHead(envelope.origin).received
             if envelope.origin == meta.origin, envelope.sequence > meta.ownHead {
-                throw HostJournalError.foreignOwnOrigin(sequence: envelope.sequence)
+                throw JournalStoreError.foreignOwnOrigin(sequence: envelope.sequence)
             }
             if envelope.sequence <= received {
                 guard let retained = try retainedDigest(envelope.id) else {
-                    throw HostJournalError.retainedRecordMissing(origin: envelope.origin, sequence: envelope.sequence)
+                    throw JournalStoreError.retainedRecordMissing(origin: envelope.origin, sequence: envelope.sequence)
                 }
                 guard retained == envelope.digest else {
-                    throw HostJournalError.fork(origin: envelope.origin, sequence: envelope.sequence)
+                    throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
                 }
             } else {
                 if let pending = try pendingEnvelope(envelope.id), pending.digest != envelope.digest {
-                    throw HostJournalError.fork(origin: envelope.origin, sequence: envelope.sequence)
+                    throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
                 }
                 origins.insert(envelope.origin)
             }
@@ -526,7 +672,7 @@ final class HostJournalStore {
                     ?? pendingEnvelope(JournalRecordID(origin: origin, sequence: sequence))
                 guard let candidate else { break }
                 guard candidate.prior == head.digest else {
-                    throw HostJournalError.fork(origin: origin, sequence: sequence)
+                    throw JournalStoreError.fork(origin: origin, sequence: sequence)
                 }
                 head = (sequence, candidate.digest)
                 sequence += 1
@@ -544,7 +690,7 @@ final class HostJournalStore {
             return
         }
         try ensureOrigin(envelope.origin, counters: &counters)
-        var head = try originHead(envelope.origin)
+        let head = try originHead(envelope.origin)
         guard envelope.sequence > head.received else {
             return
         }
@@ -560,27 +706,13 @@ final class HostJournalStore {
             counters.pendingBytes += UInt64(envelope.bytes.count)
             return
         }
-        var next: JournalEnvelope? = envelope
-        while let record = next {
-            guard record.prior == head.digest else {
-                throw HostJournalError.fork(origin: record.origin, sequence: record.sequence)
-            }
-            try insertRecord(record, position: nextPosition)
-            nextPosition += 1
-            counters.recordCount += 1
-            counters.recordBytes += UInt64(record.bytes.count)
-            head = (record.sequence, record.digest)
-            let following = JournalRecordID(origin: record.origin, sequence: record.sequence + 1)
-            next = try pendingEnvelope(following)
-            if let promoted = next {
-                try database.run(
-                    "DELETE FROM pending WHERE origin = ? AND sequence = ?",
-                    [.blob(promoted.origin), try JournalDatabase.integer(promoted.sequence)]
-                )
-                counters.pendingCount -= 1
-                counters.pendingBytes -= UInt64(promoted.bytes.count)
-            }
+        guard envelope.prior == head.digest else {
+            throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
         }
+        try insertRecord(envelope, position: nextPosition)
+        nextPosition += 1
+        counters.recordCount += 1
+        counters.recordBytes += UInt64(envelope.bytes.count)
     }
 
     private func quarantine(_ arrival: HostJournalArrival, counters: inout Counters) throws {
@@ -590,7 +722,7 @@ final class HostJournalStore {
             "SELECT digest FROM quarantine WHERE sender = ? AND cursor = ?", key, { try $0.blob(0) }
         ) {
             guard existing == digest else {
-                throw HostJournalError.quarantineConflict(sender: arrival.sender, cursor: arrival.cursor)
+                throw JournalStoreError.quarantineConflict(sender: arrival.sender, cursor: arrival.cursor)
             }
             return
         }
@@ -602,7 +734,7 @@ final class HostJournalStore {
         counters.quarantineBytes += UInt64(arrival.plaintext.count)
     }
 
-    private func exceededLimit(_ counters: Counters) throws -> HostJournalCapacity? {
+    private func exceededLimit(_ counters: Counters) throws -> JournalCapacity? {
         if counters.retainedCount > limits.historyRecords || counters.retainedBytes > limits.historyBytes {
             return .history
         }
@@ -623,7 +755,7 @@ final class HostJournalStore {
     /// Remote records after `position`, in position order.
     func incoming(after position: UInt64, limit: Int) throws -> [HostJournalIncoming] {
         try requireResumed()
-        guard limit > 0, limit <= limits.batch else { throw HostJournalError.invalidArgument("limit") }
+        guard limit > 0, limit <= limits.batch else { throw JournalStoreError.invalidArgument("limit") }
         var result: [HostJournalIncoming] = []
         try database.rows(
             "SELECT position, envelope FROM records WHERE position > ? ORDER BY position LIMIT ?",
@@ -641,8 +773,8 @@ final class HostJournalStore {
         _ = try JournalDatabase.integer(position)
         try transaction("markApplied") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
-            guard position < meta.nextPosition else { throw HostJournalError.positionOutOfRange(position) }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            guard position < meta.nextPosition else { throw JournalStoreError.positionOutOfRange(position) }
             guard position > meta.appliedThrough else { return }
             try applyThrough(position, from: meta.appliedThrough)
             try bumpRevision(meta)
@@ -721,13 +853,201 @@ final class HostJournalStore {
     /// Runs the intake fork, predecessor and own-origin checks over a whole
     /// window without writing anything.
     func verify(_ arrivals: [HostJournalArrival]) throws {
+        var proof = try beginProof(arrivals)
+        while try !extendProof(&proof, maxUnits: .max, maxBytes: .max) {}
+    }
+
+    // MARK: - Window proof
+
+    func beginProof(_ arrivals: [HostJournalArrival]) throws -> HostWindowProof {
         for arrival in arrivals {
-            guard arrival.sender.count == 32 else { throw HostJournalError.invalidArgument("sender") }
+            guard arrival.sender.count == 32 else { throw JournalStoreError.invalidArgument("sender") }
             _ = try JournalDatabase.integer(arrival.cursor)
         }
-        try database.execute("BEGIN")
-        defer { try? database.execute("COMMIT") }
-        try preflight(arrivals.map(Self.parse), meta: try readMeta())
+        return HostWindowProof(generation: generation, journalID: view.journalID, epoch: intakeEpoch, arrivals: arrivals)
+    }
+
+    /// Replaces the active proof with a new one for `arrivals`; a late call
+    /// for an earlier proof then fails with `proofStale`.
+    func beginActiveProof(_ arrivals: [HostJournalArrival]) throws -> UUID {
+        activeProof = nil
+        let proof = try beginProof(arrivals)
+        activeProof = proof
+        return proof.id
+    }
+
+    func extendActiveProof(_ id: UUID, maxUnits: Int = 512, maxBytes: Int = 262_144) throws -> Bool {
+        guard var proof = activeProof, proof.id == id else { throw JournalStoreError.proofStale }
+        activeProof = nil
+        defer { activeProof = proof }
+        return try extendProof(&proof, maxUnits: maxUnits, maxBytes: maxBytes)
+    }
+
+    /// Takes the active proof's arrivals `start..<start + count`; any other
+    /// proof or position is stale.
+    func intake(next count: Int, ofActive id: UUID, from start: Int) throws -> HostJournalIntake {
+        guard var proof = activeProof, proof.id == id, proof.consumed == start else { throw JournalStoreError.proofStale }
+        activeProof = nil
+        defer { activeProof = proof }
+        return try intake(next: count, of: &proof)
+    }
+
+    /// Advances `proof` by at most `maxBytes` of envelope parsing, or by at
+    /// most `maxUnits` envelope checks or predecessor steps inside one short
+    /// read transaction. Returns whether the whole window is proven.
+    func extendProof(_ proof: inout HostWindowProof, maxUnits: Int = 512, maxBytes: Int = 262_144) throws -> Bool {
+        try requireProofCurrent(proof)
+        switch proof.phase {
+        case .complete:
+            return true
+        case .parse(var index):
+            var bytes = 0
+            while index < proof.arrivals.count {
+                let size = proof.arrivals[index].envelopes?.reduce(0) { $0 + $1.count } ?? 0
+                if bytes > 0, bytes + size > maxBytes { break }
+                proof.parsed.append(Self.parse(proof.arrivals[index]))
+                bytes += size
+                index += 1
+            }
+            proof.phase = index < proof.arrivals.count ? .parse(index) : .check(arrival: 0, envelope: 0)
+        case .check(var arrival, var position):
+            try database.execute("BEGIN")
+            defer { try? database.execute("COMMIT") }
+            let meta = try readMeta()
+            var heads: [Data: UInt64] = [:]
+            var units = 0
+            while arrival < proof.parsed.count, units < maxUnits {
+                guard let envelopes = proof.parsed[arrival], position < envelopes.count else {
+                    arrival += 1
+                    position = 0
+                    continue
+                }
+                let envelope = envelopes[position]
+                position += 1
+                units += 1
+                if let earlier = proof.incoming[envelope.id] {
+                    guard earlier.digest == envelope.digest else {
+                        throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
+                    }
+                    continue
+                }
+                proof.incoming[envelope.id] = envelope
+                if envelope.origin == meta.origin, envelope.sequence > meta.ownHead {
+                    throw JournalStoreError.foreignOwnOrigin(sequence: envelope.sequence)
+                }
+                let received = try heads[envelope.origin] ?? originHead(envelope.origin).received
+                heads[envelope.origin] = received
+                if envelope.sequence <= received {
+                    guard let retained = try retainedDigest(envelope.id) else {
+                        throw JournalStoreError.retainedRecordMissing(origin: envelope.origin, sequence: envelope.sequence)
+                    }
+                    guard retained == envelope.digest else {
+                        throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
+                    }
+                } else {
+                    if meta.counters.pendingCount > 0, let pending = try pendingEnvelope(envelope.id),
+                       pending.digest != envelope.digest {
+                        throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
+                    }
+                    proof.touched.insert(envelope.origin)
+                }
+            }
+            if arrival < proof.parsed.count {
+                proof.phase = .check(arrival: arrival, envelope: position)
+            } else {
+                proof.walkOrder = proof.touched.sorted { $0.lexicographicallyPrecedes($1) }
+                proof.phase = proof.walkOrder.isEmpty ? .complete : .walk(origin: 0, sequence: 0, prior: Data())
+            }
+        case .walk(var origin, var sequence, var prior):
+            try database.execute("BEGIN")
+            defer { try? database.execute("COMMIT") }
+            let hasPending = try readMeta().counters.pendingCount > 0
+            var units = 0
+            while origin < proof.walkOrder.count, units < maxUnits {
+                let id = proof.walkOrder[origin]
+                if sequence == 0 {
+                    let head = try originHead(id)
+                    sequence = head.received + 1
+                    prior = head.digest
+                }
+                units += 1
+                let next = JournalRecordID(origin: id, sequence: sequence)
+                guard let candidate = try proof.incoming[next] ?? (hasPending ? pendingEnvelope(next) : nil) else {
+                    origin += 1
+                    sequence = 0
+                    continue
+                }
+                guard candidate.prior == prior else {
+                    throw JournalStoreError.fork(origin: id, sequence: sequence)
+                }
+                prior = candidate.digest
+                sequence += 1
+            }
+            proof.phase = origin < proof.walkOrder.count ? .walk(origin: origin, sequence: sequence, prior: prior) : .complete
+        }
+        return proof.isComplete
+    }
+
+    var isInTransactionForTesting: Bool { database.isInTransaction }
+
+    private func requireProofCurrent(_ proof: HostWindowProof) throws {
+        guard proof.generation == generation, proof.journalID == view.journalID, proof.epoch == intakeEpoch,
+              view.retirement == nil
+        else {
+            throw JournalStoreError.proofStale
+        }
+    }
+
+    // MARK: - Promotion
+
+    /// Moves at most `maxRecords` records, or `maxBytes` of envelopes, from
+    /// the pending rows that continue a received head into `records`, in
+    /// sequence order, across all origins together. Returns how many moved.
+    @discardableResult
+    func promote(maxRecords: Int = 128, maxBytes: Int = 131_072) throws -> Int {
+        guard hasPromotable else { return 0 }
+        let moved = try transaction("promote") { () -> Int in
+            let meta = try readMeta()
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            var origins: [Data] = []
+            try database.rows(
+                "SELECT origins.origin FROM origins JOIN pending ON pending.origin = origins.origin AND pending.sequence = origins.received + 1 ORDER BY origins.origin"
+            ) { origins.append(try $0.blob(0)) }
+            var counters = meta.counters
+            var nextPosition = meta.nextPosition
+            var moved = 0
+            var bytes = 0
+            promoting: for origin in origins {
+                var head = try originHead(origin)
+                while moved < maxRecords, let record = try pendingEnvelope(JournalRecordID(origin: origin, sequence: head.received + 1)) {
+                    guard moved == 0 || bytes + record.bytes.count <= maxBytes else { break promoting }
+                    guard record.prior == head.digest else { throw JournalStoreError.storeCorrupt("pending chain") }
+                    try database.run(
+                        "DELETE FROM pending WHERE origin = ? AND sequence = ?",
+                        [.blob(record.origin), try JournalDatabase.integer(record.sequence)]
+                    )
+                    try insertRecord(record, position: nextPosition)
+                    nextPosition += 1
+                    counters.pendingCount -= 1
+                    counters.pendingBytes -= UInt64(record.bytes.count)
+                    counters.recordCount += 1
+                    counters.recordBytes += UInt64(record.bytes.count)
+                    head = (record.sequence, record.digest)
+                    moved += 1
+                    bytes += record.bytes.count
+                }
+                if moved >= maxRecords { break }
+            }
+            guard moved > 0 else { return 0 }
+            try setMeta("nextPosition", try JournalDatabase.integer(nextPosition))
+            try writeCounters(counters)
+            if !meta.historyComplete, let target = meta.completionTarget {
+                try evaluateCompletion(target)
+            }
+            try bumpRevision(meta)
+            return moved
+        }
+        return moved
     }
 
     // MARK: - Engine state
@@ -736,7 +1056,7 @@ final class HostJournalStore {
     func markEstablished() throws {
         try transaction("markEstablished") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard !meta.established else { return }
             try setMeta("established", .integer(1))
             try bumpRevision(meta)
@@ -750,9 +1070,9 @@ final class HostJournalStore {
         _ = try JournalDatabase.integer(capturedThrough)
         try transaction("declareReady") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
-            guard case .confirmed = meta.enrollment else { throw HostJournalError.enrollmentRequired }
-            guard meta.capturedThrough >= capturedThrough else { throw HostJournalError.hostCaptureRegressed }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            guard case .confirmed = meta.enrollment else { throw JournalStoreError.enrollmentRequired }
+            guard meta.capturedThrough >= capturedThrough else { throw JournalStoreError.hostCaptureRegressed }
             guard !meta.isReady || capturedThrough > meta.readyThrough else { return }
             try setMeta("ready", .integer(1))
             try setMeta("readyThrough", try JournalDatabase.integer(max(capturedThrough, meta.readyThrough)))
@@ -764,11 +1084,11 @@ final class HostJournalStore {
     /// one in any origin, or any target after completion, is ignored.
     @discardableResult
     func recordCompletionTarget(provider: Data, through target: [Data: UInt64]) throws -> Bool {
-        guard provider.count == 32 else { throw HostJournalError.invalidArgument("provider") }
+        guard provider.count == 32 else { throw JournalStoreError.invalidArgument("provider") }
         let encoded = try Self.encodeVector(target)
         return try transaction("recordCompletionTarget") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard !meta.historyComplete else { return false }
             if let stored = meta.completionTarget {
                 guard stored.allSatisfy({ target[$0.key] ?? 0 >= $0.value }) else { return false }
@@ -782,10 +1102,10 @@ final class HostJournalStore {
     }
 
     func setHistoryProvider(_ member: Data) throws {
-        guard member.count == 32 else { throw HostJournalError.invalidArgument("provider") }
+        guard member.count == 32 else { throw JournalStoreError.invalidArgument("provider") }
         try transaction("setHistoryProvider") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard meta.historyProvider != member else { return }
             try setMeta("historyProvider", .blob(member))
             try bumpRevision(meta)
@@ -820,11 +1140,11 @@ final class HostJournalStore {
         try setMeta("completionPosition", try JournalDatabase.integer(position))
     }
 
-    static func encodeVector(_ vector: [Data: UInt64]) throws -> Data {
+    nonisolated static func encodeVector(_ vector: [Data: UInt64]) throws -> Data {
         var data = Data()
         for (origin, sequence) in vector.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
             guard origin.count == JournalEnvelope.originLength, sequence >= 1, sequence <= JournalEnvelope.maxSequence else {
-                throw HostJournalError.invalidArgument("vector")
+                throw JournalStoreError.invalidArgument("vector")
             }
             data.append(origin)
             withUnsafeBytes(of: sequence.bigEndian) { data.append(contentsOf: $0) }
@@ -832,9 +1152,9 @@ final class HostJournalStore {
         return data
     }
 
-    static func decodeVector(_ data: Data) throws -> [Data: UInt64] {
+    nonisolated static func decodeVector(_ data: Data) throws -> [Data: UInt64] {
         let entry = JournalEnvelope.originLength + 8
-        guard data.count % entry == 0, data.count / entry <= 1_024 else { throw HostJournalError.storeCorrupt("vector") }
+        guard data.count % entry == 0, data.count / entry <= 1_024 else { throw JournalStoreError.storeCorrupt("vector") }
         let bytes = Data(data)
         var vector: [Data: UInt64] = [:]
         var previous: Data?
@@ -843,7 +1163,7 @@ final class HostJournalStore {
             let sequence = bytes.subdata(in: offset + JournalEnvelope.originLength..<offset + entry).reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
             guard sequence >= 1, sequence <= JournalEnvelope.maxSequence,
                   previous.map({ $0.lexicographicallyPrecedes(origin) }) ?? true
-            else { throw HostJournalError.storeCorrupt("vector") }
+            else { throw JournalStoreError.storeCorrupt("vector") }
             vector[origin] = sequence
             previous = origin
         }
@@ -857,12 +1177,12 @@ final class HostJournalStore {
     /// original owner. A repeated sender and cursor must carry identical bytes.
     func retire(_ reason: HostJournalRetirement, heldInbox: [HostJournalHeldMessage]) throws {
         for message in heldInbox {
-            guard message.sender.count == 32 else { throw HostJournalError.invalidArgument("sender") }
+            guard message.sender.count == 32 else { throw JournalStoreError.invalidArgument("sender") }
             _ = try JournalDatabase.integer(message.cursor)
         }
         try transaction("retire") {
             let meta = try readMeta()
-            guard meta.retirement == nil else { throw HostJournalError.retired }
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
             var counters = meta.counters
             for message in heldInbox {
                 let digest = Data(SHA256.hash(data: message.plaintext))
@@ -871,7 +1191,7 @@ final class HostJournalStore {
                     "SELECT digest FROM heldInbox WHERE sender = ? AND cursor = ?", key, { try $0.blob(0) }
                 ) {
                     guard existing == digest else {
-                        throw HostJournalError.heldInboxConflict(sender: message.sender, cursor: message.cursor)
+                        throw JournalStoreError.heldInboxConflict(sender: message.sender, cursor: message.cursor)
                     }
                     continue
                 }
@@ -908,35 +1228,88 @@ final class HostJournalStore {
         isHostFenced = true
     }
 
+    /// Carries a resume this process confirmed on an earlier connection to
+    /// this file: only for the same confirmed enrollment of an active,
+    /// unfenced journal.
+    func adoptResumption(enrollmentID: Data) {
+        guard case .confirmed(let confirmed) = view.enrollment, confirmed == enrollmentID, !view.isRetired, !isHostFenced else {
+            return
+        }
+        isResumed = true
+    }
+
     private func requireHostOpen() throws {
-        if view.isRetired { throw HostJournalError.retired }
-        if isHostFenced { throw HostJournalError.fenced }
+        if view.isRetired { throw JournalStoreError.retired }
+        if isHostFenced { throw JournalStoreError.fenced }
     }
 
     private func requireResumed() throws {
         try requireHostOpen()
-        guard isResumed else { throw view.isRetired ? HostJournalError.retired : HostJournalError.notResumed }
+        guard isResumed else { throw view.isRetired ? JournalStoreError.retired : JournalStoreError.notResumed }
     }
 
     // MARK: - Transactions
 
+    enum ProofEffect: Sendable {
+        /// Leaves remote records, pending rows, origin heads and the
+        /// generation as they were.
+        case none
+        /// Changes rows a window proof reads.
+        case intake
+        /// Ends this generation.
+        case generation
+    }
+
+    /// Every transaction, and whether a window proof must be redone after it.
+    /// Submission only appends own records and raises `ownHead`, which a
+    /// proof treats as monotone.
+    static let proofEffects: [String: ProofEffect] = [
+        "enroll": .none, "resume": .none, "submit": .none, "markApplied": .none, "markEstablished": .none,
+        "declareReady": .none, "recordCompletionTarget": .none, "setHistoryProvider": .none,
+        "enterControlRepair": .none, "intake": .intake, "promote": .intake, "retire": .generation,
+    ]
+
+    /// Builds the snapshot this commit leaves before COMMIT, so nothing
+    /// fallible runs after it.
     private func transaction<T>(_ name: String, _ body: () throws -> T) throws -> T {
+        guard let effect = Self.proofEffects[name] else { throw JournalStoreError.invalidArgument("transaction \(name)") }
         try database.execute("BEGIN IMMEDIATE")
         let result: T
-        let committed: HostJournalCoreView
+        let committed: HostJournalSnapshot
         do {
             result = try body()
-            committed = try readMeta().view
+            committed = try makeSnapshot(
+                view: readMeta().view, sequence: snapshot.commitSequence + 1,
+                epoch: effect == .none ? intakeEpoch : intakeEpoch &+ 1
+            )
             try faultHookForTesting?(.beforeCommit(name))
             try database.execute("COMMIT")
         } catch {
             try? database.execute("ROLLBACK")
             throw error
         }
-        view = committed
-        self.committed?()
+        snapshot = committed
         try faultHookForTesting?(.afterCommit(name))
         return result
+    }
+
+    private func makeSnapshot(view: HostJournalCoreView, sequence: UInt64, epoch: UInt64) throws -> HostJournalSnapshot {
+        var origins: [Data] = []
+        var received: [Data: UInt64] = [:]
+        try database.rows("SELECT origin, received FROM origins ORDER BY origin") { row in
+            let origin = try row.blob(0)
+            origins.append(origin)
+            let head = try row.unsigned(1)
+            if head > 0 { received[origin] = head }
+        }
+        let promotable = try database.first(
+            "SELECT 1 FROM pending JOIN origins ON pending.origin = origins.origin AND pending.sequence = origins.received + 1 LIMIT 1",
+            [], { _ in true }
+        ) ?? false
+        return HostJournalSnapshot(
+            generation: generation, commitSequence: sequence, view: view, origins: origins, received: received,
+            hasPromotable: promotable, intakeEpoch: epoch
+        )
     }
 
     private func bumpRevision(_ meta: Meta) throws {
@@ -1033,7 +1406,7 @@ final class HostJournalStore {
 
         init(_ values: [String: UInt64]) throws {
             func value(_ key: String) throws -> UInt64 {
-                guard let value = values[key] else { throw HostJournalError.storeCorrupt("missing \(key)") }
+                guard let value = values[key] else { throw JournalStoreError.storeCorrupt("missing \(key)") }
                 return value
             }
             recordCount = try value("recordCount")
@@ -1087,7 +1460,7 @@ final class HostJournalStore {
         }
     }
 
-    static func readMeta(_ database: JournalDatabase) throws -> Meta {
+    nonisolated static func readMeta(_ database: JournalDatabase) throws -> Meta {
         var blobs: [String: Data] = [:]
         var texts: [String: String] = [:]
         var integers: [String: UInt64] = [:]
@@ -1097,26 +1470,26 @@ final class HostJournalStore {
             case "blob": blobs[key] = try row.blob(1)
             case "text": texts[key] = try row.text(1)
             case "integer": integers[key] = try row.unsigned(1)
-            default: throw HostJournalError.storeCorrupt("meta \(key)")
+            default: throw JournalStoreError.storeCorrupt("meta \(key)")
             }
         }
         func blob(_ key: String, _ length: Int?) throws -> Data {
             guard let value = blobs[key], length.map({ value.count == $0 }) ?? true else {
-                throw HostJournalError.storeCorrupt("meta \(key)")
+                throw JournalStoreError.storeCorrupt("meta \(key)")
             }
             return value
         }
         func integer(_ key: String) throws -> UInt64 {
-            guard let value = integers[key] else { throw HostJournalError.storeCorrupt("meta \(key)") }
+            guard let value = integers[key] else { throw JournalStoreError.storeCorrupt("meta \(key)") }
             return value
         }
         let retirement: HostJournalRetirement?
         switch texts["retirement"] {
         case "active": retirement = nil
         case .some(let raw):
-            guard let reason = HostJournalRetirement(rawValue: raw) else { throw HostJournalError.storeCorrupt("retirement") }
+            guard let reason = HostJournalRetirement(rawValue: raw) else { throw JournalStoreError.storeCorrupt("retirement") }
             retirement = reason
-        case nil: throw HostJournalError.storeCorrupt("retirement")
+        case nil: throw JournalStoreError.storeCorrupt("retirement")
         }
         let enrollmentID = try blob("enrollmentID", nil)
         let enrollment: HostJournalEnrollment
@@ -1124,24 +1497,24 @@ final class HostJournalStore {
         case "none" where enrollmentID.isEmpty: enrollment = .none
         case "pending" where enrollmentID.count == 16: enrollment = .pending(enrollmentID)
         case "confirmed" where enrollmentID.count == 16: enrollment = .confirmed(enrollmentID)
-        default: throw HostJournalError.storeCorrupt("enrollment")
+        default: throw JournalStoreError.storeCorrupt("enrollment")
         }
         let nextPosition = try integer("nextPosition")
         let appliedThrough = try integer("appliedThrough")
         let completionPosition = try integer("completionPosition")
         guard nextPosition >= 1, appliedThrough < nextPosition, completionPosition < nextPosition else {
-            throw HostJournalError.storeCorrupt("positions")
+            throw JournalStoreError.storeCorrupt("positions")
         }
         func flag(_ key: String) throws -> Bool {
             switch try integer(key) {
             case 0: return false
             case 1: return true
-            default: throw HostJournalError.storeCorrupt("meta \(key)")
+            default: throw JournalStoreError.storeCorrupt("meta \(key)")
             }
         }
         func member(_ key: String) throws -> Data? {
             let value = try blob(key, nil)
-            guard value.isEmpty || value.count == 32 else { throw HostJournalError.storeCorrupt("meta \(key)") }
+            guard value.isEmpty || value.count == 32 else { throw JournalStoreError.storeCorrupt("meta \(key)") }
             return value.isEmpty ? nil : value
         }
         let target = try blob("completionTarget", nil)
@@ -1205,28 +1578,40 @@ final class HostJournalStore {
         )
     }
 
-    static func requireRegularFile(_ url: URL) throws {
+    nonisolated static func requireRegularFile(_ url: URL) throws {
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         } catch {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         guard attributes[.type] as? FileAttributeType == .typeRegular else {
-            throw HostJournalError.storeUnreadable("not a regular file")
+            throw JournalStoreError.storeUnreadable("not a regular file")
         }
     }
 
-    static func checkFormat(_ database: JournalDatabase) throws {
+    nonisolated static func checkFormat(_ database: JournalDatabase) throws {
         let version = try database.first("PRAGMA user_version", [], { try $0.int64(0) }) ?? 0
-        guard version == formatVersion else { throw HostJournalError.formatUnsupported(version) }
+        guard version == formatVersion else { throw JournalStoreError.formatUnsupported(version) }
     }
 
     /// Checks every row against its own bytes, the per-origin chains, the
     /// position sequence, the mappings and the stored counters.
-    static func validate(_ database: JournalDatabase) throws -> HostJournalCoreView {
+    nonisolated static func validate(
+        _ database: JournalDatabase, cancellation: HostJournalCancellation? = nil
+    ) throws -> HostJournalCoreView {
+        if Thread.isMainThread {
+            mainThreadValidations.withLock { $0 += 1 }
+        }
+        var rowsSinceCheck = 0
+        func checkCancellation() throws {
+            rowsSinceCheck += 1
+            guard rowsSinceCheck >= 1_024 else { return }
+            rowsSinceCheck = 0
+            if cancellation?.isCancelled == true { throw CancellationError() }
+        }
         guard try database.first("PRAGMA quick_check", [], { try $0.text(0) }) == "ok" else {
-            throw HostJournalError.storeCorrupt("quick_check")
+            throw JournalStoreError.storeCorrupt("quick_check")
         }
         let meta = try readMeta(database)
         var counters = Counters()
@@ -1236,21 +1621,22 @@ final class HostJournalStore {
         var maxPosition: UInt64 = 0
         var ownPayloads: [UInt64: Data] = [:]
         try database.rows("SELECT origin, sequence, envelope, digest, position FROM records ORDER BY origin, sequence") { row in
+            try checkCancellation()
             let envelope = try stored(try row.blob(2))
             let origin = try row.blob(0)
             let sequence = try row.unsigned(1)
             let previous = heads[origin] ?? (0, JournalEnvelope.zeroDigest)
             guard envelope.origin == origin, envelope.sequence == sequence, envelope.digest == (try row.blob(3)),
                   sequence == previous.received + 1, envelope.prior == previous.digest
-            else { throw HostJournalError.storeCorrupt("record chain") }
+            else { throw JournalStoreError.storeCorrupt("record chain") }
             heads[origin] = (sequence, envelope.digest)
             if origin == meta.origin {
-                guard row.isNull(4) else { throw HostJournalError.storeCorrupt("own position") }
+                guard row.isNull(4) else { throw JournalStoreError.storeCorrupt("own position") }
                 ownPayloads[sequence] = Data(SHA256.hash(data: envelope.payload))
             } else {
                 let position = try row.unsigned(4)
                 guard position >= 1, position > lastPositions[origin] ?? 0 else {
-                    throw HostJournalError.storeCorrupt("position order")
+                    throw JournalStoreError.storeCorrupt("position order")
                 }
                 lastPositions[origin] = position
                 positions += 1
@@ -1261,7 +1647,7 @@ final class HostJournalStore {
         }
         guard positions == meta.nextPosition - 1, maxPosition == positions,
               (heads[meta.origin]?.received ?? 0) == meta.ownHead
-        else { throw HostJournalError.storeCorrupt("positions") }
+        else { throw JournalStoreError.storeCorrupt("positions") }
         var applied: [Data: UInt64] = [:]
         try database.rows(
             "SELECT origin, MAX(sequence) FROM records WHERE position IS NOT NULL AND position <= ? GROUP BY origin",
@@ -1272,28 +1658,29 @@ final class HostJournalStore {
             let head = heads[origin] ?? (0, JournalEnvelope.zeroDigest)
             guard origin.count == 16, try row.unsigned(1) == head.received, try row.blob(2) == head.digest,
                   try row.unsigned(3) == (origin == meta.origin ? 0 : applied[origin] ?? 0)
-            else { throw HostJournalError.storeCorrupt("origin \(origin.count)") }
+            else { throw JournalStoreError.storeCorrupt("origin \(origin.count)") }
             counters.originCount += 1
         }
         let knownOrigins = try originSet(database)
         guard Set(heads.keys).isSubset(of: knownOrigins), knownOrigins.contains(meta.origin) else {
-            throw HostJournalError.storeCorrupt("origins")
+            throw JournalStoreError.storeCorrupt("origins")
         }
         var mappings: UInt64 = 0
         try database.rows("SELECT id, sequence, payloadDigest FROM submissions") { row in
             guard try row.blob(0).count == 16, ownPayloads[try row.unsigned(1)] == (try row.blob(2)) else {
-                throw HostJournalError.storeCorrupt("submission")
+                throw JournalStoreError.storeCorrupt("submission")
             }
             mappings += 1
         }
-        guard mappings == meta.ownHead else { throw HostJournalError.storeCorrupt("submissions") }
+        guard mappings == meta.ownHead else { throw JournalStoreError.storeCorrupt("submissions") }
         try database.rows("SELECT origin, sequence, envelope, digest FROM pending") { row in
+            try checkCancellation()
             let envelope = try stored(try row.blob(2))
             let received = heads[envelope.origin]?.received ?? 0
             guard envelope.origin == (try row.blob(0)), envelope.sequence == (try row.unsigned(1)),
-                  envelope.digest == (try row.blob(3)), envelope.sequence > received + 1, envelope.origin != meta.origin,
+                  envelope.digest == (try row.blob(3)), envelope.sequence > received, envelope.origin != meta.origin,
                   knownOrigins.contains(envelope.origin)
-            else { throw HostJournalError.storeCorrupt("pending") }
+            else { throw JournalStoreError.storeCorrupt("pending") }
             counters.pendingCount += 1
             counters.pendingBytes += UInt64(envelope.bytes.count)
         }
@@ -1303,7 +1690,7 @@ final class HostJournalStore {
                 guard try row.blob(0).count == 32, Data(SHA256.hash(data: bytes)) == (try row.blob(2)),
                       try row.int64(3) >= 0
                 else {
-                    throw HostJournalError.storeCorrupt(table)
+                    throw JournalStoreError.storeCorrupt(table)
                 }
                 if table == "quarantine" {
                     counters.quarantineCount += 1
@@ -1314,17 +1701,17 @@ final class HostJournalStore {
                 }
             }
         }
-        guard counters == meta.counters else { throw HostJournalError.storeCorrupt("counters") }
+        guard counters == meta.counters else { throw JournalStoreError.storeCorrupt("counters") }
         if meta.historyComplete, let target = meta.completionTarget {
             guard target.allSatisfy({ (heads[$0.key]?.received ?? 0) >= $0.value }) else {
-                throw HostJournalError.storeCorrupt("completion")
+                throw JournalStoreError.storeCorrupt("completion")
             }
         }
-        guard meta.readyThrough <= meta.capturedThrough else { throw HostJournalError.storeCorrupt("ready") }
+        guard meta.readyThrough <= meta.capturedThrough else { throw JournalStoreError.storeCorrupt("ready") }
         return meta.view
     }
 
-    private static func originSet(_ database: JournalDatabase) throws -> Set<Data> {
+    nonisolated private static func originSet(_ database: JournalDatabase) throws -> Set<Data> {
         var origins: Set<Data> = []
         try database.rows("SELECT origin FROM origins") { origins.insert(try $0.blob(0)) }
         return origins
@@ -1339,11 +1726,11 @@ final class HostJournalStore {
     }
 
     /// Parses an envelope read back from the file; damage is corruption.
-    static func stored(_ bytes: Data) throws -> JournalEnvelope {
+    nonisolated static func stored(_ bytes: Data) throws -> JournalEnvelope {
         do {
             return try JournalEnvelope(parsing: bytes)
         } catch {
-            throw HostJournalError.storeCorrupt("envelope: \(error)")
+            throw JournalStoreError.storeCorrupt("envelope: \(error)")
         }
     }
 

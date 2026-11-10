@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Cancelled-join settlement, exact handoff identity and composed-view
 /// publication of intake changes.
@@ -27,9 +27,9 @@ extension HostEngineTests {
         try await wait("joined before the checkpoint") { gate != nil }
         try await wait("inviter done") { !a.canCancelPairing && a.linkedMemberCount == 2 }
         let owner = try XCTUnwrap(b.mlsSessionForTesting)
-        try enroll(a, "a")
-        try submit(a, "a", ["owned before cancellation"])
-        try ready(a, "a")
+        try await enroll(a, "a")
+        try await submit(a, "a", ["owned before cancellation"])
+        try await ready(a, "a")
         try await wait("held before cancellation") {
             _ = try await owner.synchronize()
             return try await owner.inbox().contains { (try? HostJournalMessage.decode($0.plaintext).kind) == .records }
@@ -63,9 +63,10 @@ extension HostEngineTests {
         try await wait("committed owner adopted") { b.isPaired }
         XCTAssertTrue(b.mlsSessionForTesting === owner)
         XCTAssertEqual(b.hostView?.journal?.journalID, intent.hostJournal)
-        try enroll(b, "b")
+        try await enroll(b, "b")
         try await wait("history complete") { (try? self.store(b).view.historyComplete) == true }
-        XCTAssertEqual(try applyAll(b, "b"), [Data("owned before cancellation".utf8)])
+        let applied = try await applyAll(b, "b")
+        XCTAssertEqual(applied, [Data("owned before cancellation".utf8)])
         c.cancelPairing()
     }
 
@@ -100,9 +101,10 @@ extension HostEngineTests {
         XCTAssertEqual(adoptedGroup, group)
         XCTAssertEqual(relaunched.hostView?.journal?.journalID, intent.hostJournal)
         XCTAssertNil(c.safetyCode, "the replacement join reached another inviter")
-        try enroll(relaunched, "b")
+        try await enroll(relaunched, "b")
         try await wait("history complete") { (try? self.store(relaunched).view.historyComplete) == true }
-        XCTAssertEqual(try applyAll(relaunched, "b"), [Data("owned before cancellation".utf8)])
+        let applied = try await applyAll(relaunched, "b")
+        XCTAssertEqual(applied, [Data("owned before cancellation".utf8)])
         c.cancelPairing()
     }
 
@@ -135,7 +137,7 @@ extension HostEngineTests {
         var limits = HostJournalLimits.standard
         limits.historyRecords = 3
         let (a, b) = try await completedPair(limits: limits)
-        try submit(a, "a", ["held original"])
+        try await submit(a, "a", ["held original"])
         try await wait("held") {
             if case .settled(let held) = b.hostView?.intake { return held > 0 }
             return false
@@ -165,7 +167,7 @@ extension HostEngineTests {
         let keptCheckpoint = try Data(contentsOf: checkpointURL)
 
         let reopened = engine("b", limits: limits)
-        try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) }
+        try await wait("closing settled") { reopened.hostLifecycle != .closing(.unlink) && reopened.hostLifecycle != .opening }
         XCTAssertEqual(reopened.hostLifecycle, .failed(.unlink), "another generation proved the handoff")
         XCTAssertTrue(reopened.isPaired)
         let remaining = try await XCTUnwrapAsync(reopened.mlsSessionForTesting).inbox()
@@ -246,7 +248,9 @@ extension HostEngineTests {
         XCTAssertTrue(observed.contains { $0.intake == .unknown && $0.revision > invalidated.revision }, "no invalidation was published")
         XCTAssertEqual(observed.map(\.revision), observed.map(\.revision).sorted())
 
-        XCTAssertEqual(try applyAll(a, "a"), [run[0].payload])
+        let applied = try await applyAll(a, "a")
+
+        XCTAssertEqual(applied, [run[0].payload])
         try await wait("idle and quiescent") { a.hostView?.isQuiescent == true }
         await a.stop()
         let idle = try XCTUnwrap(a.hostView)

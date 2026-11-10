@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 extension HostEngineTests {
     func testCancelledRemovedJoinRetiresItsInboxBeforeCheckpoint() async throws {
@@ -42,9 +42,9 @@ extension HostEngineTests {
         let journalURL = HostJournalStore.fileURL(in: directory("b"), journalID: journalID)
         XCTAssertFalse(b.isPaired)
         XCTAssertFalse(FileManager.default.fileExists(atPath: checkpointURL.path))
-        try enroll(a, "a")
-        try submit(a, "a", ["retain before the main checkpoint"])
-        try ready(a, "a")
+        try await enroll(a, "a")
+        try await submit(a, "a", ["retain before the main checkpoint"])
+        try await ready(a, "a")
         try await wait("held application") {
             _ = try await owner.synchronize()
             return try await owner.inbox().contains { (try? HostJournalMessage.decode($0.plaintext).kind) == .records }
@@ -84,6 +84,7 @@ extension HostEngineTests {
                 try Data(repeating: 0x5A, count: original.count).write(to: journalURL)
             }
             current = engine("b")
+            await opened(current)
 
             if let damage {
                 XCTAssertNotNil(current.hostRepair, damage)
@@ -104,6 +105,7 @@ extension HostEngineTests {
                 engines.removeAll { $0 === current }
                 try original.write(to: journalURL)
                 current = engine("b")
+                await opened(current)
             }
         } else {
             b.cancelPairing()
@@ -112,9 +114,9 @@ extension HostEngineTests {
             b.afterJoinHookForTesting = nil
         }
 
-        let closingOwner = try XCTUnwrap(current.mlsSessionForTesting)
         try await wait("removed join settled") {
-            current.mlsSessionForTesting !== closingOwner && current.canJoinExistingSync && current.hostLifecycle == .active
+            let fingerprint = try await current.mlsSessionForTesting?.fingerprint()
+            return fingerprint != nil && fingerprint != target && current.canJoinExistingSync && current.hostLifecycle == .active
         }
         let archive = try HostJournalStore.open(journalURL)
         XCTAssertEqual(archive.view.journalID, journalID)

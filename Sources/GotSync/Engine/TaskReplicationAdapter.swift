@@ -221,12 +221,14 @@ extension TaskReplicationAdapter: ReplicationData {
         return Set(control?.vector?.origins ?? [])
     }
 
-    func verify(_ window: [ReplicationWindowItem]) throws {}
-
     func chunks(of window: [ReplicationWindowItem]) -> [Range<Int>] {
         [window.indices]
     }
+}
 
+/// The demo's intake and selection, synchronous so the engine's suspension
+/// points stay where they are.
+extension TaskReplicationAdapter {
     func intake(_ chunk: [ReplicationWindowItem]) throws -> ReplicationChunkIntake {
         let arrivals = chunk.map { item -> [TaskOperation] in
             guard !item.fromSelf, case .taskOperations(let operations) = item.decoded else { return [] }

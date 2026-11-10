@@ -58,6 +58,8 @@ actor MLSSession {
     /// session.
     private var conditionalAppendSupported: Bool?
     private var tail: Task<Void, Never>?
+    /// Set when closing begins; no exclusive operation is admitted after it.
+    private var isClosing = false
     private let operations = OSAllocatedUnfairLock(initialState: MLSOperationCount())
 
     init(
@@ -457,9 +459,27 @@ actor MLSSession {
         try await client.confirmRemovalAcknowledged()
     }
 
+    /// Waits for the queued operations, then closes the client's store, so
+    /// no write to the session's files can follow.
+    func close() async throws {
+        guard await close(after: { _ in () }).closed else { throw MLSClientError.storageUnavailable }
+    }
+
+    /// Refuses new exclusive operations, waits for the ones already
+    /// accepted, then reads the final state and closes the store in one
+    /// client turn.
+    func close<T: Sendable>(
+        after read: @Sendable (isolated MLSClient) throws -> T
+    ) async -> (result: Result<T, any Error>, closed: Bool) {
+        isClosing = true
+        await tail?.value
+        return await client.close(after: read)
+    }
+
     private func exclusive<T: Sendable>(
         _ operation: @escaping @Sendable (isolated MLSSession) async throws -> T
     ) async throws -> T {
+        guard !isClosing else { throw MLSClientError.storageUnavailable }
         let previous = tail
         operations.withLock { $0.started &+= 1 }
         let task = Task {

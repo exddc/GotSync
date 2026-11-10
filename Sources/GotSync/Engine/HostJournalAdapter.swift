@@ -17,6 +17,10 @@ enum HostEngineError: Error, Equatable {
     /// An earlier join may still own this session's group; it is adopted
     /// before any new join may replace the session.
     case unsettledJoin
+    /// The launch inputs kept changing while it was opening.
+    case launchInputsChanged
+    /// A session reset could not prove that the old session closed.
+    case sessionCloseUncertain
 }
 
 enum HostLifecycleIntent: String, Codable, Sendable {
@@ -26,6 +30,8 @@ enum HostLifecycleIntent: String, Codable, Sendable {
 }
 
 enum HostLifecycle: Equatable, Sendable {
+    /// The referenced journal is being validated away from the main actor.
+    case opening
     case active
     case closing(HostLifecycleIntent)
     case failed(HostLifecycleIntent)
@@ -38,6 +44,13 @@ enum HostRepair: Equatable, Sendable {
     case ambiguousJournal
     case mlsUnreadable
     case lifecycleUnreadable
+    /// Opening could not complete; files are kept for a later launch.
+    case launchFailed(String)
+    /// The launch inputs kept changing while it was opening.
+    case launchInputsChanged
+    /// A session being reset did not prove that it closed. It stays held,
+    /// with its files and key, and no new session is built.
+    case sessionCloseUncertain
 }
 
 /// Inbox messages not owned by the journal after the last settled cycle;
@@ -64,6 +77,8 @@ struct HostEngineView: Equatable, Sendable {
     let intake: HostIntakeSummary
     let lifecycle: HostLifecycle
     let repair: HostRepair?
+    /// No accepted journal command is still waiting for its outcome.
+    let journalSettled: Bool
 
     var unuploaded: UInt64 {
         guard let journal, journal.ownHead > uploadedThrough else { return 0 }
@@ -71,58 +86,52 @@ struct HostEngineView: Equatable, Sendable {
     }
 
     var isQuiescent: Bool {
-        guard let journal else { return false }
+        guard let journal, journalSettled else { return false }
         return unuploaded == 0 && journal.undelivered == 0 && journal.pendingCount == 0 && journal.quarantineCount == 0
             && journal.historyApplied && !journal.controlRepair && repair == nil
             && intake == .settled(held: 0) && lifecycle == .active
     }
 }
 
-/// Host-journal data for the engine: opaque records in a `HostJournalStore`
+/// Host-journal data for the engine: opaque records in a `HostJournal`
 /// for the current group generation. Until the first group journal exists
-/// the adapter is unbound and holds no data.
+/// the adapter is unbound and holds no data. Shared reads come from the
+/// journal's adopted snapshot; everything that reads or writes the file is
+/// asynchronous and runs on the journal's writer.
 @MainActor
 final class HostJournalAdapter {
     static let chunkArrivals = 64
     static let chunkEnvelopes = 256
     static let chunkEnvelopeBytes = 262_144
     static let chunkPlaintextBytes = 524_288
-    static let replyBytes = 262_144
-    static let replyRecords = 256
+    nonisolated static let replyBytes = 262_144
+    nonisolated static let replyRecords = 256
 
     let directory: URL
     let limits: HostJournalLimits
-    private(set) var store: HostJournalStore?
-    /// Revision of the store when the current window's remaining arrivals
-    /// were last verified; a different revision verifies them again.
-    private var verifiedRevision: UInt64?
-    private var verifiedJournal: Data?
-    private var unverified: [HostJournalArrival] = []
+    private(set) var store: HostJournal?
+    /// The writer-held proof of the current window and how many of its
+    /// data arrivals were taken.
+    private var proof: (id: UUID, consumed: Int)?
 
     init(directory: URL, limits: HostJournalLimits) {
         self.directory = directory
         self.limits = limits
     }
 
-    func bind(_ store: HostJournalStore?) {
+    func bind(_ store: HostJournal?) {
         self.store = store
-        verifiedRevision = nil
-        verifiedJournal = nil
-        unverified = []
+        proof = nil
     }
 
-    private func bound() throws -> HostJournalStore {
+    private func bound() throws -> HostJournal {
         guard let store else { throw HostEngineError.journalUnbound }
         return store
     }
 
     /// Stores a provider's completion target received from a current member.
-    func recordCompletion(provider: Data, through: ReplicaVersionVector) throws {
-        let store = try bound()
-        try store.recordCompletionTarget(provider: provider, through: Self.dictionary(through))
-        if verifiedJournal == store.view.journalID {
-            verifiedRevision = store.view.revision
-        }
+    func recordCompletion(provider: Data, through: ReplicaVersionVector) async throws {
+        try await bound().recordCompletionTarget(provider: provider, through: Self.dictionary(through))
     }
 
     static func dictionary(_ vector: ReplicaVersionVector) -> [Data: UInt64] {
@@ -151,10 +160,19 @@ final class HostJournalAdapter {
         }
     }
 
-    private func message(_ envelopes: [JournalEnvelope]) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)]) {
-        let records = try envelopes.map { (try ReplicaDeviceID(bytes: $0.origin), $0.sequence) }
-        return (try HostJournalMessage.records(envelopes.map(\.bytes)).encoded(), records)
+    /// One records message, encoded on the writer.
+    nonisolated private static func message(_ envelopes: [JournalEnvelope]) throws -> HostJournalBatch {
+        HostJournalBatch(
+            plaintext: try HostJournalMessage.records(envelopes.map(\.bytes)).encoded(),
+            records: envelopes.map(\.id)
+        )
     }
+}
+
+/// An encoded records message and the records it carries.
+struct HostJournalBatch: Sendable {
+    let plaintext: Data
+    let records: [JournalRecordID]
 }
 
 extension HostJournalAdapter: ReplicationData {
@@ -165,11 +183,11 @@ extension HostJournalAdapter: ReplicationData {
     var localSequence: UInt64 { store?.view.ownHead ?? 0 }
 
     var helloVector: ReplicaVersionVector {
-        Self.vector((try? store?.receivedVector()) ?? [:])
+        Self.vector(store?.receivedVector ?? [:])
     }
 
     var heldOrigins: [ReplicaDeviceID] {
-        ((try? store?.origins()) ?? []).compactMap { try? ReplicaDeviceID(bytes: $0) }
+        (store?.origins ?? []).compactMap { try? ReplicaDeviceID(bytes: $0) }
     }
 
     var retainedOrigins: [ReplicaDeviceID] { helloVector.origins }
@@ -215,21 +233,6 @@ extension HostJournalAdapter: ReplicationData {
         }
     }
 
-    /// Verifies every data arrival of the window against retained, pending
-    /// and incoming records before the first chunk commits.
-    func verify(_ window: [ReplicationWindowItem]) throws {
-        let arrivals = window.compactMap(Self.arrival)
-        guard !arrivals.isEmpty else {
-            unverified = []
-            return
-        }
-        let store = try bound()
-        try store.verify(arrivals)
-        unverified = arrivals
-        verifiedJournal = store.view.journalID
-        verifiedRevision = store.view.revision
-    }
-
     func chunks(of window: [ReplicationWindowItem]) -> [Range<Int>] {
         var ranges: [Range<Int>] = []
         var start = 0
@@ -259,32 +262,52 @@ extension HostJournalAdapter: ReplicationData {
         }
         return ranges
     }
+}
+
+extension HostJournalAdapter: HostReplicationData {
+    /// Starts proving every data arrival of the window against retained,
+    /// pending and incoming records; no chunk commits before it is complete.
+    func beginWindowProof(_ window: [ReplicationWindowItem]) async throws {
+        proof = nil
+        let arrivals = window.compactMap(Self.arrival)
+        guard !arrivals.isEmpty else { return }
+        let store = try bound()
+        let id = try await store.beginProof(arrivals)
+        guard self.store === store else { throw HostEngineError.generationChanged }
+        proof = (id, 0)
+    }
+
+    func extendWindowProof() async throws -> Bool {
+        guard let current = proof else { return true }
+        let store = try bound()
+        let complete = try await store.extendProof(current.id)
+        guard self.store === store, proof?.id == current.id else { throw JournalStoreError.proofStale }
+        return complete
+    }
 
     /// Commits the chunk's data arrivals. Messages up to the first arrival
     /// the journal does not own are held; controls before it are owned by
-    /// the engine's saves.
-    func intake(_ chunk: [ReplicationWindowItem]) throws -> ReplicationChunkIntake {
+    /// the engine's saves. The writer takes exactly the next arrivals of the
+    /// current proof; a result for a replaced proof is refused.
+    func intake(_ chunk: [ReplicationWindowItem]) async throws -> ReplicationChunkIntake {
         let indexes = chunk.indices.filter { Self.arrival(chunk[$0]) != nil }
         guard !indexes.isEmpty else {
             return ReplicationChunkIntake(heldMessages: chunk.count, accepted: 0, requestsHello: false)
         }
         let store = try bound()
-        guard verifiedJournal == store.view.journalID, !store.view.isRetired else {
+        guard let current = proof, !store.view.isRetired else {
             throw HostEngineError.generationChanged
         }
-        if verifiedRevision != store.view.revision {
-            try store.verify(unverified)
+        let (result, pendingGrew) = try await store.intake(next: indexes.count, ofProof: current.id, from: current.consumed)
+        guard self.store === store, proof?.id == current.id, proof?.consumed == current.consumed else {
+            throw JournalStoreError.proofStale
         }
-        let arrivals = indexes.compactMap { Self.arrival(chunk[$0]) }
-        let pendingBefore = store.view.pendingCount
-        let result = try store.intake(arrivals)
-        unverified.removeFirst(min(result.ownedArrivals, unverified.count))
-        verifiedRevision = store.view.revision
+        proof = (current.id, current.consumed + result.ownedArrivals)
         let held = result.ownedArrivals < indexes.count ? indexes[result.ownedArrivals] : chunk.count
         return ReplicationChunkIntake(
             heldMessages: held,
             accepted: result.ownedArrivals,
-            requestsHello: result.ownedArrivals > 0 && store.view.pendingCount > pendingBefore
+            requestsHello: result.ownedArrivals > 0 && pendingGrew
         )
     }
 
@@ -292,65 +315,87 @@ extension HostJournalAdapter: ReplicationData {
     /// for a provider request, every retained record missing from it,
     /// including own records above the upload watermark. Nothing above
     /// `bound` is chosen, so a reply loop ends however many records arrive
-    /// or are submitted while it runs.
+    /// or are submitted while it runs. Selected and encoded on the writer.
     func reply(
         for obligation: ReplyObligation, uploadedThrough: UInt64, bound limit: ReplicaVersionVector?
-    ) throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
+    ) async throws -> (plaintext: Data, records: [(ReplicaDeviceID, UInt64)])? {
         let store = try bound()
+        let origin = store.view.origin
         let ceiling = limit.map(Self.dictionary)
-        var selected: [JournalRecordID: JournalEnvelope] = [:]
-        if let provided = obligation.provided {
-            for envelope in try store.records(
-                missingFrom: Self.dictionary(provided), through: ceiling, maxBytes: Self.replyBytes, maxCount: Self.replyRecords
-            ) {
-                selected[envelope.id] = envelope
+        let provided = obligation.provided.map(Self.dictionary)
+        let ownAfter = try obligation.own.map { $0[try ReplicaDeviceID(bytes: origin)] }
+        let ownLast = min(uploadedThrough, ceiling.map { $0[origin] ?? 0 } ?? uploadedThrough)
+        let batch = try await store.read("reply") { journal -> HostJournalBatch? in
+            var selected: [JournalRecordID: JournalEnvelope] = [:]
+            if let provided {
+                for envelope in try journal.records(
+                    missingFrom: provided, through: ceiling, maxBytes: Self.replyBytes, maxCount: Self.replyRecords
+                ) {
+                    selected[envelope.id] = envelope
+                }
             }
-        }
-        if let own = obligation.own, let origin = ownOrigin {
-            let last = min(uploadedThrough, ceiling.map { $0[origin.bytes] ?? 0 } ?? uploadedThrough)
-            for envelope in try store.ownRecords(after: own[origin], maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
-            where envelope.sequence <= last {
-                selected[envelope.id] = envelope
+            if let ownAfter {
+                for envelope in try journal.ownRecords(after: ownAfter, maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
+                where envelope.sequence <= ownLast {
+                    selected[envelope.id] = envelope
+                }
             }
-        }
-        var envelopes: [JournalEnvelope] = []
-        var bytes = 0
-        for envelope in selected.values.sorted(by: {
-            $0.origin == $1.origin ? $0.sequence < $1.sequence : $0.origin.lexicographicallyPrecedes($1.origin)
-        }) {
-            guard envelopes.count < Self.replyRecords, envelopes.isEmpty || bytes + envelope.bytes.count <= Self.replyBytes else {
-                break
+            var envelopes: [JournalEnvelope] = []
+            var bytes = 0
+            for envelope in selected.values.sorted(by: {
+                $0.origin == $1.origin ? $0.sequence < $1.sequence : $0.origin.lexicographicallyPrecedes($1.origin)
+            }) {
+                guard envelopes.count < Self.replyRecords, envelopes.isEmpty || bytes + envelope.bytes.count <= Self.replyBytes else {
+                    break
+                }
+                envelopes.append(envelope)
+                bytes += envelope.bytes.count
             }
-            envelopes.append(envelope)
-            bytes += envelope.bytes.count
+            return envelopes.isEmpty ? nil : try Self.message(envelopes)
         }
-        return envelopes.isEmpty ? nil : try message(envelopes)
+        guard let batch else { return nil }
+        return (batch.plaintext, try batch.records.map { (try ReplicaDeviceID(bytes: $0.origin), $0.sequence) })
     }
 
-    func joinAnnouncement() throws -> (vector: ReplicaVersionVector, messages: [Data]) {
+    /// The hello vector and own head are frozen together from one snapshot
+    /// before any batch is read, so records submitted meanwhile cannot
+    /// extend the announcement; they are uploaded afterwards.
+    func joinAnnouncement() async throws -> (vector: ReplicaVersionVector, messages: [Data]) {
         let vector = helloVector
         guard let store, store.view.ownHead > 0 else {
             return (vector, [])
         }
+        let ceiling = store.view.ownHead
         var messages: [Data] = []
         var after: UInt64 = 0
-        while after < store.view.ownHead {
-            let batch = try store.ownRecords(after: after, maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
-            guard let last = batch.last else { break }
-            messages.append(try message(batch).plaintext)
-            after = last.sequence
+        while after < ceiling {
+            let start = after
+            let batch = try await store.read("joinAnnouncement") { journal -> (HostJournalBatch, UInt64)? in
+                let envelopes = try journal.ownRecords(after: start, maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
+                    .filter { $0.sequence <= ceiling }
+                guard let last = envelopes.last else { return nil }
+                return (try Self.message(envelopes), last.sequence)
+            }
+            guard self.store === store else { throw HostEngineError.generationChanged }
+            guard let (message, last) = batch else { break }
+            messages.append(message.plaintext)
+            after = last
         }
         return (vector, messages)
     }
 
-    func upload(after uploadedThrough: UInt64) throws -> (plaintext: Data, last: UInt64) {
+    func upload(after uploadedThrough: UInt64) async throws -> (plaintext: Data, last: UInt64) {
         let store = try bound()
-        let batch = try store.ownRecords(after: uploadedThrough, maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
         let origin = try ReplicaDeviceID(bytes: store.view.origin)
-        guard let last = batch.last, batch.first?.sequence == uploadedThrough + 1 else {
-            throw ReplicaError.sequenceGap(origin: origin, expected: uploadedThrough + 1, received: batch.first?.sequence ?? 0)
+        let batch = try await store.read("upload") { journal -> (message: HostJournalBatch?, first: UInt64) in
+            let envelopes = try journal.ownRecords(after: uploadedThrough, maxBytes: Self.replyBytes, maxCount: Self.replyRecords)
+            guard envelopes.first?.sequence == uploadedThrough + 1 else { return (nil, envelopes.first?.sequence ?? 0) }
+            return (try Self.message(envelopes), uploadedThrough + 1)
         }
-        return (try message(batch).plaintext, last.sequence)
+        guard let message = batch.message, let last = message.records.last else {
+            throw ReplicaError.sequenceGap(origin: origin, expected: uploadedThrough + 1, received: batch.first)
+        }
+        return (message.plaintext, last.sequence)
     }
 }
 
