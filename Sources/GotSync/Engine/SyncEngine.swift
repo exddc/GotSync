@@ -1574,6 +1574,10 @@ public final class SyncEngine {
     }
 
     public func joinPrivateSync(phrase: String) {
+        if isHostMode, hostLifecycle == .opening {
+            startAfterHostLaunch { $0.joinPrivateSync(phrase: phrase) }
+            return
+        }
         guard canJoinExistingSync else {
             return
         }
@@ -1585,6 +1589,10 @@ public final class SyncEngine {
     }
 
     public func joinPrivateSync(url: URL) {
+        if isHostMode, hostLifecycle == .opening {
+            startAfterHostLaunch { $0.joinPrivateSync(url: url) }
+            return
+        }
         guard canJoinExistingSync else {
             return
         }

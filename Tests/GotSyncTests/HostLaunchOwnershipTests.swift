@@ -90,6 +90,38 @@ final class GatedSecretStore: SecretStore {
 /// Launch ownership: one settlement of the session constructor and the
 /// journal observation, shared by launch, stop and closing.
 extension HostEngineTests {
+    func testAURLJoinRequestedDuringOpeningStartsAfterTheLaunchSettles() async throws {
+        try await joinWhileOpening(usePhrase: false)
+    }
+
+    func testAPhraseJoinRequestedDuringOpeningStartsAfterTheLaunchSettles() async throws {
+        try await joinWhileOpening(usePhrase: true)
+    }
+
+    private func joinWhileOpening(usePhrase: Bool) async throws {
+        let first = engine("first")
+        first.createPrivateSync()
+        try await wait("invitation") { first.invitationURL != nil }
+        let (second, gate) = gatedEngine("second", holding: .read)
+        defer { gate.open() }
+        try await eventually { gate.isWaiting }
+        XCTAssertEqual(second.hostLifecycle, .opening)
+        XCTAssertNil(second.mlsSessionForTesting)
+        if usePhrase {
+            second.joinPrivateSync(phrase: try XCTUnwrap(first.invitationPhrase))
+        } else {
+            second.joinPrivateSync(url: try XCTUnwrap(first.invitationURL))
+        }
+        gate.open()
+        try await wait("join requested during opening reaches verification") {
+            first.isHostApprovalPending && second.safetyCode != nil
+        }
+        XCTAssertEqual(first.safetyCode, second.safetyCode)
+        XCTAssertEqual(second.hostLaunchesForTesting, 1)
+        first.approveSafetyCode()
+        try await wait("paired") { first.isPaired && second.isPaired && !first.canCancelPairing }
+    }
+
     func gatedEngine(_ name: String, holding point: GatedSecretStore.Point?) -> (SyncEngine, GatedSecretStore) {
         let base = stores[name] ?? MemorySecretStore()
         stores[name] = base
