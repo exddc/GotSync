@@ -251,6 +251,13 @@ import Foundation
     }
 }
 
+// MARK: - Invitation phrase
+
+@_spi(HostJournalPreview) extension Invitation {
+    /// Words in an invitation phrase, as the phrase codec defines it.
+    public static var phraseWordCount: Int { MnemonicCodec.wordCount }
+}
+
 // MARK: - Submission limits
 
 /// What one journal accepts per mutation and per `submit` call, so a host

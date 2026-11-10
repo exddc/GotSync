@@ -62,11 +62,16 @@ BLOB_SURFACE_TYPES = {
     "BlobSummary",
     "BlobImageInfo",
     "BlobDescriptorInfo",
+    "BlobDataDescriptorInfo",
+    "BlobContentKind",
     "BlobHostHooks",
 }
 
 REQUIRED_BLOB_CALLS = {
     "seal(_:route:source:expectedContentHash:)",
+    "sealData(_:route:source:expectedContentHash:)",
+    "requestIncomingData(_:route:descriptor:)",
+    "registerAvailableData(route:descriptor:)",
     "outgoing()",
     "confirmHandoff(_:descriptorDigest:)",
     "cancelOutgoing(_:)",
@@ -93,6 +98,7 @@ SURFACE_MEMBERS = {
         "blobTransfers()",
     },
     "SyncPayloadSchema": {"hostJournal(payload:version:)"},
+    "Invitation": {"phraseWordCount"},
 }
 
 REQUIRED_HOST_CALLS = {

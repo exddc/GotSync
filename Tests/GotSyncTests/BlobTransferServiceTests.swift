@@ -3,7 +3,7 @@ import ImageIO
 import os
 import UniformTypeIdentifiers
 import XCTest
-@_spi(BlobPreview) @testable import GotSync
+@_spi(HostJournalPreview) @_spi(BlobPreview) @testable import GotSync
 
 final class BlobTransferServiceTests: XCTestCase {
     private var directory: URL!
@@ -87,6 +87,150 @@ final class BlobTransferServiceTests: XCTestCase {
                                       expectedContentHash: hash)
             XCTFail("a retired binding sealed")
         } catch BlobError.notBound {}
+    }
+
+    func testDataChunkRoundTripsOnlyWithHostAdmission() async throws {
+        let source = directory.appendingPathComponent("record.part")
+        let chunk = Data((0..<600_000).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) })
+        try chunk.write(to: source)
+        let hash = Data(SHA256.hash(data: chunk))
+
+        let sender = try service("data-sender")
+        let id = try BlobTransferID(bytes: Data(repeating: 4, count: 16))
+        let sealed = try await sender.sealData(id, route: route, source: source, expectedContentHash: hash)
+        XCTAssertEqual(sealed.kind, .applicationData)
+        let offered = try await waitForOutgoing(sender) { statuses in
+            statuses.compactMap { status -> (Data, Data)? in
+                if case .readyForHandoff(let descriptor, let digest) = status.state { return (descriptor, digest) }
+                return nil
+            }.first
+        }
+        XCTAssertEqual(offered.0[4], 2, "a data descriptor is version 2")
+        let info = try BlobDataDescriptorInfo(descriptor: offered.0)
+        XCTAssertEqual(info.contentHash, hash)
+        XCTAssertEqual(info.plaintextLength, UInt64(chunk.count))
+        XCTAssertEqual(info.digest, offered.1)
+        XCTAssertThrowsError(try BlobDescriptorInfo(descriptor: offered.0)) {
+            XCTAssertEqual($0 as? BlobError, .contentKindMismatch)
+        }
+        try await sender.confirmHandoff(id, descriptorDigest: offered.1)
+
+        let receiver = try service("data-receiver")
+        let refused = try BlobTransferID(bytes: Data(repeating: 5, count: 16))
+        do {
+            try await receiver.requestIncoming(refused, route: route, descriptor: offered.0)
+            XCTFail("the image entry point queued a data descriptor")
+        } catch BlobError.contentKindMismatch {}
+        try await receiver.requestIncomingData(refused, route: route, descriptor: offered.0)
+        let rejection = try await waitForIncoming(receiver) { statuses in
+            statuses.compactMap { status -> BlobRejection? in
+                if case .rejected(let reason) = status.state { return reason }
+                return nil
+            }.first
+        }
+        XCTAssertEqual(rejection, .dataRefused, "without a host check, data is refused")
+        try await receiver.cancelIncoming(refused)
+
+        let admitted = OSAllocatedUnfairLock(initialState: [Data]())
+        await receiver.setHooks(BlobHostHooks(verifiedContentURL: { _ in nil }, acceptsData: { file, data in
+            admitted.withLock { $0.append(data.contentHash) }
+            return (try? Data(contentsOf: file)).map { Data(SHA256.hash(data: $0)) } == data.contentHash
+        }))
+        let accepted = try BlobTransferID(bytes: Data(repeating: 6, count: 16))
+        try await receiver.requestIncomingData(accepted, route: route, descriptor: offered.0)
+        let published = try await waitForIncoming(receiver) { statuses in
+            statuses.compactMap { status -> (URL, BlobContentKind)? in
+                if case .awaitingPublish(let file, _, _) = status.state { return (file, status.kind) }
+                return nil
+            }.first
+        }
+        XCTAssertEqual(published.1, .applicationData)
+        XCTAssertEqual(try Data(contentsOf: published.0), chunk)
+        XCTAssertEqual(admitted.withLock { $0 }, [hash])
+        try await receiver.confirmPublished(accepted, descriptorDigest: offered.1)
+        let summary = await receiver.summary()
+        XCTAssertEqual(summary.libraryBytes, 0)
+    }
+
+    func testImageAndDataCannotAliasOneTransferID() async throws {
+        let source = directory.appendingPathComponent("image.png")
+        try Self.writePNG(to: source, width: 16, height: 16)
+        let hash = Data(SHA256.hash(data: try Data(contentsOf: source)))
+        let sender = try service("alias")
+        let id = try BlobTransferID(bytes: Data(repeating: 7, count: 16))
+        _ = try await sender.sealData(id, route: route, source: source, expectedContentHash: hash)
+        do {
+            _ = try await sender.seal(id, route: route, source: source, expectedContentHash: hash)
+            XCTFail("an image seal reused a data transfer")
+        } catch BlobError.contentKindMismatch {}
+        let statuses = await sender.outgoing()
+        XCTAssertEqual(statuses.map(\.kind), [.applicationData])
+    }
+
+    func testRestartKeepsDataKindDescriptorAndRegistration() async throws {
+        let source = directory.appendingPathComponent("record.part")
+        let chunk = Data(repeating: 0x5A, count: 1_000)
+        try chunk.write(to: source)
+        let hash = Data(SHA256.hash(data: chunk))
+        let sender = try service("restart")
+        let id = try BlobTransferID(bytes: Data(repeating: 8, count: 16))
+        _ = try await sender.sealData(id, route: route, source: source, expectedContentHash: hash)
+        let offered = try await waitForOutgoing(sender) { statuses in
+            statuses.compactMap { status -> Data? in
+                if case .readyForHandoff(let descriptor, _) = status.state { return descriptor }
+                return nil
+            }.first
+        }
+        try await sender.registerAvailableData(route: route, descriptor: offered)
+        do {
+            try await sender.registerAvailable(route: route, descriptor: offered)
+            XCTFail("the image registry accepted a data descriptor")
+        } catch BlobError.contentKindMismatch {}
+
+        let reopened = try BlobTransferService(
+            directory: directory.appendingPathComponent("restart"), relayURL: relayURL, policy: .production,
+            relayProtocols: [FakeBlobRelay.self]
+        )
+        let statuses = await reopened.outgoing()
+        XCTAssertEqual(statuses.count, 1)
+        XCTAssertEqual(statuses.first?.kind, .applicationData)
+        XCTAssertEqual(statuses.first?.state, .readyForHandoff(descriptor: offered, digest: BlobDescriptor.digest(of: offered)))
+        let summary = await reopened.summary()
+        XCTAssertEqual(summary.availableObjects, 1)
+    }
+
+    func testFutureVersionsFlagsAndForeignKindsFailClosed() throws {
+        let data = try BlobDescriptor(
+            dataObjectID: Data(repeating: 1, count: 32), key: Data(repeating: 2, count: 32),
+            plaintextLength: 1_000, contentHash: Data(repeating: 3, count: 32)
+        ).encoded()
+        XCTAssertEqual(try BlobDescriptor.stored(data).kind, .applicationData)
+        XCTAssertThrowsError(try BlobDescriptor(decoding: data), "a v1 reader") {
+            XCTAssertEqual($0 as? BlobCodecError, .unsupportedDescriptor(version: 2, flags: 0))
+        }
+        func mutated(_ offset: Int, _ value: UInt8) -> Data {
+            var copy = data
+            copy[offset] = value
+            return copy
+        }
+        let cases: [(Data, BlobError)] = [
+            (mutated(4, 3), .unsupportedDescriptor(version: 3, flags: 0)),
+            (mutated(5, 1), .unsupportedDescriptor(version: 2, flags: 1)),
+            (mutated(113, 1), .malformedDescriptor),
+            (mutated(119, UInt8(ascii: "x")), .malformedDescriptor),
+            (data + Data([0]), .malformedDescriptor),
+        ]
+        for (bytes, error) in cases {
+            XCTAssertThrowsError(try BlobDataDescriptorInfo(descriptor: bytes)) { XCTAssertEqual($0 as? BlobError, error) }
+        }
+        let image = try BlobDescriptor(
+            objectID: Data(repeating: 1, count: 32), key: Data(repeating: 2, count: 32), plaintextLength: 1_000,
+            contentHash: Data(repeating: 3, count: 32), pixelWidth: 4, pixelHeight: 4, mediaType: "public.png"
+        ).encoded()
+        XCTAssertThrowsError(try BlobDataDescriptorInfo(descriptor: image)) {
+            XCTAssertEqual($0 as? BlobError, .contentKindMismatch)
+        }
+        XCTAssertEqual(Invitation.phraseWordCount, 17)
     }
 
     // MARK: - Helpers

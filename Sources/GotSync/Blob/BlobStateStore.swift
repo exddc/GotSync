@@ -94,6 +94,7 @@ enum BlobOutgoingPhase: Int64 {
 
 struct BlobOutgoingRow {
     var id: Data
+    var kind: BlobContentKind
     var route: Data
     var session: Data
     var expected: Data
@@ -122,7 +123,10 @@ struct BlobOutgoingRow {
     }
 
     func frozenDescriptor() throws -> BlobDescriptor {
-        try BlobDescriptor(
+        if kind == .applicationData {
+            return try BlobDescriptor(dataObjectID: objectID, key: key, plaintextLength: plaintextLength, contentHash: expected)
+        }
+        return try BlobDescriptor(
             objectID: objectID, key: key, plaintextLength: plaintextLength, contentHash: expected,
             pixelWidth: pixelWidth, pixelHeight: pixelHeight, mediaType: mediaType
         )
@@ -149,6 +153,11 @@ struct BlobIncomingRow {
     var attempts: Int
     var rejection: String?
     var retryAt: Double
+
+    /// The kind its descriptor declares; checked when the row was queued.
+    var kind: BlobContentKind {
+        descriptor.count > 4 && descriptor[descriptor.startIndex + 4] == BlobDescriptor.dataVersion ? .applicationData : .image
+    }
 }
 
 /// The service actor's SQLite store. Every method is synchronous and runs
@@ -177,6 +186,11 @@ final class BlobStateStore {
             CREATE TABLE IF NOT EXISTS available (
                 route BLOB NOT NULL, object BLOB NOT NULL, descriptor BLOB NOT NULL, PRIMARY KEY (route, object));
             """)
+        var columns: Set<String> = []
+        try database.rows("PRAGMA table_info(outgoing)") { columns.insert(try $0.text(1)) }
+        if !columns.contains("kind") {
+            try database.execute("ALTER TABLE outgoing ADD COLUMN kind INTEGER NOT NULL DEFAULT 0")
+        }
         if !existed {
             try FileManager.default.setAttributes(ProtectedStorage.fileAttributes, ofItemAtPath: files.database.path)
         }
@@ -227,7 +241,7 @@ final class BlobStateStore {
 
     private static let outgoingColumns = """
         id, route, session, expected, source, phase, seal_generation, key, object, length, hashes, media,
-        width, height, descriptor, digest, failure, attempts, retry_at
+        width, height, descriptor, digest, failure, attempts, retry_at, kind
         """
 
     func outgoing(_ id: Data) throws -> BlobOutgoingRow? {
@@ -246,7 +260,7 @@ final class BlobStateStore {
 
     func put(_ row: BlobOutgoingRow) throws {
         try database.run(
-            "INSERT OR REPLACE INTO outgoing (\(Self.outgoingColumns)) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO outgoing (\(Self.outgoingColumns)) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 .blob(row.id), .blob(row.route), .blob(row.session), .blob(row.expected), .text(row.source),
                 .integer(row.phase.rawValue), .integer(Int64(row.sealGeneration)), .blob(row.key), .blob(row.objectID),
@@ -254,6 +268,7 @@ final class BlobStateStore {
                 .integer(Int64(row.pixelWidth)), .integer(Int64(row.pixelHeight)),
                 row.descriptor.map { .blob($0) } ?? .null, row.digest.map { .blob($0) } ?? .null,
                 row.failure.map { .text($0) } ?? .null, .integer(Int64(row.attempts)), .integer(Int64(row.retryAt * 1_000)),
+                .integer(row.kind == .image ? 0 : 1),
             ]
         )
     }
@@ -264,13 +279,15 @@ final class BlobStateStore {
 
     private static func outgoingRow(_ row: JournalRow) throws -> BlobOutgoingRow {
         let hashes = try row.blob(10)
+        let kind = try row.int64(19)
         guard hashes.count % BlobFormat.hashLength == 0,
-              let phase = BlobOutgoingPhase(rawValue: try row.int64(5))
+              let phase = BlobOutgoingPhase(rawValue: try row.int64(5)),
+              kind == 0 || kind == 1
         else {
             throw BlobError.storageUnavailable
         }
         return BlobOutgoingRow(
-            id: try row.blob(0), route: try row.blob(1), session: try row.blob(2), expected: try row.blob(3),
+            id: try row.blob(0), kind: kind == 0 ? .image : .applicationData, route: try row.blob(1), session: try row.blob(2), expected: try row.blob(3),
             source: try row.text(4), phase: phase, sealGeneration: Int(try row.int64(6)), key: try row.blob(7),
             objectID: try row.blob(8), plaintextLength: try row.unsigned(9),
             partHashes: stride(from: 0, to: hashes.count, by: BlobFormat.hashLength).map {

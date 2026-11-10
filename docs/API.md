@@ -273,6 +273,8 @@ with `HostJournal.submissionLimits`, a `HostSubmissionLimits` value:
 | `maxEncodedBytesPerSubmit` | 262,144 |
 
 The values come from the journal itself, not from a copy of these numbers.
+`Invitation.phraseWordCount` is the number of words in an invitation phrase
+(17), read from the phrase codec.
 
 `@_spi(BlobPreview)` exposes encrypted image transfer for host-journal
 engines. `await engine.blobTransfers()` returns the `BlobTransferService`
@@ -294,13 +296,33 @@ in the same group.
 | `registerAvailable(route:descriptor:)`, `unregisterAvailable(route:objectID:)` | Objects whose content the host holds, re-uploaded when other members want them |
 | `release(route:objectIDs:)` | Availability hint to the relay |
 | `summary()`, `updates()` | Counts per state, `relayUnsupported`, `hostBackpressure`; a signal after each change |
-| `setHooks(_:)` | `verifiedContentURL(contentHash:)` for re-uploads and `acceptsImage(file:image:)` for the host's own check |
+| `setHooks(_:)` | `verifiedContentURL(contentHash:)` for re-uploads, `acceptsImage(file:image:)` for the host's own image check, and `acceptsData(file:data:)`, which must admit each received data chunk and refuses by default |
+| `sealData(_:route:source:expectedContentHash:)` | Seal one application-data chunk of at most 10 MiB, with no image validation |
+| `requestIncomingData(_:route:descriptor:)` | Queue an application-data descriptor |
+| `registerAvailableData(route:descriptor:)` | Register a data chunk the host holds, for re-upload |
 
 `BlobTransferID` (16 bytes) is chosen and persisted by the host; repeating a
 call with the same ID and parameters is safe, and different parameters are
-`transferMismatch`. `BlobDescriptorInfo(descriptor:)` reads a descriptor's
-object ID, content hash, length and image fields for keying host variants by
-`(route, objectID)`. Library caps are 64 MiB of bytes, 16 outgoing rows, 8
+`transferMismatch`. `BlobDescriptorInfo(descriptor:)` reads an image
+descriptor's object ID, content hash, length and image fields for keying host
+variants by `(route, objectID)`.
+
+Images and application data are separate content kinds (`BlobContentKind`).
+Application data is one chunk of a host record too large for a journal
+payload. Its descriptor is version 2, with zero flags, zero dimensions and the
+media type `com.gotdone.sync.application-data`. Image descriptors stay version
+1 and their bytes are unchanged. The image calls refuse a data descriptor, and
+the data calls refuse an image descriptor, with `contentKindMismatch`; so does
+reusing a transfer ID for the other kind. `BlobDataDescriptorInfo(descriptor:)`
+reads a data descriptor's object ID, content hash, length and digest. Statuses
+carry `kind`. Other versions and nonzero flags are `unsupportedDescriptor`, and
+an earlier library reports a version 2 descriptor as unsupported. A received
+chunk is published only after its manifest, part hashes, authentication and
+content hash are verified and `acceptsData` admits it; otherwise the variant is
+`rejected(.dataRefused)`. The host splits a large record into ordered chunks,
+checks the whole record's length and hash after assembling them, and
+acknowledges only after applying it. Every chunk counts against the same
+ledger and limits as an image. Library caps are 64 MiB of bytes, 16 outgoing rows, 8
 incoming rows holding bytes, 1,024 queued descriptors, 4,000 registered
 objects and 512 MiB of free disk; a full cap is `capacity(_:)` and nothing is
 evicted. Images must pass the provisional validator: at most 10 MiB, JPEG, PNG,

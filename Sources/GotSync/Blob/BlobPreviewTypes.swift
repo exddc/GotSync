@@ -12,6 +12,14 @@ import Foundation
     }
 }
 
+/// What a sealed object holds. An image descriptor (version 1) and an
+/// application-data descriptor (version 2) are never accepted in each other's place.
+@_spi(BlobPreview) public enum BlobContentKind: Hashable, Sendable {
+    case image
+    /// One chunk of a host record too large for a journal payload.
+    case applicationData
+}
+
 /// The ledger class that refused new work. Accepted rows and files are never
 /// evicted to make room; the host keeps its durable intent and retries.
 @_spi(BlobPreview) public enum BlobCapacity: Equatable, Sendable {
@@ -57,6 +65,8 @@ import Foundation
     case storageUnavailable
     /// The relay does not offer blob storage.
     case relayUnsupported
+    /// The transfer ID or descriptor belongs to the other content kind.
+    case contentKindMismatch
 }
 
 /// Why an outgoing transfer stopped before it was ever offered.
@@ -85,6 +95,7 @@ import Foundation
 
     public let id: BlobTransferID
     public let route: BlobRoute
+    public let kind: BlobContentKind
     public let contentHash: Data
     public let state: State
 }
@@ -94,6 +105,8 @@ import Foundation
     case relayIntegrity
     case descriptorMismatch
     case imageRejected
+    /// The host's `acceptsData` hook did not admit the application data.
+    case dataRefused
 }
 
 @_spi(BlobPreview) public struct BlobIncomingStatus: Equatable, Sendable {
@@ -112,6 +125,7 @@ import Foundation
 
     public let id: BlobTransferID
     public let route: BlobRoute
+    public let kind: BlobContentKind
     public let objectID: Data
     public let digest: Data
     /// Whether the row belongs to a session that has ended.
@@ -170,6 +184,23 @@ import Foundation
     }
 }
 
+/// The public fields of a version 2 application-data descriptor. An image
+/// descriptor is refused with `contentKindMismatch`; the key is not exposed.
+@_spi(BlobPreview) public struct BlobDataDescriptorInfo: Equatable, Sendable {
+    public let objectID: Data
+    public let contentHash: Data
+    public let plaintextLength: UInt64
+    public let digest: Data
+
+    public init(descriptor: Data) throws {
+        let decoded = try BlobDescriptor.decodeForService(descriptor, kind: .applicationData)
+        objectID = decoded.objectID
+        contentHash = decoded.contentHash
+        plaintextLength = decoded.plaintextLength
+        digest = BlobDescriptor.digest(of: descriptor)
+    }
+}
+
 /// Host callbacks. They may be called from any task.
 @_spi(BlobPreview) public struct BlobHostHooks: Sendable {
     /// A host-owned file whose content has `contentHash`, for re-uploading an
@@ -178,25 +209,40 @@ import Foundation
     /// The host's own acceptance check on a received image, after the library's
     /// validator. Rejecting marks only this variant rejected.
     public var acceptsImage: @Sendable (_ file: URL, _ image: BlobImageInfo) async -> Bool
+    /// Admits a received application-data chunk after its length, part
+    /// hashes, authentication and content hash were verified. Refuses unless
+    /// the host supplies a check.
+    public var acceptsData: @Sendable (_ file: URL, _ data: BlobDataDescriptorInfo) async -> Bool
 
     public init(
         verifiedContentURL: @escaping @Sendable (_ contentHash: Data) async -> URL?,
-        acceptsImage: @escaping @Sendable (_ file: URL, _ image: BlobImageInfo) async -> Bool = { _, _ in true }
+        acceptsImage: @escaping @Sendable (_ file: URL, _ image: BlobImageInfo) async -> Bool = { _, _ in true },
+        acceptsData: @escaping @Sendable (_ file: URL, _ data: BlobDataDescriptorInfo) async -> Bool = { _, _ in false }
     ) {
         self.verifiedContentURL = verifiedContentURL
         self.acceptsImage = acceptsImage
+        self.acceptsData = acceptsData
     }
 }
 
 extension BlobDescriptor {
-    /// Decodes with the errors the service reports to the host.
-    static func decodeForService(_ encoded: Data) throws -> BlobDescriptor {
+    /// Decodes a descriptor of `kind` with the errors the service reports to
+    /// the host. A well-formed descriptor of the other kind is `contentKindMismatch`.
+    static func decodeForService(_ encoded: Data, kind: BlobContentKind = .image) throws -> BlobDescriptor {
         do {
-            return try BlobDescriptor(decoding: encoded)
+            return try BlobDescriptor(decoding: encoded, accepting: [kind])
         } catch BlobCodecError.unsupportedDescriptor(let version, let flags) {
+            if flags == 0, (try? BlobDescriptor(decoding: encoded, accepting: [.image, .applicationData])) != nil {
+                throw BlobError.contentKindMismatch
+            }
             throw BlobError.unsupportedDescriptor(version: version, flags: flags)
         } catch {
             throw BlobError.malformedDescriptor
         }
+    }
+
+    /// Any supported descriptor, for rows whose kind was checked on entry.
+    static func stored(_ encoded: Data) throws -> BlobDescriptor {
+        try BlobDescriptor(decoding: encoded, accepting: [.image, .applicationData])
     }
 }
