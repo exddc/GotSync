@@ -179,7 +179,7 @@ public final class HostJournal {
 
     /// Runs a host call and raises only public errors. An admitted call's
     /// committed outcome is returned unchanged.
-    private func surfacing<T>(_ body: () async throws -> T) async throws -> T {
+    private func surfacing<T>(_ body: @MainActor () async throws -> T) async throws -> T {
         do {
             return try await body()
         } catch {
