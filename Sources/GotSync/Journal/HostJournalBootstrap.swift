@@ -50,6 +50,8 @@ enum HostSnapshotRefusalReason: String, Codable, Sendable, CaseIterable {
     case hostRefused
     case declinedByHost
     case noProvider
+    /// Current members did not all report the offered retention floor.
+    case corroborationMismatch
 
     /// Reasons a provider may send; the others arise only at the recipient.
     static let providerReasons: Set<Self> = [.schemaMismatch, .notRegistered, .tooLarge, .notAtCut, .exportFailed, .transferFailed]
@@ -71,6 +73,9 @@ struct HostSnapshotOffer: Codable, Equatable, Sendable {
     let length: UInt64
     let contentHash: Data
     let chunks: [Data]
+    /// The committed retention floor's proposal digest when this offer is
+    /// that floor's checkpoint; nil for an export at the provider's cut.
+    var floor: Data? = nil
 
     var coverage: [Data: UInt64] {
         Dictionary(uniqueKeysWithValues: anchors.map { ($0.origin, $0.sequence) })
@@ -85,6 +90,7 @@ struct HostSnapshotOffer: Codable, Equatable, Sendable {
             && anchors.count <= HostSnapshotBounds.maxOrigins
             && anchors.allSatisfy { $0.origin.count == 16 && $0.sequence > 0 && $0.digest.count == 32 }
             && zip(anchors, anchors.dropFirst()).allSatisfy { $0.origin.lexicographicallyPrecedes($1.origin) }
+            && (floor.map { $0.count == 32 } ?? true)
     }
 
     /// The library-owned transfer ID of chunk `index`.

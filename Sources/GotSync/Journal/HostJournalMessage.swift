@@ -21,6 +21,10 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
         case reservation
         case release
         case reservations
+        /// Sent only in compacting groups, whose members all decode them.
+        case retentionProposal
+        case retentionVote
+        case retentionState
     }
 
     let version: Int
@@ -38,6 +42,9 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
     var snapshotSchema: String? = nil
     var snapshot: HostSnapshotOffer? = nil
     var snapshotRefusal: String? = nil
+    var retention: HostRetentionProposal? = nil
+    var vote: HostRetentionVote? = nil
+    var corroboration: HostRetentionCorroboration? = nil
 
     static func records(_ envelopes: [Data]) -> HostJournalMessage {
         HostJournalMessage(version: version, kind: .records, records: envelopes)
@@ -49,6 +56,24 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
         var message = HostJournalMessage(version: version, kind: .complete, member: member, through: through)
         message.snapshot = snapshot
         message.snapshotRefusal = snapshot == nil ? refusal?.rawValue : nil
+        return message
+    }
+
+    static func retentionProposal(_ proposal: HostRetentionProposal) -> HostJournalMessage {
+        var message = HostJournalMessage(version: version, kind: .retentionProposal)
+        message.retention = proposal
+        return message
+    }
+
+    static func retentionVote(_ vote: HostRetentionVote) -> HostJournalMessage {
+        var message = HostJournalMessage(version: version, kind: .retentionVote)
+        message.vote = vote
+        return message
+    }
+
+    static func retentionState(_ corroboration: HostRetentionCorroboration) -> HostJournalMessage {
+        var message = HostJournalMessage(version: version, kind: .retentionState)
+        message.corroboration = corroboration
         return message
     }
 
@@ -95,7 +120,7 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
     /// The engine's control value for a control kind; nil for records and completion.
     var control: ReplicationMessage? {
         switch kind {
-        case .records, .complete:
+        case .records, .complete, .retentionProposal, .retentionVote, .retentionState:
             return nil
         case .hello:
             return .hello(vector: vector ?? ReplicaVersionVector(), provider: provider)
@@ -122,7 +147,7 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
             message.records != nil, message.vector != nil, message.provider != nil, message.member != nil,
             message.origins != nil, message.epoch != nil, message.reservation != nil, message.reservations != nil,
             message.overflowed != nil, message.through != nil, message.snapshotSchema != nil, message.snapshot != nil,
-            message.snapshotRefusal != nil,
+            message.snapshotRefusal != nil, message.retention != nil, message.vote != nil, message.corroboration != nil,
         ]
         func only(_ allowed: Set<Int>) -> Bool {
             fields.enumerated().allSatisfy { allowed.contains($0.offset) || !$0.element }
@@ -145,6 +170,12 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
                 && message.origins.map(OriginReservation.isCanonical) == true
         case .release:
             valid = only([3, 6]) && message.member?.count == 32 && message.reservation != nil
+        case .retentionProposal:
+            valid = only([13]) && message.retention?.isWellFormed == true
+        case .retentionVote:
+            valid = only([14]) && message.vote?.isWellFormed == true
+        case .retentionState:
+            valid = only([15]) && message.corroboration?.isWellFormed == true
         case .reservations:
             let entries = message.reservations ?? []
             valid = only([3, 7, 8]) && message.member?.count == 32 && message.reservations != nil

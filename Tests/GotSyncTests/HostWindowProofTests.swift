@@ -266,6 +266,8 @@ final class HostWindowProofTests: XCTestCase {
             "enroll": .none, "resume": .none, "submit": .none, "markApplied": .none, "markEstablished": .none,
             "declareReady": .none, "recordCompletionTarget": .none, "setHistoryProvider": .none,
             "enterControlRepair": .none, "intake": .intake, "promote": .intake, "retire": .generation,
+            "requestSnapshot": .none, "refuseSnapshot": .none, "advanceSnapshot": .none, "commitSnapshotInstall": .none,
+            "commitRetentionFloor": .intake, "pruneBelowFloor": .intake, "adoptRetentionFloor": .intake,
         ])
     }
 }

@@ -161,7 +161,7 @@ final class HostJournalAdapter {
             return HostJournalArrival(
                 sender: item.message.sender, cursor: item.message.cursor, plaintext: item.message.plaintext, envelopes: nil
             )
-        case .taskOperations, .hostComplete, .control:
+        case .taskOperations, .hostComplete, .hostRetention, .control:
             return nil
         }
     }
@@ -219,6 +219,8 @@ extension HostJournalAdapter: ReplicationData {
             return (nil, .hostRecords(message))
         case .complete:
             return (nil, .hostComplete(member: message.member ?? Data(), through: message.through ?? ReplicaVersionVector()))
+        case .retentionProposal, .retentionVote, .retentionState:
+            return (nil, .hostRetention(message))
         case .hello, .reservation, .release, .reservations:
             return (message.control, .control)
         }
@@ -238,7 +240,7 @@ extension HostJournalAdapter: ReplicationData {
             return origins
         case .control:
             return Set(control?.vector?.origins ?? [])
-        case .hostComplete:
+        case .hostComplete, .hostRetention:
             return []
         case .undecodable, .taskOperations:
             return nil

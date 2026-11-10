@@ -18,6 +18,7 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
     }
 
     static let hostJournalPrefix = "gotsync.journal1."
+    static let compactingHostJournalPrefix = "gotsync.journal2."
 
     /// Opaque host records of `payload` at `version`, carried by the host
     /// journal.
@@ -31,7 +32,28 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
         return SyncPayloadSchema(identifier: identifier, version: version)
     }
 
-    var isHostJournal: Bool { identifier.hasPrefix(Self.hostJournalPrefix) }
+    /// Host records of `payload` at `version` in a group whose members may
+    /// agree on a retention floor and remove history below it. Every member
+    /// must register snapshot and retention hosts; libraries without
+    /// compaction refuse to pair into such a group. The checkpoint schema is
+    /// `payload` at `version`.
+    @_spi(HostJournalPreview) public static func compactingHostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
+        let identifier = compactingHostJournalPrefix + payload
+        guard version > 0, !payload.hasPrefix("gotsync."), SyncGroupProfile.isLabel(payload),
+              SyncGroupProfile.isLabel(identifier)
+        else {
+            throw SyncGroupProfileError.invalidDescriptor
+        }
+        return SyncPayloadSchema(identifier: identifier, version: version)
+    }
+
+    var isHostJournal: Bool { identifier.hasPrefix(Self.hostJournalPrefix) || allowsRetention }
+    var allowsRetention: Bool { identifier.hasPrefix(Self.compactingHostJournalPrefix) }
+    /// The checkpoint schema name of a compacting group.
+    var retentionSnapshotSchema: String? {
+        guard allowsRetention else { return nil }
+        return HostSnapshotSchemaName.make(label: String(identifier.dropFirst(Self.compactingHostJournalPrefix.count)), version: version)
+    }
 }
 
 public enum SyncGroupProfileError: Error, Equatable, Sendable {

@@ -62,9 +62,9 @@ final class HostJournalStoreTests: XCTestCase {
         let (store, _) = try enrolled()
         let url = store.url
         _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(2), count: 3), cursor: 1)])
-        try JournalFixture.tamper(url, "PRAGMA user_version = 4")
+        try JournalFixture.tamper(url, "PRAGMA user_version = 5")
         let unsupported = try JournalFixture.fileHash(url)
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(4)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(5)) }
         XCTAssertEqual(try JournalFixture.fileHash(url), unsupported)
         try JournalFixture.tamper(url, "PRAGMA user_version = 3")
 
@@ -89,10 +89,10 @@ final class HostJournalStoreTests: XCTestCase {
 
     func testUnsupportedWALStoreIsPreservedExactly() throws {
         let url = HostJournalStore.fileURL(in: directory, journalID: Data(repeating: 3, count: 16))
-        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=4", create: true)
+        try JournalFixture.tamper(url, "PRAGMA journal_mode=WAL; CREATE TABLE example(x INTEGER); INSERT INTO example VALUES(42); PRAGMA user_version=5", create: true)
         let before = JournalFixture.storedState(url)
         XCTAssertEqual(Array(try XCTUnwrap(before[""])[18...19]), [2, 2])
-        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(4)) }
+        XCTAssertThrowsError(try HostJournalStore.open(url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(5)) }
         XCTAssertEqual(JournalFixture.storedState(url), before)
     }
 
