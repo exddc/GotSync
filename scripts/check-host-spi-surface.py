@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Checks the HostJournalPreview SPI surface of GotSync through its symbol graph.
+"""Checks the HostJournalPreview and BlobPreview SPI surfaces of GotSync through its symbol graph.
 
 The surface is the set of SPI symbols plus every symbol inside an SPI type.
-It must equal the reviewed set of types and engine members, and no surface
-declaration may name a storage, writer, SQLite, MLS or test-hook type.
+It must equal the reviewed set of types and engine members of each group, and
+no surface declaration may name a storage, writer, SQLite, MLS, relay-client,
+codec or test-hook type.
 Pre-existing public API outside the surface is not inspected.
 
 Usage: check-host-spi-surface.py [--graph-dir DIR]
@@ -20,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SPI_GROUP = "HostJournalPreview"
+SPI_GROUPS = {"HostJournalPreview", "BlobPreview"}
 
 SURFACE_TYPES = {
     "HostJournal",
@@ -45,6 +46,40 @@ SURFACE_TYPES = {
     "HostQuarantineReason",
     "HostArchiveCursor",
     "HostArchivePage",
+    "HostSubmissionLimits",
+}
+
+BLOB_SURFACE_TYPES = {
+    "BlobTransferService",
+    "BlobTransferID",
+    "BlobRoute",
+    "BlobCapacity",
+    "BlobError",
+    "BlobOutgoingFailure",
+    "BlobOutgoingStatus",
+    "BlobRejection",
+    "BlobIncomingStatus",
+    "BlobSummary",
+    "BlobImageInfo",
+    "BlobDescriptorInfo",
+    "BlobHostHooks",
+}
+
+REQUIRED_BLOB_CALLS = {
+    "seal(_:route:source:expectedContentHash:)",
+    "outgoing()",
+    "confirmHandoff(_:descriptorDigest:)",
+    "cancelOutgoing(_:)",
+    "requestIncoming(_:route:descriptor:)",
+    "incoming()",
+    "confirmPublished(_:descriptorDigest:)",
+    "cancelIncoming(_:)",
+    "registerAvailable(route:descriptor:)",
+    "unregisterAvailable(route:objectID:)",
+    "release(route:objectIDs:)",
+    "summary()",
+    "setHooks(_:)",
+    "updates()",
 }
 
 SURFACE_MEMBERS = {
@@ -55,6 +90,7 @@ SURFACE_MEMBERS = {
         "hostJournalArchives()",
         "exportHostJournal(_:after:limit:)",
         "discardRetiredHostJournal(_:confirmingJournalID:)",
+        "blobTransfers()",
     },
     "SyncPayloadSchema": {"hostJournal(payload:version:)"},
 }
@@ -68,13 +104,16 @@ REQUIRED_HOST_CALLS = {
     "incoming(after:limit:)",
     "markApplied(through:)",
     "declareReady(capturedThrough:)",
+    "submissionLimits",
 }
 
 FORBIDDEN_NAMES = re.compile(
     r"HostJournalStore|HostJournalWriter|HostJournalSnapshot|HostJournalFiles|HostEngineView|"
     r"JournalDatabase|JournalStoreError|\bJournalCapacity\b|JournalValue|HostJournalListing|"
     r"HostJournalExport|HostJournalProvenance|OpaquePointer|SQLite|sqlite3|MLSSession|MLSClient|"
-    r"MLSStore|ForTesting|forTesting"
+    r"MLSStore|ForTesting|forTesting|BlobStateStore|BlobFiles|BlobRelayClient|BlobRelayError|BlobCipher|"
+    r"BlobSealedObject|BlobManifest|BlobPartLayout|\bBlobDescriptor\b|\bBlobBinding\b|BlobWorkGate|BlobSignal|"
+    r"BlobCodecError|BlobImageValidator"
 )
 FORBIDDEN_MODULE_PREFIXES = ("s:10GotSyncMLS", "s:18GotSyncMLSBindings", "c:@")
 
@@ -140,7 +179,7 @@ def main():
     arguments = parser.parse_args()
     problems = []
 
-    extra_groups = source_spi_groups() - {SPI_GROUP}
+    extra_groups = source_spi_groups() - SPI_GROUPS
     if extra_groups:
         problems.append(f"unexpected SPI groups {sorted(extra_groups)}")
 
@@ -151,10 +190,12 @@ def main():
     surface = {}
     for precise, symbol in symbols.items():
         path = symbol["pathComponents"]
-        if path[0] in SURFACE_TYPES:
+        if path[0] in SURFACE_TYPES or path[0] in BLOB_SURFACE_TYPES:
             surface[precise] = symbol
             if path[0] == "HostJournal" and len(path) > 1 and (len(path) != 2 or path[1] not in REQUIRED_HOST_CALLS):
                 problems.append(f"unreviewed host call {'.'.join(path)}")
+            if path[0] == "BlobTransferService" and len(path) > 1 and (len(path) != 2 or path[1] not in REQUIRED_BLOB_CALLS):
+                problems.append(f"unreviewed blob call {'.'.join(path)}")
         elif symbol.get("spi"):
             allowed = SURFACE_MEMBERS.get(path[0], set())
             if len(path) != 2 or path[1] not in allowed:
@@ -162,7 +203,7 @@ def main():
             surface[precise] = symbol
 
     present = {tuple(symbol["pathComponents"]) for symbol in surface.values()}
-    for name in SURFACE_TYPES:
+    for name in SURFACE_TYPES | BLOB_SURFACE_TYPES:
         if (name,) not in present:
             problems.append(f"missing surface type {name}")
     for owner, members in SURFACE_MEMBERS.items():
@@ -172,6 +213,9 @@ def main():
     for call in REQUIRED_HOST_CALLS:
         if ("HostJournal", call) not in present:
             problems.append(f"missing host call HostJournal.{call}")
+    for call in REQUIRED_BLOB_CALLS:
+        if ("BlobTransferService", call) not in present:
+            problems.append(f"missing blob call BlobTransferService.{call}")
 
     for precise, symbol in surface.items():
         where = ".".join(symbol["pathComponents"])
@@ -195,7 +239,7 @@ def main():
 
     if problems:
         fail(sorted(set(problems)))
-    print(f"SPI surface check passed: {len(surface)} symbols in {len(SURFACE_TYPES)} types and "
+    print(f"SPI surface check passed: {len(surface)} symbols in {len(SURFACE_TYPES | BLOB_SURFACE_TYPES)} types and "
           f"{sum(len(members) for members in SURFACE_MEMBERS.values())} members")
 
 

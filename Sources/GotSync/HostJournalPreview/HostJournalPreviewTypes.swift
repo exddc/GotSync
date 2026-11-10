@@ -251,6 +251,28 @@ import Foundation
     }
 }
 
+// MARK: - Submission limits
+
+/// What one journal accepts per mutation and per `submit` call, so a host
+/// can size its batches without guessing the wire overhead.
+@_spi(HostJournalPreview) public struct HostSubmissionLimits: Equatable, Sendable {
+    /// The largest `HostMutation.payload`.
+    public let maxPayloadBytes: Int
+    /// Bytes each mutation adds to its payload once encoded as an envelope.
+    public let envelopeOverheadBytes: Int
+    /// The most mutations one `submit` call may carry.
+    public let maxRecordsPerSubmit: Int
+    /// The most encoded envelope bytes, overhead included, one `submit` call may carry.
+    public let maxEncodedBytesPerSubmit: Int
+
+    init(_ limits: HostJournalLimits) {
+        maxPayloadBytes = JournalEnvelope.maxPayloadLength
+        envelopeOverheadBytes = JournalEnvelope.headerLength
+        maxRecordsPerSubmit = limits.batch
+        maxEncodedBytesPerSubmit = limits.submitCallBytes
+    }
+}
+
 // MARK: - Errors
 
 @_spi(HostJournalPreview) public enum HostJournalCapacity: Equatable, Sendable {

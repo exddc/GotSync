@@ -256,6 +256,58 @@ The Keychain implementation requires a service name; use your own application
 namespace. Unit tests use an in-memory implementation. The example tests cover
 Keychain-backed identity and storage on the iOS Simulator.
 
+## Preview SPI
+
+Two groups of preview API are imported with `@_spi`. They are for the GotDone
+integration and may change. `scripts/check-host-spi-surface.py` checks both
+surfaces against a reviewed list.
+
+`@_spi(HostJournalPreview)` exposes the host journal. Size `submit` batches
+with `HostJournal.submissionLimits`, a `HostSubmissionLimits` value:
+
+| Field | Value |
+| --- | --- |
+| `maxPayloadBytes` | 65,536 |
+| `envelopeOverheadBytes` | 64 |
+| `maxRecordsPerSubmit` | 256 |
+| `maxEncodedBytesPerSubmit` | 262,144 |
+
+The values come from the journal itself, not from a copy of these numbers.
+
+`@_spi(BlobPreview)` exposes encrypted image transfer for host-journal
+engines. `await engine.blobTransfers()` returns the `BlobTransferService`
+actor, or nil in other modes. The engine binds the service to the active group
+during sync and retires the binding before leave, removal, reset or erase
+changes MLS state. A binding is kept across launches while the same member stays
+in the same group.
+
+| Call | Purpose |
+| --- | --- |
+| `seal(_:route:source:expectedContentHash:)` | Seal a private clone of a host file under a fresh key and upload it. The host file is never written or deleted |
+| `outgoing()` | Statuses. Only `readyForHandoff(descriptor, digest)` exposes a frozen descriptor |
+| `confirmHandoff(_:descriptorDigest:)` | Delete the row after the host stored the descriptor in its record; a different digest is `staleConfirmation` |
+| `cancelOutgoing(_:)` | Drop a transfer that was never offered |
+| `requestIncoming(_:route:descriptor:)` | Queue a descriptor from an accepted host record |
+| `incoming()` | Statuses. `awaitingPublish(file, contentHash, digest)` is verified content the host publishes |
+| `confirmPublished(_:descriptorDigest:)` | Delete the verified file after the host published it |
+| `cancelIncoming(_:)` | Drop an unverified variant, such as a rejected one |
+| `registerAvailable(route:descriptor:)`, `unregisterAvailable(route:objectID:)` | Objects whose content the host holds, re-uploaded when other members want them |
+| `release(route:objectIDs:)` | Availability hint to the relay |
+| `summary()`, `updates()` | Counts per state, `relayUnsupported`, `hostBackpressure`; a signal after each change |
+| `setHooks(_:)` | `verifiedContentURL(contentHash:)` for re-uploads and `acceptsImage(file:image:)` for the host's own check |
+
+`BlobTransferID` (16 bytes) is chosen and persisted by the host; repeating a
+call with the same ID and parameters is safe, and different parameters are
+`transferMismatch`. `BlobDescriptorInfo(descriptor:)` reads a descriptor's
+object ID, content hash, length and image fields for keying host variants by
+`(route, objectID)`. Library caps are 64 MiB of bytes, 16 outgoing rows, 8
+incoming rows holding bytes, 1,024 queued descriptors, 4,000 registered
+objects and 512 MiB of free disk; a full cap is `capacity(_:)` and nothing is
+evicted. Images must pass the provisional validator: at most 10 MiB, JPEG, PNG,
+HEIC, HEIF, GIF, TIFF or WebP, at most 64 frames, 8,192 pixels per side and 40
+million pixels per frame. These limits are policy, not a measured memory
+ceiling. Files live under `blob-v1/` in the storage directory.
+
 ## Deferred API refinements
 
 Main-actor isolation preserves the existing serial recovery behavior. MLS
