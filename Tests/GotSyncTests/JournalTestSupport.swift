@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import SQLite3
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 extension HostJournalStore {
     /// Intake followed by every bounded promotion step, for tests that check
@@ -61,11 +61,11 @@ enum JournalFixture {
         var database: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0)
         guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK else {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         defer { sqlite3_close_v2(database) }
         guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
-            throw HostJournalError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
+            throw JournalStoreError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
         }
     }
 
@@ -76,7 +76,7 @@ enum JournalFixture {
     static func hotImage(of url: URL, into directory: URL) throws -> URL {
         var database: OpaquePointer?
         guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         defer { sqlite3_close_v2(database) }
         let spill = """
@@ -86,7 +86,7 @@ enum JournalFixture {
             INSERT INTO heldInbox(sender, cursor, plaintext, digest) SELECT randomblob(32), i, zeroblob(20000), randomblob(32) FROM n;
             """
         guard sqlite3_exec(database, spill, nil, nil, nil) == SQLITE_OK else {
-            throw HostJournalError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
+            throw JournalStoreError.storeCorrupt(String(cString: sqlite3_errmsg(database)))
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let copy = directory.appendingPathComponent(url.lastPathComponent)
@@ -113,7 +113,7 @@ enum JournalFixture {
         var items: [HostJournalExportItem] = []
         var cursor: HostJournalExportCursor?
         repeat {
-            let page = try HostJournalArchive.export(url, after: cursor, limit: pageSize)
+            let page = try HostJournalFiles.export(url, after: cursor, limit: pageSize)
             items += page.items
             cursor = page.next
         } while cursor != nil

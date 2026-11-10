@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Ten host-journal devices share one group on the real relay that
 /// `scripts/test-integration.sh` starts, each with its own identity,
@@ -14,10 +14,10 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
     private var metricsURL: URL!
     private var stores: [String: MemorySecretStore] = [:]
     private var engines: [String: SyncEngine] = [:]
-    private var provenances: [String: HostJournalProvenance] = [:]
+    private var provenances: [String: HostProvenance] = [:]
     private var captured: [String: UInt64] = [:]
     private var applied: [String: [String]] = [:]
-    private var appliedThrough: [String: UInt64] = [:]
+    private var appliedThrough: [String: JournalPosition] = [:]
     private let profile = try! SyncGroupProfile(
         application: "org.gotsync.host-acceptance", schema: .hostJournal(payload: "example.records", version: 1),
         memberLimit: SyncGroupProfile.supportedMemberCeiling
@@ -140,16 +140,16 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
     private func resume(_ engine: SyncEngine, _ name: String) async throws {
         try await wait("\(name) opened") { engine.hostLifecycle != .opening }
         let stored = try XCTUnwrap(provenances[name])
-        provenances[name] = try await XCTUnwrap(engine.hostJournal).resume(HostJournalProvenance(
+        provenances[name] = try await XCTUnwrap(engine.hostJournal).resume(HostProvenance(
             journalID: stored.journalID, enrollmentID: stored.enrollmentID,
-            appliedThrough: appliedThrough[name, default: 0], capturedThrough: captured[name, default: 0]
+            appliedThrough: appliedThrough[name], capturedThrough: captured[name, default: 0]
         ))
     }
 
     private func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) async throws {
         captured[name, default: 0] += UInt64(payloads.count)
         _ = try await XCTUnwrap(engine.hostJournal).submit(
-            payloads.map { HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data($0.utf8)) },
+            payloads.map { HostMutation(id: HostMutationID(UUID()), payload: Data($0.utf8)) },
             capturedThrough: captured[name, default: 0]
         )
     }
@@ -158,7 +158,7 @@ final class HostTenDeviceAcceptanceTests: XCTestCase {
     /// device holds every other device's records with complete history.
     private func settled(_ name: String, expecting count: Int) async -> Bool {
         guard let engine = engines[name], let journal = engine.hostJournal else { return false }
-        while let batch = try? await journal.incoming(after: journal.view.appliedThrough, limit: 64), let last = batch.last {
+        while let batch = try? await journal.incoming(after: JournalPosition(rawValue: journal.view.appliedThrough), limit: 64), let last = batch.last {
             applied[name, default: []] += batch.map { String(decoding: $0.payload, as: UTF8.self) }
             guard (try? await journal.markApplied(through: last.position)) != nil else { return false }
             appliedThrough[name] = last.position

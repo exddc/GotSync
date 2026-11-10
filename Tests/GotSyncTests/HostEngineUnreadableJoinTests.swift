@@ -2,7 +2,7 @@ import Foundation
 import GotSyncMLS
 import SQLite3
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 extension HostEngineTests {
     func testUnreadableJoinedOwnerSurvivesReplacementJoinAndRestart() async throws {

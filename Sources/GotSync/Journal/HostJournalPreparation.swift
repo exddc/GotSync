@@ -40,13 +40,13 @@ enum HostJournalPreparation {
         do {
             do {
                 return try snapshot(url, cancellation)
-            } catch HostJournalError.storage(let code, _) where code == JournalDatabase.hotJournalCode {
+            } catch JournalStoreError.storage(let code, _) where code == JournalDatabase.hotJournalCode {
                 try recover(url, cancellation)
                 return try snapshot(url, cancellation)
             }
-        } catch HostJournalError.storage(let code, let message) {
+        } catch JournalStoreError.storage(let code, let message) {
             if cancellation.isCancelled { throw CancellationError() }
-            throw HostJournalError.storeUnreadable("\(code): \(message)")
+            throw JournalStoreError.storeUnreadable("\(code): \(message)")
         }
     }
 
@@ -68,7 +68,7 @@ enum HostJournalPreparation {
         try HostJournalStore.checkFormat(database)
         let mode = try database.first("PRAGMA journal_mode", [], { try $0.text(0) }) ?? ""
         guard mode == "delete" else {
-            throw HostJournalError.storeCorrupt("journal mode \(mode)")
+            throw JournalStoreError.storeCorrupt("journal mode \(mode)")
         }
         let token = try fileToken(url, database)
         let view = try HostJournalStore.validate(database, cancellation: cancellation)
@@ -78,20 +78,20 @@ enum HostJournalPreparation {
     /// Reads the token while `database` holds a lock: the path must still
     /// name the inode SQLite opened, before and after reading the header.
     static func fileToken(_ url: URL, _ database: JournalDatabase) throws -> HostJournalFileToken {
-        guard try !database.hasMoved() else { throw HostJournalError.storeUnreadable("moved while opening") }
+        guard try !database.hasMoved() else { throw JournalStoreError.storeUnreadable("moved while opening") }
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
-        guard descriptor >= 0 else { throw HostJournalError.storeMissing }
+        guard descriptor >= 0 else { throw JournalStoreError.storeMissing }
         defer { close(descriptor) }
         var opened = stat()
         var named = stat()
         guard fstat(descriptor, &opened) == 0, stat(url.path, &named) == 0,
               opened.st_dev == named.st_dev, opened.st_ino == named.st_ino
         else {
-            throw HostJournalError.storeUnreadable("replaced while opening")
+            throw JournalStoreError.storeUnreadable("replaced while opening")
         }
         var header = [UInt8](repeating: 0, count: 100)
-        guard pread(descriptor, &header, 100, 0) == 100 else { throw HostJournalError.storeCorrupt("header") }
-        guard try !database.hasMoved() else { throw HostJournalError.storeUnreadable("moved while opening") }
+        guard pread(descriptor, &header, 100, 0) == 100 else { throw JournalStoreError.storeCorrupt("header") }
+        guard try !database.hasMoved() else { throw JournalStoreError.storeUnreadable("moved while opening") }
         return HostJournalFileToken(
             device: UInt64(opened.st_dev), inode: UInt64(opened.st_ino), header: Data(header[24..<32] + header[40..<44])
         )

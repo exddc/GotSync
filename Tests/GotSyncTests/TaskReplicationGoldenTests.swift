@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 @MainActor
 final class TaskReplicationGoldenTests: XCTestCase {

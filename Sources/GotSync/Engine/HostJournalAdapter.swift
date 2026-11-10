@@ -46,6 +46,8 @@ enum HostRepair: Equatable, Sendable {
     case lifecycleUnreadable
     /// Opening could not complete; files are kept for a later launch.
     case launchFailed(String)
+    /// The launch inputs kept changing while it was opening.
+    case launchInputsChanged
     /// A session being reset did not prove that it closed. It stays held,
     /// with its files and key, and no new session is built.
     case sessionCloseUncertain
@@ -279,7 +281,7 @@ extension HostJournalAdapter: HostReplicationData {
         guard let current = proof else { return true }
         let store = try bound()
         let complete = try await store.extendProof(current.id)
-        guard self.store === store, proof?.id == current.id else { throw HostJournalError.proofStale }
+        guard self.store === store, proof?.id == current.id else { throw JournalStoreError.proofStale }
         return complete
     }
 
@@ -298,7 +300,7 @@ extension HostJournalAdapter: HostReplicationData {
         }
         let (result, pendingGrew) = try await store.intake(next: indexes.count, ofProof: current.id, from: current.consumed)
         guard self.store === store, proof?.id == current.id, proof?.consumed == current.consumed else {
-            throw HostJournalError.proofStale
+            throw JournalStoreError.proofStale
         }
         proof = (current.id, current.consumed + result.ownedArrivals)
         let held = result.ownedArrivals < indexes.count ? indexes[result.ownedArrivals] : chunk.count

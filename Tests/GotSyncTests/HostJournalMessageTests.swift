@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class HostJournalMessageTests: XCTestCase {
     private let member = Data(repeating: 0x21, count: 32)

@@ -3182,7 +3182,7 @@ public final class SyncEngine {
             let chunkHeld: (held: Int, requestsHello: Bool)
             do {
                 chunkHeld = try await drainChunk(chunk, before: held, of: messages.count, fingerprint: fingerprint, session: session)
-            } catch HostJournalError.proofStale {
+            } catch JournalStoreError.proofStale {
                 guard try await proveWindow(Array(window[range.lowerBound...]), session: session) else {
                     requestSyncCycle(force: true)
                     break
@@ -3219,7 +3219,7 @@ public final class SyncEngine {
                 }
                 try requireHostBinding(binding, session)
                 return true
-            } catch HostJournalError.proofStale {
+            } catch JournalStoreError.proofStale {
                 try requireHostBinding(binding, session)
             }
         }
@@ -4065,10 +4065,10 @@ public final class SyncEngine {
             return .blocked(.incompatibleGroupProfile)
         case MLSRelayError.historyExpired:
             return .blocked(.syncHistoryExpired)
-        case ReplicaError.operationFork, HostJournalError.fork, HostJournalError.foreignOwnOrigin,
-             HostJournalError.retainedRecordMissing:
+        case ReplicaError.operationFork, JournalStoreError.fork, JournalStoreError.foreignOwnOrigin,
+             JournalStoreError.retainedRecordMissing:
             return .blocked(.syncHistoryConflict)
-        case is HostJournalError, is HostEngineError:
+        case is JournalStoreError, is HostEngineError:
             return .storage
         case MLSSessionError.unresolvedConflict, is SyncCycleError:
             return .transient
@@ -4252,18 +4252,24 @@ extension SyncEngine {
         )
     }
 
-    /// The active journal while new host work may start.
-    var hostJournal: HostJournal? {
-        hostWorkAllowed && hostAdapter?.store?.isClosed != true ? hostAdapter?.store : nil
+    /// The handle of the current journal generation while host work may
+    /// start; nil while opening, closing, failed, repaired or stopped. A
+    /// handle is never re-bound: after a change, read this again.
+    @_spi(HostJournalPreview) public var hostJournal: HostJournal? {
+        guard hostWorkAllowed, let store = hostAdapter?.store, store.fence == .open else { return nil }
+        return store
     }
 
-    func hostJournalArchives() throws -> [HostJournalListing] {
+    /// The directory holding this engine's journal files; nil for task profiles.
+    var hostJournalDirectory: URL? { hostAdapter?.directory }
+
+    func hostJournalListings() throws -> [HostJournalListing] {
         guard let directory = hostAdapter?.directory else { return [] }
-        return try HostJournalArchive.discover(in: directory)
+        return try HostJournalFiles.discover(in: directory)
     }
 
     func exportHostJournal(_ url: URL, after cursor: HostJournalExportCursor?, limit: Int) throws -> HostJournalExportPage {
-        try HostJournalArchive.export(url, after: cursor, limit: limit)
+        try HostJournalFiles.export(url, after: cursor, limit: limit)
     }
 
     /// Waits until no writer of that journal remains open, so the file is
@@ -4272,9 +4278,9 @@ extension SyncEngine {
         guard let directory = hostAdapter?.directory else { return }
         await awaitHostJournalShutdowns()
         if let bound = hostAdapter?.store, bound.view.journalID == journalID, !bound.isClosed {
-            throw HostJournalError.notArchived
+            throw JournalStoreError.notArchived
         }
-        try HostJournalArchive.discard(in: directory, journalID: journalID, confirming: confirming)
+        try HostJournalFiles.discard(in: directory, journalID: journalID, confirming: confirming)
     }
 
     private var hostWorkAllowed: Bool {
@@ -4325,7 +4331,7 @@ extension SyncEngine {
 
     /// An independent stream of composed-view revisions: the current one
     /// first, then the newest on every publication, until `stop`.
-    func hostViewChanges() -> AsyncStream<UInt64> {
+    @_spi(HostJournalPreview) public func hostViewChanges() -> AsyncStream<UInt64> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<UInt64>.makeStream(bufferingPolicy: .bufferingNewest(1))
         hostViewSubscribers[id] = continuation
@@ -4408,8 +4414,8 @@ extension SyncEngine {
     }
 
     private func hostArchivesAdmitLink() -> Bool {
-        guard let listings = try? hostJournalArchives() else { return false }
-        return HostJournalArchive.admitsNewLink(listings)
+        guard let listings = try? hostJournalListings() else { return false }
+        return HostJournalFiles.admitsNewLink(listings)
     }
 
     /// A provider may choose a completion cut only once its own history is
@@ -4669,7 +4675,7 @@ extension SyncEngine {
                 return .failed(error)
             }
         }()
-        async let listings = Result { try HostJournalArchive.discover(in: directory) }
+        async let listings = Result { try HostJournalFiles.discover(in: directory) }
         return PreparedHostLaunch(session: await session, listings: await listings)
     }
 
@@ -4743,13 +4749,13 @@ extension SyncEngine {
             let inputs = currentHostLaunchInputs
             if inputs == launch.inputs { break }
             guard attempts < 3 else {
-                failHostLaunch(HostEngineError.launchInputsChanged)
+                hostRepair = hostRepair ?? .launchInputsChanged
                 return .failed
             }
             attempts += 1
             launch.inputs = inputs
             guard let directory = hostAdapter?.directory else { return .dropped }
-            listings = await Task.detached { Result { try HostJournalArchive.discover(in: directory) } }.value
+            listings = await Task.detached { Result { try HostJournalFiles.discover(in: directory) } }.value
         }
         let observed: [HostJournalListing]
         switch listings {

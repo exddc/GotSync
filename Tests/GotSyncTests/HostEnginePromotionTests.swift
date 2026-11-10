@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Engine drains prove the whole frozen window before any intake and
 /// promote pending chains in bounded steps.
@@ -38,7 +38,7 @@ extension HostEngineTests {
         do {
             try await b.drainInboxForTesting()
             XCTFail("a window ending in a forked chain was taken")
-        } catch HostJournalError.fork(let forkedOrigin, let sequence) {
+        } catch JournalStoreError.fork(let forkedOrigin, let sequence) {
             XCTAssertEqual(forkedOrigin, origin)
             XCTAssertEqual(sequence, 1_201)
         }

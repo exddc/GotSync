@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import GotSyncMLS
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class MemorySecretStore: SecretStore, @unchecked Sendable {
     private let lock = NSLock()

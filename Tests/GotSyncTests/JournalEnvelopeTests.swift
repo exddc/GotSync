@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class JournalEnvelopeTests: XCTestCase {
     private let origin = Data(repeating: 0xA1, count: 16)

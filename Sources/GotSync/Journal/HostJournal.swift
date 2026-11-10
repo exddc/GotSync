@@ -6,8 +6,8 @@ import Foundation
 /// is adopted, and an admitted command runs to its outcome even when its
 /// caller is cancelled. `view` and the origin inventory are read from the
 /// adopted snapshot without touching the file.
-@MainActor
-final class HostJournal {
+@_spi(HostJournalPreview) @MainActor
+public final class HostJournal {
     enum Admission {
         /// Host enrollment, submission, application and readiness.
         case host
@@ -115,36 +115,76 @@ final class HostJournal {
                 return journal
             }
         }
-        throw HostJournalError.storeUnreadable("changed or contended while opening")
+        throw JournalStoreError.storeUnreadable("changed or contended while opening")
     }
 
     // MARK: - Host calls
 
-    func enroll() async throws -> HostJournalProvenance {
+    /// The journal this handle is bound to.
+    public var journalID: Data { view.journalID }
+
+    /// The group the journal belongs to.
+    public var group: Data { view.group }
+
+    /// Starts an enrollment that the host confirms with `resume` after saving
+    /// the returned provenance.
+    public func enroll() async throws -> HostProvenance {
         resumedEnrollment = nil
-        return try await perform("enroll", .host) { try $0.enroll() }
+        let started = try await surfacing { try await perform("enroll", .host) { try $0.enroll() } }
+        return HostProvenance(started)
     }
 
-    func resume(_ stored: HostJournalProvenance) async throws -> HostJournalProvenance {
-        let confirmed = try await perform("resume", .host) { try $0.resume(stored) }
+    /// Confirms a pending enrollment, or checks a confirmed one against the
+    /// host's saved provenance. Required once per process before the other
+    /// host calls.
+    public func resume(_ stored: HostProvenance) async throws -> HostProvenance {
+        let provenance = stored.stored
+        let confirmed = try await surfacing { try await perform("resume", .host) { try $0.resume(provenance) } }
         resumedEnrollment = confirmed.enrollmentID
-        return confirmed
+        return HostProvenance(confirmed)
     }
 
-    func submit(_ batch: [HostJournalMutation], capturedThrough: UInt64) async throws -> [JournalRecordID] {
-        try await perform("submit", .host) { try $0.submit(batch, capturedThrough: capturedThrough) }
+    /// Appends new mutations as own records and returns the existing record
+    /// for a repeated ID with the same payload. All or nothing.
+    public func submit(_ batch: [HostMutation], capturedThrough: UInt64) async throws -> [HostRecordID] {
+        let mutations = batch.map { HostJournalMutation(id: $0.id.bytes, payload: $0.payload) }
+        let records = try await surfacing {
+            try await perform("submit", .host) { try $0.submit(mutations, capturedThrough: capturedThrough) }
+        }
+        return records.map(HostRecordID.init)
     }
 
-    func incoming(after position: UInt64, limit: Int) async throws -> [HostJournalIncoming] {
-        try await perform("incoming", .host) { try $0.incoming(after: position, limit: limit) }
+    /// Remote records after `position`, nil for the start, in delivery order.
+    public func incoming(after position: JournalPosition?, limit: Int) async throws -> [IncomingRecord] {
+        let after = position?.rawValue ?? 0
+        let records = try await surfacing {
+            try await perform("incoming", .host) { try $0.incoming(after: after, limit: limit) }
+        }
+        return records.compactMap(IncomingRecord.init)
     }
 
-    func markApplied(through position: UInt64) async throws {
-        try await perform("markApplied", .host) { try $0.markApplied(through: position) }
+    /// Records that the host committed its business state through `position`.
+    public func markApplied(through position: JournalPosition) async throws {
+        let through = position.rawValue
+        try await surfacing { try await perform("markApplied", .host) { try $0.markApplied(through: through) } }
     }
 
-    func declareReady(capturedThrough: UInt64) async throws {
-        try await perform("declareReady", .host) { try $0.declareReady(capturedThrough: capturedThrough) }
+    /// The host has submitted all of its preexisting content through its
+    /// capture counter `capturedThrough`.
+    public func declareReady(capturedThrough: UInt64) async throws {
+        try await surfacing {
+            try await perform("declareReady", .host) { try $0.declareReady(capturedThrough: capturedThrough) }
+        }
+    }
+
+    /// Runs a host call and raises only public errors. An admitted call's
+    /// committed outcome is returned unchanged.
+    private func surfacing<T>(_ body: () async throws -> T) async throws -> T {
+        do {
+            return try await body()
+        } catch {
+            throw HostJournalError.surfaced(error)
+        }
     }
 
     // MARK: - Engine calls
@@ -256,11 +296,11 @@ final class HostJournal {
     private func admit(_ admission: Admission) throws -> UInt64 {
         switch admission {
         case .host:
-            guard fence == .open else { throw view.isRetired ? HostJournalError.retired : HostJournalError.fenced }
+            guard fence == .open else { throw view.isRetired ? JournalStoreError.retired : JournalStoreError.fenced }
         case .engine:
-            guard fence < .closing else { throw HostJournalError.fenced }
+            guard fence < .closing else { throw JournalStoreError.fenced }
         case .handoff:
-            guard fence < .closed else { throw HostJournalError.fenced }
+            guard fence < .closed else { throw JournalStoreError.fenced }
         case .internal:
             break
         }

@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Characterizes closing a near-limit pending chain: the window proof
 /// steps, the arriving head's proof-token intake, and every bounded

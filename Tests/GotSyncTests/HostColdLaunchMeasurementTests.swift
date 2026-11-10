@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// One process-cold launch of a full journal: archive discovery, validation
 /// on a detached task's own connection, and the main-actor install. Run once
@@ -21,7 +21,7 @@ final class HostColdLaunchMeasurementTests: XCTestCase {
         }
         let url = HostJournalStore.fileURL(in: directory, journalID: journalID)
         let launch = ContinuousClock.now
-        let listings = try HostJournalArchive.discover(in: directory)
+        let listings = try HostJournalFiles.discover(in: directory)
         let discovered = ContinuousClock.now
         let cancellation = HostJournalCancellation()
         let prepared = try await Task.detached(priority: .userInitiated) {

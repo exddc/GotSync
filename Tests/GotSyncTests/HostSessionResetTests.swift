@@ -1,5 +1,5 @@
 import Foundation
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 import GotSyncMLS
 import os
 import XCTest
@@ -246,15 +246,19 @@ extension HostEngineTests {
     func testAFreshFounderDeclineClosesTheOldSessionBeforeTodaysDeletion() async throws {
         let a = engine("a")
         let b = engine("b")
-        var gate: CheckedContinuation<Void, Never>?
-        a.afterAddGateForTesting = { await withCheckedContinuation { gate = $0 } }
+        let gate = ResetPairingGate()
+        defer {
+            a.afterAddGateForTesting = nil
+            gate.release()
+        }
+        a.afterAddGateForTesting = { await gate.wait() }
         try await wait("host ready") { !a.canCancelPairing }
         a.createPrivateSync()
         try await wait("invitation") { a.invitationURL != nil }
         b.joinPrivateSync(url: try XCTUnwrap(a.invitationURL))
         try await wait("safety code") { a.isHostApprovalPending && b.safetyCode != nil }
         a.approveSafetyCode()
-        try await wait("inviter held after its Add") { gate != nil }
+        try await wait("inviter held after its Add") { gate.isHeld }
         let old = try XCTUnwrap(a.mlsSessionForTesting)
         let oldDirectory = a.mlsDirectoryForTesting
         let claims = directory("a").appendingPathComponent(ReplicationCheckpoint.foundingClaimsFilename)
@@ -266,8 +270,7 @@ extension HostEngineTests {
         }
         b.rejectSafetyCode()
         try await wait("decline received") { a.peerDecisionForTesting == false }
-        gate?.resume()
-        gate = nil
+        gate.release()
         try await wait("declined and replaced") {
             a.lastPairingFailure == .pairingDeclined && a.mlsSessionForTesting != nil && a.mlsDirectoryForTesting != oldDirectory
         }
@@ -279,6 +282,26 @@ extension HostEngineTests {
         XCTAssertFalse(FileManager.default.fileExists(atPath: claims.path))
         XCTAssertNotEqual(try stores["a"]?.read(account: SecretStoreMLSStateKey.account), key)
         XCTAssertEqual(try Self.journalFiles(directory("a")), journalsBefore, "the decline changed journal retention")
+    }
+}
+
+@MainActor
+private final class ResetPairingGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    var isHeld: Bool { continuation != nil }
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        let waiting = continuation
+        continuation = nil
+        waiting?.resume()
     }
 }
 

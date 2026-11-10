@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Ownership, finite delivery, certification and intake status of the host
 /// engine across closing, restarts, saved obligations and direct MLS work.
@@ -120,7 +120,7 @@ extension HostEngineTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try await HostJournal.create(in: directory, group: JournalFixture.group, founder: true)
         _ = try await store.resume(try await store.enroll())
-        _ = try await store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data("cut".utf8))], capturedThrough: 1)
+        _ = try await store.submit([HostMutation(id: HostMutationID(bytes: JournalFixture.mutationID(1)), payload: Data("cut".utf8))], capturedThrough: 1)
         let adapter = HostJournalAdapter(directory: directory, limits: .standard)
         adapter.bind(store)
         let cut = adapter.helloVector
@@ -128,7 +128,7 @@ extension HostEngineTests {
         obligation.merge(ReplicaVersionVector(), provider: true)
         obligation.addBootstrap(Data(repeating: 0xAA, count: 32), from: ReplicaVersionVector())
         obligation.bootstrap![0].cut = cut
-        _ = try await store.submit([HostJournalMutation(id: JournalFixture.mutationID(2), payload: Data("after cut".utf8))], capturedThrough: 2)
+        _ = try await store.submit([HostMutation(id: HostMutationID(bytes: JournalFixture.mutationID(2)), payload: Data("after cut".utf8))], capturedThrough: 2)
         let selected = try await XCTUnwrapAsync(try await adapter.reply(for: obligation, uploadedThrough: 0, bound: cut))
         XCTAssertEqual(selected.records.map(\.1), [1])
         obligation.advance(past: selected.records)
@@ -323,8 +323,8 @@ extension HostEngineTests {
             XCTAssertNil(cached.view.retirement, path)
             let before = try JournalFixture.fileHash(cached.url)
             let refusals: [(String, () async throws -> Void)] = [
-                ("submit", { _ = try await cached.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data("x".utf8))], capturedThrough: 99) }),
-                ("markApplied", { try await cached.markApplied(through: 0) }),
+                ("submit", { _ = try await cached.submit([HostMutation(id: HostMutationID(UUID()), payload: Data("x".utf8))], capturedThrough: 99) }),
+                ("markApplied", { try await cached.markApplied(through: try XCTUnwrap(JournalPosition(rawValue: 1))) }),
                 ("declareReady", { try await cached.declareReady(capturedThrough: 99) }),
                 ("enroll", { _ = try await cached.enroll() }),
                 ("resume", { _ = try await cached.resume(provenance) }),

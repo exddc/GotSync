@@ -1,6 +1,6 @@
 import CryptoKit
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class BlobCodecTests: XCTestCase {
     func testLayoutMatchesFrozenBoundaryVectorsInBothDirections() throws {

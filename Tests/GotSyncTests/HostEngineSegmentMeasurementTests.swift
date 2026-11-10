@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Main-actor segments of the host engine around the writer: window decode
 /// stretches, the drain-chunk continuation up to acknowledgement, checkpoint

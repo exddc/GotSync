@@ -3,7 +3,7 @@ import Foundation
 import GotSyncMLS
 import SQLite3
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Ten devices, each with its own identity, storage, and secret store, share
 /// one group on the real relay that `scripts/test-integration.sh` starts.

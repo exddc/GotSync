@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 extension HostEngineTests {
     func testCancelledRemovedJoinRetiresItsInboxBeforeCheckpoint() async throws {

@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Measures host intake through the writer: each proof step and chunk
 /// commit as the engine awaits it, which now runs off the main actor, plus a

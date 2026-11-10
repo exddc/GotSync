@@ -58,7 +58,7 @@ actor HostJournalWriter {
         hook: (@Sendable (HostJournalCommitPoint) throws -> Void)?, _ body: @Sendable (HostJournalStore) throws -> T
     ) -> HostJournalOutcome<T> {
         guard let store else {
-            return HostJournalOutcome(result: .failure(HostJournalError.fenced), snapshot: nil)
+            return HostJournalOutcome(result: .failure(JournalStoreError.fenced), snapshot: nil)
         }
         store.faultHookForTesting = hook
         defer { store.faultHookForTesting = nil }

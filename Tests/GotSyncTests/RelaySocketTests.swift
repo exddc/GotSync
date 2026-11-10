@@ -1,5 +1,5 @@
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class RelaySocketTests: XCTestCase {
     func testRegistrationIsCanonicalAndOpaque() throws {

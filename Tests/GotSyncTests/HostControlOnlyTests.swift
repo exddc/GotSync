@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Control-only MLS processing used by host departures: group state, cursor
 /// and speaker evidence advance, application plaintext is never stored.

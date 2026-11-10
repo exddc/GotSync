@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// The off-main writer boundary: ticket order, settlement of committed and
 /// failed commands, caller cancellation, fences, connection close, the
@@ -18,14 +18,14 @@ final class HostWriterBoundaryTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    private func enrolled() async throws -> (HostJournal, HostJournalProvenance) {
+    private func enrolled() async throws -> (HostJournal, HostProvenance) {
         let journal = try await HostJournal.create(in: directory, group: JournalFixture.group)
         let provenance = try await journal.resume(try await journal.enroll())
         return (journal, provenance)
     }
 
-    private func mutation(_ index: Int, _ text: String = "edit") -> HostJournalMutation {
-        HostJournalMutation(id: JournalFixture.mutationID(index), payload: Data("\(text) \(index)".utf8))
+    private func mutation(_ index: Int, _ text: String = "edit") -> HostMutation {
+        HostMutation(id: HostMutationID(bytes: JournalFixture.mutationID(index)), payload: Data("\(text) \(index)".utf8))
     }
 
     private func openConnections(_ url: URL) -> Int {
@@ -79,8 +79,8 @@ final class HostWriterBoundaryTests: XCTestCase {
         XCTAssertEqual(journal.view.ownHead, 1)
 
         let resumer = Task {
-            try await journal.resume(HostJournalProvenance(
-                journalID: provenance.journalID, enrollmentID: provenance.enrollmentID, appliedThrough: 0, capturedThrough: 1
+            try await journal.resume(HostProvenance(
+                journalID: provenance.journalID, enrollmentID: provenance.enrollmentID, appliedThrough: nil, capturedThrough: 1
             ))
         }
         try await waitUntil { gate != nil }
@@ -90,20 +90,29 @@ final class HostWriterBoundaryTests: XCTestCase {
         let resumed = try await resumer.value
         XCTAssertEqual(resumed.capturedThrough, 1)
 
-        let applier = Task { try await journal.markApplied(through: 0) }
+        journal.deliveryGateForTesting = nil
+        let arrivals = [JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(0xA1), count: 1), cursor: 1)]
+        let proof = try await journal.beginProof(arrivals)
+        while try await !journal.extendProof(proof) {}
+        _ = try await journal.intake(next: 1, ofProof: proof, from: 0)
+        let incoming = try await journal.incoming(after: nil, limit: 1)
+        let position = try XCTUnwrap(incoming.first?.position)
+        journal.deliveryGateForTesting = { _ in await withCheckedContinuation { gate = $0 } }
+        let applier = Task { try await journal.markApplied(through: position) }
         try await waitUntil { gate != nil }
         applier.cancel()
         gate?.resume()
         gate = nil
         try await applier.value
+        XCTAssertEqual(journal.view.appliedThrough, position.rawValue)
         journal.deliveryGateForTesting = nil
 
         let retried = try await journal.submit([mutation(1)], capturedThrough: 1)
         XCTAssertEqual(retried, records, "an exact retry got different records")
         XCTAssertEqual(journal.view.ownHead, 1)
-        await XCTAssertThrowsErrorAsync(try await journal.resume(HostJournalProvenance(
-            journalID: provenance.journalID, enrollmentID: provenance.enrollmentID, appliedThrough: 0, capturedThrough: 0
-        ))) { XCTAssertEqual($0 as? HostJournalError, .hostCaptureRegressed) }
+        await XCTAssertThrowsErrorAsync(try await journal.resume(HostProvenance(
+            journalID: provenance.journalID, enrollmentID: provenance.enrollmentID, appliedThrough: nil, capturedThrough: 0
+        ))) { XCTAssertEqual($0 as? HostJournalError, .repairRequired(.hostCaptureRegressed)) }
         await journal.shutdown()
     }
 
@@ -123,7 +132,7 @@ final class HostWriterBoundaryTests: XCTestCase {
         let (journal, _) = try await enrolled()
         _ = try await journal.submit([mutation(1)], capturedThrough: 1)
         let snapshot = journal.snapshot
-        let conflicting = HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data("different".utf8))
+        let conflicting = HostMutation(id: HostMutationID(bytes: JournalFixture.mutationID(1)), payload: Data("different".utf8))
         await XCTAssertThrowsErrorAsync(try await journal.submit([conflicting], capturedThrough: 1)) {
             XCTAssertEqual($0 as? HostJournalError, .hostMutationConflict(conflicting.id))
         }
@@ -174,13 +183,13 @@ final class HostWriterBoundaryTests: XCTestCase {
         let first = try await journal.beginProof(arrivals)
         while try await !journal.extendProof(first) {}
         let second = try await journal.beginProof(arrivals)
-        await XCTAssertThrowsErrorAsync(try await journal.extendProof(first)) { XCTAssertEqual($0 as? HostJournalError, .proofStale) }
+        await XCTAssertThrowsErrorAsync(try await journal.extendProof(first)) { XCTAssertEqual($0 as? JournalStoreError, .proofStale) }
         await XCTAssertThrowsErrorAsync(try await journal.intake(next: 1, ofProof: first, from: 0)) {
-            XCTAssertEqual($0 as? HostJournalError, .proofStale)
+            XCTAssertEqual($0 as? JournalStoreError, .proofStale)
         }
         while try await !journal.extendProof(second) {}
         await XCTAssertThrowsErrorAsync(try await journal.intake(next: 1, ofProof: second, from: 1)) {
-            XCTAssertEqual($0 as? HostJournalError, .proofStale, "a chunk was taken out of order")
+            XCTAssertEqual($0 as? JournalStoreError, .proofStale, "a chunk was taken out of order")
         }
         let firstChunk = try await journal.intake(next: 1, ofProof: second, from: 0).intake.ownedArrivals
         XCTAssertEqual(firstChunk, 1)
@@ -328,7 +337,7 @@ extension HostEngineTests {
         let head = journal.view.ownHead
         let gate = held(journal, "submit")
         let next = captured["b", default: 0] + 1
-        let submitter = Task { try await journal.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data("held".utf8))], capturedThrough: next) }
+        let submitter = Task { try await journal.submit([HostMutation(id: HostMutationID(UUID()), payload: Data("held".utf8))], capturedThrough: next) }
         try await until { gate() != nil }
         submitter.cancel()
         b.unlinkAndKeepTasks()
@@ -352,7 +361,7 @@ extension HostEngineTests {
         let gate = held(journal, "submit")
         let next = captured["b", default: 0] + 1
         captured["b"] = next
-        let submitter = Task { try await journal.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data("held".utf8))], capturedThrough: next) }
+        let submitter = Task { try await journal.submit([HostMutation(id: HostMutationID(UUID()), payload: Data("held".utf8))], capturedThrough: next) }
         try await until { gate() != nil }
         HostJournalWriter.connectionsForTesting.withLock { $0.peak = $0.open[url.path] ?? 0 }
         var stopped = false
@@ -382,7 +391,7 @@ extension HostEngineTests {
         XCTAssertNotEqual(fresh.generation, journal.generation)
         XCTAssertEqual(fresh.view.ownHead, journal.view.ownHead)
         try await submit(b, "b", ["after restart"])
-        await XCTAssertThrowsErrorAsync(try await journal.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data())], capturedThrough: 99)) {
+        await XCTAssertThrowsErrorAsync(try await journal.submit([HostMutation(id: HostMutationID(UUID()), payload: Data())], capturedThrough: 99)) {
             XCTAssertEqual($0 as? HostJournalError, .fenced)
         }
         XCTAssertEqual(HostJournalWriter.connectionsForTesting.withLock { $0.peak }, 1, "two writers overlapped on one path")
@@ -507,7 +516,7 @@ extension HostEngineTests {
         journal.deliveryGateForTesting = { name in
             if name == "incoming" { await withCheckedContinuation { gate = $0 } }
         }
-        let reading = Task { try await journal.incoming(after: 0, limit: 1) }
+        let reading = Task { try await journal.incoming(after: nil, limit: 1) }
         try await until { gate != nil }
         let replying = Task { try await a.sendRepliesForTesting() }
         try await Task.sleep(for: .milliseconds(150))
@@ -528,7 +537,7 @@ extension HostEngineTests {
         journal.deliveryGateForTesting = { name in
             if name == "incoming" { await withCheckedContinuation { gate = $0 } }
         }
-        let reading = Task { try await journal.incoming(after: 0, limit: 1) }
+        let reading = Task { try await journal.incoming(after: nil, limit: 1) }
         try await until { gate != nil }
         XCTAssertEqual(a.hostView?.journalSettled, false)
         XCTAssertEqual(a.hostView?.isQuiescent, false, "a paused result was reported quiescent")

@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Host-journal groups on the one sync engine: generation binding, provider
 /// eligibility and finite completion, intake ownership, quiescence and the
@@ -14,7 +14,7 @@ final class HostEngineTests: XCTestCase {
     var rendezvous: FakePairingRendezvous!
     var stores: [String: MemorySecretStore] = [:]
     var engines: [SyncEngine] = []
-    var provenances: [String: HostJournalProvenance] = [:]
+    var provenances: [String: HostProvenance] = [:]
     var captured: [String: UInt64] = [:]
     let profile = try! SyncGroupProfile(
         application: "org.gotsync.host", schema: .hostJournal(payload: "example.records", version: 1), memberLimit: 10
@@ -124,9 +124,9 @@ final class HostEngineTests: XCTestCase {
         try await engine.reopenStoppedHostJournalForTesting()
         let journal = try store(engine)
         if let stored = provenances[name] {
-            provenances[name] = try await journal.resume(HostJournalProvenance(
+            provenances[name] = try await journal.resume(HostProvenance(
                 journalID: stored.journalID, enrollmentID: stored.enrollmentID,
-                appliedThrough: max(stored.appliedThrough, journal.view.appliedThrough),
+                appliedThrough: JournalPosition(rawValue: max(stored.appliedThrough?.rawValue ?? 0, journal.view.appliedThrough)),
                 capturedThrough: captured[name] ?? stored.capturedThrough
             ))
         } else {
@@ -135,11 +135,11 @@ final class HostEngineTests: XCTestCase {
     }
 
     @discardableResult
-    func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) async throws -> [JournalRecordID] {
+    func submit(_ engine: SyncEngine, _ name: String, _ payloads: [String]) async throws -> [HostRecordID] {
         try await engine.reopenStoppedHostJournalForTesting()
         captured[name, default: 0] += UInt64(payloads.count)
         return try await store(engine).submit(
-            payloads.map { HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data($0.utf8)) },
+            payloads.map { HostMutation(id: HostMutationID(UUID()), payload: Data($0.utf8)) },
             capturedThrough: captured[name, default: 0]
         )
     }
@@ -155,7 +155,7 @@ final class HostEngineTests: XCTestCase {
         let journal = try store(engine)
         var payloads: [Data] = []
         while true {
-            let batch = try await journal.incoming(after: journal.view.appliedThrough, limit: 64)
+            let batch = try await journal.incoming(after: JournalPosition(rawValue: journal.view.appliedThrough), limit: 64)
             guard let last = batch.last else { return payloads }
             payloads += batch.map(\.payload)
             try await journal.markApplied(through: last.position)
@@ -426,7 +426,7 @@ final class HostEngineTests: XCTestCase {
         do {
             try await b.drainInboxForTesting()
             XCTFail("a forked window was taken")
-        } catch HostJournalError.fork(let forked, let sequence) {
+        } catch JournalStoreError.fork(let forked, let sequence) {
             XCTAssertEqual(forked, origin)
             XCTAssertEqual(sequence, 1)
         }
@@ -499,7 +499,7 @@ final class HostEngineTests: XCTestCase {
         let journalID = stale.view.journalID
         b.unlinkAndKeepTasks()
         try await wait("unlinked") { !b.isPaired && b.hostLifecycle == .active }
-        await XCTAssertThrowsErrorAsync(try await stale.submit([HostJournalMutation(id: HostJournalStore.randomBytes(16), payload: Data())], capturedThrough: 9)) {
+        await XCTAssertThrowsErrorAsync(try await stale.submit([HostMutation(id: HostMutationID(UUID()), payload: Data())], capturedThrough: 9)) {
             XCTAssertEqual($0 as? HostJournalError, .retired)
         }
         let url = HostJournalStore.fileURL(in: directory("b"), journalID: journalID)
@@ -684,7 +684,7 @@ final class HostEngineTests: XCTestCase {
         c.joinPrivateSync(url: try XCTUnwrap(a.invitationURL))
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertNil(c.safetyCode)
-        XCTAssertEqual(try c.hostJournalArchives().count, 4)
+        XCTAssertEqual(try c.hostJournalListings().count, 4)
         let url = HostJournalStore.fileURL(in: directory("c"), journalID: retired[0])
         XCTAssertNotNil(try c.exportHostJournal(url, after: nil, limit: 10))
         await XCTAssertThrowsErrorAsync(try await c.discardRetiredHostJournal(retired[0], confirming: retired[1]))

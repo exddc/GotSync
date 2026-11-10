@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Main-actor segments of journal commands through the writer: each
 /// command's admission and settlement, and the lateness of a 1 ms main-actor
@@ -32,7 +32,7 @@ final class HostWriterSegmentMeasurementTests: XCTestCase {
             let journal = try await HostJournal.create(in: directory, group: JournalFixture.group)
             _ = try await journal.resume(try await journal.enroll())
             let batch = (0..<(limit / 65_536)).map {
-                HostJournalMutation(id: JournalFixture.mutationID(sample * 100 + $0), payload: Data(repeating: UInt8($0), count: 65_536 - 64))
+                HostMutation(id: HostMutationID(bytes: JournalFixture.mutationID(sample * 100 + $0)), payload: Data(repeating: UInt8($0), count: 65_536 - 64))
             }
             observe(journal)
             try await timed("submit.new.wall") { _ = try await journal.submit(batch, capturedThrough: 16) }
@@ -68,10 +68,12 @@ final class HostWriterSegmentMeasurementTests: XCTestCase {
         for _ in 0..<samples {
             position += 1
             let single = position
-            try await timed("markApplied.1.wall") { try await journal.markApplied(through: single) }
+            let singlePosition = try XCTUnwrap(JournalPosition(rawValue: single))
+            try await timed("markApplied.1.wall") { try await journal.markApplied(through: singlePosition) }
             position += 256
             let batched = position
-            try await timed("markApplied.256.wall") { try await journal.markApplied(through: batched) }
+            let batchedPosition = try XCTUnwrap(JournalPosition(rawValue: batched))
+            try await timed("markApplied.256.wall") { try await journal.markApplied(through: batchedPosition) }
         }
         stopTicker()
         await journal.shutdown()

@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// The bounded window proof, its intake token and bounded promotion of
 /// pending chains.
@@ -129,7 +129,7 @@ final class HostWindowProofTests: XCTestCase {
             return nil
         }
         XCTAssertEqual(pending, chain[1...].map(\.bytes))
-        XCTAssertThrowsError(try store.promote()) { XCTAssertEqual($0 as? HostJournalError, .retired) }
+        XCTAssertThrowsError(try store.promote()) { XCTAssertEqual($0 as? JournalStoreError, .retired) }
     }
 
     func testValidationAcceptsPromotableButRejectsPendingAtOrBelowTheHead() throws {
@@ -142,7 +142,7 @@ final class HostWindowProofTests: XCTestCase {
         XCTAssertNoThrow(try HostJournalStore.open(store.url))
         try JournalFixture.tamper(store.url, "INSERT INTO pending SELECT origin, sequence, envelope, digest FROM records WHERE sequence = 1")
         let damaged = JournalFixture.storedState(store.url)
-        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt("pending")) }
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt("pending")) }
         XCTAssertEqual(JournalFixture.storedState(store.url), damaged)
     }
 
@@ -150,7 +150,7 @@ final class HostWindowProofTests: XCTestCase {
         let store = try HostJournalStore.create(in: directory, group: JournalFixture.group)
         try JournalFixture.tamper(store.url, "PRAGMA user_version = 2")
         let before = JournalFixture.storedState(store.url)
-        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(2)) }
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(2)) }
         XCTAssertEqual(JournalFixture.storedState(store.url), before)
     }
 
@@ -193,7 +193,7 @@ final class HostWindowProofTests: XCTestCase {
                 steps += 1
                 XCTAssertFalse(store.isInTransactionForTesting)
             }
-        }()) { XCTAssertEqual($0 as? HostJournalError, .fork(origin: origin, sequence: 1_201)) }
+        }()) { XCTAssertEqual($0 as? JournalStoreError, .fork(origin: origin, sequence: 1_201)) }
         XCTAssertGreaterThan(steps, 2, "the fork was not found in a later walk step")
         XCTAssertEqual(JournalFixture.storedState(store.url), before)
         XCTAssertEqual(store.view.revision, revision)
@@ -223,7 +223,7 @@ final class HostWindowProofTests: XCTestCase {
         var proof = try store.beginProof([JournalFixture.arrival(chain, cursor: 1)])
         XCTAssertFalse(try store.extendProof(&proof))
         _ = try store.intake([JournalFixture.arrival(try JournalFixture.chain(JournalFixture.origin(5), count: 1), cursor: 9)])
-        XCTAssertThrowsError(try store.extendProof(&proof)) { XCTAssertEqual($0 as? HostJournalError, .proofStale) }
+        XCTAssertThrowsError(try store.extendProof(&proof)) { XCTAssertEqual($0 as? JournalStoreError, .proofStale) }
         var (fresh, _) = try prove(store, [JournalFixture.arrival(chain, cursor: 1)])
         XCTAssertEqual(try store.intake(next: 1, of: &fresh).ownedArrivals, 1)
         XCTAssertEqual(store.view.delivered, 1_201)
@@ -247,9 +247,9 @@ final class HostWindowProofTests: XCTestCase {
         let chain = try JournalFixture.chain(JournalFixture.origin(4), count: 3)
         var (proof, _) = try prove(store, [JournalFixture.arrival(chain, cursor: 1)])
         let replacement = try HostJournalStore.open(store.url)
-        XCTAssertThrowsError(try replacement.intake(next: 1, of: &proof)) { XCTAssertEqual($0 as? HostJournalError, .proofStale) }
+        XCTAssertThrowsError(try replacement.intake(next: 1, of: &proof)) { XCTAssertEqual($0 as? JournalStoreError, .proofStale) }
         try store.retire(.unlink, heldInbox: [])
-        XCTAssertThrowsError(try store.intake(next: 1, of: &proof)) { XCTAssertEqual($0 as? HostJournalError, .proofStale) }
+        XCTAssertThrowsError(try store.intake(next: 1, of: &proof)) { XCTAssertEqual($0 as? JournalStoreError, .proofStale) }
     }
 
     func testIncompleteProofCannotIntake() throws {

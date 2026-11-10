@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 @MainActor
 final class SyncEngineMLSTests: XCTestCase {

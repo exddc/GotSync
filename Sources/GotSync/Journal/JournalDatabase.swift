@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-enum JournalValue: Hashable, Sendable {
+enum JournalValue: Hashable, Codable, Sendable {
     case integer(Int64)
     case blob(Data)
     case text(String)
@@ -26,7 +26,7 @@ final class JournalDatabase {
             flags |= SQLITE_OPEN_CREATE
         }
         guard let parent = realpath(url.deletingLastPathComponent().path, nil) else {
-            throw HostJournalError.storeMissing
+            throw JournalStoreError.storeMissing
         }
         defer { free(parent) }
         let path = URL(fileURLWithPath: String(cString: parent)).appendingPathComponent(url.lastPathComponent).path
@@ -35,7 +35,7 @@ final class JournalDatabase {
         guard code == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "open failed"
             sqlite3_close_v2(database)
-            throw HostJournalError.storage(code: code, message: message)
+            throw JournalStoreError.storage(code: code, message: message)
         }
         handle = database
         sqlite3_extended_result_codes(database, 1)
@@ -79,7 +79,7 @@ final class JournalDatabase {
 
     static func integer(_ value: UInt64) throws -> JournalValue {
         guard value <= UInt64(Int64.max) else {
-            throw HostJournalError.valueOutOfRange
+            throw JournalStoreError.valueOutOfRange
         }
         return .integer(Int64(value))
     }
@@ -158,7 +158,7 @@ final class JournalDatabase {
         try body(statement)
     }
 
-    private func error(_ code: Int32) -> HostJournalError {
+    private func error(_ code: Int32) -> JournalStoreError {
         .storage(code: code, message: String(cString: sqlite3_errmsg(handle)))
     }
 }
@@ -172,7 +172,7 @@ struct JournalRow {
 
     func int64(_ column: Int32) throws -> Int64 {
         guard sqlite3_column_type(statement, column) == SQLITE_INTEGER else {
-            throw HostJournalError.storeCorrupt("column \(column) is not an integer")
+            throw JournalStoreError.storeCorrupt("column \(column) is not an integer")
         }
         return sqlite3_column_int64(statement, column)
     }
@@ -180,14 +180,14 @@ struct JournalRow {
     func unsigned(_ column: Int32) throws -> UInt64 {
         let value = try int64(column)
         guard value >= 0 else {
-            throw HostJournalError.storeCorrupt("column \(column) is negative")
+            throw JournalStoreError.storeCorrupt("column \(column) is negative")
         }
         return UInt64(value)
     }
 
     func blob(_ column: Int32) throws -> Data {
         guard sqlite3_column_type(statement, column) == SQLITE_BLOB else {
-            throw HostJournalError.storeCorrupt("column \(column) is not a blob")
+            throw JournalStoreError.storeCorrupt("column \(column) is not a blob")
         }
         let count = Int(sqlite3_column_bytes(statement, column))
         guard count > 0, let pointer = sqlite3_column_blob(statement, column) else {
@@ -198,7 +198,7 @@ struct JournalRow {
 
     func text(_ column: Int32) throws -> String {
         guard sqlite3_column_type(statement, column) == SQLITE_TEXT, let pointer = sqlite3_column_text(statement, column) else {
-            throw HostJournalError.storeCorrupt("column \(column) is not text")
+            throw JournalStoreError.storeCorrupt("column \(column) is not text")
         }
         return String(cString: pointer)
     }

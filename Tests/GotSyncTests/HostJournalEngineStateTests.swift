@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Format 2 journal state used by the engine: readiness, completion,
 /// establishment, control repair, window verification and record selection.
@@ -27,7 +27,7 @@ final class HostJournalEngineStateTests: XCTestCase {
         let store = try HostJournalStore.create(in: directory, group: JournalFixture.group)
         try JournalFixture.tamper(store.url, "PRAGMA user_version = 1")
         let before = JournalFixture.storedState(store.url)
-        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? HostJournalError, .formatUnsupported(1)) }
+        XCTAssertThrowsError(try HostJournalStore.open(store.url)) { XCTAssertEqual($0 as? JournalStoreError, .formatUnsupported(1)) }
         XCTAssertEqual(JournalFixture.storedState(store.url), before)
     }
 
@@ -91,7 +91,7 @@ final class HostJournalEngineStateTests: XCTestCase {
 
     func testReadinessNeedsTheCaptureToBeSubmitted() throws {
         let store = try resumed(founder: true)
-        XCTAssertThrowsError(try store.declareReady(capturedThrough: 1)) { XCTAssertEqual($0 as? HostJournalError, .hostCaptureRegressed) }
+        XCTAssertThrowsError(try store.declareReady(capturedThrough: 1)) { XCTAssertEqual($0 as? JournalStoreError, .hostCaptureRegressed) }
         XCTAssertFalse(store.view.isReady)
         _ = try store.submit([HostJournalMutation(id: JournalFixture.mutationID(1), payload: Data("seed".utf8))], capturedThrough: 1)
         try store.declareReady(capturedThrough: 1)
@@ -101,7 +101,7 @@ final class HostJournalEngineStateTests: XCTestCase {
         try empty.declareReady(capturedThrough: 0)
         XCTAssertTrue(empty.view.isReady)
         let unresumed = try HostJournalStore.open(empty.url)
-        XCTAssertThrowsError(try unresumed.declareReady(capturedThrough: 0)) { XCTAssertEqual($0 as? HostJournalError, .notResumed) }
+        XCTAssertThrowsError(try unresumed.declareReady(capturedThrough: 0)) { XCTAssertEqual($0 as? JournalStoreError, .notResumed) }
         XCTAssertTrue(unresumed.view.isReady)
     }
 
@@ -132,7 +132,7 @@ final class HostJournalEngineStateTests: XCTestCase {
             try FileManager.default.copyItem(at: store.url, to: copy)
             try JournalFixture.tamper(copy, damage)
             let before = JournalFixture.storedState(copy)
-            XCTAssertThrowsError(try HostJournalStore.open(copy), damage) { XCTAssertEqual($0 as? HostJournalError, .storeCorrupt(reason), damage) }
+            XCTAssertThrowsError(try HostJournalStore.open(copy), damage) { XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt(reason), damage) }
             XCTAssertEqual(JournalFixture.storedState(copy), before, damage)
         }
     }
@@ -150,7 +150,7 @@ final class HostJournalEngineStateTests: XCTestCase {
         ]
         let before = JournalFixture.storedState(store.url)
         let view = store.view
-        XCTAssertThrowsError(try store.verify(window)) { XCTAssertEqual($0 as? HostJournalError, .fork(origin: origin, sequence: 1)) }
+        XCTAssertThrowsError(try store.verify(window)) { XCTAssertEqual($0 as? JournalStoreError, .fork(origin: origin, sequence: 1)) }
         XCTAssertNoThrow(try store.verify(Array(window[..<2])))
         XCTAssertEqual(JournalFixture.storedState(store.url), before)
         XCTAssertEqual(store.view, view)

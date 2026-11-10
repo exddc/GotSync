@@ -2,7 +2,7 @@ import Foundation
 import GotSyncMLS
 import os
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// A secret store that can hold the MLS state key's read or write until
 /// released, so a test can act while a launch's session constructor runs.
@@ -345,7 +345,7 @@ extension HostEngineTests {
         }
         await opened(relaunched)
         XCTAssertEqual(observed, 3, "the observation was not bounded to three attempts")
-        guard case .launchFailed? = relaunched.hostRepair else { return XCTFail("no terminal launch failure") }
+        guard case .launchInputsChanged? = relaunched.hostRepair else { return XCTFail("no terminal launch failure") }
         XCTAssertEqual(relaunched.phase, .failed)
         XCTAssertEqual(try Self.journalFiles(directory("b")), files)
     }

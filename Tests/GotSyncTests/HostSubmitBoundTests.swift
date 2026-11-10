@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// One `submit` call carries at most `submitCallBytes` of encoded envelopes;
 /// a host splits its outbox into calls and keeps every row until accepted.
@@ -47,7 +47,7 @@ final class HostSubmitBoundTests: XCTestCase {
         let before = state(store)
         let view = store.view
         XCTAssertThrowsError(try store.submit(over, capturedThrough: 50)) {
-            XCTAssertEqual($0 as? HostJournalError, .capacity(.submitCallTooLarge(limit: limit)))
+            XCTAssertEqual($0 as? JournalStoreError, .capacity(.submitCallTooLarge(limit: limit)))
         }
         XCTAssertEqual(state(store), before)
         XCTAssertEqual(store.view, view)
@@ -60,7 +60,7 @@ final class HostSubmitBoundTests: XCTestCase {
         let payloadOnly = (1...count).map { HostJournalMutation(id: JournalFixture.mutationID($0), payload: Data(count: limit / count)) }
         XCTAssertLessThanOrEqual(payloadOnly.reduce(0) { $0 + $1.payload.count }, limit)
         XCTAssertThrowsError(try store.submit(payloadOnly, capturedThrough: 17)) {
-            XCTAssertEqual($0 as? HostJournalError, .capacity(.submitCallTooLarge(limit: limit)))
+            XCTAssertEqual($0 as? JournalStoreError, .capacity(.submitCallTooLarge(limit: limit)))
         }
     }
 
@@ -71,7 +71,7 @@ final class HostSubmitBoundTests: XCTestCase {
         let records = try store.submit(first, capturedThrough: 40) + store.submit(second, capturedThrough: 40)
         let head = store.view.ownHead
         XCTAssertThrowsError(try store.submit(first + second + [batch(totalling: 1_024, from: 200)[0]], capturedThrough: 40)) {
-            XCTAssertEqual($0 as? HostJournalError, .capacity(.submitCallTooLarge(limit: limit)), "already accepted IDs were not counted")
+            XCTAssertEqual($0 as? JournalStoreError, .capacity(.submitCallTooLarge(limit: limit)), "already accepted IDs were not counted")
         }
         XCTAssertEqual(try store.submit(first, capturedThrough: 40) + store.submit(second, capturedThrough: 40), records)
         XCTAssertEqual(store.view.ownHead, head)
@@ -86,7 +86,7 @@ final class HostSubmitBoundTests: XCTestCase {
         var later = batch(totalling: limit / 2, from: 100)
         later.append(HostJournalMutation(id: first[0].id, payload: Data("different".utf8)))
         XCTAssertThrowsError(try store.submit(later, capturedThrough: 30)) {
-            XCTAssertEqual($0 as? HostJournalError, .hostMutationConflict(first[0].id))
+            XCTAssertEqual($0 as? JournalStoreError, .hostMutationConflict(first[0].id))
         }
         XCTAssertEqual(state(store), before)
         XCTAssertEqual(store.view.ownHead, head)
@@ -121,7 +121,7 @@ final class HostSubmitBoundTests: XCTestCase {
         XCTAssertThrowsError(try reopened.submit(
             restartedHost.state.outbox.sorted { $0.key < $1.key }.map { HostJournalMutation(id: Data(base64Encoded: $0.key)!, payload: $0.value) },
             capturedThrough: restartedHost.state.capturedThrough
-        )) { XCTAssertEqual($0 as? HostJournalError, .capacity(.submitCallTooLarge(limit: limit))) }
+        )) { XCTAssertEqual($0 as? JournalStoreError, .capacity(.submitCallTooLarge(limit: limit))) }
         XCTAssertEqual(reopened.view.ownHead, firstChunk)
 
         _ = try restartedHost.submitOutbox(reopened, maxBytes: limit)

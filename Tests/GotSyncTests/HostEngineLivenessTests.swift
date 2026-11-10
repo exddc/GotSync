@@ -1,7 +1,7 @@
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 /// Intake settles only after the last MLS-capable worker ends, and the
 /// composed view reaches every independent subscriber.
