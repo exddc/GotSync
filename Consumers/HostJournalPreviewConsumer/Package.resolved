@@ -1,0 +1,14 @@
+{
+  "originHash" : "670a8948f1437262f1b3927d5322c25193d2a11a4f93b8ee61910230687210a8",
+  "pins" : [
+    {
+      "identity" : "gotsync",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/exddc/GotSync.git",
+      "state" : {
+        "revision" : "5e1923651ab92b990d81b9aec764544c1a1f2099"
+      }
+    }
+  ],
+  "version" : 3
+}

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds and tests the HostJournalPreview consumer as an external package
-# against a copy of this checkout without Artifacts/, so GotSync resolves the
-# pinned MLS binary, then checks the SPI surface.
+# against GotSync at the URL and revision its Package.swift pins, resolved
+# from scratch outside this checkout, then checks the SPI surface.
 set -euo pipefail
 source "$(dirname "$0")/project-env.sh"
 cd "$GOTSYNC_REPO_ROOT"
@@ -19,6 +19,13 @@ if grep -rnE '^[[:space:]]*import[[:space:]]+GotSync([[:space:]]|$)' "$CONSUMER/
     exit 1
 fi
 
+pinned="$(grep -oE '\.package\(url: "[^"]+", revision: "[0-9a-f]{40}"\)' "$CONSUMER/Package.swift" || true)"
+if [ -z "$pinned" ] || grep -q 'path:' "$CONSUMER/Package.swift"; then
+    echo "The consumer must pin GotSync by URL and full revision"
+    exit 1
+fi
+revision="$(printf '%s' "$pinned" | grep -oE '[0-9a-f]{40}')"
+
 python3 -B -m unittest discover -s scripts/tests -p 'test_host_spi_surface.py'
 uv sync --project server --locked --no-editable
 GOTSYNC_TEST_DIR="$(mktemp -d)"
@@ -32,11 +39,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-GOTSYNC_COPY="$GOTSYNC_TEST_DIR/GotSync"
+GOTSYNC_COPY="$GOTSYNC_TEST_DIR/consumer"
 mkdir -p "$GOTSYNC_COPY"
-rsync -a --exclude .git --exclude .build --exclude .swiftpm --exclude Artifacts --exclude 'server/.venv' \
-    ./ "$GOTSYNC_COPY/"
-[ ! -e "$GOTSYNC_COPY/Artifacts" ] || { echo "The copy still holds Artifacts/"; exit 1; }
+rsync -a --exclude .build --exclude .swiftpm "$CONSUMER/" "$GOTSYNC_COPY/"
 
 mkdir -p "$GOTSYNC_TEST_DIR/server"
 "$UV_PROJECT_ENVIRONMENT/bin/python" scripts/run-integration-server.py "$GOTSYNC_TEST_DIR/server" > "$GOTSYNC_TEST_DIR/server.log" 2>&1 &
@@ -51,10 +56,12 @@ source "$GOTSYNC_TEST_DIR/server/endpoints.env"
 export GOTSYNC_RELAY_URL GOTSYNC_MAILBOX_URL GOTSYNC_INTEGRATION=1 GOTSYNC_REQUIRE_INTEGRATION=1
 
 (
-    cd "$GOTSYNC_COPY/$CONSUMER"
-    swift test --scratch-path "$GOTSYNC_CACHE_DIR/host-consumer-build"
+    cd "$GOTSYNC_COPY"
+    swift test --scratch-path "$GOTSYNC_TEST_DIR/build"
+    grep -q "\"revision\" : \"$revision\"" Package.resolved || { echo "GotSync did not resolve to $revision"; exit 1; }
     xcodebuild -scheme HostJournalPreviewConsumer -destination 'generic/platform=iOS Simulator' \
-        -derivedDataPath "$GOTSYNC_CACHE_DIR/host-consumer-ios" CODE_SIGNING_ALLOWED=NO -quiet build
+        -derivedDataPath "$GOTSYNC_TEST_DIR/ios" -clonedSourcePackagesDirPath "$GOTSYNC_TEST_DIR/ios-packages" \
+        CODE_SIGNING_ALLOWED=NO -quiet build
 )
 
 "$UV_PROJECT_ENVIRONMENT/bin/python" scripts/check-host-spi-surface.py
