@@ -2,6 +2,14 @@ import Foundation
 import os
 @_spi(HostJournalPreview) import GotSync
 
+@_spi(HostJournalPreview) @MainActor
+public protocol ReferenceHostInbox: AnyObject {
+    func incoming(after position: JournalPosition?, limit: Int) async throws -> [IncomingRecord]
+    func markApplied(through position: JournalPosition) async throws
+}
+
+@_spi(HostJournalPreview) extension HostJournal: ReferenceHostInbox {}
+
 /// A minimal host of the preview journal: registers, a
 /// capture counter, an outbox and the stored provenance, saved as one JSON
 /// file. It follows the host obligations: capture and outbox are saved
@@ -101,7 +109,10 @@ public final class ReferenceHost {
     /// Applies every delivered remote record, saving the business state
     /// before acknowledging it. Returns how many were applied.
     @discardableResult
-    public func applyIncoming(_ journal: HostJournal) async throws -> Int {
+    public func applyIncoming(_ journal: any ReferenceHostInbox) async throws -> Int {
+        if let position = state.appliedThrough {
+            try await journal.markApplied(through: position)
+        }
         var applied = 0
         while true {
             let received = try await journal.incoming(after: state.appliedThrough, limit: 64)

@@ -171,6 +171,48 @@ final class RelayHostTests: XCTestCase {
         XCTAssertEqual(try ReferenceHost(url: host.url).state, host.state)
     }
 
+    func testPersistedApplicationWatermarkIsAcknowledgedOnRetryWithoutNewTraffic() async throws {
+        let first = start("first", MemorySecrets())
+        let second = start("second", MemorySecrets())
+        try await pair(first, second)
+        let firstHost = try ReferenceHost(url: root.appendingPathComponent("first.json"))
+        let secondHost = try ReferenceHost(url: root.appendingPathComponent("second.json"))
+        let firstJournal = try await activeJournal(first)
+        let secondJournal = try await activeJournal(second)
+        try await firstHost.enrollOrResume(firstJournal)
+        try await secondHost.enrollOrResume(secondJournal)
+        try firstHost.capture("color", "blue")
+        try await firstHost.submitOutbox(firstJournal)
+        _ = try await firstHost.declareReadyIfSubmitted(firstJournal)
+        _ = try await secondHost.declareReadyIfSubmitted(secondJournal)
+        try await wait("incoming record and completed history") {
+            (try? await secondJournal.incoming(after: nil, limit: 64).count) == 1
+                && second.hostJournalView?.journal?.historyComplete == true
+        }
+
+        let inbox = FailingAcknowledgementInbox(secondJournal)
+        do {
+            _ = try await secondHost.applyIncoming(inbox)
+            XCTFail("the first acknowledgement unexpectedly succeeded")
+        } catch FailingAcknowledgementInbox.Failure.transient {}
+
+        let position = try XCTUnwrap(secondHost.state.appliedThrough)
+        let saved = try Data(contentsOf: secondHost.url)
+        XCTAssertEqual(try ReferenceHost(url: secondHost.url).state, secondHost.state)
+        XCTAssertEqual(secondHost.state.registers, ["color": "blue"])
+        XCTAssertNil(second.hostJournalView?.journal?.appliedThrough)
+        XCTAssertEqual(second.hostJournalView?.journal?.historyApplied, false)
+
+        let applied = try await secondHost.applyIncoming(inbox)
+        XCTAssertEqual(applied, 0)
+        XCTAssertEqual(inbox.acknowledgements, [position, position])
+        XCTAssertEqual(try Data(contentsOf: secondHost.url), saved)
+        XCTAssertEqual(second.hostJournalView?.journal?.appliedThrough, position)
+        XCTAssertEqual(second.hostJournalView?.journal?.historyApplied, true)
+        guard second.hostJournalView?.journal?.appliedThrough == position else { return }
+        try await converge([(first, firstHost), (second, secondHost)])
+    }
+
     // MARK: - Harness
 
     private func start(_ name: String, _ secrets: MemorySecrets) -> SyncEngine {
@@ -230,5 +272,25 @@ final class RelayHostTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(100))
         }
+    }
+}
+
+@MainActor
+private final class FailingAcknowledgementInbox: ReferenceHostInbox {
+    enum Failure: Error { case transient }
+
+    private let journal: HostJournal
+    private(set) var acknowledgements: [JournalPosition] = []
+
+    init(_ journal: HostJournal) { self.journal = journal }
+
+    func incoming(after position: JournalPosition?, limit: Int) async throws -> [IncomingRecord] {
+        try await journal.incoming(after: position, limit: limit)
+    }
+
+    func markApplied(through position: JournalPosition) async throws {
+        acknowledgements.append(position)
+        if acknowledgements.count == 1 { throw Failure.transient }
+        try await journal.markApplied(through: position)
     }
 }
