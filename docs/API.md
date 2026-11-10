@@ -295,11 +295,13 @@ in the same group.
 | `cancelIncoming(_:)` | Drop an unverified variant, such as a rejected one |
 | `registerAvailable(route:descriptor:)`, `unregisterAvailable(route:objectID:)` | Objects whose content the host holds, re-uploaded when other members want them |
 | `release(route:objectIDs:)` | Availability hint to the relay |
-| `summary()`, `updates()` | Counts per state, `relayUnsupported`, `hostBackpressure`; a signal after each change |
+| `summary()`, `summary(for:)`, `updates()` | Aggregate or kind-filtered transfer/registry counts; byte totals, `relayUnsupported` and resource flags remain global. A signal follows each change |
 | `setHooks(_:)` | `verifiedContentURL(contentHash:)` for re-uploads, `acceptsImage(file:image:)` for the host's own image check, and `acceptsData(file:data:)`, which must admit each received data chunk and refuses by default |
 | `sealData(_:route:source:expectedContentHash:)` | Seal one application-data chunk of at most 10 MiB, with no image validation |
 | `requestIncomingData(_:route:descriptor:)` | Queue an application-data descriptor |
 | `registerAvailableData(route:descriptor:)` | Register a data chunk the host holds, for re-upload |
+
+`BlobTransferService.maximumObjectPlaintextLength` exposes the codec's per-object plaintext limit for both content kinds. Filtered counts describe transfers or registered variants, not distinct logical images.
 
 `BlobTransferID` (16 bytes) is chosen and persisted by the host; repeating a
 call with the same ID and parameters is safe, and different parameters are

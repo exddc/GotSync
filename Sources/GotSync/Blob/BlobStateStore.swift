@@ -347,8 +347,13 @@ final class BlobStateStore {
         }
     }
 
-    func availableCount() throws -> Int {
-        try database.first("SELECT COUNT(*) FROM available", []) { Int(try $0.int64(0)) } ?? 0
+    func availableCount(kind: BlobContentKind? = nil) throws -> Int {
+        if let kind {
+            let version = kind == .image ? BlobDescriptor.version : BlobDescriptor.dataVersion
+            return try database.first("SELECT COUNT(*) FROM available WHERE substr(descriptor, 5, 1) = ?",
+                                      [.blob(Data([version]))]) { Int(try $0.int64(0)) } ?? 0
+        }
+        return try database.first("SELECT COUNT(*) FROM available", []) { Int(try $0.int64(0)) } ?? 0
     }
 
     func register(route: Data, objectID: Data, descriptor: Data) throws {

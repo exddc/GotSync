@@ -89,6 +89,68 @@ final class BlobTransferServiceTests: XCTestCase {
         } catch BlobError.notBound {}
     }
 
+    func testSummaryFiltersImageAndDataTransfers() async throws {
+        XCTAssertEqual(BlobTransferService.maximumObjectPlaintextLength, 10_485_760)
+        let source = directory.appendingPathComponent("mixed.png")
+        try Self.writePNG(to: source, width: 8, height: 8)
+        let hash = Data(SHA256.hash(data: try Data(contentsOf: source)))
+        let sender = try service("mixed-sender")
+        let imageID = try BlobTransferID(bytes: Data(repeating: 11, count: 16))
+        let dataID = try BlobTransferID(bytes: Data(repeating: 12, count: 16))
+        _ = try await sender.seal(imageID, route: route, source: source, expectedContentHash: hash)
+        _ = try await sender.sealData(dataID, route: route, source: source, expectedContentHash: hash)
+        let offered = try await waitForOutgoing(sender) { statuses -> [BlobOutgoingStatus]? in
+            guard statuses.count == 2, statuses.allSatisfy({
+                if case .readyForHandoff = $0.state { return true }
+                return false
+            }) else { return nil }
+            return statuses
+        }
+        for status in offered {
+            guard case .readyForHandoff(let descriptor, _) = status.state else { continue }
+            switch status.kind {
+            case .image: try await sender.registerAvailable(route: route, descriptor: descriptor)
+            case .applicationData: try await sender.registerAvailableData(route: route, descriptor: descriptor)
+            }
+        }
+        let total = await sender.summary()
+        let images = await sender.summary(for: .image)
+        let data = await sender.summary(for: .applicationData)
+        XCTAssertEqual(total.outgoingOffered, 2)
+        XCTAssertEqual(images.outgoingOffered, 1)
+        XCTAssertEqual(data.outgoingOffered, 1)
+        XCTAssertEqual(total.availableObjects, 2)
+        XCTAssertEqual(images.availableObjects, 1)
+        XCTAssertEqual(data.availableObjects, 1)
+        XCTAssertEqual(images.libraryBytes, total.libraryBytes)
+        XCTAssertEqual(data.libraryBytes, total.libraryBytes)
+
+        let receiver = try service("mixed-receiver")
+        await receiver.setHooks(BlobHostHooks(verifiedContentURL: { _ in nil }, acceptsData: { _, _ in true }))
+        for status in offered {
+            guard case .readyForHandoff(let descriptor, _) = status.state else { continue }
+            switch status.kind {
+            case .image: try await receiver.requestIncoming(status.id, route: route, descriptor: descriptor)
+            case .applicationData: try await receiver.requestIncomingData(status.id, route: route, descriptor: descriptor)
+            }
+        }
+        _ = try await waitForIncoming(receiver) { statuses -> Bool? in
+            guard statuses.count == 2, statuses.allSatisfy({
+                if case .awaitingPublish = $0.state { return true }
+                return false
+            }) else { return nil }
+            return true
+        }
+        let received = await receiver.summary()
+        let receivedImages = await receiver.summary(for: .image)
+        let receivedData = await receiver.summary(for: .applicationData)
+        XCTAssertEqual(received.incomingVerified, 2)
+        XCTAssertEqual(receivedImages.incomingVerified, 1)
+        XCTAssertEqual(receivedData.incomingVerified, 1)
+        XCTAssertEqual(receivedImages.libraryBytes, received.libraryBytes)
+        XCTAssertEqual(receivedData.libraryBytes, received.libraryBytes)
+    }
+
     func testDataChunkRoundTripsOnlyWithHostAdmission() async throws {
         let source = directory.appendingPathComponent("record.part")
         let chunk = Data((0..<600_000).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) })
