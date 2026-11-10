@@ -234,7 +234,7 @@ final class HostStandIn {
 
 @MainActor
 func XCTAssertThrowsErrorAsync<T>(
-    _ expression: @autoclosure () async throws -> T, _ message: String = "",
+    _ expression: @autoclosure @MainActor () async throws -> T, _ message: String = "",
     file: StaticString = #filePath, line: UInt = #line, _ handler: (Error) -> Void = { _ in }
 ) async {
     do {

@@ -441,11 +441,11 @@ extension HostEngineTests {
 
     func testNothingKeepsAReplacedSessionAliveAfterErase() async throws {
         let (_, b) = try await completedPair()
-        weak let replaced = b.mlsSessionForTesting
-        XCTAssertNotNil(replaced)
+        let replaced = WeakSessionReference(b.mlsSessionForTesting)
+        XCTAssertNotNil(replaced.value)
         b.eraseLocalData()
         try await wait("erased") { b.hostLifecycle == .active && !b.isPaired }
-        try await wait("released") { replaced == nil }
+        try await wait("released") { replaced.value == nil }
     }
 
     func testStopAndClosingJoinOneSettlement() async throws {
@@ -462,6 +462,13 @@ extension HostEngineTests {
         XCTAssertEqual(gate.keyReads, 1, "a second constructor ran while the first was settling")
         XCTAssertNotNil(relaunched.mlsSessionForTesting)
     }
+}
+
+@MainActor
+private final class WeakSessionReference {
+    weak var value: MLSSession?
+
+    init(_ value: MLSSession?) { self.value = value }
 }
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
