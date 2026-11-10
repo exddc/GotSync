@@ -126,6 +126,9 @@ public final class HostJournal {
     /// The group the journal belongs to.
     public var group: Data { view.group }
 
+    /// This journal's per-mutation and per-call submission limits.
+    public var submissionLimits: HostSubmissionLimits { HostSubmissionLimits(limits) }
+
     /// Starts an enrollment that the host confirms with `resume` after saving
     /// the returned provenance.
     public func enroll() async throws -> HostProvenance {

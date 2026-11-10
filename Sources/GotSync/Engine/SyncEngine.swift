@@ -303,6 +303,15 @@ public final class SyncEngine {
     private var hostAdapter: HostJournalAdapter? { replication as? HostJournalAdapter }
     /// Host-journal profiles carry opaque host records instead of demo tasks.
     private let isHostMode: Bool
+    /// The blob service's directory in host mode, nil otherwise.
+    let blobDirectory: URL?
+    let endpointPolicy: EndpointSecurityPolicy
+    var blobService: BlobTransferService?
+    var blobOpenTask: Task<BlobTransferService?, Never>?
+    /// A retirement requested before the service finished opening.
+    var blobRetirePending = false
+    /// Bumped by every retirement, so a bind that started earlier is dropped.
+    var blobBindingEpoch: UInt64 = 0
     private let hostJournalLimits: HostJournalLimits
     private(set) var hostLifecycle: HostLifecycle = .active { didSet { publishHostView() } }
     private var hostLifecycleTask: Task<Void, Never>?
@@ -362,6 +371,8 @@ public final class SyncEngine {
             publishHostView()
         }
     }
+    func isCurrentBlobSession(_ candidate: MLSSession) -> Bool { session === candidate }
+
     /// Keeps the composed view's revision growing across session
     /// replacement, since a new session counts its operations from zero.
     private var hostSessionRevisionBase: UInt64 = 0
@@ -468,6 +479,7 @@ public final class SyncEngine {
         let baseDirectory = configuration.storageDirectory
         relayURL = configuration.endpoints.relayURL
         mailboxURL = configuration.endpoints.mailboxURL
+        endpointPolicy = configuration.endpointPolicy
         invitationURLScheme = configuration.invitationURLScheme
         groupProfile = configuration.groupProfile
         self.secretStore = secretStore
@@ -504,6 +516,7 @@ public final class SyncEngine {
 
         var notice: SyncError?
         isHostMode = configuration.groupProfile.schema.isHostJournal
+        blobDirectory = isHostMode ? baseDirectory.appendingPathComponent(BlobTransferService.directoryName, isDirectory: true) : nil
         self.hostJournalLimits = hostJournalLimits
         if isHostMode {
             var erasePending = false
@@ -3016,6 +3029,9 @@ public final class SyncEngine {
         }
         if try await !session.isRemoved() {
             try await requireGroupProfile(session: session)
+            if isHostMode {
+                await bindBlobService(session)
+            }
         }
         invalidateHostIntake()
         var flushed = true
@@ -3901,6 +3917,7 @@ public final class SyncEngine {
     /// that is still open can then never create journal files next to the
     /// database of the session that replaced it.
     private func eraseCurrentMLSState() throws {
+        retireBlobBinding()
         try ReplicationCheckpoint.remove(at: foundingClaimsURL)
         try MLSSession.erase(directory: mlsDirectory, secretStore: secretStore)
         mlsDirectory = Self.freshMLSDirectory(in: mlsRoot)
@@ -5014,6 +5031,7 @@ extension SyncEngine {
         if case .closing = hostLifecycle {
             return
         }
+        retireBlobBinding()
         hostAdapter?.store?.beginClosing()
         let joinIntent = checkpoint == nil ? try? ReplicationCheckpoint.load(from: joinIntentURL) : nil
         let record = HostLifecycleRecord(

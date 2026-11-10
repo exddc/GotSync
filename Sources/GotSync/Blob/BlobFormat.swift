@@ -33,8 +33,16 @@ enum BlobCodecError: Error, Equatable {
     case storedOutputMismatch
 }
 
-struct BlobRoute: Hashable, Sendable {
-    let bytes: Data
+/// The 32-byte route of the group a blob belongs to.
+@_spi(BlobPreview) public struct BlobRoute: Hashable, Sendable {
+    public let bytes: Data
+
+    public init(bytes: Data) throws {
+        guard bytes.count == 32 else {
+            throw BlobError.invalidIdentifier
+        }
+        self.bytes = Data(bytes)
+    }
 
     init(_ bytes: Data) throws {
         guard bytes.count == 32 else {

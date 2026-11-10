@@ -175,6 +175,15 @@ public actor MLSClient {
         guard !record.removed, record.writerToken.count == 32 else { throw MLSClientError.invalidState }
         return record.writerToken
     }
+    /// The group route and writer token from one record, for blob transfers.
+    /// Fails when the client is removed or not in a group.
+    package func blobAccess() throws -> (group: Data, token: Data) {
+        let record = try store.read()
+        guard !record.removed, let group = record.group, group.count == 32, record.writerToken.count == 32 else {
+            throw MLSClientError.invalidState
+        }
+        return (group, record.writerToken)
+    }
     public func removalAuthorization() throws -> Data? { try store.read().removalAuthorization }
     public func members() throws -> [MLSMember] {
         try GotSyncMLSBindings.members(state: store.read().state).map {

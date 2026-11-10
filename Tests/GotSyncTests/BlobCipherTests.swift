@@ -1,6 +1,6 @@
 import CryptoKit
 import XCTest
-@_spi(HostJournalPreview) @testable import GotSync
+@_spi(HostJournalPreview) @_spi(BlobPreview) @testable import GotSync
 
 final class BlobCipherTests: XCTestCase {
     private var directory: URL!
