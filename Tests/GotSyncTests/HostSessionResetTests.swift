@@ -247,16 +247,21 @@ extension HostEngineTests {
         let a = engine("a")
         let b = engine("b")
         let gate = ResetPairingGate()
+        let joinGate = ResetPairingGate()
         defer {
             a.afterAddGateForTesting = nil
+            b.beforeJoinHookForTesting = nil
             gate.release()
+            joinGate.release()
         }
         a.afterAddGateForTesting = { await gate.wait() }
+        b.beforeJoinHookForTesting = { _, _, _, _ in await joinGate.wait() }
         try await wait("host ready") { !a.canCancelPairing }
         a.createPrivateSync()
         try await wait("invitation") { a.invitationURL != nil }
         b.joinPrivateSync(url: try XCTUnwrap(a.invitationURL))
         try await wait("safety code") { a.isHostApprovalPending && b.safetyCode != nil }
+        try await wait("joiner held before accepting its Welcome") { joinGate.isHeld }
         a.approveSafetyCode()
         try await wait("inviter held after its Add") { gate.isHeld }
         let old = try XCTUnwrap(a.mlsSessionForTesting)
