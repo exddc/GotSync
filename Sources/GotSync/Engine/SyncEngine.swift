@@ -300,9 +300,9 @@ public final class SyncEngine {
     private var hasDurableStorage: Bool
     private let replication: any ReplicationData
     private var taskAdapter: TaskReplicationAdapter? { replication as? TaskReplicationAdapter }
-    private var hostAdapter: HostJournalAdapter? { replication as? HostJournalAdapter }
+    var hostAdapter: HostJournalAdapter? { replication as? HostJournalAdapter }
     /// Host-journal profiles carry opaque host records instead of demo tasks.
-    private let isHostMode: Bool
+    let isHostMode: Bool
     /// The blob service's directory in host mode, nil otherwise.
     let blobDirectory: URL?
     let endpointPolicy: EndpointSecurityPolicy
@@ -312,6 +312,27 @@ public final class SyncEngine {
     var blobRetirePending = false
     /// Bumped by every retirement, so a bind that started earlier is dropped.
     var blobBindingEpoch: UInt64 = 0
+    /// The app's snapshot host; nil keeps full-history bootstrap.
+    var snapshotHooks: HostSnapshotHooks?
+    /// Library-owned snapshot staging and transfers in host mode, nil otherwise.
+    let snapshotDirectory: URL?
+    var snapshotService: BlobTransferService?
+    var snapshotOpenTask: Task<BlobTransferService?, Never>?
+    var snapshotRetirePending = false
+    var snapshotUpdatesTask: Task<Void, Never>?
+    /// Provider exports running, by recipient.
+    var snapshotExportTasks: [Data: Task<Void, Never>] = [:]
+    /// The recipient's fetch, install or cleanup step.
+    var snapshotRecipientTask: Task<Void, Never>?
+    let snapshotAdmission = HostSnapshotAdmission()
+    /// The provider's export ledger, loaded on first use.
+    var snapshotLedgerCache: HostSnapshotExportLedger?
+    /// Offers whose fetched content was released in this process.
+    var snapshotCleanedIDs: Set<Data> = []
+    /// When the current offer's content was first seen unavailable.
+    var snapshotUnavailableSince: ContinuousClock.Instant?
+    var snapshotRelayProtocolsForTesting: [AnyClass]?
+    var snapshotUnavailableLimitForTesting: Duration?
     private let hostJournalLimits: HostJournalLimits
     private(set) var hostLifecycle: HostLifecycle = .active { didSet { publishHostView() } }
     private var hostLifecycleTask: Task<Void, Never>?
@@ -364,7 +385,7 @@ public final class SyncEngine {
     private var historyRequestCycles = 0
     static let hostLifecycleFilename = "host-lifecycle.json"
     static let hostJoinBudget: UInt64 = 8 * 1_024 * 1_024
-    private var session: MLSSession? {
+    var session: MLSSession? {
         didSet {
             guard oldValue !== session else { return }
             hostSessionRevisionBase &+= (oldValue?.operationCount.started ?? 0) &+ 1
@@ -376,7 +397,7 @@ public final class SyncEngine {
     /// Keeps the composed view's revision growing across session
     /// replacement, since a new session counts its operations from zero.
     private var hostSessionRevisionBase: UInt64 = 0
-    private var checkpoint: ReplicationCheckpoint? { didSet { publishState() } }
+    private(set) var checkpoint: ReplicationCheckpoint? { didSet { publishState() } }
     private let pairingRetryDelayNanoseconds: UInt64
     private let syncIntervalNanoseconds: UInt64
     private let approvalTimeoutNanoseconds: UInt64
@@ -438,7 +459,7 @@ public final class SyncEngine {
     /// operations did not fit.
     private var isInboxBackpressured = false
     private var answeredHeldHelloCursors: Set<UInt64> = []
-    private var replyObligation: ReplyObligation?
+    private(set) var replyObligation: ReplyObligation?
     private var isHistoryBlocked = false
     private var appIsActive = true
     private var pendingMailboxSince: Date?
@@ -517,6 +538,7 @@ public final class SyncEngine {
         var notice: SyncError?
         isHostMode = configuration.groupProfile.schema.isHostJournal
         blobDirectory = isHostMode ? baseDirectory.appendingPathComponent(BlobTransferService.directoryName, isDirectory: true) : nil
+        snapshotDirectory = isHostMode ? baseDirectory.appendingPathComponent(Self.snapshotDirectoryName, isDirectory: true) : nil
         self.hostJournalLimits = hostJournalLimits
         if isHostMode {
             var erasePending = false
@@ -1892,8 +1914,8 @@ public final class SyncEngine {
             let running = Set([
                 pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask, joinSettlementTask,
                 syncLoopTask, syncCycleTask, backgroundFlushTask, departureTask, hostLifecycleTask, hostSettlementTask,
-                hostOpenTask, hostLaunchStartTask,
-            ].compactMap { $0 } + hostWorkersForTesting).subtracting(settled)
+                hostOpenTask, hostLaunchStartTask, snapshotRecipientTask,
+            ].compactMap { $0 } + Array(snapshotExportTasks.values) + hostWorkersForTesting).subtracting(settled)
             guard !running.isEmpty else { break }
             for task in running {
                 task.cancel()
@@ -1930,6 +1952,8 @@ public final class SyncEngine {
         settlementDeferred = false
         for subscriber in hostViewSubscribers.values { subscriber.finish() }
         hostViewSubscribers.removeAll()
+        snapshotRecipientTask = nil
+        snapshotExportTasks = [:]
         syncLoopTask = nil
         syncCycleTask = nil
         syncCycleID = nil
@@ -2912,7 +2936,7 @@ public final class SyncEngine {
         }
     }
 
-    private func requestSyncCycle(force: Bool, allowInactive: Bool = false) {
+    func requestSyncCycle(force: Bool, allowInactive: Bool = false) {
         guard
             hasDurableStorage,
             isPaired,
@@ -3062,6 +3086,9 @@ public final class SyncEngine {
         if !flushed {
             _ = try await session.flush()
             try await resolveReservationAttempts(session: session)
+        }
+        if isHostMode {
+            try await advanceSnapshotBootstrap(session: session)
         }
         try await sendReplies(session: session)
         let controlRepair = hostAdapter?.store?.view.controlRepair ?? false
@@ -3263,12 +3290,12 @@ public final class SyncEngine {
 
     /// What host work captured before suspending: the session, the bound
     /// writer generation and its journal.
-    private struct HostBinding {
+    struct HostBinding {
         let generation: UUID
         let journal: Data
     }
 
-    private func hostBinding(_ session: MLSSession) throws -> HostBinding {
+    func hostBinding(_ session: MLSSession) throws -> HostBinding {
         try requireCurrent(session)
         guard hostWorkAllowed, let store = hostAdapter?.store else { throw HostEngineError.generationChanged }
         return HostBinding(generation: store.generation, journal: store.view.journalID)
@@ -3276,7 +3303,7 @@ public final class SyncEngine {
 
     /// The session, writer generation and journal are still the captured
     /// ones and host work is still allowed.
-    private func requireHostBinding(_ binding: HostBinding, _ session: MLSSession) throws {
+    func requireHostBinding(_ binding: HostBinding, _ session: MLSSession) throws {
         try requireCurrent(session)
         guard hostWorkAllowed, let store = hostAdapter?.store, store.generation == binding.generation,
               store.view.journalID == binding.journal
@@ -3327,7 +3354,7 @@ public final class SyncEngine {
             try requireHostBinding(captured, session)
             for item in chunk.prefix(application.heldMessages) where !item.fromSelf && roster.contains(item.message.sender) {
                 if case .hostComplete(let member, let through) = item.decoded, member == fingerprint {
-                    try await host.recordCompletion(provider: item.message.sender, through: through)
+                    try await host.recordCompletion(provider: item.message.sender, through: through, plaintext: item.message.plaintext)
                     try requireHostBinding(captured, session)
                 }
             }
@@ -3392,7 +3419,8 @@ public final class SyncEngine {
             if isProvider, roster.contains(hello.sender) {
                 obligation.addRecipient(hello.sender)
                 if isHostMode {
-                    obligation.addBootstrap(hello.sender, from: vector)
+                    let request = (try? HostJournalMessage.decode(chunk[hello.index].message.plaintext))?.snapshotSchema
+                    obligation.addBootstrap(hello.sender, from: vector, snapshot: request)
                 }
             }
             obligation.retain(origins: replication.retainedOrigins)
@@ -3414,7 +3442,7 @@ public final class SyncEngine {
         return (held, application.requestsHello)
     }
 
-    private func requireCurrent(_ session: MLSSession) throws {
+    func requireCurrent(_ session: MLSSession) throws {
         guard !Task.isCancelled, hasDurableStorage, self.session === session else {
             throw CancellationError()
         }
@@ -3437,8 +3465,13 @@ public final class SyncEngine {
     /// operation it has not applied.
     private func sendReplies(session: MLSSession) async throws {
         let snapshot = isHostMode ? replication.helloVector : nil
+        if isHostMode {
+            try await prepareSnapshotExports(session: session)
+        }
         while var obligation = replyObligation, let current = checkpoint {
-            if let index = obligation.bootstrap?.firstIndex(where: { $0.cut == nil }), try await hostMayCertify(session: session) {
+            var answered: Data?
+            if let index = obligation.bootstrap?.firstIndex(where: { $0.cut == nil && isSnapshotExportResolved($0) }),
+               try await hostMayCertify(session: session) {
                 let entry = obligation.bootstrap![index]
                 obligation.bootstrap![index].cut = replication.helloVector
                 obligation.merge(entry.from, provider: true)
@@ -3470,10 +3503,15 @@ public final class SyncEngine {
                     guard try await hostMayCertify(session: session) else {
                         return
                     }
-                    try await send(plaintext: HostJournalMessage.complete(member: entry.member, through: cut).encoded(), session: session)
+                    let export = entry.snapshot == nil ? nil : snapshotExport(for: entry.member)
+                    let message = HostJournalMessage.complete(
+                        member: entry.member, through: cut, snapshot: export?.offer, refusal: export?.refusal
+                    )
+                    try await send(plaintext: message.encoded(), session: session)
                     try requireCurrent(session)
                 }
                 obligation.removeBootstrap(entry.member)
+                answered = entry.member
             } else if let recipient = obligation.recipients?.first {
                 if obligation.bootstrap?.contains(where: { $0.member == recipient }) == true {
                     return
@@ -3507,6 +3545,9 @@ public final class SyncEngine {
             let next: ReplyObligation? = obligation.isEmpty ? nil : obligation
             try ReplyObligation.save(next, to: replyObligationURL)
             replyObligation = next
+            if let answered {
+                await finishSnapshotExport(for: answered)
+            }
         }
     }
 
@@ -3526,6 +3567,7 @@ public final class SyncEngine {
                 try await store.setHistoryProvider(provider)
                 try requireHostBinding(captured, session)
             }
+            try await requestSnapshotBootstrap(binding: captured, session: session)
             guard checkpoint?.joinPending == true, checkpoint?.group == announced.group else {
                 throw CancellationError()
             }
@@ -3600,7 +3642,7 @@ public final class SyncEngine {
         try await send(plaintext: replication.encode(message), session: session)
     }
 
-    private func send(plaintext: Data, session: MLSSession) async throws {
+    func send(plaintext: Data, session: MLSSession) async throws {
         invalidateHostIntake()
         guard case .accepted = try await session.send(plaintext) else {
             throw SyncCycleError.notDelivered
@@ -4308,7 +4350,7 @@ extension SyncEngine {
         try HostJournalFiles.discard(in: directory, journalID: journalID, confirming: confirming)
     }
 
-    private var hostWorkAllowed: Bool {
+    var hostWorkAllowed: Bool {
         !isHostMode || (hostLifecycle == .active && hostRepair == nil)
     }
 
@@ -4462,7 +4504,7 @@ extension SyncEngine {
     /// snapshot right now. Checked again immediately before each send, so a
     /// saved cut or snapshot request stays queued while control state is
     /// incomplete.
-    private func hostMayCertify(session: MLSSession) async throws -> Bool {
+    func hostMayCertify(session: MLSSession) async throws -> Bool {
         guard hostProviderEligible else { return false }
         let unknownOrigins = try await admissionView(session: session).unknownOrigins
         try requireCurrent(session)
@@ -5237,13 +5279,21 @@ extension SyncEngine {
         let others = try await session.members().map(\.fingerprint).filter { $0 != own }
             .sorted { $0.lexicographicallyPrecedes($1) }
         try requireCurrent(session)
-        guard let first = others.first else { return }
+        guard let first = others.first else {
+            if store.view.isDeliveryHeld {
+                let binding = try hostBinding(session)
+                try await store.refuseSnapshot(.noProvider, in: [.requested])
+                try requireHostBinding(binding, session)
+            }
+            return
+        }
         let next = store.view.historyProvider.flatMap { previous in
             others.first { previous.lexicographicallyPrecedes($0) }
         } ?? first
         let binding = try hostBinding(session)
         try await store.setHistoryProvider(next)
         try requireHostBinding(binding, session)
+        try await requestSnapshotBootstrap(binding: binding, session: session)
         try await send(.hello(vector: replication.helloVector, provider: next), session: session)
     }
 }

@@ -5,6 +5,10 @@ import Foundation
 /// `records` carries opaque record envelopes. `complete` tells `member`
 /// that this provider sent every record up to `through`. The remaining
 /// kinds carry the same control fields as `ReplicationMessage` version 2.
+///
+/// Snapshot bootstrap adds optional fields that earlier libraries ignore:
+/// `snapshotSchema` on a provider hello, and `snapshot` or
+/// `snapshotRefusal` on `complete`.
 struct HostJournalMessage: Codable, Equatable, Sendable {
     static let version = 3
     static let maxRecords = 256
@@ -31,13 +35,21 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
     var reservations: [OriginReservation]? = nil
     var overflowed: Bool? = nil
     var through: ReplicaVersionVector? = nil
+    var snapshotSchema: String? = nil
+    var snapshot: HostSnapshotOffer? = nil
+    var snapshotRefusal: String? = nil
 
     static func records(_ envelopes: [Data]) -> HostJournalMessage {
         HostJournalMessage(version: version, kind: .records, records: envelopes)
     }
 
-    static func complete(member: Data, through: ReplicaVersionVector) -> HostJournalMessage {
-        HostJournalMessage(version: version, kind: .complete, member: member, through: through)
+    static func complete(
+        member: Data, through: ReplicaVersionVector, snapshot: HostSnapshotOffer? = nil, refusal: HostSnapshotRefusalReason? = nil
+    ) -> HostJournalMessage {
+        var message = HostJournalMessage(version: version, kind: .complete, member: member, through: through)
+        message.snapshot = snapshot
+        message.snapshotRefusal = snapshot == nil ? refusal?.rawValue : nil
+        return message
     }
 
     /// The version 3 form of a control message. Operations have none.
@@ -109,7 +121,8 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
         let fields: [Bool] = [
             message.records != nil, message.vector != nil, message.provider != nil, message.member != nil,
             message.origins != nil, message.epoch != nil, message.reservation != nil, message.reservations != nil,
-            message.overflowed != nil, message.through != nil,
+            message.overflowed != nil, message.through != nil, message.snapshotSchema != nil, message.snapshot != nil,
+            message.snapshotRefusal != nil,
         ]
         func only(_ allowed: Set<Int>) -> Bool {
             fields.enumerated().allSatisfy { allowed.contains($0.offset) || !$0.element }
@@ -121,9 +134,12 @@ struct HostJournalMessage: Codable, Equatable, Sendable {
             valid = only([0]) && (1...maxRecords).contains(records.count) && records.allSatisfy { !$0.isEmpty }
                 && records.reduce(0) { $0 + $1.count } <= maxRecordBytes
         case .hello:
-            valid = only([1, 2]) && message.vector != nil && (message.provider.map { $0.count == 32 } ?? true)
+            valid = only([1, 2, 10]) && message.vector != nil && (message.provider.map { $0.count == 32 } ?? true)
+                && (message.snapshotSchema.map { message.provider != nil && HostSnapshotSchemaName.isValid($0) } ?? true)
         case .complete:
-            valid = only([3, 9]) && message.member?.count == 32 && message.through != nil
+            valid = only([3, 9, 11, 12]) && message.member?.count == 32 && message.through != nil
+                && !(message.snapshot != nil && message.snapshotRefusal != nil)
+                && (message.snapshotRefusal.map { $0.utf8.count <= 32 } ?? true)
         case .reservation:
             valid = only([3, 4, 5]) && message.member?.count == 32 && message.epoch != nil
                 && message.origins.map(OriginReservation.isCanonical) == true

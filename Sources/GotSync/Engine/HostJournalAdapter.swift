@@ -130,8 +130,14 @@ final class HostJournalAdapter {
     }
 
     /// Stores a provider's completion target received from a current member.
-    func recordCompletion(provider: Data, through: ReplicaVersionVector) async throws {
-        try await bound().recordCompletionTarget(provider: provider, through: Self.dictionary(through))
+    /// A requested snapshot bootstrap takes the offer or refusal the
+    /// completion message carries.
+    func recordCompletion(provider: Data, through: ReplicaVersionVector, plaintext: Data) async throws {
+        let message = try? HostJournalMessage.decode(plaintext)
+        try await bound().recordCompletionTarget(
+            provider: provider, through: Self.dictionary(through), offer: message?.snapshot,
+            refusal: message?.snapshotRefusal.flatMap(HostSnapshotRefusalReason.init(rawValue:))
+        )
     }
 
     static func dictionary(_ vector: ReplicaVersionVector) -> [Data: UInt64] {
@@ -194,8 +200,14 @@ extension HostJournalAdapter: ReplicationData {
 
     var retriesHeldWithoutMessages: Bool { false }
 
+    /// A hello naming a provider asks for a snapshot while this journal's
+    /// bootstrap is requested.
     func encode(_ control: ReplicationMessage) throws -> Data {
-        try HostJournalMessage(control: control).encoded()
+        var message = try HostJournalMessage(control: control)
+        if control.kind == .hello, control.provider != nil, let bootstrap = store?.view.bootstrap, bootstrap.phase == .requested {
+            message.snapshotSchema = bootstrap.schema
+        }
+        return try message.encoded()
     }
 
     func decode(_ plaintext: Data) -> (control: ReplicationMessage?, decoded: ReplicationDecoded) {

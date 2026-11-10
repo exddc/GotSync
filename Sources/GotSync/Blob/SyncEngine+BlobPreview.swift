@@ -47,6 +47,7 @@ extension SyncEngine {
         } else if blobDirectory != nil {
             blobRetirePending = true
         }
+        retireSnapshotTransfers()
     }
 
     /// Binds the service to the session's group, unless a retirement happened
@@ -67,6 +68,9 @@ extension SyncEngine {
         }
         _ = try? await service.ensureBound(route: route, member: member, notRetiredSince: token) {
             try await client.blobAccess()
+        }
+        if snapshotService != nil || snapshotHooks != nil {
+            await bindSnapshotService(session)
         }
     }
 }

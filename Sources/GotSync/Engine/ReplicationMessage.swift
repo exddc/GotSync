@@ -334,16 +334,18 @@ struct ReplyObligation: Codable, Equatable, Sendable {
         let member: Data
         let from: ReplicaVersionVector
         var cut: ReplicaVersionVector?
+        /// The snapshot schema the member asked to install, if any.
+        var snapshot: String? = nil
     }
 
     var isEmpty: Bool { own == nil && provided == nil && (recipients ?? []).isEmpty && (bootstrap ?? []).isEmpty }
 
     /// Adds a request unless `member` already has one; a repeated hello does
     /// not replace its cut.
-    mutating func addBootstrap(_ member: Data, from vector: ReplicaVersionVector) {
+    mutating func addBootstrap(_ member: Data, from vector: ReplicaVersionVector, snapshot: String? = nil) {
         var entries = bootstrap ?? []
         guard !entries.contains(where: { $0.member == member }) else { return }
-        entries.append(Bootstrap(member: member, from: vector, cut: nil))
+        entries.append(Bootstrap(member: member, from: vector, cut: nil, snapshot: snapshot))
         bootstrap = Array(entries.suffix(SyncGroupProfile.supportedMemberCeiling))
     }
 

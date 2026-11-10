@@ -205,6 +205,8 @@ import Foundation
     public let retainedCount: UInt64
     public let retainedBytes: UInt64
     public let controlRepair: Bool
+    /// The joiner's snapshot bootstrap; `.fullHistory` unless requested.
+    public let bootstrap: HostSnapshotBootstrap
 }
 
 /// The composed host view. `journal` is nil while no generation is bound,
@@ -245,7 +247,8 @@ import Foundation
                 undelivered: core.undelivered, uploadedThrough: view.uploadedThrough, unuploaded: view.unuploaded,
                 historyComplete: core.historyComplete, historyApplied: core.historyApplied,
                 pendingCount: core.pendingCount, quarantineCount: core.quarantineCount, heldCount: core.heldCount,
-                retainedCount: core.retainedCount, retainedBytes: core.retainedBytes, controlRepair: core.controlRepair
+                retainedCount: core.retainedCount, retainedBytes: core.retainedBytes, controlRepair: core.controlRepair,
+                bootstrap: HostSnapshotBootstrap(core.bootstrap)
             )
         }
     }
@@ -363,6 +366,8 @@ import Foundation
     case exportRevisionChanged
     /// The journal file could not be read or written; details stay internal.
     case storageUnavailable
+    /// A snapshot bootstrap holds delivery; see `HostJournalState.bootstrap`.
+    case bootstrapPending
 
     /// The public form of any error a host call can raise. Cancellation
     /// passes through unchanged.
@@ -407,6 +412,7 @@ import Foundation
         case .exportRevisionChanged: self = .exportRevisionChanged
         case .notArchived: self = .notArchived
         case .confirmationMismatch: self = .confirmationMismatch
+        case .bootstrapPending: self = .bootstrapPending
         }
     }
 

@@ -45,6 +45,7 @@ final class HostJournalPreviewMappingTests: XCTestCase {
             (.exportRevisionChanged, .exportRevisionChanged),
             (.notArchived, .notArchived),
             (.confirmationMismatch, .confirmationMismatch),
+            (.bootstrapPending, .bootstrapPending),
         ]
         for (source, expected) in table {
             let surfaced = HostJournalError.surfaced(source)
