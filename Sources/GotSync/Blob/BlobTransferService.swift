@@ -29,6 +29,8 @@ struct BlobBinding: Equatable, Sendable {
     static let availabilityInterval: TimeInterval = 6 * 3_600
     static let directoryName = "blob-v1"
 
+    public static var maximumObjectPlaintextLength: UInt64 { BlobFormat.maxPlaintextLength }
+
     private struct Fence {
         var generation: UInt64 = 0
         /// The newest generation retired outside the actor, so a later bind
@@ -72,7 +74,7 @@ struct BlobBinding: Equatable, Sendable {
     private var activeFetches: Set<Data> = []
     private var sealing: [Data: Sealing] = [:]
     private var cancelledSeals: Set<Data> = []
-    private var waitingCapacity: Set<Data> = []
+    private var waitingCapacity: [Data: BlobContentKind] = [:]
     private var relayUnsupported = false
     private var hooks: BlobHostHooks?
 
@@ -331,7 +333,7 @@ struct BlobBinding: Equatable, Sendable {
         guard expectedContentHash.count == BlobFormat.hashLength else { throw BlobError.invalidIdentifier }
         let active = try requireBinding(route)
         guard try countOutgoing() + sealing.count < Self.maxOutgoingRows else {
-            waitingCapacity.insert(id.bytes)
+            waitingCapacity[id.bytes] = kind
             throw BlobError.capacity(.outgoingRows)
         }
         let length: UInt64
@@ -341,7 +343,7 @@ struct BlobBinding: Equatable, Sendable {
             throw BlobError.sourceUnreadable
         }
         guard let layout = try? BlobPartLayout(plaintextLength: length) else { throw BlobError.exceedsSyncLimits }
-        let ticket = try reserve(Int64(length + layout.ciphertextLength), for: id.bytes)
+        let ticket = try reserve(Int64(length + layout.ciphertextLength), for: id.bytes, kind: kind)
         cancelledSeals.remove(id.bytes)
         let generation = active.binding.generation
         let session = active.binding.session
@@ -390,7 +392,7 @@ struct BlobBinding: Equatable, Sendable {
         guard row.descriptor == nil else { throw BlobError.alreadyOffered }
         try write { try store.deleteOutgoing(id.bytes) }
         removeCommitted(files.sealedFile(row.id, generation: row.sealGeneration))
-        waitingCapacity.remove(id.bytes)
+        waitingCapacity.removeValue(forKey: id.bytes)
         notify()
     }
 
@@ -500,8 +502,18 @@ struct BlobBinding: Equatable, Sendable {
     }
 
     public func summary() -> BlobSummary {
+        makeSummary(kind: nil)
+    }
+
+    /// Filters transfer and registry counts; byte totals and resource flags
+    /// still describe the shared service ledger and relay.
+    public func summary(for kind: BlobContentKind) -> BlobSummary {
+        makeSummary(kind: kind)
+    }
+
+    private func makeSummary(kind: BlobContentKind?) -> BlobSummary {
         var summary = BlobSummary()
-        for status in outgoing() {
+        for status in outgoing() where kind == nil || status.kind == kind {
             switch status.state {
             case .uploading: summary.outgoingUploading += 1
             case .readyForHandoff: summary.outgoingOffered += 1
@@ -510,7 +522,7 @@ struct BlobBinding: Equatable, Sendable {
             case .retired: summary.outgoingRetired += 1
             }
         }
-        for status in incoming() {
+        for status in incoming() where kind == nil || status.kind == kind {
             switch status.state {
             case .queued: summary.incomingQueued += 1
             case .fetching: summary.incomingFetching += 1
@@ -521,8 +533,8 @@ struct BlobBinding: Equatable, Sendable {
             case .retired: break
             }
         }
-        summary.outgoingWaitingCapacity = waitingCapacity.count
-        summary.availableObjects = (try? countAvailable()) ?? 0
+        summary.outgoingWaitingCapacity = waitingCapacity.values.filter { kind == nil || $0 == kind }.count
+        summary.availableObjects = (try? countAvailable(kind: kind)) ?? 0
         summary.libraryBytes = committedBytes + reservations.values.reduce(0, +)
         summary.relayUnsupported = relayUnsupported
         let outgoingRows = (try? countOutgoing()) ?? 0
@@ -580,17 +592,17 @@ struct BlobBinding: Equatable, Sendable {
 
     // MARK: - Ledger
 
-    private func reserve(_ bytes: Int64, for id: Data) throws -> UUID {
+    private func reserve(_ bytes: Int64, for id: Data, kind: BlobContentKind) throws -> UUID {
         let reserved = reservations.values.reduce(0, +)
         guard committedBytes + reserved + bytes <= Self.ledgerBytes else {
-            waitingCapacity.insert(id)
+            waitingCapacity[id] = kind
             throw BlobError.capacity(.libraryBytes)
         }
         guard let free = BlobFiles.freeBytes(at: files.root), free - reserved - bytes >= Self.diskFloor else {
-            waitingCapacity.insert(id)
+            waitingCapacity[id] = kind
             throw BlobError.capacity(.diskFloor)
         }
-        waitingCapacity.remove(id)
+        waitingCapacity.removeValue(forKey: id)
         let ticket = UUID()
         reservations[ticket] = bytes
         return ticket
@@ -651,8 +663,8 @@ struct BlobBinding: Equatable, Sendable {
         do { return try store.outgoingCount() } catch { throw BlobError.storageUnavailable }
     }
 
-    private func countAvailable() throws -> Int {
-        do { return try store.availableCount() } catch { throw BlobError.storageUnavailable }
+    private func countAvailable(kind: BlobContentKind? = nil) throws -> Int {
+        do { return try store.availableCount(kind: kind) } catch { throw BlobError.storageUnavailable }
     }
 
     // MARK: - Sealing
@@ -753,7 +765,7 @@ struct BlobBinding: Equatable, Sendable {
         guard let session = currentSession(generation), let row = try? store.outgoing(id), row.session == session,
               row.phase == .sealed || row.phase == .uploaded, row.descriptor == nil,
               let route = try? BlobRoute(row.route), let layout = try? row.layout,
-              let ticket = try? reserve(Int64(layout.plaintextLength + layout.ciphertextLength), for: id)
+              let ticket = try? reserve(Int64(layout.plaintextLength + layout.ciphertextLength), for: id, kind: row.kind)
         else {
             return
         }
@@ -985,7 +997,7 @@ struct BlobBinding: Equatable, Sendable {
         row.digest = BlobDescriptor.digest(of: encoded)
         row.phase = .offered
         guard (try? write { try store.put(row) }) != nil else { return }
-        waitingCapacity.remove(id)
+        waitingCapacity.removeValue(forKey: id)
         notify()
     }
 
@@ -1028,7 +1040,7 @@ struct BlobBinding: Equatable, Sendable {
             guard let layout = try? BlobDescriptor.stored(row.descriptor).layout else { continue }
             if row.phase != .fetching, byteRows >= Self.maxIncomingByteRows { continue }
             let existing = BlobFiles.size(files.ciphertext(row.id))
-            guard let ticket = try? reserve(Int64(layout.ciphertextLength + layout.plaintextLength), for: row.id) else { continue }
+            guard let ticket = try? reserve(Int64(layout.ciphertextLength + layout.plaintextLength), for: row.id, kind: row.kind) else { continue }
             committedBytes = max(0, committedBytes - existing)
             fetchTickets[row.id] = ticket
             if row.phase != .fetching {
@@ -1364,7 +1376,7 @@ struct BlobBinding: Equatable, Sendable {
             source = await hooks.verifiedContentURL(descriptor.contentHash)
         }
         guard isCurrent(generation),
-              let ticket = try? reserve(Int64(descriptor.layout.ciphertextLength), for: objectID)
+              let ticket = try? reserve(Int64(descriptor.layout.ciphertextLength), for: objectID, kind: descriptor.kind)
         else {
             return nil
         }

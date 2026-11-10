@@ -68,6 +68,7 @@ BLOB_SURFACE_TYPES = {
 }
 
 REQUIRED_BLOB_CALLS = {
+    "maximumObjectPlaintextLength",
     "seal(_:route:source:expectedContentHash:)",
     "sealData(_:route:source:expectedContentHash:)",
     "requestIncomingData(_:route:descriptor:)",
@@ -83,6 +84,7 @@ REQUIRED_BLOB_CALLS = {
     "unregisterAvailable(route:objectID:)",
     "release(route:objectIDs:)",
     "summary()",
+    "summary(for:)",
     "setHooks(_:)",
     "updates()",
 }
