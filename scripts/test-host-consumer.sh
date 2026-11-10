@@ -58,7 +58,15 @@ export GOTSYNC_RELAY_URL GOTSYNC_MAILBOX_URL GOTSYNC_INTEGRATION=1 GOTSYNC_REQUI
 (
     cd "$GOTSYNC_COPY"
     swift test --scratch-path "$GOTSYNC_TEST_DIR/build"
-    grep -q "\"revision\" : \"$revision\"" Package.resolved || { echo "GotSync did not resolve to $revision"; exit 1; }
+    python3 - "$revision" <<'PY'
+import json
+import sys
+
+with open("Package.resolved") as file:
+    pins = [pin for pin in json.load(file).get("pins", []) if pin.get("identity") == "gotsync"]
+if len(pins) != 1 or pins[0].get("location") != "https://github.com/exddc/GotSync.git" or pins[0].get("state", {}).get("revision") != sys.argv[1]:
+    sys.exit(f"GotSync did not resolve to {sys.argv[1]}")
+PY
     xcodebuild -scheme HostJournalPreviewConsumer -destination 'generic/platform=iOS Simulator' \
         -derivedDataPath "$GOTSYNC_TEST_DIR/ios" -clonedSourcePackagesDirPath "$GOTSYNC_TEST_DIR/ios-packages" \
         CODE_SIGNING_ALLOWED=NO -quiet build
