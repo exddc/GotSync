@@ -48,6 +48,7 @@ struct BlobBinding: Equatable, Sendable {
     }
 
     private struct Sealing {
+        let kind: BlobContentKind
         let route: Data
         let expected: Data
         let task: Task<BlobOutgoingStatus, Error>
@@ -290,7 +291,7 @@ struct BlobBinding: Equatable, Sendable {
         }
     }
 
-    /// Seals a private clone of `source` under a fresh key and commits it.
+    /// Seals a private clone of an image file under a fresh key and commits it.
     /// Returns the existing status for a repeated ID with the same route and
     /// hash. The host keeps `source`; the library never changes it.
     public func seal(
@@ -299,11 +300,31 @@ struct BlobBinding: Equatable, Sendable {
         source: URL,
         expectedContentHash: Data
     ) async throws -> BlobOutgoingStatus {
+        try await seal(id, kind: .image, route: route, source: source, expected: expectedContentHash)
+    }
+
+    /// Seals one application-data chunk of at most 10 MiB, such as one part of
+    /// a host record too large for a journal payload. No image validation
+    /// runs; the descriptor is a version 2 data descriptor.
+    public func sealData(
+        _ id: BlobTransferID,
+        route: BlobRoute,
+        source: URL,
+        expectedContentHash: Data
+    ) async throws -> BlobOutgoingStatus {
+        try await seal(id, kind: .applicationData, route: route, source: source, expected: expectedContentHash)
+    }
+
+    private func seal(
+        _ id: BlobTransferID, kind: BlobContentKind, route: BlobRoute, source: URL, expected expectedContentHash: Data
+    ) async throws -> BlobOutgoingStatus {
         if let row = try readOutgoing(id.bytes) {
+            guard row.kind == kind else { throw BlobError.contentKindMismatch }
             guard row.route == route.bytes, row.expected == expectedContentHash else { throw BlobError.transferMismatch }
             return outgoingStatus(row)
         }
         if let running = sealing[id.bytes] {
+            guard running.kind == kind else { throw BlobError.contentKindMismatch }
             guard running.route == route.bytes, running.expected == expectedContentHash else { throw BlobError.transferMismatch }
             return try await running.task.value
         }
@@ -329,18 +350,19 @@ struct BlobBinding: Equatable, Sendable {
             let candidate: BlobSealCandidate
             do {
                 candidate = try await Self.produceSeal(
-                    id: id.bytes, source: source, expected: expectedContentHash, route: route, files: files, sealGeneration: 0
+                    id: id.bytes, kind: kind, source: source, expected: expectedContentHash, route: route, files: files,
+                    sealGeneration: 0
                 )
             } catch {
                 self.release(ticket)
                 throw error
             }
             return try self.commitSealed(
-                candidate, id: id.bytes, route: route, source: source, expected: expectedContentHash,
+                candidate, id: id.bytes, kind: kind, route: route, source: source, expected: expectedContentHash,
                 generation: generation, session: session, ticket: ticket
             )
         }
-        sealing[id.bytes] = Sealing(route: route.bytes, expected: expectedContentHash, task: task)
+        sealing[id.bytes] = Sealing(kind: kind, route: route.bytes, expected: expectedContentHash, task: task)
         defer { sealing[id.bytes] = nil }
         return try await task.value
     }
@@ -372,13 +394,25 @@ struct BlobBinding: Equatable, Sendable {
         notify()
     }
 
-    /// Queues a descriptor from an accepted host record for fetching.
+    /// Queues an image descriptor from an accepted host record for fetching.
+    /// An application-data descriptor is refused with `contentKindMismatch`.
     public func requestIncoming(_ id: BlobTransferID, route: BlobRoute, descriptor: Data) throws {
+        try requestIncoming(id, kind: .image, route: route, descriptor: descriptor)
+    }
+
+    /// Queues an application-data descriptor from an accepted host record. The
+    /// verified chunk is admitted only by the host's `acceptsData` hook.
+    public func requestIncomingData(_ id: BlobTransferID, route: BlobRoute, descriptor: Data) throws {
+        try requestIncoming(id, kind: .applicationData, route: route, descriptor: descriptor)
+    }
+
+    private func requestIncoming(_ id: BlobTransferID, kind: BlobContentKind, route: BlobRoute, descriptor: Data) throws {
         if let row = try readIncoming(id.bytes) {
+            guard row.kind == kind else { throw BlobError.contentKindMismatch }
             guard row.route == route.bytes, row.descriptor == descriptor else { throw BlobError.transferMismatch }
             return
         }
-        let decoded = try BlobDescriptor.decodeForService(descriptor)
+        let decoded = try BlobDescriptor.decodeForService(descriptor, kind: kind)
         let active = try requireBinding(route)
         let rows = try readAllIncoming()
         guard rows.filter({ !$0.phase.holdsBytes }).count < Self.maxQueuedDescriptors else {
@@ -418,10 +452,20 @@ struct BlobBinding: Equatable, Sendable {
         notify()
     }
 
-    /// Records that the host holds verified content for `descriptor`, so it can
-    /// be re-uploaded when other members want it.
+    /// Records that the host holds verified content for an image `descriptor`,
+    /// so it can be re-uploaded when other members want it.
     public func registerAvailable(route: BlobRoute, descriptor: Data) throws {
-        let decoded = try BlobDescriptor.decodeForService(descriptor)
+        try register(route: route, descriptor: descriptor, kind: .image)
+    }
+
+    /// Records that the host holds the content of an application-data
+    /// descriptor, for re-upload.
+    public func registerAvailableData(route: BlobRoute, descriptor: Data) throws {
+        try register(route: route, descriptor: descriptor, kind: .applicationData)
+    }
+
+    private func register(route: BlobRoute, descriptor: Data, kind: BlobContentKind) throws {
+        let decoded = try BlobDescriptor.decodeForService(descriptor, kind: kind)
         let active = try requireBinding(route)
         if let existing = try readAvailable(route: route.bytes, objectID: decoded.objectID) {
             guard existing == descriptor else { throw BlobError.transferMismatch }
@@ -510,13 +554,13 @@ struct BlobBinding: Equatable, Sendable {
             }
         }
         return BlobOutgoingStatus(
-            id: try! BlobTransferID(bytes: row.id), route: try! BlobRoute(bytes: row.route),
+            id: try! BlobTransferID(bytes: row.id), route: try! BlobRoute(bytes: row.route), kind: row.kind,
             contentHash: row.expected, state: state
         )
     }
 
     private func incomingStatus(_ row: BlobIncomingRow) -> BlobIncomingStatus {
-        let decoded = try? BlobDescriptor(decoding: row.descriptor)
+        let decoded = try? BlobDescriptor.stored(row.descriptor)
         let state: BlobIncomingStatus.State
         switch row.phase {
         case .queued: state = .queued
@@ -528,7 +572,8 @@ struct BlobBinding: Equatable, Sendable {
         case .retired: state = .retired
         }
         return BlobIncomingStatus(
-            id: try! BlobTransferID(bytes: row.id), route: try! BlobRoute(bytes: row.route), objectID: row.objectID,
+            id: try! BlobTransferID(bytes: row.id), route: try! BlobRoute(bytes: row.route), kind: row.kind,
+            objectID: row.objectID,
             digest: row.digest, isRetired: isRetired(session: row.session), state: state
         )
     }
@@ -615,7 +660,7 @@ struct BlobBinding: Equatable, Sendable {
     /// Clone, hash, validate and seal, all off the actor. Returns a candidate
     /// the actor commits or discards.
     private static func produceSeal(
-        id: Data, source: URL, expected: Data, route: BlobRoute, files: BlobFiles, sealGeneration: Int
+        id: Data, kind: BlobContentKind, source: URL, expected: Data, route: BlobRoute, files: BlobFiles, sealGeneration: Int
     ) async throws -> BlobSealCandidate {
         let clone = files.clone(id)
         let output = files.sealedFile(id, generation: sealGeneration)
@@ -627,7 +672,9 @@ struct BlobBinding: Equatable, Sendable {
                 throw BlobError.sourceUnreadable
             }
             guard try Self.contentHash(of: clone) == expected else { throw BlobError.sourceChanged }
-            let image = try await Self.validate(clone)
+            let image = kind == .image
+                ? try await Self.validate(clone)
+                : BlobImageInfo(mediaType: BlobDescriptor.dataMediaType, pixelWidth: 0, pixelHeight: 0)
             let sealed = try await BlobWorkGate.seal.run { () throws -> BlobSealedObject in
                 let input = try FileHandle(forReadingFrom: clone)
                 defer { try? input.close() }
@@ -668,7 +715,7 @@ struct BlobBinding: Equatable, Sendable {
     }
 
     private func commitSealed(
-        _ candidate: BlobSealCandidate, id: Data, route: BlobRoute, source: URL, expected: Data,
+        _ candidate: BlobSealCandidate, id: Data, kind: BlobContentKind, route: BlobRoute, source: URL, expected: Data,
         generation: UInt64, session: Data, ticket: UUID
     ) throws -> BlobOutgoingStatus {
         defer {
@@ -681,7 +728,7 @@ struct BlobBinding: Equatable, Sendable {
             throw BlobError.staleBinding
         }
         let row = BlobOutgoingRow(
-            id: id, route: route.bytes, session: session, expected: expected, source: source.path,
+            id: id, kind: kind, route: route.bytes, session: session, expected: expected, source: source.path,
             phase: .sealed, sealGeneration: 0, key: candidate.sealed.key.withUnsafeBytes { Data($0) },
             objectID: candidate.sealed.objectID, plaintextLength: candidate.sealed.manifest.layout.plaintextLength,
             partHashes: candidate.sealed.manifest.partHashes, mediaType: candidate.image.mediaType,
@@ -714,7 +761,7 @@ struct BlobBinding: Equatable, Sendable {
         let candidate: BlobSealCandidate
         do {
             candidate = try await Self.produceSeal(
-                id: id, source: URL(fileURLWithPath: row.source), expected: row.expected, route: route,
+                id: id, kind: row.kind, source: URL(fileURLWithPath: row.source), expected: row.expected, route: route,
                 files: files, sealGeneration: next
             )
         } catch {
@@ -978,7 +1025,7 @@ struct BlobBinding: Equatable, Sendable {
         let byteRows = ((try? store.allIncoming()) ?? []).filter { $0.phase.holdsBytes }.count
         for var row in due {
             if let ticket = fetchTickets[row.id] { return .work((row, ticket)) }
-            guard let layout = try? BlobDescriptor(decoding: row.descriptor).layout else { continue }
+            guard let layout = try? BlobDescriptor.stored(row.descriptor).layout else { continue }
             if row.phase != .fetching, byteRows >= Self.maxIncomingByteRows { continue }
             let existing = BlobFiles.size(files.ciphertext(row.id))
             guard let ticket = try? reserve(Int64(layout.ciphertextLength + layout.plaintextLength), for: row.id) else { continue }
@@ -1034,7 +1081,9 @@ struct BlobBinding: Equatable, Sendable {
     }
 
     private nonisolated func fetch(_ row: BlobIncomingRow, generation: UInt64) async {
-        guard let context = await context(generation), let descriptor = try? BlobDescriptor(decoding: row.descriptor) else {
+        guard let context = await context(generation), let descriptor = try? BlobDescriptor.stored(row.descriptor),
+              descriptor.kind == row.kind
+        else {
             return
         }
         let layout = descriptor.layout
@@ -1096,6 +1145,16 @@ struct BlobBinding: Equatable, Sendable {
                 }
             } catch {
                 await failIntegrity(row.id, generation: generation, rejection: .relayIntegrity)
+                return
+            }
+            if descriptor.kind == .applicationData {
+                guard let info = try? BlobDataDescriptorInfo(descriptor: row.descriptor), let hooks = await hooks,
+                      await hooks.acceptsData(opened, info)
+                else {
+                    await reject(row.id, generation: generation, rejection: .dataRefused)
+                    return
+                }
+                await commitVerified(row.id, generation: generation)
                 return
             }
             let image: BlobImageInfo
@@ -1294,11 +1353,11 @@ struct BlobBinding: Equatable, Sendable {
         if let row = ((try? store.allOutgoing()) ?? []).first(where: {
             $0.session == session && $0.phase == .offered && $0.objectID == objectID
         }), let encoded = row.descriptor {
-            descriptor = try? BlobDescriptor(decoding: encoded)
+            descriptor = try? BlobDescriptor.stored(encoded)
             outgoing = row.id
             source = URL(fileURLWithPath: row.source)
         } else if let encoded = try? store.available(route: route.bytes, objectID: objectID) {
-            descriptor = try? BlobDescriptor(decoding: encoded)
+            descriptor = try? BlobDescriptor.stored(encoded)
         }
         guard let descriptor else { return nil }
         if source == nil || !FileManager.default.fileExists(atPath: source!.path), let hooks {
@@ -1414,6 +1473,7 @@ extension BlobRejection {
         case .relayIntegrity: "relayIntegrity"
         case .descriptorMismatch: "descriptorMismatch"
         case .imageRejected: "imageRejected"
+        case .dataRefused: "dataRefused"
         }
     }
 
@@ -1421,6 +1481,7 @@ extension BlobRejection {
         switch name {
         case "descriptorMismatch": self = .descriptorMismatch
         case "imageRejected": self = .imageRejected
+        case "dataRefused": self = .dataRefused
         default: self = .relayIntegrity
         }
     }
