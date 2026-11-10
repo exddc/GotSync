@@ -1212,12 +1212,24 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=os.getenv("GOTSYNC_ENABLE_BLOBS") == "1",
         help="serve encrypted blob parts under /v2/mls/blob/ (also GOTSYNC_ENABLE_BLOBS=1); off by default",
     )
-    parser.add_argument("--blob-directory", default=DEFAULT_BLOB_DIRECTORY)
-    parser.add_argument("--blob-database", default=DEFAULT_BLOB_DATABASE_PATH)
+    parser.add_argument(
+        "--blob-directory",
+        default=os.getenv("GOTSYNC_BLOB_DIRECTORY") or DEFAULT_BLOB_DIRECTORY,
+        help="blob part directory (also GOTSYNC_BLOB_DIRECTORY)",
+    )
+    parser.add_argument(
+        "--blob-database",
+        default=os.getenv("GOTSYNC_BLOB_DATABASE") or DEFAULT_BLOB_DATABASE_PATH,
+        help="blob metadata database (also GOTSYNC_BLOB_DATABASE)",
+    )
     parser.add_argument(
         "--blob-require-route-header",
         action="store_true",
-        help="answer blob requests only when a trusted proxy tagged them X-GotSync-Route: blob",
+        default=os.getenv("GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER") == "1",
+        help=(
+            "answer blob requests only when a trusted proxy tagged them X-GotSync-Route: blob "
+            "(also GOTSYNC_BLOB_REQUIRE_ROUTE_HEADER=1)"
+        ),
     )
     return parser
 
