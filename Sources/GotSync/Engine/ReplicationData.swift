@@ -15,6 +15,8 @@ enum ReplicationDecoded {
     case taskOperations([TaskOperation])
     case hostRecords(HostJournalMessage)
     case hostComplete(member: Data, through: ReplicaVersionVector)
+    /// A retention proposal, vote or committed-floor corroboration.
+    case hostRetention(HostJournalMessage)
     case control
     /// Not readable as a message of this schema.
     case undecodable

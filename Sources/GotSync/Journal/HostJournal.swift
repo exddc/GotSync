@@ -238,6 +238,27 @@ public final class HostJournal {
         }
     }
 
+    // MARK: - Retention floor
+
+    func retentionDecline(_ anchors: [HostSnapshotAnchor]) async throws -> HostRetentionDeclineReason? {
+        try await perform("retentionDecline", .engine) { try $0.retentionDecline(anchors) }
+    }
+
+    @discardableResult
+    func commitRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) async throws -> Bool {
+        try await perform("commitRetentionFloor", .engine) { try $0.commitRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint) }
+    }
+
+    @discardableResult
+    func pruneBelowFloor() async throws -> Int {
+        try await perform("pruneBelowFloor", .engine) { try $0.pruneBelowFloor() }
+    }
+
+    @discardableResult
+    func adoptRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) async throws -> Bool {
+        try await perform("adoptRetentionFloor", .engine) { try $0.adoptRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint) }
+    }
+
     // MARK: - Snapshot bootstrap
 
     @discardableResult

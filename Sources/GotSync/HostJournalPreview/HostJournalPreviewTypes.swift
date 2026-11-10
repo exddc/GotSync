@@ -207,6 +207,8 @@ import Foundation
     public let controlRepair: Bool
     /// The joiner's snapshot bootstrap; `.fullHistory` unless requested.
     public let bootstrap: HostSnapshotBootstrap
+    /// The committed retention floor; nil while every record is retained.
+    public let retention: HostRetentionState?
 }
 
 /// The composed host view. `journal` is nil while no generation is bound,
@@ -248,7 +250,7 @@ import Foundation
                 historyComplete: core.historyComplete, historyApplied: core.historyApplied,
                 pendingCount: core.pendingCount, quarantineCount: core.quarantineCount, heldCount: core.heldCount,
                 retainedCount: core.retainedCount, retainedBytes: core.retainedBytes, controlRepair: core.controlRepair,
-                bootstrap: HostSnapshotBootstrap(core.bootstrap)
+                bootstrap: HostSnapshotBootstrap(core.bootstrap), retention: core.retention.map(HostRetentionState.init)
             )
         }
     }
@@ -470,6 +472,11 @@ import Foundation
     case pending(record: HostRecordID, envelope: Data)
     case quarantined(sender: Data, cursor: UInt64, reason: HostQuarantineReason, bytes: Data)
     case heldInbox(sender: Data, cursor: UInt64, plaintext: Data)
+    /// The checkpoint that replaces the records removed under the retention
+    /// floor. It comes first in a compacted journal's export. `chunks` are
+    /// the library-owned chunk files in order; empty when they are not held,
+    /// in which case the removed history is not recoverable from this file.
+    case checkpoint(floor: [Data: UInt64], length: UInt64, contentHash: Data, chunks: [URL])
 
     /// Exported envelopes were validated when the journal opened; one that
     /// does not parse now is reported as corruption.
@@ -504,6 +511,8 @@ import Foundation
             self = .quarantined(sender: sender, cursor: cursor, reason: reason, bytes: bytes)
         case .held(let sender, let cursor, let plaintext):
             self = .heldInbox(sender: sender, cursor: cursor, plaintext: plaintext)
+        case .checkpoint(let offer):
+            self = .checkpoint(floor: offer.coverage, length: offer.length, contentHash: offer.contentHash, chunks: [])
         }
     }
 }
@@ -511,6 +520,9 @@ import Foundation
 @_spi(HostJournalPreview) public enum HostQuarantineReason: String, Sendable {
     case undecodable
     case malformedEnvelopes
+    /// It carried a record removed under the retention floor without a run
+    /// proving its bytes.
+    case belowFloor
 }
 
 /// Where the next export page starts. Bound to one journal and one

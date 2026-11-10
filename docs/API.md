@@ -362,6 +362,38 @@ before pairing; without hooks, bootstrap keeps full history.
 
 **Retention:** every record stays retained and byte-checked. A snapshot changes only delivery, never retention.
 
+### Retention floors (compacting groups)
+
+A group created with `SyncPayloadSchema.compactingHostJournal(payload:version:)`
+may remove history, and only that profile allows it. Libraries without
+compaction, and clients configured with the `hostJournal` profile, refuse to
+pair into such a group, before Add.
+
+Every member must register two hosts before creating or joining; otherwise
+pairing fails with `incompatibleGroupProfile`:
+- a snapshot host whose schema is `HostSnapshotSchema(label: payload, version: version)`;
+- `registerRetentionHost(_:)`.
+
+**A round:**
+1. The current roster's lowest fingerprint coordinates. `proposeRetentionFloor()` starts a round on it and returns `notCoordinator` elsewhere. It also proposes on its own at 16 MiB of retained bytes.
+2. The coordinator exports a checkpoint at its cut through the snapshot `export` hook, stores it durably and uploads it.
+3. Every other member, by its own authenticated vote, accepts only after it has:
+   - fetched and stored the checkpoint, registered for re-upload;
+   - applied everything at or below the floor;
+   - no pending, quarantined or held content;
+   - its retention host's `attest` returning the journal's application marker and capture counter, an empty outbox and kept deletion metadata.
+4. When all have accepted, each member commits the floor. Records at or below it are then removed.
+
+A missing, offline, declining or changed roster commits nothing.
+
+**After compaction:**
+- An arriving record at or below the floor is a duplicate only within an exact run to the floor's anchor or to a retained record. Otherwise its message is quarantined (`belowFloor`).
+- Host mutation IDs keep their sequences.
+- Archive exports of a compacted journal start with `HostArchiveItem.checkpoint`.
+- A joiner installs the floor's checkpoint after every other current member reported the same floor, and then receives only records above it.
+
+`HostJournalState.retention` shows the floor and what was removed.
+
 ## Deferred API refinements
 
 Main-actor isolation preserves the existing serial recovery behavior. MLS

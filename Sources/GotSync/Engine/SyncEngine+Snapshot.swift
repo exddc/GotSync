@@ -72,12 +72,12 @@ struct HostSnapshotExportLedger: Codable, Equatable, Sendable {
 }
 
 /// A provider-side reason to answer with a refusal instead of an offer.
-private struct HostSnapshotExportRefused: Error {
+struct HostSnapshotExportRefused: Error {
     let reason: HostSnapshotRefusalReason
 }
 
 /// One packed export: its length, hash and chunk files in order.
-private struct HostSnapshotPacked: Sendable {
+struct HostSnapshotPacked: Sendable {
     let length: UInt64
     let contentHash: Data
     let chunks: [(url: URL, hash: Data)]
@@ -147,7 +147,7 @@ extension SyncEngine {
             snapshotService = service
             let admission = snapshotAdmission
             await service.setHooks(BlobHostHooks(
-                verifiedContentURL: { _ in nil },
+                verifiedContentURL: { [checkpointFiles] hash in checkpointFiles.url(for: hash) },
                 acceptsImage: { _, _ in false },
                 acceptsData: { _, info in admission.admits(info.digest) }
             ))
@@ -185,6 +185,7 @@ extension SyncEngine {
         guard (try? await service.ensureBound(route: route, member: member, notRetiredSince: token) {
             try await client.blobAccess()
         }) != nil else { return nil }
+        await registerCheckpointAvailability(service, route: route)
         return route
     }
 
@@ -271,6 +272,11 @@ extension SyncEngine {
             }
             guard hooks.schema.name == schema else {
                 entry.refusal = .schemaMismatch
+                ledger[request.member] = entry
+                continue
+            }
+            if let checkpoint = committedCheckpointOffer() {
+                entry.offer = checkpoint
                 ledger[request.member] = entry
                 continue
             }
@@ -373,7 +379,7 @@ extension SyncEngine {
     }
 
     /// Splits `file` into chunk files and hashes the whole and every chunk.
-    nonisolated private static func pack(_ file: URL, id: Data, into directory: URL) throws -> HostSnapshotPacked {
+    nonisolated static func pack(_ file: URL, id: Data, into directory: URL) throws -> HostSnapshotPacked {
         let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values?.isRegularFile == true, let size = values?.fileSize, size > 0 else {
             throw HostSnapshotExportRefused(reason: .exportFailed)
@@ -396,7 +402,7 @@ extension SyncEngine {
     }
 
     /// Seals every chunk and returns their descriptors once all are uploaded.
-    private func sealSnapshot(id: Data, packed: HostSnapshotPacked, session: MLSSession) async throws -> [Data] {
+    func sealSnapshot(id: Data, packed: HostSnapshotPacked, session: MLSSession) async throws -> [Data] {
         guard let service = await openSnapshotService(), let route = await bindSnapshotService(session) else {
             throw HostSnapshotExportRefused(reason: .transferFailed)
         }
@@ -480,7 +486,20 @@ extension SyncEngine {
         case .requested:
             return
         case .offered:
-            guard store.view.historyComplete, let offer = bootstrap.offer, let hooks = snapshotHooks else { return }
+            guard let offer = bootstrap.offer, let hooks = snapshotHooks else { return }
+            if let floor = offer.floor {
+                // A retention floor's checkpoint covers records no member keeps;
+                // its anchors were corroborated by every current member and
+                // adopted, and the tail chains from them.
+                guard store.view.retention?.proposal == floor, store.view.historyComplete else { return }
+                if hooks.schema.name != offer.schema || !Self.descriptorsMatch(offer) {
+                    try await store.refuseSnapshot(hooks.schema.name != offer.schema ? .schemaMismatch : .malformedOffer, in: [.offered], id: offer.id)
+                } else {
+                    try await store.advanceSnapshot(id: offer.id, from: .offered, to: .fetching)
+                }
+                return
+            }
+            guard store.view.historyComplete else { return }
             if offer.schema != bootstrap.schema || hooks.schema.name != offer.schema {
                 try await store.refuseSnapshot(.schemaMismatch, in: [.offered], id: offer.id)
             } else if !Self.descriptorsMatch(offer) {
@@ -575,6 +594,19 @@ extension SyncEngine {
         }
         snapshotUnavailableSince = nil
         guard files.count == ids.count else { return }
+        if offer.floor != nil {
+            var checkpoint = offer
+            checkpoint.floor = nil
+            if let directory = checkpointDirectoryForJoiner(journal: store.view.journalID, checkpoint: checkpoint.id) {
+                let stored = try await Task.detached(priority: .utility) { [files] in
+                    try Self.storeCheckpoint(files, offer: checkpoint, into: directory)
+                }.value
+                guard stored else {
+                    try await store.refuseSnapshot(.contentMismatch, in: [.fetching], id: offer.id)
+                    return
+                }
+            }
+        }
         let assembled = try await Task.detached(priority: .utility) {
             try Self.assemble(files, into: file, length: offer.length, hash: offer.contentHash)
         }.value

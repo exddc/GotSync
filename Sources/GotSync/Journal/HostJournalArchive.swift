@@ -15,6 +15,8 @@ enum HostJournalExportItem: Equatable, Sendable {
     case pending(origin: Data, sequence: UInt64, envelope: Data)
     case quarantined(sender: Data, cursor: UInt64, reason: String, bytes: Data)
     case held(sender: Data, cursor: UInt64, plaintext: Data)
+    /// The committed floor's checkpoint, first in a compacted journal's export.
+    case checkpoint(HostSnapshotOffer)
 }
 
 /// Where the next export page starts. A cursor belongs to one journal and
@@ -116,7 +118,8 @@ enum HostJournalFiles {
             let next = items.count == limit ? items.last.map {
                 HostJournalExportCursor(journalID: meta.journalID, revision: meta.revision, section: $0.0, key: $0.1)
             } : nil
-            return HostJournalExportPage(items: items.map(\.2), next: next)
+            let checkpoint = cursor == nil ? meta.retention.map { HostJournalExportItem.checkpoint($0.checkpoint) } : nil
+            return HostJournalExportPage(items: (checkpoint.map { [$0] } ?? []) + items.map(\.2), next: next)
         }
     }
 

@@ -134,6 +134,7 @@ import Foundation
     case hostRefused
     case declinedByHost
     case noProvider
+    case corroborationMismatch
 
     init(_ reason: HostSnapshotRefusalReason) {
         switch reason {
@@ -152,6 +153,7 @@ import Foundation
         case .hostRefused: self = .hostRefused
         case .declinedByHost: self = .declinedByHost
         case .noProvider: self = .noProvider
+        case .corroborationMismatch: self = .corroborationMismatch
         }
     }
 }

@@ -332,6 +332,17 @@ public final class SyncEngine {
     /// When the current offer's content was first seen unavailable.
     var snapshotUnavailableSince: ContinuousClock.Instant?
     var snapshotRelayProtocolsForTesting: [AnyClass]?
+    /// The app's retention host; nil declines every floor.
+    var retentionHooks: HostRetentionHooks?
+    /// The open retention round, in memory only.
+    var retentionRound: HostRetentionRound?
+    /// The coordinator's checkpoint export or a member's vote.
+    var retentionTask: Task<Void, Never>?
+    /// Committed floors other members reported to this joiner, by sender.
+    var retentionCorroborations: [Data: HostRetentionCorroboration] = [:]
+    /// Joiners that asked for a snapshot and still wait for this member's floor.
+    var retentionCorroborationRecipients: Set<Data> = []
+    let checkpointFiles = HostCheckpointFiles()
     var snapshotUnavailableLimitForTesting: Duration?
     private let hostJournalLimits: HostJournalLimits
     private(set) var hostLifecycle: HostLifecycle = .active { didSet { publishHostView() } }
@@ -1914,7 +1925,7 @@ public final class SyncEngine {
             let running = Set([
                 pairingTask, pairingExpiryTask, pairingReaderTask, reconcileTask, joinSettlementTask,
                 syncLoopTask, syncCycleTask, backgroundFlushTask, departureTask, hostLifecycleTask, hostSettlementTask,
-                hostOpenTask, hostLaunchStartTask, snapshotRecipientTask,
+                hostOpenTask, hostLaunchStartTask, snapshotRecipientTask, retentionTask,
             ].compactMap { $0 } + Array(snapshotExportTasks.values) + hostWorkersForTesting).subtracting(settled)
             guard !running.isEmpty else { break }
             for task in running {
@@ -1954,6 +1965,10 @@ public final class SyncEngine {
         hostViewSubscribers.removeAll()
         snapshotRecipientTask = nil
         snapshotExportTasks = [:]
+        retentionTask = nil
+        retentionRound = nil
+        retentionCorroborations = [:]
+        retentionCorroborationRecipients = []
         syncLoopTask = nil
         syncCycleTask = nil
         syncCycleID = nil
@@ -1969,6 +1984,10 @@ public final class SyncEngine {
     private func beginInvitation(linked: Bool) {
         if isHostMode, hostLifecycle == .opening {
             startAfterHostLaunch { $0.beginInvitation(linked: linked) }
+            return
+        }
+        guard retentionParticipationReady else {
+            fail(SyncError.incompatibleGroupProfile)
             return
         }
         guard let session, !isHeldSyncStateUnreadable, hostWorkAllowed else {
@@ -2024,6 +2043,10 @@ public final class SyncEngine {
     private func beginJoin(with invitation: Invitation) {
         if isHostMode, hostLifecycle == .opening {
             startAfterHostLaunch { $0.beginJoin(with: invitation) }
+            return
+        }
+        guard retentionParticipationReady else {
+            fail(SyncError.incompatibleGroupProfile)
             return
         }
         guard let session, !isHeldSyncStateUnreadable, hostWorkAllowed else {
@@ -3089,6 +3112,7 @@ public final class SyncEngine {
         }
         if isHostMode {
             try await advanceSnapshotBootstrap(session: session)
+            try await advanceRetention(session: session)
         }
         try await sendReplies(session: session)
         let controlRepair = hostAdapter?.store?.view.controlRepair ?? false
@@ -3353,6 +3377,9 @@ public final class SyncEngine {
         if let host = hostAdapter, let captured = binding {
             try requireHostBinding(captured, session)
             for item in chunk.prefix(application.heldMessages) where !item.fromSelf && roster.contains(item.message.sender) {
+                if case .hostRetention(let message) = item.decoded {
+                    receiveRetention(message, sender: item.message.sender, roster: roster, epoch: epoch, me: fingerprint)
+                }
                 if case .hostComplete(let member, let through) = item.decoded, member == fingerprint {
                     try await host.recordCompletion(provider: item.message.sender, through: through, plaintext: item.message.plaintext)
                     try requireHostBinding(captured, session)
@@ -3422,6 +3449,10 @@ public final class SyncEngine {
                     let request = (try? HostJournalMessage.decode(chunk[hello.index].message.plaintext))?.snapshotSchema
                     obligation.addBootstrap(hello.sender, from: vector, snapshot: request)
                 }
+            }
+            if isHostMode, roster.contains(hello.sender),
+               (try? HostJournalMessage.decode(chunk[hello.index].message.plaintext))?.snapshotSchema != nil {
+                noteCorroborationRecipient(hello.sender)
             }
             obligation.retain(origins: replication.retainedOrigins)
             if hello.index >= held {

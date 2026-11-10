@@ -58,6 +58,12 @@ SURFACE_TYPES = {
     "HostSnapshotHooks",
     "HostSnapshotRefusal",
     "HostSnapshotBootstrap",
+    "HostRetentionRequest",
+    "HostRetentionAttestation",
+    "HostRetentionHooks",
+    "HostRetentionDecline",
+    "HostRetentionProposalOutcome",
+    "HostRetentionState",
 }
 
 BLOB_SURFACE_TYPES = {
@@ -111,8 +117,10 @@ SURFACE_MEMBERS = {
         "blobTransfers()",
         "registerSnapshotHost(_:)",
         "declineSnapshotBootstrap()",
+        "registerRetentionHost(_:)",
+        "proposeRetentionFloor()",
     },
-    "SyncPayloadSchema": {"hostJournal(payload:version:)"},
+    "SyncPayloadSchema": {"hostJournal(payload:version:)", "compactingHostJournal(payload:version:)"},
     "Invitation": {"phraseWordCount"},
 }
 
@@ -136,7 +144,9 @@ FORBIDDEN_NAMES = re.compile(
     r"MLSStore|ForTesting|forTesting|BlobStateStore|BlobFiles|BlobRelayClient|BlobRelayError|BlobCipher|"
     r"BlobSealedObject|BlobManifest|BlobPartLayout|\bBlobDescriptor\b|\bBlobBinding\b|BlobWorkGate|BlobSignal|"
     r"BlobCodecError|BlobImageValidator|HostJournalBootstrapState|HostSnapshotOffer|HostSnapshotAnchor|HostSnapshotPhase|"
-    r"HostSnapshotRefusalReason|HostSnapshotExportLedger|HostSnapshotAdmission|HostSnapshotBounds"
+    r"HostSnapshotRefusalReason|HostSnapshotExportLedger|HostSnapshotAdmission|HostSnapshotBounds|HostJournalRetentionState|"
+    r"\bHostRetentionProposal\b|HostRetentionVote|HostRetentionCorroboration|HostRetentionDeclineReason|HostRetentionRound|"
+    r"HostCheckpointFiles|HostRetentionBounds"
 )
 FORBIDDEN_MODULE_PREFIXES = ("s:10GotSyncMLS", "s:18GotSyncMLSBindings", "c:@")
 

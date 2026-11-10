@@ -150,6 +150,9 @@ struct HostWindowProof: Sendable {
     fileprivate(set) var phase: Phase = .parse(0)
     /// Arrivals already taken by `intake(next:of:)`.
     fileprivate(set) var consumed = 0
+    /// Arrivals carrying a removed below-floor record without a run proving
+    /// it; they are quarantined, never taken as duplicates.
+    fileprivate(set) var belowFloor: Set<Int> = []
 
     var isComplete: Bool { phase == .complete }
 
@@ -204,6 +207,8 @@ struct HostJournalCoreView: Equatable, Sendable {
     let controlRepair: Bool
     /// A snapshot bootstrap this journal requested; nil keeps full history.
     let bootstrap: HostJournalBootstrapState?
+    /// The committed all-member retention floor; nil keeps every record.
+    let retention: HostJournalRetentionState?
 
     var isRetired: Bool { retirement != nil }
     var isDeliveryHeld: Bool { bootstrap?.phase.holdsDelivery == true }
@@ -242,6 +247,10 @@ final class HostJournalStore {
     static let fileSuffix = ".sqlite3"
     static let creatingSuffix = ".creating"
     nonisolated static let formatVersion: Int64 = 3
+    /// A journal some of whose records were removed below a retention floor.
+    /// Earlier libraries refuse it as `formatUnsupported` instead of reading
+    /// the missing rows as corruption.
+    nonisolated static let compactedFormatVersion: Int64 = 4
     /// Full validations run on the main thread, for tests of cold opening.
     nonisolated static let mainThreadValidations = OSAllocatedUnfairLock(initialState: 0)
 
@@ -551,15 +560,20 @@ final class HostJournalStore {
             throw JournalStoreError.invalidArgument("proof range")
         }
         let range = proof.consumed..<(proof.consumed + count)
-        let result = try intakeChecked(Array(proof.arrivals[range]), parsed: Array(proof.parsed[range]), proven: true)
+        let quarantined = Set(proof.belowFloor.filter(range.contains).map { $0 - range.lowerBound })
+        let result = try intakeChecked(
+            Array(proof.arrivals[range]), parsed: Array(proof.parsed[range]), proven: true, quarantined: quarantined
+        )
         proof.epoch = intakeEpoch
         proof.consumed += result.ownedArrivals
         return result
     }
 
-    private func intakeChecked(_ arrivals: [HostJournalArrival], parsed: [[JournalEnvelope]?], proven: Bool) throws -> HostJournalIntake {
+    private func intakeChecked(
+        _ arrivals: [HostJournalArrival], parsed: [[JournalEnvelope]?], proven: Bool, quarantined: Set<Int> = []
+    ) throws -> HostJournalIntake {
         do {
-            return try intakeTransaction(arrivals, parsed: parsed, proven: proven)
+            return try intakeTransaction(arrivals, parsed: parsed, proven: proven, quarantined: quarantined)
         } catch let refused as NothingOwned {
             return HostJournalIntake(ownedArrivals: 0, refusal: refused.refusal)
         }
@@ -571,22 +585,22 @@ final class HostJournalStore {
     }
 
     private func intakeTransaction(
-        _ arrivals: [HostJournalArrival], parsed: [[JournalEnvelope]?], proven: Bool
+        _ arrivals: [HostJournalArrival], parsed: [[JournalEnvelope]?], proven: Bool, quarantined proved: Set<Int>
     ) throws -> HostJournalIntake {
         try transaction("intake") {
             let meta = try readMeta()
             guard meta.retirement == nil else { throw JournalStoreError.retired }
-            if !proven {
-                try preflight(parsed, meta: meta)
-            }
+            let quarantined = proven ? proved : try preflight(parsed, meta: meta)
             var counters = meta.counters
             var nextPosition = meta.nextPosition
             var owned = 0
             var refusal: JournalCapacity?
-            for (arrival, envelopes) in zip(arrivals, parsed) {
+            for (index, (arrival, envelopes)) in zip(arrivals, parsed).enumerated() {
                 try database.execute("SAVEPOINT arrival")
                 let before = (counters, nextPosition)
-                if let envelopes {
+                if quarantined.contains(index) {
+                    try quarantine(arrival, reason: "belowFloor", counters: &counters)
+                } else if let envelopes {
                     for envelope in envelopes {
                         try accept(envelope, meta: meta, counters: &counters, nextPosition: &nextPosition)
                     }
@@ -629,7 +643,17 @@ final class HostJournalStore {
         return envelopes
     }
 
-    private func preflight(_ parsed: [[JournalEnvelope]?], meta: Meta) throws {
+    /// Checks every envelope and returns the arrivals to quarantine because
+    /// they carry a removed below-floor record no run proves.
+    private func preflight(_ parsed: [[JournalEnvelope]?], meta: Meta) throws -> Set<Int> {
+        var belowFloor: Set<Int> = []
+        for (index, envelopes) in parsed.enumerated() {
+            guard let envelopes, let retention = meta.retention else { continue }
+            if try envelopes.contains(where: { try isPrunedBelowFloor($0, retention) }),
+               try !dischargesBelowFloor(envelopes, retention) {
+                belowFloor.insert(index)
+            }
+        }
         var incoming: [JournalRecordID: JournalEnvelope] = [:]
         var origins: Set<Data> = []
         var heads: [Data: (received: UInt64, digest: Data)] = [:]
@@ -643,7 +667,8 @@ final class HostJournalStore {
         func pendingEnvelope(_ id: JournalRecordID) throws -> JournalEnvelope? {
             hasPending ? try self.pendingEnvelope(id) : nil
         }
-        for envelope in parsed.compactMap({ $0 }).joined() {
+        for (index, envelopes) in parsed.enumerated() where !belowFloor.contains(index) {
+          for envelope in envelopes ?? [] {
             if let earlier = incoming[envelope.id] {
                 guard earlier.digest == envelope.digest else {
                     throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
@@ -656,6 +681,9 @@ final class HostJournalStore {
                 throw JournalStoreError.foreignOwnOrigin(sequence: envelope.sequence)
             }
             if envelope.sequence <= received {
+                if let retention = meta.retention, try isPrunedBelowFloor(envelope, retention) {
+                    continue
+                }
                 guard let retained = try retainedDigest(envelope.id) else {
                     throw JournalStoreError.retainedRecordMissing(origin: envelope.origin, sequence: envelope.sequence)
                 }
@@ -668,6 +696,7 @@ final class HostJournalStore {
                 }
                 origins.insert(envelope.origin)
             }
+          }
         }
         for origin in origins {
             var head = try originHead(origin)
@@ -683,6 +712,50 @@ final class HostJournalStore {
                 sequence += 1
             }
         }
+        return belowFloor
+    }
+
+    /// A record at or below the floor whose row was removed. Every member
+    /// received its floor's records before committing, and a joiner adopts
+    /// the floor without them, so an absent row there is a removed one.
+    private func isPrunedBelowFloor(_ envelope: JournalEnvelope, _ retention: HostJournalRetentionState) throws -> Bool {
+        guard let anchor = retention.anchor(envelope.origin), envelope.sequence <= anchor.sequence else { return false }
+        return try retainedDigest(envelope.id) == nil
+    }
+
+    /// Every removed below-floor record of the arrival lies in a contiguous
+    /// run, linked by `prior`, that ends at the floor anchor's digest or right
+    /// before a retained record whose `prior` is the run's last digest. The
+    /// hash chain then makes the run exactly the removed bytes.
+    private func dischargesBelowFloor(_ envelopes: [JournalEnvelope], _ retention: HostJournalRetentionState) throws -> Bool {
+        for anchor in retention.anchors {
+            let below = envelopes.filter { $0.origin == anchor.origin && $0.sequence <= anchor.sequence }
+            guard !below.isEmpty else { continue }
+            var runs: [[JournalEnvelope]] = []
+            for envelope in below {
+                if let last = runs.last?.last, envelope.sequence == last.sequence + 1 {
+                    runs[runs.count - 1].append(envelope)
+                } else {
+                    runs.append([envelope])
+                }
+            }
+            for run in runs where try run.contains(where: { try isPrunedBelowFloor($0, retention) }) {
+                for (earlier, later) in zip(run, run.dropFirst()) where later.prior != earlier.digest {
+                    return false
+                }
+                let last = run[run.count - 1]
+                if last.sequence == anchor.sequence {
+                    guard last.digest == anchor.digest else { return false }
+                } else {
+                    let next = JournalRecordID(origin: anchor.origin, sequence: last.sequence + 1)
+                    guard let bytes = try database.first(
+                        "SELECT envelope FROM records WHERE origin = ? AND sequence = ?",
+                        [.blob(next.origin), try JournalDatabase.integer(next.sequence)], { try $0.blob(0) }
+                    ), try Self.stored(bytes).prior == last.digest else { return false }
+                }
+            }
+        }
+        return true
     }
 
     private func accept(
@@ -720,7 +793,7 @@ final class HostJournalStore {
         counters.recordBytes += UInt64(envelope.bytes.count)
     }
 
-    private func quarantine(_ arrival: HostJournalArrival, counters: inout Counters) throws {
+    private func quarantine(_ arrival: HostJournalArrival, reason: String? = nil, counters: inout Counters) throws {
         let digest = Data(SHA256.hash(data: arrival.plaintext))
         let key: [JournalValue] = [.blob(arrival.sender), try JournalDatabase.integer(arrival.cursor)]
         if let existing = try database.first(
@@ -733,7 +806,7 @@ final class HostJournalStore {
         }
         try database.run(
             "INSERT INTO quarantine(sender, cursor, reason, bytes, digest) VALUES (?, ?, ?, ?, ?)",
-            key + [.text(arrival.envelopes == nil ? "undecodable" : "malformedEnvelopes"), .blob(arrival.plaintext), .blob(digest)]
+            key + [.text(reason ?? (arrival.envelopes == nil ? "undecodable" : "malformedEnvelopes")), .blob(arrival.plaintext), .blob(digest)]
         )
         counters.quarantineCount += 1
         counters.quarantineBytes += UInt64(arrival.plaintext.count)
@@ -970,6 +1043,15 @@ final class HostJournalStore {
                 let envelope = envelopes[position]
                 position += 1
                 units += 1
+                if proof.belowFloor.contains(arrival) {
+                    continue
+                }
+                if let retention = meta.retention, try isPrunedBelowFloor(envelope, retention) {
+                    if try !dischargesBelowFloor(envelopes, retention) {
+                        proof.belowFloor.insert(arrival)
+                    }
+                    continue
+                }
                 if let earlier = proof.incoming[envelope.id] {
                     guard earlier.digest == envelope.digest else {
                         throw JournalStoreError.fork(origin: envelope.origin, sequence: envelope.sequence)
@@ -1271,9 +1353,172 @@ final class HostJournalStore {
             if advanced > meta.appliedThrough {
                 try applyThrough(advanced, from: meta.appliedThrough)
             }
+            if let floor = offer.floor, let retention = meta.retention, retention.proposal == floor, !retention.floorApplied {
+                try markFloorApplied(retention)
+            }
             try bumpRevision(meta)
             return true
         }
+    }
+
+    // MARK: - Retention floor
+
+    /// Why this journal cannot accept a floor at `anchors` now, or nil. Read
+    /// before voting; `commitRetentionFloor` checks the record conditions again.
+    func retentionDecline(_ anchors: [HostSnapshotAnchor]) throws -> HostRetentionDeclineReason? {
+        let meta = try readMeta()
+        let view = meta.view
+        guard view.historyApplied, view.isReady, view.pendingCount == 0, view.quarantineCount == 0, view.heldCount == 0,
+              !view.controlRepair, !view.isDeliveryHeld, meta.retirement == nil
+        else { return .unsettled }
+        return try floorDecline(anchors, meta: meta)
+    }
+
+    private func floorDecline(_ anchors: [HostSnapshotAnchor], meta: Meta) throws -> HostRetentionDeclineReason? {
+        if let committed = meta.retention {
+            guard committed.floorApplied else { return .unsettled }
+            for old in committed.anchors {
+                guard let new = anchors.first(where: { $0.origin == old.origin }), new.sequence >= old.sequence else {
+                    return .belowCommittedFloor
+                }
+            }
+        }
+        for anchor in anchors {
+            if let committed = meta.retention?.anchor(anchor.origin), committed.sequence == anchor.sequence {
+                guard committed.digest == anchor.digest else { return .anchorMismatch }
+                continue
+            }
+            guard let digest = try retainedDigest(JournalRecordID(origin: anchor.origin, sequence: anchor.sequence)) else {
+                return .notCaughtUp
+            }
+            guard digest == anchor.digest else { return .anchorMismatch }
+            if anchor.origin == meta.origin {
+                guard anchor.sequence <= meta.ownHead else { return .notCaughtUp }
+            } else {
+                let applied = try database.first(
+                    "SELECT applied FROM origins WHERE origin = ?", [.blob(anchor.origin)], { try $0.unsigned(0) }
+                ) ?? 0
+                guard anchor.sequence <= applied else { return .notCaughtUp }
+            }
+        }
+        return nil
+    }
+
+    /// Commits a floor every current member accepted: records at or below it
+    /// become removable. The checkpoint must reflect exactly the anchors.
+    @discardableResult
+    func commitRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) throws -> Bool {
+        guard round.count == 16, proposal.count == 32, checkpoint.isWellFormed, checkpoint.floor == nil else {
+            throw JournalStoreError.invalidArgument("floor")
+        }
+        return try transaction("commitRetentionFloor") {
+            let meta = try readMeta()
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            guard meta.retention?.proposal != proposal else { return false }
+            guard try floorDecline(checkpoint.anchors, meta: meta) == nil else { return false }
+            try storeFloor(round: round, proposal: proposal, checkpoint: checkpoint, applied: true, meta: meta)
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    /// Removes at most `maxRecords` records at or below the committed floor,
+    /// lowest sequences first, and marks the file compacted. Returns how many.
+    @discardableResult
+    func pruneBelowFloor(maxRecords: Int = HostRetentionBounds.pruneStep) throws -> Int {
+        guard let retention = view.retention, retention.floorApplied, view.retirement == nil else { return 0 }
+        let (uncovered, values) = try Self.uncoveredClause(retention.floor)
+        let covered = uncovered.replacingOccurrences(of: " AND NOT (", with: " AND (")
+        return try transaction("pruneBelowFloor") {
+            let meta = try readMeta()
+            guard let current = meta.retention, current.proposal == retention.proposal else { return 0 }
+            var removed: [(origin: Data, sequence: UInt64, bytes: UInt64, positioned: Bool)] = []
+            try database.rows(
+                "SELECT origin, sequence, length(envelope), position IS NOT NULL FROM records WHERE 1 = 1\(covered) ORDER BY sequence LIMIT ?",
+                values + [.integer(Int64(maxRecords))]
+            ) { row in
+                removed.append((try row.blob(0), try row.unsigned(1), try row.unsigned(2), try row.int64(3) == 1))
+            }
+            guard !removed.isEmpty else { return 0 }
+            for record in removed {
+                try database.run(
+                    "DELETE FROM records WHERE origin = ? AND sequence = ?",
+                    [.blob(record.origin), try JournalDatabase.integer(record.sequence)]
+                )
+            }
+            var counters = meta.counters
+            let bytes = removed.reduce(UInt64(0)) { $0 + $1.bytes }
+            counters.recordCount -= UInt64(removed.count)
+            counters.recordBytes -= bytes
+            try writeCounters(counters)
+            try setSnapshotMeta("prunedRecords", try JournalDatabase.integer(current.prunedRecords + UInt64(removed.count)))
+            try setSnapshotMeta("prunedBytes", try JournalDatabase.integer(current.prunedBytes + bytes))
+            let positioned = UInt64(removed.filter(\.positioned).count)
+            try setSnapshotMeta("prunedPositions", try JournalDatabase.integer(current.prunedPositions + positioned))
+            try database.execute("PRAGMA user_version = \(Self.compactedFormatVersion)")
+            try bumpRevision(meta)
+            return removed.count
+        }
+    }
+
+    /// Adopts a committed floor every other current member corroborated, for
+    /// a joiner that never received the removed records: each origin's head
+    /// starts at its anchor, so the tail above it promotes normally.
+    @discardableResult
+    func adoptRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) throws -> Bool {
+        guard round.count == 16, proposal.count == 32, checkpoint.isWellFormed, checkpoint.floor == nil else {
+            throw JournalStoreError.invalidArgument("floor")
+        }
+        return try transaction("adoptRetentionFloor") {
+            let meta = try readMeta()
+            guard meta.retirement == nil, meta.retention == nil, meta.bootstrap?.offer?.floor == proposal,
+                  meta.bootstrap?.phase == .offered
+            else { return false }
+            var counters = meta.counters
+            for anchor in checkpoint.anchors {
+                guard anchor.origin != meta.origin else { throw JournalStoreError.invalidArgument("own origin floor") }
+                try ensureOrigin(anchor.origin, counters: &counters)
+                guard try originHead(anchor.origin).received == 0,
+                      try database.first(
+                          "SELECT 1 FROM pending WHERE origin = ? AND sequence <= ?",
+                          [.blob(anchor.origin), try JournalDatabase.integer(anchor.sequence)], { _ in true }
+                      ) == nil
+                else { return false }
+                try database.run(
+                    "UPDATE origins SET received = ?, head = ? WHERE origin = ?",
+                    [try JournalDatabase.integer(anchor.sequence), .blob(anchor.digest), .blob(anchor.origin)]
+                )
+            }
+            try writeCounters(counters)
+            try storeFloor(round: round, proposal: proposal, checkpoint: checkpoint, applied: false, meta: meta)
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    private func storeFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer, applied: Bool, meta: Meta) throws {
+        try setSnapshotMeta("retentionRound", .blob(round))
+        try setSnapshotMeta("retentionProposal", .blob(proposal))
+        try setSnapshotMeta("retentionFloor", .blob(try ReplicaCanonicalJSON.encode(checkpoint.anchors)))
+        try setSnapshotMeta("retentionCheckpoint", .blob(try ReplicaCanonicalJSON.encode(checkpoint)))
+        try setSnapshotMeta("retentionFloorApplied", .integer(applied ? 1 : 0))
+        if meta.retention == nil {
+            try setSnapshotMeta("prunedRecords", .integer(0))
+            try setSnapshotMeta("prunedBytes", .integer(0))
+            try setSnapshotMeta("prunedPositions", .integer(0))
+        }
+    }
+
+    /// The installed checkpoint reflects the floor's records, so each origin's
+    /// applied sequence starts at least at its anchor.
+    private func markFloorApplied(_ retention: HostJournalRetentionState) throws {
+        for anchor in retention.anchors {
+            try database.run(
+                "UPDATE origins SET applied = MAX(applied, ?) WHERE origin = ?",
+                [try JournalDatabase.integer(anchor.sequence), .blob(anchor.origin)]
+            )
+        }
+        try setSnapshotMeta("retentionFloorApplied", .integer(1))
     }
 
     private func setSnapshotRefusal(_ reason: HostSnapshotRefusalReason) throws {
@@ -1448,6 +1693,7 @@ final class HostJournalStore {
         "declareReady": .none, "recordCompletionTarget": .none, "setHistoryProvider": .none,
         "enterControlRepair": .none, "intake": .intake, "promote": .intake, "retire": .generation,
         "requestSnapshot": .none, "refuseSnapshot": .none, "advanceSnapshot": .none, "commitSnapshotInstall": .none,
+        "commitRetentionFloor": .intake, "pruneBelowFloor": .intake, "adoptRetentionFloor": .intake,
     ]
 
     /// Builds the snapshot this commit leaves before COMMIT, so nothing
@@ -1503,7 +1749,7 @@ final class HostJournalStore {
 
     /// Snapshot keys exist only once a bootstrap was requested.
     private func setSnapshotMeta(_ key: String, _ value: JournalValue) throws {
-        precondition(key.hasPrefix("snapshot"))
+        precondition(key.hasPrefix("snapshot") || key.hasPrefix("retention") || key.hasPrefix("pruned"))
         try database.run("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [.text(key), value])
     }
 
@@ -1630,6 +1876,7 @@ final class HostJournalStore {
         let historyProvider: Data?
         let controlRepair: Bool
         let bootstrap: HostJournalBootstrapState?
+        let retention: HostJournalRetentionState?
 
         var view: HostJournalCoreView {
             HostJournalCoreView(
@@ -1643,7 +1890,8 @@ final class HostJournalStore {
                 established: established, isReady: isReady, readyThrough: readyThrough,
                 historyComplete: historyComplete, completionProvider: completionProvider,
                 completionTarget: completionTarget, completionPosition: completionPosition,
-                historyProvider: historyProvider, controlRepair: controlRepair, bootstrap: bootstrap
+                historyProvider: historyProvider, controlRepair: controlRepair, bootstrap: bootstrap,
+                retention: retention
             )
         }
     }
@@ -1708,6 +1956,7 @@ final class HostJournalStore {
         let target = try blob("completionTarget", nil)
         let historyComplete = try flag("historyComplete")
         let bootstrap = try readBootstrap(texts: texts, blobs: blobs)
+        let retention = try readRetention(blobs: blobs, integers: integers)
         return Meta(
             journalID: try blob("journalID", 16), group: try blob("group", 32), origin: try blob("origin", 16),
             retirement: retirement, revision: try integer("revision"), enrollment: enrollment,
@@ -1717,7 +1966,28 @@ final class HostJournalStore {
             historyComplete: historyComplete, completionProvider: try member("completionProvider"),
             completionTarget: target.isEmpty ? nil : try decodeVector(target),
             completionPosition: completionPosition, historyProvider: try member("historyProvider"),
-            controlRepair: try flag("controlRepair"), bootstrap: bootstrap
+            controlRepair: try flag("controlRepair"), bootstrap: bootstrap, retention: retention
+        )
+    }
+
+    /// Absent keys mean no floor was committed or adopted.
+    nonisolated private static func readRetention(blobs: [String: Data], integers: [String: UInt64]) throws -> HostJournalRetentionState? {
+        guard let round = blobs["retentionRound"] else { return nil }
+        guard let proposal = blobs["retentionProposal"], let anchorBytes = blobs["retentionFloor"],
+              let checkpointBytes = blobs["retentionCheckpoint"], let applied = integers["retentionFloorApplied"],
+              round.count == 16, proposal.count == 32, applied <= 1
+        else { throw JournalStoreError.storeCorrupt("retention") }
+        let anchors = try ReplicaCanonicalJSON.decode([HostSnapshotAnchor].self, from: anchorBytes)
+        let checkpoint = try ReplicaCanonicalJSON.decode(HostSnapshotOffer.self, from: checkpointBytes)
+        guard !anchors.isEmpty, checkpoint.isWellFormed, checkpoint.anchors == anchors,
+              zip(anchors, anchors.dropFirst()).allSatisfy({ $0.origin.lexicographicallyPrecedes($1.origin) })
+        else { throw JournalStoreError.storeCorrupt("retention") }
+        let pruned = integers["prunedRecords"] ?? 0
+        let positions = integers["prunedPositions"] ?? 0
+        guard positions <= pruned else { throw JournalStoreError.storeCorrupt("retention") }
+        return HostJournalRetentionState(
+            round: round, proposal: proposal, anchors: anchors, checkpoint: checkpoint, floorApplied: applied == 1,
+            prunedRecords: pruned, prunedBytes: integers["prunedBytes"] ?? 0, prunedPositions: positions
         )
     }
 
@@ -1802,7 +2072,7 @@ final class HostJournalStore {
 
     nonisolated static func checkFormat(_ database: JournalDatabase) throws {
         let version = try database.first("PRAGMA user_version", [], { try $0.int64(0) }) ?? 0
-        guard version == formatVersion else { throw JournalStoreError.formatUnsupported(version) }
+        guard version == formatVersion || version == compactedFormatVersion else { throw JournalStoreError.formatUnsupported(version) }
     }
 
     /// Checks every row against its own bytes, the per-origin chains, the
@@ -1835,9 +2105,16 @@ final class HostJournalStore {
             let envelope = try stored(try row.blob(2))
             let origin = try row.blob(0)
             let sequence = try row.unsigned(1)
-            let previous = heads[origin] ?? (0, JournalEnvelope.zeroDigest)
+            let anchor = meta.retention?.anchor(origin)
+            var previous = heads[origin] ?? (0, JournalEnvelope.zeroDigest)
+            if heads[origin] == nil, let anchor, sequence > 1 {
+                // Records below the first retained one were removed under the floor.
+                guard sequence <= anchor.sequence + 1 else { throw JournalStoreError.storeCorrupt("record chain") }
+                previous = sequence == anchor.sequence + 1 ? (anchor.sequence, anchor.digest) : (sequence - 1, envelope.prior)
+            }
             guard envelope.origin == origin, envelope.sequence == sequence, envelope.digest == (try row.blob(3)),
-                  sequence == previous.received + 1, envelope.prior == previous.digest
+                  sequence == previous.received + 1, envelope.prior == previous.digest,
+                  anchor.map({ $0.sequence != sequence || $0.digest == envelope.digest }) ?? true
             else { throw JournalStoreError.storeCorrupt("record chain") }
             heads[origin] = (sequence, envelope.digest)
             if origin == meta.origin {
@@ -1855,7 +2132,13 @@ final class HostJournalStore {
             counters.recordCount += 1
             counters.recordBytes += UInt64(envelope.bytes.count)
         }
-        guard positions == meta.nextPosition - 1, maxPosition == positions,
+        for anchor in meta.retention?.anchors ?? [] where (heads[anchor.origin]?.received ?? 0) < anchor.sequence {
+            guard heads[anchor.origin] == nil else { throw JournalStoreError.storeCorrupt("record chain") }
+            heads[anchor.origin] = (anchor.sequence, anchor.digest)
+        }
+        let prunedPositions = meta.retention?.prunedPositions ?? 0
+        guard positions + prunedPositions == meta.nextPosition - 1, maxPosition <= meta.nextPosition - 1,
+              prunedPositions > 0 || maxPosition == positions,
               (heads[meta.origin]?.received ?? 0) == meta.ownHead
         else { throw JournalStoreError.storeCorrupt("positions") }
         var applied: [Data: UInt64] = [:]
@@ -1863,6 +2146,11 @@ final class HostJournalStore {
             "SELECT origin, MAX(sequence) FROM records WHERE position IS NOT NULL AND position <= ? GROUP BY origin",
             [try JournalDatabase.integer(meta.appliedThrough)]
         ) { applied[try $0.blob(0)] = try $0.unsigned(1) }
+        if let retention = meta.retention, retention.floorApplied {
+            for anchor in retention.anchors where anchor.origin != meta.origin {
+                applied[anchor.origin] = max(applied[anchor.origin] ?? 0, anchor.sequence)
+            }
+        }
         try database.rows("SELECT origin, received, head, applied FROM origins") { row in
             let origin = try row.blob(0)
             let head = heads[origin] ?? (0, JournalEnvelope.zeroDigest)
@@ -1877,7 +2165,10 @@ final class HostJournalStore {
         }
         var mappings: UInt64 = 0
         try database.rows("SELECT id, sequence, payloadDigest FROM submissions") { row in
-            guard try row.blob(0).count == 16, ownPayloads[try row.unsigned(1)] == (try row.blob(2)) else {
+            let sequence = try row.unsigned(1)
+            let removed = sequence <= (meta.retention?.anchor(meta.origin)?.sequence ?? 0) && ownPayloads[sequence] == nil
+            let payloadDigest = try row.blob(2)
+            guard try row.blob(0).count == 16, removed || ownPayloads[sequence] == payloadDigest else {
                 throw JournalStoreError.storeCorrupt("submission")
             }
             mappings += 1
