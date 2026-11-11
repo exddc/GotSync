@@ -25,6 +25,8 @@ SPI_GROUPS = {"HostJournalPreview", "BlobPreview"}
 
 SURFACE_TYPES = {
     "HostJournal",
+    "HostJournalReader",
+    "HostJournalInfo",
     "HostJournalView",
     "HostJournalState",
     "HostJournalLifecycle",
@@ -114,6 +116,7 @@ REQUIRED_BLOB_CALLS = {
 }
 
 SURFACE_MEMBERS = {
+    "HostJournalReader": {"init(storageDirectory:)", "journals()", "export(_:after:limit:)"},
     "SyncEngine": {
         "hostJournal",
         "hostJournalView",
@@ -239,6 +242,8 @@ def main():
             surface[precise] = symbol
             if path[0] == "HostJournal" and len(path) > 1 and (len(path) != 2 or path[1] not in REQUIRED_HOST_CALLS):
                 problems.append(f"unreviewed host call {'.'.join(path)}")
+            if path[0] == "HostJournalReader" and len(path) > 1 and (len(path) != 2 or path[1] not in SURFACE_MEMBERS["HostJournalReader"]):
+                problems.append(f"unreviewed reader call {'.'.join(path)}")
             if path[0] == "BlobTransferService" and len(path) > 1 and (len(path) != 2 or path[1] not in REQUIRED_BLOB_CALLS):
                 problems.append(f"unreviewed blob call {'.'.join(path)}")
         elif len(path) == 2 and path[1] in SURFACE_MEMBERS.get(path[0], set()):
