@@ -183,7 +183,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var groups: [Data: Group] = [:]
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
-    private var droppedWriterAppend: (writer: Data, accepted: Int)?
+    private var droppedWriterAppend: (writer: Data, accepted: Int, unavailable: Bool)?
     private var appendsUnavailable = false
     private var unavailableAfterDrop = false
     private var holdsDroppedResponse = false
@@ -288,9 +288,9 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     /// Drops the response to `authorization`'s next new application entry
-    /// after `accepted` more, then makes appends unavailable.
-    func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int) {
-        droppedWriterAppend = (Self.digest(authorization), accepted)
+    /// after `accepted` more.
+    func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int, thenUnavailable: Bool = true) {
+        droppedWriterAppend = (Self.digest(authorization), accepted, thenUnavailable)
     }
     var isWriterAppendDropPending: Bool { droppedWriterAppend != nil }
 
@@ -523,10 +523,10 @@ actor FakeMLSRelay: MLSRelayTransport {
         if let drop = droppedWriterAppend, drop.writer == sender, delivery.kind == .application {
             guard drop.accepted > 0 else {
                 droppedWriterAppend = nil
-                appendsUnavailable = true
+                appendsUnavailable = drop.unavailable
                 throw URLError(.networkConnectionLost)
             }
-            droppedWriterAppend = (drop.writer, drop.accepted - 1)
+            droppedWriterAppend = (drop.writer, drop.accepted - 1, drop.unavailable)
         }
         if dropAddResponse, delivery.welcome != nil {
             dropAddResponse = false

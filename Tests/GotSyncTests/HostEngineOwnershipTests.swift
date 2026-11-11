@@ -531,6 +531,47 @@ extension HostEngineTests {
         XCTAssertEqual(joiner.hostView?.journal?.historyApplied, true)
     }
 
+    func testPairingWaitsForAnIntakeOutcomeBeforeAdmission() async throws {
+        let (a, b) = try await completedPair()
+        try await wait("member may invite") { b.canInviteToGroup }
+        b.createPrivateSync()
+        try await wait("invitation") { b.invitationURL != nil }
+        let invitation = try XCTUnwrap(b.invitationURL)
+        let journal = try store(b)
+        var release: CheckedContinuation<Void, Never>?
+        var held = false
+        var waiting = false
+        journal.deliveryGateForTesting = { name in
+            guard name == "intake", !held else { return }
+            held = true
+            await withCheckedContinuation { release = $0 }
+        }
+        b.admissionWaitHookForTesting = { waiting = true }
+        defer {
+            journal.deliveryGateForTesting = nil
+            b.admissionWaitHookForTesting = nil
+            release?.resume()
+        }
+        try await submit(a, "a", ["arrived during the invitation"])
+        try await wait("intake held before adoption") { held }
+        XCTAssertTrue(journal.isIntakeOutstanding)
+        let j = engine("j")
+        j.joinPrivateSync(url: invitation)
+        try await wait("admission waits or refuses") { waiting || j.phase == .failed }
+        XCTAssertTrue(waiting)
+        XCTAssertNotEqual(j.phase, .failed)
+        XCTAssertFalse(j.isPaired)
+        XCTAssertEqual(b.linkedMemberCount, 2)
+        guard waiting else { return }
+        release?.resume()
+        release = nil
+        try await wait("safety code") { b.isHostApprovalPending && j.safetyCode != nil }
+        b.approveSafetyCode()
+        try await wait("paired after intake") { b.isPaired && j.isPaired && !b.canCancelPairing }
+        XCTAssertEqual(b.linkedMemberCount, 3)
+        XCTAssertFalse(journal.isIntakeOutstanding)
+    }
+
     func testOwnRecordAboveALostWatermarkReachesTheJoinerThroughTheCut() async throws {
         let (a, b) = try await completedPair()
         try await wait("history uploaded") { a.hostView?.unuploaded == 0 }
