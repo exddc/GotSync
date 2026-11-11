@@ -460,6 +460,7 @@ final class HostJournalStore {
     /// a host ahead in application advances the library.
     func resume(_ stored: HostJournalProvenance) throws -> HostJournalProvenance {
         try requireHostOpen()
+        _ = try JournalDatabase.integer(stored.capturedThrough)
         let result = try transaction("resume") { () -> HostJournalProvenance in
             let meta = try readMeta()
             guard stored.journalID == meta.journalID else { throw JournalStoreError.staleJournal }
@@ -472,6 +473,7 @@ final class HostJournalStore {
                     throw JournalStoreError.hostProvenanceMismatch
                 }
                 try setMeta("enrollment", .text("confirmed"))
+                try setMeta("capturedThrough", try JournalDatabase.integer(stored.capturedThrough))
                 try bumpRevision(meta)
                 return HostJournalProvenance(
                     journalID: meta.journalID, enrollmentID: enrollmentID,
