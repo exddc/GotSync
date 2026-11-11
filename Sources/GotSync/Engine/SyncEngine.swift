@@ -428,7 +428,8 @@ public final class SyncEngine {
     private var peerDecision: Bool?
     /// Why the inviter refused this joiner, when it said.
     private var peerRefusal: SyncError?
-    private(set) var lastPairingFailure: SyncError?
+    /// The last attempt's terminal failure, cleared when another pairing attempt starts.
+    public private(set) var lastPairingFailure: SyncError?
     private var reservationsInFlight: [OriginReservation.Attempt] = []
     private var lastKnownEpoch: UInt64 = 0
     private var reservationRequestCycles = 0

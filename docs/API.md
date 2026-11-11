@@ -274,6 +274,8 @@ internal type.
   - `mutationFinalized`;
   - `captureRequired`.
 
+`SyncEngine.lastPairingFailure` retains the typed terminal failure of a pairing attempt until the next attempt starts. Use it to finish host pairing waits; `errorMessage` is presentation state that later sync activity can replace.
+
 For a linked member, `SyncEngine.canInviteToGroup` reports whether local membership, reservation history and host readiness allow an invitation now. A newly joined member can wait for it before calling `inviteToGroup()`; network errors can still occur after admission. `isGroupAtCapacity` identifies a full roster.
 
 When `resume` confirms a pending enrollment, it records the host's saved starting capture counter in the same transaction. A store that brings a nonzero counter from an earlier journal therefore has a matching initial export cut without inventing a submission. On an already confirmed enrollment, a host-ahead capture counter remains host rollback evidence; submission advances the journal's counter. Readiness still requires the host to finish its initial outbox.
