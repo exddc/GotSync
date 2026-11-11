@@ -6,7 +6,7 @@ import Foundation
 /// is adopted, and an admitted command runs to its outcome even when its
 /// caller is cancelled. `view` and the origin inventory are read from the
 /// adopted snapshot without touching the file.
-@_spi(HostJournalPreview) @MainActor
+@MainActor
 public final class HostJournal {
     enum Admission {
         /// Host enrollment, submission, application and readiness.
@@ -47,6 +47,8 @@ public final class HostJournal {
     /// The enrollment a resume on this generation confirmed; a later
     /// generation of the same file in this process inherits it.
     private(set) var resumedEnrollment: Data?
+    /// Set in reclaiming groups: enrollment records the declared store.
+    var declaresAncestry = false
     /// Called when a snapshot is adopted and whenever the journal turns
     /// busy or settled.
     var changed: (@MainActor () -> Void)?
@@ -132,9 +134,44 @@ public final class HostJournal {
     /// Starts an enrollment that the host confirms with `resume` after saving
     /// the returned provenance.
     public func enroll() async throws -> HostProvenance {
+        try await enroll(declaring: declaresAncestry ? .undeclared : nil)
+    }
+
+    /// Enrolls declaring the local store. In reclaiming groups the
+    /// declaration is stored immutably and classifies the store's ancestry;
+    /// a repeated enrollment must declare the same store.
+    public func enroll(incarnation: HostStoreIncarnation) async throws -> HostProvenance {
+        try await enroll(declaring: declaresAncestry ? incarnation.record : nil)
+    }
+
+    private func enroll(declaring incarnation: HostStoreIncarnationRecord?) async throws -> HostProvenance {
         resumedEnrollment = nil
-        let started = try await surfacing { try await perform("enroll", .host) { try $0.enroll() } }
+        let started = try await surfacing { try await perform("enroll", .host) { try $0.enroll(incarnation: incarnation) } }
         return HostProvenance(started)
+    }
+
+    /// Records the host's explicit preserving resolution of a stale,
+    /// foreign or unknown ancestry. Needed before `declareReady`.
+    public func resolveAncestry(_ resolution: HostAncestryResolution) async throws {
+        try await surfacing { _ = try await perform("resolveAncestry", .host) { try $0.resolveAncestry() } }
+    }
+
+    /// What this store applied in this group, to save with the provenance
+    /// and present at a later enrollment.
+    public func lineage() async throws -> HostLineage {
+        try await surfacing { HostLineage(try await perform("lineage", .host) { try $0.lineage() }) }
+    }
+
+    /// The finalization fence, in reclaiming groups: with the outbox empty at
+    /// `capturedThrough`, no mutation captured through it will be submitted
+    /// again. Mappings of own records removed under the floor are released
+    /// afterwards, and a later mutation captured at or before the fence
+    /// without a mapping is refused.
+    public func finalizeSubmissions(capturedThrough: UInt64) async throws -> HostFinalization {
+        guard declaresAncestry else { throw HostJournalError.invalidArgument }
+        return try await surfacing {
+            HostFinalization(try await perform("finalizeSubmissions", .host) { try $0.finalizeSubmissions(capturedThrough: capturedThrough) })
+        }
     }
 
     /// Confirms a pending enrollment, or checks a confirmed one against the
@@ -150,7 +187,7 @@ public final class HostJournal {
     /// Appends new mutations as own records and returns the existing record
     /// for a repeated ID with the same payload. All or nothing.
     public func submit(_ batch: [HostMutation], capturedThrough: UInt64) async throws -> [HostRecordID] {
-        let mutations = batch.map { HostJournalMutation(id: $0.id.bytes, payload: $0.payload) }
+        let mutations = batch.map { HostJournalMutation(id: $0.id.bytes, payload: $0.payload, capturedAt: $0.capturedAt) }
         let records = try await surfacing {
             try await perform("submit", .host) { try $0.submit(mutations, capturedThrough: capturedThrough) }
         }
@@ -245,8 +282,22 @@ public final class HostJournal {
     }
 
     @discardableResult
-    func commitRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) async throws -> Bool {
-        try await perform("commitRetentionFloor", .engine) { try $0.commitRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint) }
+    func commitRetentionFloor(
+        round: Data, proposal: Data, checkpoint: HostSnapshotOffer, reclaimStores: [Data]? = nil
+    ) async throws -> Bool {
+        try await perform("commitRetentionFloor", .engine) {
+            try $0.commitRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint, reclaimStores: reclaimStores)
+        }
+    }
+
+    @discardableResult
+    func releaseFinalizedMappings() async throws -> Int {
+        try await perform("releaseFinalizedMappings", .engine) { try $0.releaseFinalizedMappings() }
+    }
+
+    @discardableResult
+    func markReclamationApplied(frontier: [Data: UInt64]) async throws -> Bool {
+        try await perform("markReclamationApplied", .engine) { try $0.markReclamationApplied(frontier: frontier) }
     }
 
     @discardableResult
@@ -255,8 +306,12 @@ public final class HostJournal {
     }
 
     @discardableResult
-    func adoptRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) async throws -> Bool {
-        try await perform("adoptRetentionFloor", .engine) { try $0.adoptRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint) }
+    func adoptRetentionFloor(
+        round: Data, proposal: Data, checkpoint: HostSnapshotOffer, reclamation: HostJournalReclamationState? = nil
+    ) async throws -> Bool {
+        try await perform("adoptRetentionFloor", .engine) {
+            try $0.adoptRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint, reclamation: reclamation)
+        }
     }
 
     // MARK: - Snapshot bootstrap

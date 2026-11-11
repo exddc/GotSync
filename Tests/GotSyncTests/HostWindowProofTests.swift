@@ -268,6 +268,8 @@ final class HostWindowProofTests: XCTestCase {
             "enterControlRepair": .none, "intake": .intake, "promote": .intake, "retire": .generation,
             "requestSnapshot": .none, "refuseSnapshot": .none, "advanceSnapshot": .none, "commitSnapshotInstall": .none,
             "commitRetentionFloor": .intake, "pruneBelowFloor": .intake, "adoptRetentionFloor": .intake,
+            "resolveAncestry": .none, "finalizeSubmissions": .none, "releaseFinalizedMappings": .none,
+            "markReclamationApplied": .none,
         ])
     }
 }

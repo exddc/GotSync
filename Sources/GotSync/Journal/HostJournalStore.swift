@@ -50,6 +50,13 @@ enum JournalStoreError: Error, Equatable {
     case confirmationMismatch
     /// Delivery is held while a snapshot bootstrap is unresolved.
     case bootstrapPending
+    /// The store's ancestry needs the host's explicit preserving resolution.
+    case ancestryUnresolved
+    /// The mutation was captured at or before the finalization fence and its
+    /// mapping was released; it is never accepted as a new mutation.
+    case mutationFinalized
+    /// A mutation lacks its capture counter after mappings were released.
+    case captureRequired
 }
 
 struct HostJournalLimits: Equatable, Sendable {
@@ -96,6 +103,9 @@ struct HostJournalProvenance: Equatable, Sendable {
 struct HostJournalMutation: Equatable, Sendable {
     let id: Data
     let payload: Data
+    /// The capture counter saved with the outbox entry; required once
+    /// mappings were released under the finalization fence.
+    var capturedAt: UInt64? = nil
 }
 
 /// One MLS application message. `envelopes` is nil when its plaintext could
@@ -209,11 +219,23 @@ struct HostJournalCoreView: Equatable, Sendable {
     let bootstrap: HostJournalBootstrapState?
     /// The committed all-member retention floor; nil keeps every record.
     let retention: HostJournalRetentionState?
+    /// The store the host declared at enrollment; nil before, or for profiles without ancestry.
+    let incarnation: HostStoreIncarnationRecord?
+    let ancestryResolved: Bool
+    let reclamation: HostJournalReclamationState?
+    let finalization: HostJournalFinalizationState?
+
+    /// Founded the group: complete from the start, with no provider.
+    var isFounder: Bool { historyComplete && completionProvider == nil && completionTarget == nil }
+    var ancestry: HostAncestryKind? {
+        incarnation.map { HostAncestryKind.classify($0, group: group, founder: isFounder, frontier: reclamation?.frontier) }
+    }
+    var isAncestryResolved: Bool { ancestry.map { $0.resolvesItself || ancestryResolved } ?? true }
 
     var isRetired: Bool { retirement != nil }
-    var isDeliveryHeld: Bool { bootstrap?.phase.holdsDelivery == true }
+    var isDeliveryHeld: Bool { bootstrap?.phase.holdsDelivery == true || retention?.floorApplied == false }
     /// The host applied every record of its completed history.
-    var historyApplied: Bool { historyComplete && appliedThrough >= completionPosition }
+    var historyApplied: Bool { historyComplete && appliedThrough >= completionPosition && !isDeliveryHeld }
     var undelivered: UInt64 { delivered - appliedThrough }
     var retainedCount: UInt64 { recordCount + pendingCount }
     var retainedBytes: UInt64 { recordBytes + pendingBytes }
@@ -409,12 +431,19 @@ final class HostJournalStore {
     /// Starts an enrollment that the host confirms with `resume` after saving
     /// the returned provenance. Refused once an enrollment was confirmed,
     /// whether or not any record exists.
-    func enroll() throws -> HostJournalProvenance {
+    func enroll(incarnation: HostStoreIncarnationRecord? = nil) throws -> HostJournalProvenance {
         try requireHostOpen()
+        if let incarnation, !incarnation.isWellFormed { throw JournalStoreError.invalidArgument("incarnation") }
         return try transaction("enroll") {
             let meta = try readMeta()
             guard meta.retirement == nil else { throw JournalStoreError.retired }
             if case .confirmed = meta.enrollment { throw JournalStoreError.hostProvenanceMissing }
+            if let incarnation {
+                if let stored = meta.incarnation, stored != incarnation { throw JournalStoreError.hostProvenanceMismatch }
+                if meta.incarnation == nil {
+                    try setSnapshotMeta("incarnation", .blob(try ReplicaCanonicalJSON.encode(incarnation)))
+                }
+            }
             let enrollmentID = Self.randomBytes(16)
             try setMeta("enrollment", .text("pending"))
             try setMeta("enrollmentID", .blob(enrollmentID))
@@ -493,6 +522,11 @@ final class HostJournalStore {
             let meta = try readMeta()
             guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard case .confirmed = meta.enrollment else { throw JournalStoreError.enrollmentRequired }
+            if meta.incarnation != nil {
+                guard meta.view.historyApplied, !meta.view.isDeliveryHeld, meta.retention?.floorApplied != false,
+                      meta.view.isAncestryResolved
+                else { throw JournalStoreError.ancestryUnresolved }
+            }
             guard capturedThrough >= meta.capturedThrough else { throw JournalStoreError.hostCaptureRegressed }
             var counters = meta.counters
             var ownHead = meta.ownHead
@@ -506,6 +540,12 @@ final class HostJournalStore {
                     guard existing.1 == payloadDigest else { throw JournalStoreError.hostMutationConflict(mutation.id) }
                     records.append(JournalRecordID(origin: meta.origin, sequence: existing.0))
                     continue
+                }
+                if let fence = meta.finalization {
+                    guard let capturedAt = mutation.capturedAt, capturedAt <= capturedThrough else {
+                        throw JournalStoreError.captureRequired
+                    }
+                    guard capturedAt > fence.capture else { throw JournalStoreError.mutationFinalized }
                 }
                 let head = try originHead(meta.origin)
                 guard head.received == ownHead else { throw JournalStoreError.storeCorrupt("own head") }
@@ -837,7 +877,7 @@ final class HostJournalStore {
         try requireResumed()
         guard limit > 0, limit <= limits.batch else { throw JournalStoreError.invalidArgument("limit") }
         let bootstrap = view.bootstrap
-        guard bootstrap?.phase.holdsDelivery != true else { return [] }
+        guard !view.isDeliveryHeld else { return [] }
         let (uncovered, coveredValues) = try Self.uncoveredClause(bootstrap?.coverage)
         var result: [HostJournalIncoming] = []
         try database.rows(
@@ -865,7 +905,7 @@ final class HostJournalStore {
     func coveredThrough(after position: UInt64) throws -> UInt64? {
         try requireResumed()
         let meta = try readMeta()
-        guard meta.bootstrap?.phase.holdsDelivery != true else { throw JournalStoreError.bootstrapPending }
+        guard !meta.view.isDeliveryHeld else { throw JournalStoreError.bootstrapPending }
         guard position < meta.nextPosition else { throw JournalStoreError.positionOutOfRange(position) }
         let covered = try Self.pastCovered(position, coverage: meta.bootstrap?.coverage, in: database, next: meta.nextPosition)
         return covered > position ? covered : nil
@@ -880,7 +920,7 @@ final class HostJournalStore {
             guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard position < meta.nextPosition else { throw JournalStoreError.positionOutOfRange(position) }
             guard position > meta.appliedThrough else { return }
-            guard meta.bootstrap?.phase.holdsDelivery != true else { throw JournalStoreError.bootstrapPending }
+            guard !meta.view.isDeliveryHeld else { throw JournalStoreError.bootstrapPending }
             try applyThrough(position, from: meta.appliedThrough)
             try bumpRevision(meta)
         }
@@ -1199,6 +1239,8 @@ final class HostJournalStore {
             let meta = try readMeta()
             guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard case .confirmed = meta.enrollment else { throw JournalStoreError.enrollmentRequired }
+            guard meta.retention?.floorApplied != false else { throw JournalStoreError.bootstrapPending }
+            guard meta.view.isAncestryResolved else { throw JournalStoreError.ancestryUnresolved }
             guard meta.capturedThrough >= capturedThrough else { throw JournalStoreError.hostCaptureRegressed }
             guard !meta.isReady || capturedThrough > meta.readyThrough else { return }
             try setMeta("ready", .integer(1))
@@ -1407,7 +1449,7 @@ final class HostJournalStore {
     /// Commits a floor every current member accepted: records at or below it
     /// become removable. The checkpoint must reflect exactly the anchors.
     @discardableResult
-    func commitRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) throws -> Bool {
+    func commitRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer, reclaimStores: [Data]? = nil) throws -> Bool {
         guard round.count == 16, proposal.count == 32, checkpoint.isWellFormed, checkpoint.floor == nil else {
             throw JournalStoreError.invalidArgument("floor")
         }
@@ -1416,7 +1458,11 @@ final class HostJournalStore {
             guard meta.retirement == nil else { throw JournalStoreError.retired }
             guard meta.retention?.proposal != proposal else { return false }
             guard try floorDecline(checkpoint.anchors, meta: meta) == nil else { return false }
+            if reclaimStores != nil, !meta.view.isAncestryResolved { return false }
             try storeFloor(round: round, proposal: proposal, checkpoint: checkpoint, applied: true, meta: meta)
+            if let reclaimStores {
+                try storeReclamation(checkpoint.coverage, stores: reclaimStores, applied: false)
+            }
             try bumpRevision(meta)
             return true
         }
@@ -1465,7 +1511,9 @@ final class HostJournalStore {
     /// a joiner that never received the removed records: each origin's head
     /// starts at its anchor, so the tail above it promotes normally.
     @discardableResult
-    func adoptRetentionFloor(round: Data, proposal: Data, checkpoint: HostSnapshotOffer) throws -> Bool {
+    func adoptRetentionFloor(
+        round: Data, proposal: Data, checkpoint: HostSnapshotOffer, reclamation: HostJournalReclamationState? = nil
+    ) throws -> Bool {
         guard round.count == 16, proposal.count == 32, checkpoint.isWellFormed, checkpoint.floor == nil else {
             throw JournalStoreError.invalidArgument("floor")
         }
@@ -1491,6 +1539,106 @@ final class HostJournalStore {
             }
             try writeCounters(counters)
             try storeFloor(round: round, proposal: proposal, checkpoint: checkpoint, applied: false, meta: meta)
+            if let reclamation {
+                try storeReclamation(reclamation.frontier, stores: reclamation.stores, applied: false)
+            }
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    private func storeReclamation(_ frontier: [Data: UInt64], stores: [Data], applied: Bool) throws {
+        try setSnapshotMeta("reclamationFrontier", .blob(try Self.encodeVector(frontier)))
+        try setSnapshotMeta("reclamationStores", .blob(try ReplicaCanonicalJSON.encode(stores.sorted { $0.lexicographicallyPrecedes($1) })))
+        try setSnapshotMeta("reclamationApplied", .integer(applied ? 1 : 0))
+    }
+
+    // MARK: - Provenance, ancestry and finalization
+
+    /// Records the host's explicit preserving resolution of an ancestry that
+    /// does not resolve itself.
+    @discardableResult
+    func resolveAncestry() throws -> Bool {
+        try requireHostOpen()
+        return try transaction("resolveAncestry") {
+            let meta = try readMeta()
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            guard let ancestry = meta.view.ancestry, !ancestry.resolvesItself, !meta.ancestryResolved else { return false }
+            try setSnapshotMeta("ancestryResolved", .integer(1))
+            try bumpRevision(meta)
+            return true
+        }
+    }
+
+    /// What this journal's store applied in its group, for the host's next enrollment.
+    func lineage() throws -> HostLineageRecord {
+        let meta = try readMeta()
+        var applied: [Data: UInt64] = [:]
+        try database.rows("SELECT origin, applied FROM origins WHERE applied > 0") { applied[try $0.blob(0)] = try $0.unsigned(1) }
+        if let retention = meta.retention, retention.floorApplied {
+            for anchor in retention.anchors { applied[anchor.origin] = max(applied[anchor.origin] ?? 0, anchor.sequence) }
+        }
+        applied[meta.origin] = meta.ownHead
+        let reclaimed = meta.reclamation.flatMap { $0.applied ? $0.frontier : nil } ?? [:]
+        return HostLineageRecord(
+            group: meta.group, journalID: meta.journalID, storeID: meta.incarnation?.storeID,
+            applied: HostVectorEntry.entries(applied), reclaimedThrough: HostVectorEntry.entries(reclaimed)
+        )
+    }
+
+    /// The host's fence: with its outbox empty at capture counter
+    /// `capturedThrough`, no mutation captured through it will be submitted
+    /// again. Mappings of every current own record become releasable once
+    /// removed under the floor.
+    @discardableResult
+    func finalizeSubmissions(capturedThrough: UInt64) throws -> HostJournalFinalizationState {
+        try requireResumed()
+        return try transaction("finalizeSubmissions") {
+            let meta = try readMeta()
+            guard meta.retirement == nil else { throw JournalStoreError.retired }
+            guard capturedThrough == meta.capturedThrough else { throw JournalStoreError.hostCaptureRegressed }
+            let released = meta.finalization?.released ?? 0
+            if let fence = meta.finalization, fence.capture >= capturedThrough, fence.own >= meta.ownHead { return fence }
+            try setSnapshotMeta("finalizedCapture", try JournalDatabase.integer(capturedThrough))
+            try setSnapshotMeta("finalizedOwn", try JournalDatabase.integer(meta.ownHead))
+            try setSnapshotMeta("releasedMappings", try JournalDatabase.integer(released))
+            try bumpRevision(meta)
+            return HostJournalFinalizationState(capture: capturedThrough, own: meta.ownHead, released: released)
+        }
+    }
+
+    /// Deletes at most `maxMappings` host-mutation mappings of own records
+    /// that are both finalized and removed under the floor. Returns how many.
+    @discardableResult
+    func releaseFinalizedMappings(maxMappings: Int = HostRetentionBounds.pruneStep) throws -> Int {
+        guard let fence = view.finalization, let floor = view.retention?.anchor(view.origin)?.sequence, view.retirement == nil else {
+            return 0
+        }
+        let through = min(fence.own, floor)
+        return try transaction("releaseFinalizedMappings") {
+            let meta = try readMeta()
+            var ids: [Data] = []
+            try database.rows(
+                "SELECT id FROM submissions WHERE sequence <= ? AND sequence NOT IN (SELECT sequence FROM records WHERE origin = ?) LIMIT ?",
+                [try JournalDatabase.integer(through), .blob(meta.origin), .integer(Int64(maxMappings))]
+            ) { ids.append(try $0.blob(0)) }
+            guard !ids.isEmpty else { return 0 }
+            for id in ids {
+                try database.run("DELETE FROM submissions WHERE id = ?", [.blob(id)])
+            }
+            try setSnapshotMeta("releasedMappings", try JournalDatabase.integer((meta.finalization?.released ?? 0) + UInt64(ids.count)))
+            try bumpRevision(meta)
+            return ids.count
+        }
+    }
+
+    /// The host reclaimed tombstones and clears through the frontier.
+    @discardableResult
+    func markReclamationApplied(frontier: [Data: UInt64]) throws -> Bool {
+        try transaction("markReclamationApplied") {
+            let meta = try readMeta()
+            guard let reclamation = meta.reclamation, reclamation.frontier == frontier, !reclamation.applied else { return false }
+            try setSnapshotMeta("reclamationApplied", .integer(1))
             try bumpRevision(meta)
             return true
         }
@@ -1694,6 +1842,8 @@ final class HostJournalStore {
         "enterControlRepair": .none, "intake": .intake, "promote": .intake, "retire": .generation,
         "requestSnapshot": .none, "refuseSnapshot": .none, "advanceSnapshot": .none, "commitSnapshotInstall": .none,
         "commitRetentionFloor": .intake, "pruneBelowFloor": .intake, "adoptRetentionFloor": .intake,
+        "resolveAncestry": .none, "finalizeSubmissions": .none, "releaseFinalizedMappings": .none,
+        "markReclamationApplied": .none,
     ]
 
     /// Builds the snapshot this commit leaves before COMMIT, so nothing
@@ -1749,7 +1899,8 @@ final class HostJournalStore {
 
     /// Snapshot keys exist only once a bootstrap was requested.
     private func setSnapshotMeta(_ key: String, _ value: JournalValue) throws {
-        precondition(key.hasPrefix("snapshot") || key.hasPrefix("retention") || key.hasPrefix("pruned"))
+        precondition(["snapshot", "retention", "pruned", "incarnation", "ancestry", "reclamation", "finalized", "released"]
+            .contains { key.hasPrefix($0) })
         try database.run("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [.text(key), value])
     }
 
@@ -1877,6 +2028,10 @@ final class HostJournalStore {
         let controlRepair: Bool
         let bootstrap: HostJournalBootstrapState?
         let retention: HostJournalRetentionState?
+        let incarnation: HostStoreIncarnationRecord?
+        let ancestryResolved: Bool
+        let reclamation: HostJournalReclamationState?
+        let finalization: HostJournalFinalizationState?
 
         var view: HostJournalCoreView {
             HostJournalCoreView(
@@ -1891,7 +2046,8 @@ final class HostJournalStore {
                 historyComplete: historyComplete, completionProvider: completionProvider,
                 completionTarget: completionTarget, completionPosition: completionPosition,
                 historyProvider: historyProvider, controlRepair: controlRepair, bootstrap: bootstrap,
-                retention: retention
+                retention: retention, incarnation: incarnation, ancestryResolved: ancestryResolved,
+                reclamation: reclamation, finalization: finalization
             )
         }
     }
@@ -1957,6 +2113,22 @@ final class HostJournalStore {
         let historyComplete = try flag("historyComplete")
         let bootstrap = try readBootstrap(texts: texts, blobs: blobs)
         let retention = try readRetention(blobs: blobs, integers: integers)
+        let incarnation = try blobs["incarnation"].map { bytes -> HostStoreIncarnationRecord in
+            let decoded = try ReplicaCanonicalJSON.decode(HostStoreIncarnationRecord.self, from: bytes)
+            guard decoded.isWellFormed else { throw JournalStoreError.storeCorrupt("incarnation") }
+            return decoded
+        }
+        let reclamation = try blobs["reclamationFrontier"].map { bytes -> HostJournalReclamationState in
+            guard let stores = blobs["reclamationStores"], let applied = integers["reclamationApplied"], applied <= 1 else {
+                throw JournalStoreError.storeCorrupt("reclamation")
+            }
+            return HostJournalReclamationState(
+                frontier: try decodeVector(bytes), stores: try ReplicaCanonicalJSON.decode([Data].self, from: stores), applied: applied == 1
+            )
+        }
+        let finalization = integers["finalizedCapture"].map {
+            HostJournalFinalizationState(capture: $0, own: integers["finalizedOwn"] ?? 0, released: integers["releasedMappings"] ?? 0)
+        }
         return Meta(
             journalID: try blob("journalID", 16), group: try blob("group", 32), origin: try blob("origin", 16),
             retirement: retirement, revision: try integer("revision"), enrollment: enrollment,
@@ -1966,7 +2138,9 @@ final class HostJournalStore {
             historyComplete: historyComplete, completionProvider: try member("completionProvider"),
             completionTarget: target.isEmpty ? nil : try decodeVector(target),
             completionPosition: completionPosition, historyProvider: try member("historyProvider"),
-            controlRepair: try flag("controlRepair"), bootstrap: bootstrap, retention: retention
+            controlRepair: try flag("controlRepair"), bootstrap: bootstrap, retention: retention,
+            incarnation: incarnation, ancestryResolved: (integers["ancestryResolved"] ?? 0) == 1,
+            reclamation: reclamation, finalization: finalization
         )
     }
 
@@ -2173,7 +2347,7 @@ final class HostJournalStore {
             }
             mappings += 1
         }
-        guard mappings == meta.ownHead else { throw JournalStoreError.storeCorrupt("submissions") }
+        guard mappings + (meta.finalization?.released ?? 0) == meta.ownHead else { throw JournalStoreError.storeCorrupt("submissions") }
         try database.rows("SELECT origin, sequence, envelope, digest FROM pending") { row in
             try checkCancellation()
             let envelope = try stored(try row.blob(2))

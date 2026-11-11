@@ -35,7 +35,7 @@ struct HostRetentionRound {
     let opened = ContinuousClock.now
 }
 
-@_spi(HostJournalPreview) extension SyncEngine {
+extension SyncEngine {
     /// Registers the app's retention host, or removes it with nil. Without a
     /// host this member declines every floor. A compacting group also needs
     /// a snapshot host of the profile's schema before pairing.
@@ -226,6 +226,7 @@ extension SyncEngine {
         ))
         try Task.checkCancellation()
         try requireHostBinding(binding, session)
+        if case .tooLarge = outcome { throw HostSnapshotExportRefused(reason: .tooLarge) }
         guard case .exported(let echo) = outcome, echo.appliedThrough?.rawValue ?? 0 == cut.appliedThrough,
               echo.capturedThrough == cut.capturedThrough
         else { return nil }
@@ -269,8 +270,14 @@ extension SyncEngine {
         let current = try await session.members().map(\.fingerprint).sorted { $0.lexicographicallyPrecedes($1) }
         try requireCurrent(session)
         guard current == roster else { return nil }
-        return HostRetentionProposal(round: HostJournalStore.randomBytes(16), epoch: epoch, roster: roster, anchors: cut.anchors,
-                                     checkpoint: checkpoint)
+        var proposal = HostRetentionProposal(round: HostJournalStore.randomBytes(16), epoch: epoch, roster: roster,
+                                             anchors: cut.anchors, checkpoint: checkpoint)
+        if groupProfile.schema.allowsReclamation, attest.reclaim != nil, !retentionReclaimDeclined,
+           let declared = store.view.incarnation?.storeID, store.view.isAncestryResolved {
+            proposal.reclaim = true
+            proposal.store = declared
+        }
+        return proposal
     }
 
     /// The host's own durable cut equals the journal's and nothing waits in
@@ -338,6 +345,13 @@ extension SyncEngine {
                 guard try await store.pruneBelowFloor() > 0 else { break }
                 try requireHostBinding(binding, session)
             }
+            if groupProfile.schema.allowsReclamation {
+                for _ in 0..<8 {
+                    guard try await store.releaseFinalizedMappings() > 0 else { break }
+                    try requireHostBinding(binding, session)
+                }
+                try await applyReclamation(store: store, binding: binding, session: session)
+            }
         }
         if retentionRound == nil, retentionTask == nil, roster.first == me, roster.count > 1,
            store.view.retainedBytes >= HostRetentionBounds.automaticBytes {
@@ -357,6 +371,9 @@ extension SyncEngine {
             return
         }
         if round.votes.values.contains(where: { !$0.accept }) {
+            if round.proposal.reclaim == true, round.votes.values.contains(where: { $0.reason == .unsupported }) {
+                retentionReclaimDeclined = true
+            }
             dropRetentionRound(store: store)
             return
         }
@@ -385,8 +402,17 @@ extension SyncEngine {
         guard let current = retentionRound, current.digest == round.digest, current.voted,
               voters.allSatisfy({ current.votes[$0]?.accept == true })
         else { return }
+        var stores: [Data]?
+        if round.proposal.reclaim == true {
+            let scope = [round.proposal.store] + voters.map { current.votes[$0]?.store }
+            guard scope.allSatisfy({ $0?.count == 16 }) else {
+                dropRetentionRound(store: store)
+                return
+            }
+            stores = scope.compactMap { $0 }
+        }
         let committed = try await store.commitRetentionFloor(
-            round: round.proposal.round, proposal: round.digest, checkpoint: round.proposal.checkpoint
+            round: round.proposal.round, proposal: round.digest, checkpoint: round.proposal.checkpoint, reclaimStores: stores
         )
         try requireHostBinding(binding, session)
         retentionRound = nil
@@ -420,6 +446,7 @@ extension SyncEngine {
             guard var current = self.retentionRound, current.digest == round.digest, !current.voted else { return }
             var vote = HostRetentionVote(round: round.proposal.round, proposal: round.digest, accept: reason == nil)
             vote.reason = reason
+            vote.store = self.hostAdapter?.store?.view.incarnation?.storeID
             do {
                 try await self.send(plaintext: HostJournalMessage.retentionVote(vote).encoded(), session: session)
             } catch {
@@ -437,6 +464,8 @@ extension SyncEngine {
               proposal.checkpoint.schema == groupProfile.schema.retentionSnapshotSchema
         else { return .unsupported }
         let binding = try hostBinding(session)
+        if groupProfile.schema.allowsReclamation, !store.view.isAncestryResolved { return .ancestryUnresolved }
+        if proposal.reclaim == true, attest.reclaim == nil || store.view.incarnation?.storeID == nil { return .unsupported }
         if let decline = try await store.retentionDecline(proposal.anchors) { return decline }
         if let failure = try await fetchCheckpoint(proposal.checkpoint, store: store, session: session) { return failure }
         try requireHostBinding(binding, session)
@@ -518,10 +547,14 @@ extension SyncEngine {
     private func sendCorroborations(store: HostJournal, binding: HostBinding, session: MLSSession) async throws {
         guard let retention = store.view.retention, retention.floorApplied, !retentionCorroborationRecipients.isEmpty else { return }
         for member in retentionCorroborationRecipients.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
-            let corroboration = HostRetentionCorroboration(
+            var corroboration = HostRetentionCorroboration(
                 member: member, round: retention.round, proposal: retention.proposal, anchors: retention.anchors,
                 contentHash: retention.checkpoint.contentHash
             )
+            if let reclamation = store.view.reclamation {
+                corroboration.reclaimedThrough = HostVectorEntry.entries(reclamation.frontier)
+                corroboration.stores = reclamation.stores
+            }
             try await send(plaintext: HostJournalMessage.retentionState(corroboration).encoded(), session: session)
             try requireHostBinding(binding, session)
             retentionCorroborationRecipients.remove(member)
@@ -539,21 +572,28 @@ extension SyncEngine {
         let others = roster.filter { $0 != me }
         guard !others.isEmpty else { return }
         var round: Data?
+        var reclaimed: ([HostVectorEntry]?, [Data]?)?
         for member in others {
             guard let corroboration = retentionCorroborations[member] else { return }
             guard corroboration.proposal == floor, corroboration.anchors == offer.anchors,
-                  corroboration.contentHash == offer.contentHash, round == nil || round == corroboration.round
+                  corroboration.contentHash == offer.contentHash, round == nil || round == corroboration.round,
+                  reclaimed == nil || (reclaimed?.0 == corroboration.reclaimedThrough && reclaimed?.1 == corroboration.stores)
             else {
                 try await store.refuseSnapshot(.corroborationMismatch, in: [.offered], id: offer.id)
                 try requireHostBinding(binding, session)
                 return
             }
             round = corroboration.round
+            reclaimed = (corroboration.reclaimedThrough, corroboration.stores)
         }
         guard let round else { return }
         var checkpoint = offer
         checkpoint.floor = nil
-        try await store.adoptRetentionFloor(round: round, proposal: floor, checkpoint: checkpoint)
+        var reclamation: HostJournalReclamationState?
+        if let frontier = reclaimed?.0, let stores = reclaimed?.1 {
+            reclamation = HostJournalReclamationState(frontier: HostVectorEntry.vector(frontier), stores: stores, applied: false)
+        }
+        try await store.adoptRetentionFloor(round: round, proposal: floor, checkpoint: checkpoint, reclamation: reclamation)
         try requireHostBinding(binding, session)
         while try await store.promote() > 0 {
             try requireHostBinding(binding, session)
@@ -569,5 +609,30 @@ extension SyncEngine {
         var offer = retention.checkpoint
         offer.floor = retention.proposal
         return offer
+    }
+}
+
+extension SyncEngine {
+    /// Asks the host to reclaim through a committed frontier until it
+    /// returns, then records that it did. Only a member that applied the
+    /// floor and resolved its ancestry reclaims.
+    func applyReclamation(store: HostJournal, binding: HostBinding, session: MLSSession) async throws {
+        guard let reclamation = store.view.reclamation, !reclamation.applied, store.view.retention?.floorApplied == true,
+              store.view.isAncestryResolved, let reclaim = retentionHooks?.reclaim, retentionTask == nil
+        else { return }
+        let request = HostReclamation(reclamation)
+        retentionTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.retentionTask = nil }
+            do {
+                try await reclaim(request)
+                try Task.checkCancellation()
+                try self.requireHostBinding(binding, session)
+                try await store.markReclamationApplied(frontier: reclamation.frontier)
+                self.requestSyncCycle(force: true)
+            } catch {
+                // Asked again in a later cycle; the hook is idempotent.
+            }
+        }
     }
 }
