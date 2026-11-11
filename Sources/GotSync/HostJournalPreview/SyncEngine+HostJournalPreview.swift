@@ -1,6 +1,6 @@
 import Foundation
 
-@_spi(HostJournalPreview) extension SyncEngine {
+extension SyncEngine {
     /// The composed host view; nil for task profiles.
     public var hostJournalView: HostJournalView? {
         hostView.map(HostJournalView.init)

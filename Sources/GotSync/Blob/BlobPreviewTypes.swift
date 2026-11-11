@@ -1,7 +1,7 @@
 import Foundation
 
 /// A host-chosen, persisted 16-byte identity for one outgoing or incoming transfer.
-@_spi(BlobPreview) public struct BlobTransferID: Hashable, Sendable {
+public struct BlobTransferID: Hashable, Sendable {
     public let bytes: Data
 
     public init(bytes: Data) throws {
@@ -14,7 +14,7 @@ import Foundation
 
 /// What a sealed object holds. An image descriptor (version 1) and an
 /// application-data descriptor (version 2) are never accepted in each other's place.
-@_spi(BlobPreview) public enum BlobContentKind: Hashable, Sendable {
+public enum BlobContentKind: Hashable, Sendable {
     case image
     /// One chunk of a host record too large for a journal payload.
     case applicationData
@@ -22,7 +22,7 @@ import Foundation
 
 /// The ledger class that refused new work. Accepted rows and files are never
 /// evicted to make room; the host keeps its durable intent and retries.
-@_spi(BlobPreview) public enum BlobCapacity: Equatable, Sendable {
+public enum BlobCapacity: Equatable, Sendable {
     /// Library bytes would exceed the 64 MiB ledger.
     case libraryBytes
     /// 16 outgoing rows exist, in any state.
@@ -37,7 +37,7 @@ import Foundation
     case diskFloor
 }
 
-@_spi(BlobPreview) public enum BlobError: Error, Equatable, Sendable {
+public enum BlobError: Error, Equatable, Sendable {
     /// No active group session is bound.
     case notBound
     /// The route is not the bound group's route.
@@ -70,14 +70,14 @@ import Foundation
 }
 
 /// Why an outgoing transfer stopped before it was ever offered.
-@_spi(BlobPreview) public enum BlobOutgoingFailure: Equatable, Sendable {
+public enum BlobOutgoingFailure: Equatable, Sendable {
     case sourceChanged
     case sourceUnreadable
     case exceedsSyncLimits
     case imageRejected
 }
 
-@_spi(BlobPreview) public struct BlobOutgoingStatus: Equatable, Sendable {
+public struct BlobOutgoingStatus: Equatable, Sendable {
     public enum State: Equatable, Sendable {
         /// Sealed and not yet complete on the relay.
         case uploading
@@ -101,7 +101,7 @@ import Foundation
 }
 
 /// Why an incoming variant was rejected. Only this descriptor is affected.
-@_spi(BlobPreview) public enum BlobRejection: Equatable, Sendable {
+public enum BlobRejection: Equatable, Sendable {
     case relayIntegrity
     case descriptorMismatch
     case imageRejected
@@ -109,7 +109,7 @@ import Foundation
     case dataRefused
 }
 
-@_spi(BlobPreview) public struct BlobIncomingStatus: Equatable, Sendable {
+public struct BlobIncomingStatus: Equatable, Sendable {
     public enum State: Equatable, Sendable {
         case queued
         case fetching
@@ -133,7 +133,7 @@ import Foundation
     public let state: State
 }
 
-@_spi(BlobPreview) public struct BlobSummary: Equatable, Sendable {
+public struct BlobSummary: Equatable, Sendable {
     public var outgoingUploading = 0
     /// Distinct transfers refused for capacity since they last made progress.
     public var outgoingWaitingCapacity = 0
@@ -158,7 +158,7 @@ import Foundation
 }
 
 /// What the image validator read from an image's headers.
-@_spi(BlobPreview) public struct BlobImageInfo: Equatable, Sendable {
+public struct BlobImageInfo: Equatable, Sendable {
     /// A uniform type identifier, such as `public.jpeg`.
     public let mediaType: String
     public let pixelWidth: UInt32
@@ -167,7 +167,7 @@ import Foundation
 
 /// The public fields of a v1 descriptor, for keying host variants by
 /// `(route, objectID)`. The key is not exposed.
-@_spi(BlobPreview) public struct BlobDescriptorInfo: Equatable, Sendable {
+public struct BlobDescriptorInfo: Equatable, Sendable {
     public let objectID: Data
     public let contentHash: Data
     public let plaintextLength: UInt64
@@ -186,7 +186,7 @@ import Foundation
 
 /// The public fields of a version 2 application-data descriptor. An image
 /// descriptor is refused with `contentKindMismatch`; the key is not exposed.
-@_spi(BlobPreview) public struct BlobDataDescriptorInfo: Equatable, Sendable {
+public struct BlobDataDescriptorInfo: Equatable, Sendable {
     public let objectID: Data
     public let contentHash: Data
     public let plaintextLength: UInt64
@@ -202,7 +202,7 @@ import Foundation
 }
 
 /// Host callbacks. They may be called from any task.
-@_spi(BlobPreview) public struct BlobHostHooks: Sendable {
+public struct BlobHostHooks: Sendable {
     /// A host-owned file whose content has `contentHash`, for re-uploading an
     /// object other members want. Return nil when none is held.
     public var verifiedContentURL: @Sendable (_ contentHash: Data) async -> URL?

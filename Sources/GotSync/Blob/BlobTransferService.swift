@@ -18,7 +18,7 @@ struct BlobBinding: Equatable, Sendable {
 /// checks the captured binding generation and the row's session. Cloning,
 /// sealing, network and validation run off the actor and only produce
 /// candidates. Host source files are never written or deleted.
-@_spi(BlobPreview) public actor BlobTransferService {
+public actor BlobTransferService {
     static let ledgerBytes: Int64 = 64 * 1_024 * 1_024
     static let maxOutgoingRows = 16
     static let maxIncomingByteRows = 8

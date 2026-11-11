@@ -2,7 +2,7 @@ import Foundation
 
 /// A host-chosen identifier of one mutation; resubmitting the same ID with
 /// the same payload returns the same record.
-@_spi(HostJournalPreview) public struct HostMutationID: Hashable, Codable, Sendable {
+public struct HostMutationID: Hashable, Codable, Sendable {
     public let uuid: UUID
 
     public init(_ uuid: UUID) {
@@ -24,7 +24,7 @@ import Foundation
 }
 
 /// One record: its origin and its sequence within that origin.
-@_spi(HostJournalPreview) public struct HostRecordID: Hashable, Sendable {
+public struct HostRecordID: Hashable, Sendable {
     public let origin: Data
     public let sequence: UInt64
 
@@ -36,7 +36,7 @@ import Foundation
 
 /// A position in the journal's delivery order. Always positive and within
 /// the storage range; "nothing" is expressed as nil, never as zero.
-@_spi(HostJournalPreview) public struct JournalPosition: Comparable, Hashable, Codable, Sendable {
+public struct JournalPosition: Comparable, Hashable, Codable, Sendable {
     public let rawValue: UInt64
 
     /// Nil for zero and for values beyond the storage range.
@@ -71,7 +71,7 @@ import Foundation
 /// What the host saves with its business state and presents on every
 /// launch. `capturedThrough` is the host's own capture counter, saved with
 /// its outbox before submission.
-@_spi(HostJournalPreview) public struct HostProvenance: Codable, Hashable, Sendable {
+public struct HostProvenance: Codable, Hashable, Sendable {
     public let journalID: Data
     public let enrollmentID: Data
     /// The last position applied to the host's business state; nil for none.
@@ -100,18 +100,26 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public struct HostMutation: Sendable {
+public struct HostMutation: Sendable {
     public let id: HostMutationID
     public let payload: Data
+    /// The capture counter saved with this mutation's outbox entry. Required
+    /// in reclaiming groups once `finalizeSubmissions` released mappings.
+    public let capturedAt: UInt64?
 
     public init(id: HostMutationID, payload: Data) {
+        self.init(id: id, payload: payload, capturedAt: nil)
+    }
+
+    public init(id: HostMutationID, payload: Data, capturedAt: UInt64?) {
         self.id = id
         self.payload = payload
+        self.capturedAt = capturedAt
     }
 }
 
 /// A remote record in delivery order.
-@_spi(HostJournalPreview) public struct IncomingRecord: Sendable {
+public struct IncomingRecord: Sendable {
     public let position: JournalPosition
     public let record: HostRecordID
     public let payload: Data
@@ -126,13 +134,13 @@ import Foundation
 
 // MARK: - State
 
-@_spi(HostJournalPreview) public enum HostEnrollmentState: Equatable, Sendable {
+public enum HostEnrollmentState: Equatable, Sendable {
     case none
     case pending
     case confirmed
 }
 
-@_spi(HostJournalPreview) public enum HostClosingIntent: Equatable, Sendable {
+public enum HostClosingIntent: Equatable, Sendable {
     case unlink
     case removed
     case erase
@@ -146,7 +154,7 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public enum HostJournalLifecycle: Equatable, Sendable {
+public enum HostJournalLifecycle: Equatable, Sendable {
     case opening
     case active
     case closing(HostClosingIntent)
@@ -164,12 +172,12 @@ import Foundation
 
 /// Inbox messages the journal does not own yet; unknown while MLS work may
 /// have changed the inbox since the last settled cycle.
-@_spi(HostJournalPreview) public enum HostIntakeState: Equatable, Sendable {
+public enum HostIntakeState: Equatable, Sendable {
     case unknown
     case settled(held: Int)
 }
 
-@_spi(HostJournalPreview) public enum HostRetirementReason: Equatable, Sendable {
+public enum HostRetirementReason: Equatable, Sendable {
     case unlink
     case removed
     case orphaned
@@ -184,7 +192,7 @@ import Foundation
 }
 
 /// The committed state of the bound journal generation.
-@_spi(HostJournalPreview) public struct HostJournalState: Equatable, Sendable {
+public struct HostJournalState: Equatable, Sendable {
     public let journalID: Data
     public let group: Data
     public let enrollment: HostEnrollmentState
@@ -209,11 +217,15 @@ import Foundation
     public let bootstrap: HostSnapshotBootstrap
     /// The committed retention floor; nil while every record is retained.
     public let retention: HostRetentionState?
+    /// The enrolled store's ancestry in reclaiming groups; nil elsewhere.
+    public let ancestry: HostAncestryState?
+    public let reclamation: HostReclamation?
+    public let finalization: HostFinalization?
 }
 
 /// The composed host view. `journal` is nil while no generation is bound,
 /// for example while opening or after a failure, so nothing is invented.
-@_spi(HostJournalPreview) public struct HostJournalView: Equatable, Sendable {
+public struct HostJournalView: Equatable, Sendable {
     /// Rises with every change; a new value means "read again".
     public let revision: UInt64
     public let lifecycle: HostJournalLifecycle
@@ -250,7 +262,9 @@ import Foundation
                 historyComplete: core.historyComplete, historyApplied: core.historyApplied,
                 pendingCount: core.pendingCount, quarantineCount: core.quarantineCount, heldCount: core.heldCount,
                 retainedCount: core.retainedCount, retainedBytes: core.retainedBytes, controlRepair: core.controlRepair,
-                bootstrap: HostSnapshotBootstrap(core.bootstrap), retention: core.retention.map(HostRetentionState.init)
+                bootstrap: HostSnapshotBootstrap(core.bootstrap), retention: core.retention.map(HostRetentionState.init),
+                ancestry: core.ancestry.map { HostAncestryState(ancestry: HostAncestry($0), isResolved: core.isAncestryResolved) },
+                reclamation: core.reclamation.map(HostReclamation.init), finalization: core.finalization.map(HostFinalization.init)
             )
         }
     }
@@ -258,7 +272,7 @@ import Foundation
 
 // MARK: - Invitation phrase
 
-@_spi(HostJournalPreview) extension Invitation {
+extension Invitation {
     /// Words in an invitation phrase, as the phrase codec defines it.
     public static var phraseWordCount: Int { MnemonicCodec.wordCount }
 }
@@ -267,7 +281,7 @@ import Foundation
 
 /// What one journal accepts per mutation and per `submit` call, so a host
 /// can size its batches without guessing the wire overhead.
-@_spi(HostJournalPreview) public struct HostSubmissionLimits: Equatable, Sendable {
+public struct HostSubmissionLimits: Equatable, Sendable {
     /// The largest `HostMutation.payload`.
     public let maxPayloadBytes: Int
     /// Bytes each mutation adds to its payload once encoded as an envelope.
@@ -287,7 +301,7 @@ import Foundation
 
 // MARK: - Errors
 
-@_spi(HostJournalPreview) public enum HostJournalCapacity: Equatable, Sendable {
+public enum HostJournalCapacity: Equatable, Sendable {
     /// One `submit` call's encoded envelopes exceed `limit` bytes.
     case submitCallTooLarge(limit: Int)
     case submitBudget
@@ -311,7 +325,7 @@ import Foundation
 
 /// Why host work stopped preserving everything. No diagnostic text is
 /// carried, only the typed reason.
-@_spi(HostJournalPreview) public enum HostJournalRepair: Equatable, Sendable {
+public enum HostJournalRepair: Equatable, Sendable {
     case journalMissing
     case journalUnreadable
     case journalCorrupt
@@ -346,7 +360,7 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public enum HostJournalError: Error, Equatable, Sendable {
+public enum HostJournalError: Error, Equatable, Sendable {
     /// This handle's generation was fenced or closed; read `hostJournal` again.
     case fenced
     case retired
@@ -370,6 +384,13 @@ import Foundation
     case storageUnavailable
     /// A snapshot bootstrap holds delivery; see `HostJournalState.bootstrap`.
     case bootstrapPending
+    /// The store's ancestry needs `resolveAncestry(_:)` first; see `HostJournalState.ancestry`.
+    case ancestryUnresolved
+    /// Captured at or before the finalization fence; its mapping was released
+    /// and it is never accepted as a new mutation.
+    case mutationFinalized
+    /// After mappings were released every mutation needs `capturedAt`.
+    case captureRequired
 
     /// The public form of any error a host call can raise. Cancellation
     /// passes through unchanged.
@@ -415,6 +436,9 @@ import Foundation
         case .notArchived: self = .notArchived
         case .confirmationMismatch: self = .confirmationMismatch
         case .bootstrapPending: self = .bootstrapPending
+        case .ancestryUnresolved: self = .ancestryUnresolved
+        case .mutationFinalized: self = .mutationFinalized
+        case .captureRequired: self = .captureRequired
         }
     }
 
@@ -434,7 +458,7 @@ import Foundation
 
 // MARK: - Archives
 
-@_spi(HostJournalPreview) public struct HostJournalArchive: Hashable, Sendable {
+public struct HostJournalArchive: Hashable, Sendable {
     public let journalID: Data
     public let group: Data
     public let origin: Data
@@ -466,7 +490,7 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public enum HostArchiveItem: Sendable {
+public enum HostArchiveItem: Sendable {
     case own(record: HostRecordID, mutation: HostMutationID?, envelope: Data, payload: Data)
     case remote(position: JournalPosition, record: HostRecordID, applied: Bool, envelope: Data, payload: Data)
     case pending(record: HostRecordID, envelope: Data)
@@ -517,7 +541,7 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public enum HostQuarantineReason: String, Sendable {
+public enum HostQuarantineReason: String, Sendable {
     case undecodable
     case malformedEnvelopes
     /// It carried a record removed under the retention floor without a run
@@ -527,7 +551,7 @@ import Foundation
 
 /// Where the next export page starts. Bound to one journal and one
 /// committed revision; a continuation after any commit is refused.
-@_spi(HostJournalPreview) public struct HostArchiveCursor: Codable, Hashable, Sendable {
+public struct HostArchiveCursor: Codable, Hashable, Sendable {
     let value: HostJournalExportCursor
 
     private enum CodingKeys: String, CodingKey { case version, value }
@@ -571,7 +595,7 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public struct HostArchivePage: Sendable {
+public struct HostArchivePage: Sendable {
     public let items: [HostArchiveItem]
     public let next: HostArchiveCursor?
 }

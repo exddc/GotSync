@@ -64,6 +64,13 @@ SURFACE_TYPES = {
     "HostRetentionDecline",
     "HostRetentionProposalOutcome",
     "HostRetentionState",
+    "HostLineage",
+    "HostStoreIncarnation",
+    "HostAncestry",
+    "HostAncestryResolution",
+    "HostAncestryState",
+    "HostReclamation",
+    "HostFinalization",
 }
 
 BLOB_SURFACE_TYPES = {
@@ -120,7 +127,9 @@ SURFACE_MEMBERS = {
         "registerRetentionHost(_:)",
         "proposeRetentionFloor()",
     },
-    "SyncPayloadSchema": {"hostJournal(payload:version:)", "compactingHostJournal(payload:version:)"},
+    "SyncPayloadSchema": {
+        "hostJournal(payload:version:)", "compactingHostJournal(payload:version:)", "reclaimingHostJournal(payload:version:)",
+    },
     "Invitation": {"phraseWordCount"},
 }
 
@@ -135,6 +144,10 @@ REQUIRED_HOST_CALLS = {
     "coveredThrough(after:)",
     "declareReady(capturedThrough:)",
     "submissionLimits",
+    "enroll(incarnation:)",
+    "resolveAncestry(_:)",
+    "lineage()",
+    "finalizeSubmissions(capturedThrough:)",
 }
 
 FORBIDDEN_NAMES = re.compile(
@@ -146,7 +159,8 @@ FORBIDDEN_NAMES = re.compile(
     r"BlobCodecError|BlobImageValidator|HostJournalBootstrapState|HostSnapshotOffer|HostSnapshotAnchor|HostSnapshotPhase|"
     r"HostSnapshotRefusalReason|HostSnapshotExportLedger|HostSnapshotAdmission|HostSnapshotBounds|HostJournalRetentionState|"
     r"\bHostRetentionProposal\b|HostRetentionVote|HostRetentionCorroboration|HostRetentionDeclineReason|HostRetentionRound|"
-    r"HostCheckpointFiles|HostRetentionBounds"
+    r"HostCheckpointFiles|HostRetentionBounds|HostLineageRecord|HostStoreIncarnationRecord|HostAncestryKind|"
+    r"HostJournalReclamationState|HostJournalFinalizationState|HostVectorEntry"
 )
 FORBIDDEN_MODULE_PREFIXES = ("s:10GotSyncMLS", "s:18GotSyncMLSBindings", "c:@")
 
@@ -217,8 +231,6 @@ def main():
         problems.append(f"unexpected SPI groups {sorted(extra_groups)}")
 
     symbols, relationships = load(arguments.graph_dir or dump_graph())
-    if not any(symbol.get("spi") for symbol in symbols.values()):
-        fail(["the graph carries no SPI symbols; was --include-spi-symbols honored?"])
 
     surface = {}
     for precise, symbol in symbols.items():
@@ -229,6 +241,8 @@ def main():
                 problems.append(f"unreviewed host call {'.'.join(path)}")
             if path[0] == "BlobTransferService" and len(path) > 1 and (len(path) != 2 or path[1] not in REQUIRED_BLOB_CALLS):
                 problems.append(f"unreviewed blob call {'.'.join(path)}")
+        elif len(path) == 2 and path[1] in SURFACE_MEMBERS.get(path[0], set()):
+            surface[precise] = symbol
         elif symbol.get("spi"):
             allowed = SURFACE_MEMBERS.get(path[0], set())
             if len(path) != 2 or path[1] not in allowed:

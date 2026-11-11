@@ -19,10 +19,11 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
 
     static let hostJournalPrefix = "gotsync.journal1."
     static let compactingHostJournalPrefix = "gotsync.journal2."
+    static let reclaimingHostJournalPrefix = "gotsync.journal3."
 
     /// Opaque host records of `payload` at `version`, carried by the host
     /// journal.
-    @_spi(HostJournalPreview) public static func hostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
+    public static func hostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
         let identifier = hostJournalPrefix + payload
         guard version > 0, !payload.hasPrefix("gotsync."), SyncGroupProfile.isLabel(payload),
               SyncGroupProfile.isLabel(identifier)
@@ -37,7 +38,7 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
     /// must register snapshot and retention hosts; libraries without
     /// compaction refuse to pair into such a group. The checkpoint schema is
     /// `payload` at `version`.
-    @_spi(HostJournalPreview) public static func compactingHostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
+    public static func compactingHostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
         let identifier = compactingHostJournalPrefix + payload
         guard version > 0, !payload.hasPrefix("gotsync."), SyncGroupProfile.isLabel(payload),
               SyncGroupProfile.isLabel(identifier)
@@ -47,12 +48,32 @@ public struct SyncPayloadSchema: Equatable, Hashable, Sendable {
         return SyncPayloadSchema(identifier: identifier, version: version)
     }
 
+    /// A compacting group whose members also declare store incarnations,
+    /// resolve ancestry explicitly, may agree to reclaim tombstones and
+    /// clears below an all-member frontier and may release finalized
+    /// host-mutation mappings. Libraries without these semantics refuse to
+    /// pair into it; `hostJournal` and `compactingHostJournal` groups keep
+    /// their own semantics.
+    public static func reclaimingHostJournal(payload: String, version: UInt16) throws -> SyncPayloadSchema {
+        let identifier = reclaimingHostJournalPrefix + payload
+        guard version > 0, !payload.hasPrefix("gotsync."), SyncGroupProfile.isLabel(payload),
+              SyncGroupProfile.isLabel(identifier)
+        else {
+            throw SyncGroupProfileError.invalidDescriptor
+        }
+        return SyncPayloadSchema(identifier: identifier, version: version)
+    }
+
     var isHostJournal: Bool { identifier.hasPrefix(Self.hostJournalPrefix) || allowsRetention }
-    var allowsRetention: Bool { identifier.hasPrefix(Self.compactingHostJournalPrefix) }
+    var allowsRetention: Bool {
+        identifier.hasPrefix(Self.compactingHostJournalPrefix) || identifier.hasPrefix(Self.reclaimingHostJournalPrefix)
+    }
+    var allowsReclamation: Bool { identifier.hasPrefix(Self.reclaimingHostJournalPrefix) }
     /// The checkpoint schema name of a compacting group.
     var retentionSnapshotSchema: String? {
         guard allowsRetention else { return nil }
-        return HostSnapshotSchemaName.make(label: String(identifier.dropFirst(Self.compactingHostJournalPrefix.count)), version: version)
+        let prefix = allowsReclamation ? Self.reclaimingHostJournalPrefix : Self.compactingHostJournalPrefix
+        return HostSnapshotSchemaName.make(label: String(identifier.dropFirst(prefix.count)), version: version)
     }
 }
 

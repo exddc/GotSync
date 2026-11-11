@@ -2,7 +2,7 @@ import Foundation
 
 /// The compact-state format a snapshot host exports and installs. A
 /// joiner installs only an offer of exactly its own schema.
-@_spi(HostJournalPreview) public struct HostSnapshotSchema: Hashable, Sendable {
+public struct HostSnapshotSchema: Hashable, Sendable {
     public let label: String
     public let version: UInt16
 
@@ -18,7 +18,7 @@ import Foundation
 }
 
 /// Identifies one exported snapshot; an install is idempotent per ID.
-@_spi(HostJournalPreview) public struct HostSnapshotID: Hashable, Sendable {
+public struct HostSnapshotID: Hashable, Sendable {
     public let uuid: UUID
 
     init(bytes: Data) {
@@ -28,7 +28,7 @@ import Foundation
     var bytes: Data { HostMutationID(uuid).bytes }
 }
 
-@_spi(HostJournalPreview) public enum HostSnapshotLimits {
+public enum HostSnapshotLimits {
     /// The largest export a provider offers. A larger one is refused after
     /// Add and the joiner continues on full history.
     public static let maxBytes = HostSnapshotBounds.maxBytes
@@ -39,7 +39,7 @@ import Foundation
 /// Read the compact state in one store transaction whose application
 /// marker equals `appliedThrough` and whose capture counter equals
 /// `capturedThrough`; exclude captured mutations not yet submitted.
-@_spi(HostJournalPreview) public struct HostSnapshotCut: Sendable {
+public struct HostSnapshotCut: Sendable {
     public let id: HostSnapshotID
     public let journalID: Data
     public let appliedThrough: JournalPosition?
@@ -49,7 +49,7 @@ import Foundation
 }
 
 /// The markers the export read, in the same transaction as its content.
-@_spi(HostJournalPreview) public struct HostSnapshotExport: Sendable {
+public struct HostSnapshotExport: Sendable {
     public let appliedThrough: JournalPosition?
     public let capturedThrough: UInt64
 
@@ -59,15 +59,17 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public enum HostSnapshotExportResult: Sendable {
+public enum HostSnapshotExportResult: Sendable {
     case exported(HostSnapshotExport)
     /// The store is not at the cut, for example with unsubmitted outbox
     /// rows; the library reads a fresh cut and asks again.
     case notAtCut
+    /// The host's encoded compact state exceeds `HostSnapshotLimits.maxBytes`.
+    case tooLarge
 }
 
 /// A verified snapshot to merge into the host's store.
-@_spi(HostJournalPreview) public struct HostSnapshotInstall: Sendable {
+public struct HostSnapshotInstall: Sendable {
     public let id: HostSnapshotID
     public let schema: HostSnapshotSchema
     public let journalID: Data
@@ -85,7 +87,7 @@ import Foundation
     public let coverage: [Data: UInt64]
 }
 
-@_spi(HostJournalPreview) public enum HostSnapshotInstallOutcome: Sendable {
+public enum HostSnapshotInstallOutcome: Sendable {
     /// Merged and saved in one transaction with the snapshot ID, or already
     /// installed earlier.
     case installed
@@ -96,7 +98,7 @@ import Foundation
 
 /// The app's snapshot host. The hooks run off the main actor and are
 /// cancelled with the engine's work; each must be idempotent.
-@_spi(HostJournalPreview) public struct HostSnapshotHooks: Sendable {
+public struct HostSnapshotHooks: Sendable {
     public let schema: HostSnapshotSchema
     public let export: @Sendable (HostSnapshotCut) async throws -> HostSnapshotExportResult
     /// Merges, never replaces: local data, unsent outbox rows and drafts stay.
@@ -118,7 +120,7 @@ import Foundation
     }
 }
 
-@_spi(HostJournalPreview) public enum HostSnapshotRefusal: Equatable, Sendable {
+public enum HostSnapshotRefusal: Equatable, Sendable {
     case notOffered
     case schemaMismatch
     case providerNotRegistered
@@ -161,7 +163,7 @@ import Foundation
 /// Where a joiner's snapshot bootstrap stands. Every case from `requested`
 /// to `installing` holds delivery: `incoming` returns nothing and
 /// `markApplied` throws `bootstrapPending`.
-@_spi(HostJournalPreview) public enum HostSnapshotBootstrap: Equatable, Sendable {
+public enum HostSnapshotBootstrap: Equatable, Sendable {
     /// No snapshot was requested; every record is delivered.
     case fullHistory
     case requested
@@ -172,7 +174,8 @@ import Foundation
     /// Covered records are skipped; the tail is delivered.
     case installed(HostSnapshotID)
     case completed(HostSnapshotID)
-    /// Nothing was installed; every record is delivered.
+    /// Nothing was installed. Full-history groups deliver every record;
+    /// a compacted floor remains held until its checkpoint is installed.
     case refused(HostSnapshotRefusal)
 
     init(_ state: HostJournalBootstrapState?) {

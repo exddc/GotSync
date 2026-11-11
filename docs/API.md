@@ -256,13 +256,25 @@ The Keychain implementation requires a service name; use your own application
 namespace. Unit tests use an in-memory implementation. The example tests cover
 Keychain-backed identity and storage on the iOS Simulator.
 
-## Preview SPI
+## Host journal and blob API
 
-Two groups of preview API are imported with `@_spi`. They are for the GotDone
-integration and may change. `scripts/check-host-spi-surface.py` checks both
-surfaces against a reviewed list.
+The host journal and the encrypted blob transfer are ordinary `public` API.
+They were preview SPI before. `scripts/check-host-spi-surface.py` checks both
+surfaces against a reviewed list by name, and checks that no surface names an
+internal type.
 
-`@_spi(HostJournalPreview)` exposes the host journal. Size `submit` batches
+**Migrating from the preview imports:**
+- `@_spi(HostJournalPreview) import GotSync` and `@_spi(BlobPreview) import GotSync` keep compiling. No symbol is renamed.
+- Replace them with `import GotSync` at any time.
+- `HostMutation(id:payload:)` stays; reclaiming groups pass `capturedAt` through `HostMutation(id:payload:capturedAt:)`.
+- `enroll()` stays; reclaiming groups declare the store with `enroll(incarnation:)`.
+- Exhaustive switches over `HostJournalError` need:
+  - `bootstrapPending`;
+  - `ancestryUnresolved`;
+  - `mutationFinalized`;
+  - `captureRequired`.
+
+The host journal: size `submit` batches
 with `HostJournal.submissionLimits`, a `HostSubmissionLimits` value:
 
 | Field | Value |
@@ -276,7 +288,7 @@ The values come from the journal itself, not from a copy of these numbers.
 `Invitation.phraseWordCount` is the number of words in an invitation phrase
 (17), read from the phrase codec.
 
-`@_spi(BlobPreview)` exposes encrypted image transfer for host-journal
+The blob API provides encrypted image transfer for host-journal
 engines. `await engine.blobTransfers()` returns the `BlobTransferService`
 actor, or nil in other modes. The engine binds the service to the active group
 during sync and retires the binding before leave, removal, reset or erase
@@ -394,6 +406,36 @@ A missing, offline, declining or changed roster commits nothing.
 
 `HostJournalState.retention` shows the floor and what was removed.
 
+### Provenance, ancestry and reclamation (reclaiming groups)
+
+`SyncPayloadSchema.reclaimingHostJournal(payload:version:)` adds three things
+to the compacting group:
+- store provenance;
+- ancestry gating;
+- tombstone and clear reclamation, plus host-mutation mapping release.
+
+Libraries without these semantics refuse to pair into it. `hostJournal` and
+`compactingHostJournal` groups are unchanged.
+
+**Enrolling:**
+- Mint a `storeID` once for the local store and keep it across restores and relinks.
+- Enroll with `enroll(incarnation: HostStoreIncarnation(storeID:content:lineage:))`, presenting every `HostLineage` saved earlier.
+- Save `HostJournal.lineage()` with the provenance.
+
+**Ancestry:**
+- `HostJournalState.ancestry` shows `fresh`, `founder`, `sameLineage`, `staleLineage`, `foreign` or `unknown`.
+- The last three need a preserving merge, then `resolveAncestry(.merged)`. Until then, `declareReady` throws `ancestryUnresolved` and this member declines every floor.
+
+**Reclamation:**
+- When every current member's retention host has a `reclaim` hook, a round also agrees on a reclamation frontier, with every current store in its scope.
+- `reclaim(HostReclamation)` deletes tombstones and clears whose deleting journal record is at or below the frontier, and saves the frontier in the same transaction. It is asked again until it returns.
+- A later joiner whose saved lineage is behind the frontier is `staleLineage`.
+
+**Mapping release:**
+- `finalizeSubmissions(capturedThrough:)` with an empty outbox fences every mutation captured through it. Mappings of own records removed under the floor are released afterwards.
+- After that, a mutation without `capturedAt` is refused `captureRequired`.
+- A finalized mutation whose mapping is gone is refused `mutationFinalized`. It never gets a new sequence.
+
 ## Deferred API refinements
 
 Main-actor isolation preserves the existing serial recovery behavior. MLS
@@ -415,3 +457,11 @@ full separation of localized copy and celebration timing is deferred.
 which does not invalidate credentials or require link repair, and for a
 blocked delivery log. A later API
 revision should expose typed codes consistently for all error surfaces.
+
+### Joining and checkpoint failure
+
+In reclaiming groups, submission remains fenced until the finite history cut has been applied, any checkpoint installed, and ancestry resolved. Keep capture local during that wait; do not publish ambiguous old incarnations before the preserving merge. A compacted checkpoint refusal keeps incoming delivery and acknowledgements held because full history is unavailable.
+
+Installing a checkpoint does not acknowledge application-side reclamation. The library calls the idempotent reclamation hook after installation and ancestry resolution, and records completion only after that hook returns. The host must commit its reclamation frontier with its barrier changes.
+
+A snapshot exporter may return `HostSnapshotExportResult.tooLarge` before writing an oversized file. The recipient then sees `HostSnapshotRefusal.tooLarge`; full-history fallback is available only when no adopted retention floor requires that checkpoint.

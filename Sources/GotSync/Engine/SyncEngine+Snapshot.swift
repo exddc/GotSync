@@ -85,7 +85,7 @@ struct HostSnapshotPacked: Sendable {
 
 // MARK: - Host registration
 
-@_spi(HostJournalPreview) extension SyncEngine {
+extension SyncEngine {
     /// Registers the app's snapshot host, or removes it with nil. A joiner
     /// asks for a snapshot only while a host is registered and its journal
     /// is fresh; a provider exports only for a joiner of the same schema.
@@ -357,6 +357,7 @@ extension SyncEngine {
             ))
             try Task.checkCancellation()
             try requireHostBinding(binding, session)
+            if case .tooLarge = outcome { throw HostSnapshotExportRefused(reason: .tooLarge) }
             guard case .exported(let echo) = outcome, echo.appliedThrough?.rawValue ?? 0 == cut.appliedThrough,
                   echo.capturedThrough == cut.capturedThrough
             else {

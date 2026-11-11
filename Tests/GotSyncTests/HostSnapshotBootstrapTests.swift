@@ -12,6 +12,7 @@ final class SnapshotTestHost: Sendable {
         var completed: [HostSnapshotID] = []
         var blockFirstExport = false
         var blockFirstInstall = false
+        var tooLarge = false
     }
 
     let content: Data
@@ -31,6 +32,7 @@ final class SnapshotTestHost: Sendable {
                     return state.blockFirstExport
                 }
                 if block { try await Task.sleep(for: .seconds(120)) }
+                if state.withLock({ $0.tooLarge }) { return .tooLarge }
                 try content.write(to: cut.destination)
                 return .exported(HostSnapshotExport(appliedThrough: cut.appliedThrough, capturedThrough: cut.capturedThrough))
             },
@@ -176,6 +178,26 @@ extension HostEngineTests {
         XCTAssertEqual(provider.state.withLock { $0.exports.count }, 0)
         let applied4 = try await applyAll(b, "b")
         XCTAssertEqual(applied4, [Data("one".utf8), Data("two".utf8)])
+        XCTAssertTrue(try store(b).view.historyApplied)
+    }
+
+    func testAnOversizeHostExportReportsTooLargeAndPreservesFullHistory() async throws {
+        FakeBlobRelay.reset()
+        let provider = SnapshotTestHost(content: Data())
+        provider.state.withLock { $0.tooLarge = true }
+        let joiner = SnapshotTestHost(content: Data())
+        let a = snapshotEngine("a", host: provider)
+        let b = snapshotEngine("b", host: joiner)
+        try await pair(a, b)
+        try await enroll(a, "a")
+        try await submit(a, "a", ["one"])
+        try await ready(a, "a")
+        try await enroll(b, "b")
+        try await wait("oversize refused") { self.bootstrap(b) == .refused }
+        XCTAssertEqual(b.hostJournalView?.journal?.bootstrap, .refused(.tooLarge))
+        XCTAssertEqual(joiner.state.withLock { $0.installs.count }, 0)
+        let received = try await applyAll(b, "b")
+        XCTAssertEqual(received, [Data("one".utf8)])
         XCTAssertTrue(try store(b).view.historyApplied)
     }
 
