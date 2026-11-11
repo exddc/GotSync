@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum BlobRelayError: Error, Equatable {
     /// The relay has no blob lane, or the request did not reach it.
@@ -41,6 +42,7 @@ final class BlobRelayClient: Sendable {
     private let policy: EndpointSecurityPolicy
     private let session: URLSession
     private let pacer = BlobRequestPacer(interval: 0.25)
+    private let invalidated = OSAllocatedUnfairLock(initialState: false)
 
     init(baseURL: URL, policy: EndpointSecurityPolicy, protocolClasses: [AnyClass]? = nil) {
         self.baseURL = baseURL
@@ -61,7 +63,11 @@ final class BlobRelayClient: Sendable {
     }
 
     func invalidate() {
-        session.invalidateAndCancel()
+        invalidated.withLock { invalidated in
+            guard !invalidated else { return }
+            invalidated = true
+            session.invalidateAndCancel()
+        }
     }
 
     // MARK: Endpoints
@@ -150,14 +156,7 @@ final class BlobRelayClient: Sendable {
         let url = try binaryURL("put", route: route, objectID: objectID, index: index)
         var request = baseRequest(url, token: token)
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        await pacer.admit()
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.upload(for: request, from: part)
-        } catch {
-            throw BlobRelayError.transport
-        }
+        let (data, response) = try await execute(request, upload: part, limit: Self.metadataResponseBytes)
         let http = try check(response, url: url, data: data)
         guard data.count <= Self.metadataResponseBytes else { throw BlobRelayError.invalidResponse }
         try require(http, data: data)
@@ -188,33 +187,8 @@ final class BlobRelayClient: Sendable {
     }
 
     private func perform(_ request: URLRequest, url: URL, limit: Int, binary: Int?) async throws -> Data {
-        await pacer.admit()
-        let bytes: URLSession.AsyncBytes
-        let response: URLResponse
-        do {
-            (bytes, response) = try await session.bytes(for: request)
-        } catch {
-            throw BlobRelayError.transport
-        }
-        guard let http = response as? HTTPURLResponse, http.url == url else { throw BlobRelayError.invalidResponse }
-        if http.value(forHTTPHeaderField: "Content-Encoding") != nil {
-            throw BlobRelayError.invalidResponse
-        }
-        if http.expectedContentLength > Int64(limit) {
-            throw BlobRelayError.invalidResponse
-        }
-        var data = Data()
-        data.reserveCapacity(min(limit, max(0, Int(http.expectedContentLength))))
-        do {
-            for try await byte in bytes {
-                guard data.count < limit else { throw BlobRelayError.invalidResponse }
-                data.append(byte)
-            }
-        } catch let error as BlobRelayError {
-            throw error
-        } catch {
-            throw BlobRelayError.transport
-        }
+        let (data, response) = try await execute(request, limit: limit)
+        let http = try check(response, url: url, data: data)
         try require(http, data: data)
         if let binary {
             guard http.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("application/octet-stream") == true,
@@ -229,6 +203,32 @@ final class BlobRelayClient: Sendable {
             throw BlobRelayError.invalidResponse
         }
         return data
+    }
+
+    private func execute(_ request: URLRequest, upload: Data? = nil, limit: Int) async throws -> (Data, HTTPURLResponse) {
+        await pacer.admit()
+        try Task.checkCancellation()
+        let response = BlobRelayResponse(url: request.url!, limit: limit)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                invalidated.withLock { invalidated in
+                    guard !invalidated else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    let task: URLSessionDataTask
+                    if let upload {
+                        task = session.uploadTask(with: request, from: upload)
+                    } else {
+                        task = session.dataTask(with: request)
+                    }
+                    task.delegate = response
+                    response.start(task, continuation: continuation)
+                }
+            }
+        } onCancel: {
+            response.cancel()
+        }
     }
 
     private func check(_ response: URLResponse, url: URL, data: Data) throws -> HTTPURLResponse {
@@ -308,6 +308,103 @@ final class BlobRelayClient: Sendable {
             throw BlobRelayError.invalidResponse
         }
         return set
+    }
+}
+
+private final class BlobRelayResponse: NSObject, URLSessionDataDelegate, Sendable {
+    private typealias Output = (Data, HTTPURLResponse)
+
+    private struct State {
+        var task: URLSessionDataTask?
+        var continuation: CheckedContinuation<Output, any Error>?
+        var response: HTTPURLResponse?
+        var data = Data()
+        var failure: BlobRelayError?
+        var cancelled = false
+    }
+
+    private let url: URL
+    private let limit: Int
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(url: URL, limit: Int) {
+        self.url = url
+        self.limit = limit
+    }
+
+    func start(_ task: URLSessionDataTask, continuation: CheckedContinuation<(Data, HTTPURLResponse), any Error>) {
+        let cancelled = state.withLock { state in
+            guard !state.cancelled else { return true }
+            state.task = task
+            state.continuation = continuation
+            task.resume()
+            return false
+        }
+        if cancelled {
+            task.cancel()
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    func cancel() {
+        state.withLock { state in
+            state.cancelled = true
+            state.task?.cancel()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let disposition: URLSession.ResponseDisposition = state.withLock { state in
+            guard let http = response as? HTTPURLResponse, http.url == url,
+                  http.value(forHTTPHeaderField: "Content-Encoding") == nil,
+                  http.expectedContentLength <= Int64(limit) else {
+                state.failure = .invalidResponse
+                return .cancel
+            }
+            state.response = http
+            return state.cancelled ? .cancel : .allow
+        }
+        completionHandler(disposition)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let cancel = state.withLock { state in
+            guard state.failure == nil, !state.cancelled else { return true }
+            guard data.count <= limit - state.data.count else {
+                state.failure = .invalidResponse
+                return true
+            }
+            state.data.append(data)
+            return false
+        }
+        if cancel { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        let completion = state.withLock { state -> (CheckedContinuation<Output, any Error>, Result<Output, any Error>)? in
+            guard let continuation = state.continuation else { return nil }
+            let result: Result<Output, any Error>
+            if let failure = state.failure {
+                result = .failure(failure)
+            } else if state.cancelled || (error as? URLError)?.code == .cancelled {
+                result = .failure(CancellationError())
+            } else if error != nil {
+                result = .failure(BlobRelayError.transport)
+            } else if let response = state.response {
+                result = .success((state.data, response))
+            } else {
+                result = .failure(BlobRelayError.invalidResponse)
+            }
+            state.continuation = nil
+            state.task = nil
+            state.response = nil
+            state.data = Data()
+            return (continuation, result)
+        }
+        if let (continuation, result) = completion { continuation.resume(with: result) }
     }
 }
 
