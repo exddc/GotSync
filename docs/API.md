@@ -274,6 +274,8 @@ internal type.
   - `mutationFinalized`;
   - `captureRequired`.
 
+When `resume` confirms a pending enrollment, it records the host's saved starting capture counter in the same transaction. A store that brings a nonzero counter from an earlier journal therefore has a matching initial export cut without inventing a submission. On an already confirmed enrollment, a host-ahead capture counter remains host rollback evidence; submission advances the journal's counter. Readiness still requires the host to finish its initial outbox.
+
 The host journal: size `submit` batches
 with `HostJournal.submissionLimits`, a `HostSubmissionLimits` value:
 

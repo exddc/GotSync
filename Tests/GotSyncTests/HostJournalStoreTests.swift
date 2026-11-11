@@ -192,6 +192,40 @@ final class HostJournalStoreTests: XCTestCase {
 
     // MARK: - Enrollment and continuity
 
+    func testPendingEnrollmentConfirmsItsSavedStartingCaptureCut() throws {
+        let store = try HostJournalStore.create(in: directory, group: JournalFixture.group, founder: true)
+        let pending = try store.enroll()
+        let saved = HostJournalProvenance(
+            journalID: pending.journalID, enrollmentID: pending.enrollmentID, appliedThrough: 0, capturedThrough: 17
+        )
+        XCTAssertEqual(try store.resume(saved), saved)
+        XCTAssertEqual(store.view.capturedThrough, 17)
+        XCTAssertEqual(try store.snapshotExportCut().capturedThrough, 17)
+        XCTAssertEqual(store.view.ownHead, 0)
+        try store.declareReady(capturedThrough: 17)
+        let reopened = try reopen(store)
+        XCTAssertEqual(reopened.view.capturedThrough, 17)
+        XCTAssertEqual(reopened.view.readyThrough, 17)
+        XCTAssertThrowsError(try reopened.resume(pending)) {
+            XCTAssertEqual($0 as? JournalStoreError, .hostCaptureRegressed)
+        }
+        XCTAssertEqual(try reopened.resume(saved), saved)
+        XCTAssertEqual(try reopened.snapshotExportCut().capturedThrough, 17)
+    }
+
+    func testPendingEnrollmentRefusesAnUnstorableCaptureWithoutConfirming() throws {
+        let store = try HostJournalStore.create(in: directory, group: JournalFixture.group)
+        let pending = try store.enroll()
+        let before = try JournalFixture.fileHash(store.url)
+        XCTAssertThrowsError(try store.resume(HostJournalProvenance(
+            journalID: pending.journalID, enrollmentID: pending.enrollmentID, appliedThrough: 0, capturedThrough: UInt64.max
+        )))
+        XCTAssertEqual(try JournalFixture.fileHash(store.url), before)
+        XCTAssertFalse(store.isResumed)
+        XCTAssertEqual(store.view.capturedThrough, 0)
+        XCTAssertEqual(try store.resume(pending), pending)
+    }
+
     func testLostProvenanceAfterEmptyConfirmedEnrollmentDoesNotEnrollAgain() throws {
         let (store, _) = try enrolled()
         let reopened = try reopen(store)
