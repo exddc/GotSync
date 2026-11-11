@@ -41,6 +41,13 @@ class HostSPISurfaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("unreviewed host call HostJournal.promote()", result.stderr)
 
+    def test_a_reader_write_command_is_refused(self):
+        graph = self.graph()
+        graph["symbols"].append(symbol(["HostJournalReader", "discard()"], spi=False))
+        result = self.check(graph)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unreviewed reader call HostJournalReader.discard()", result.stderr)
+
     def test_an_extra_blob_service_call_is_refused(self):
         graph = self.graph()
         graph["symbols"].append(symbol(["BlobTransferService", "bind(route:)"]))

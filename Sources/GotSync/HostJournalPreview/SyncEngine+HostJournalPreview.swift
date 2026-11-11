@@ -24,21 +24,7 @@ extension SyncEngine {
         guard let directory = hostJournalDirectory, journalID.count == 16 else {
             throw HostJournalError.invalidArgument
         }
-        do {
-            let page = try exportHostJournal(
-                HostJournalStore.fileURL(in: directory, journalID: journalID), after: cursor?.value, limit: limit
-            )
-            let items = try page.items.map { item -> HostArchiveItem in
-                if case .checkpoint(let offer) = item {
-                    return .checkpoint(floor: offer.coverage, length: offer.length, contentHash: offer.contentHash,
-                                       chunks: checkpointChunks(journal: journalID, offer: offer) ?? [])
-                }
-                return try HostArchiveItem(item)
-            }
-            return HostArchivePage(items: items, next: page.next.map { HostArchiveCursor(value: $0) })
-        } catch {
-            throw HostJournalError.surfaced(error)
-        }
+        return try HostJournalReader(storageDirectory: directory).export(journalID, after: cursor, limit: limit)
     }
 
     /// Deletes one retired journal, only when `confirmingJournalID` repeats

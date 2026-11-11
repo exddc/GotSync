@@ -465,3 +465,9 @@ In reclaiming groups, submission remains fenced until the finite history cut has
 Installing a checkpoint does not acknowledge application-side reclamation. The library calls the idempotent reclamation hook after installation and ancestry resolution, and records completion only after that hook returns. The host must commit its reclamation frontier with its barrier changes.
 
 A snapshot exporter may return `HostSnapshotExportResult.tooLarge` before writing an oversized file. The recipient then sees `HostSnapshotRefusal.tooLarge`; full-history fallback is available only when no adopted retention floor requires that checkpoint.
+
+### Offline journal inspection
+
+`HostJournalReader(storageDirectory:)` reads the same storage directory as `SyncConfiguration`, without creating an engine, identity, directory or connection to a relay. `journals()` returns active and retired `HostJournalInfo` values. A missing directory, an unreadable journal or an incomplete creation throws instead of looking empty. `export(_:after:limit:)` returns the existing revision-bound archive pages, including checkpoint files; checkpoint length and hash must be verified before decoding.
+
+For image cleanup, freeze the app's reference sources and compare the inventory with the journals the app expects. Every other owner must be inspected too. An active journal (`retirement == nil`) may have an associated MLS inbox the reader cannot inspect: stopping its writer is insufficient. After a completed Leave, a retired journal owns the handed-off inbox and can be inspected without restarting sync. Preserve content if any expected journal, checkpoint, pending record or quarantine cannot be understood. This reader has no write or discard method.
