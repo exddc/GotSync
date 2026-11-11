@@ -70,6 +70,7 @@ struct HostRetentionProposal: Codable, Equatable, Sendable {
             && roster.allSatisfy { $0.count == 32 } && zip(roster, roster.dropFirst()).allSatisfy { $0.lexicographicallyPrecedes($1) }
             && !anchors.isEmpty && checkpoint.isWellFormed && checkpoint.anchors == anchors && checkpoint.floor == nil
             && (reclaim != true || store?.count == 16)
+            && (store.map { $0.count == 16 } ?? true)
     }
 }
 
@@ -85,7 +86,8 @@ struct HostRetentionVote: Codable, Equatable, Sendable {
 
     var isWellFormed: Bool {
         round.count == 16 && proposal.count == 32 && accept == (reason == nil)
-            && (applied?.count ?? 0) <= HostSnapshotBounds.maxOrigins
+            && (applied.map(HostSnapshotAnchor.isCanonical) ?? true)
+            && (store.map { $0.count == 16 } ?? true)
     }
 }
 
@@ -101,7 +103,18 @@ struct HostRetentionCorroboration: Codable, Equatable, Sendable {
     var stores: [Data]? = nil
 
     var isWellFormed: Bool {
-        member.count == 32 && round.count == 16 && proposal.count == 32 && contentHash.count == 32 && !anchors.isEmpty
-            && anchors.count <= HostSnapshotBounds.maxOrigins
+        guard member.count == 32, round.count == 16, proposal.count == 32, contentHash.count == 32,
+              !anchors.isEmpty, HostSnapshotAnchor.isCanonical(anchors)
+        else { return false }
+        switch (reclaimedThrough, stores) {
+        case (nil, nil):
+            return true
+        case let (frontier?, stores?):
+            guard HostVectorEntry.isCanonical(frontier) else { return false }
+            return HostJournalReclamationState(frontier: HostVectorEntry.vector(frontier), stores: stores, applied: false)
+                .isWellFormed(at: anchors)
+        default:
+            return false
+        }
     }
 }

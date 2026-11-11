@@ -63,6 +63,14 @@ struct HostSnapshotAnchor: Codable, Equatable, Hashable, Sendable {
     let origin: Data
     let sequence: UInt64
     let digest: Data
+
+    static func isCanonical(_ anchors: [HostSnapshotAnchor]) -> Bool {
+        anchors.count <= HostSnapshotBounds.maxOrigins
+            && anchors.allSatisfy {
+                $0.origin.count == JournalEnvelope.originLength && (1...JournalEnvelope.maxSequence).contains($0.sequence) && $0.digest.count == 32
+            }
+            && zip(anchors, anchors.dropFirst()).allSatisfy { $0.origin.lexicographicallyPrecedes($1.origin) }
+    }
 }
 
 /// The bounded manifest of one snapshot, carried in `complete`.
@@ -87,9 +95,7 @@ struct HostSnapshotOffer: Codable, Equatable, Sendable {
         id.count == 16 && HostSnapshotSchemaName.isValid(schema) && contentHash.count == 32
             && (1...HostSnapshotBounds.maxBytes).contains(length)
             && (1...HostSnapshotBounds.maxChunks).contains(chunks.count) && chunks.allSatisfy { !$0.isEmpty && $0.count <= 512 }
-            && anchors.count <= HostSnapshotBounds.maxOrigins
-            && anchors.allSatisfy { $0.origin.count == 16 && $0.sequence > 0 && $0.digest.count == 32 }
-            && zip(anchors, anchors.dropFirst()).allSatisfy { $0.origin.lexicographicallyPrecedes($1.origin) }
+            && HostSnapshotAnchor.isCanonical(anchors)
             && (floor.map { $0.count == 32 } ?? true)
     }
 
