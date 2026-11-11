@@ -175,4 +175,108 @@ final class HostProvenanceStoreTests: XCTestCase {
                                                     checkpoint: checkpoint, reclaimStores: [storeA]))
         XCTAssertNotNil(store.view.reclamation)
     }
+
+    func testLineageRejectsMalformedVectorsBeforeEnrollment() throws {
+        let valid = token(applied: [x: 3])
+        let encoded = try ReplicaCanonicalJSON.encode(valid)
+        XCTAssertEqual(try JSONDecoder().decode(HostLineage.self, from: encoded).applied, [x: 3])
+        let entry = HostVectorEntry(origin: x, sequence: 3)
+        let invalid = [
+            [HostVectorEntry(origin: Data(repeating: 1, count: 32), sequence: 3)],
+            [HostVectorEntry(origin: x, sequence: 0)],
+            [HostVectorEntry(origin: x, sequence: UInt64.max)],
+            [entry, entry],
+            [HostVectorEntry(origin: JournalFixture.origin(3), sequence: 1), entry],
+        ]
+        for vector in invalid {
+            for reclaimed in [false, true] {
+                let record = HostLineageRecord(
+                    group: valid.group, journalID: valid.journalID, storeID: valid.storeID,
+                    applied: reclaimed ? valid.applied : vector, reclaimedThrough: reclaimed ? vector : []
+                )
+                XCTAssertThrowsError(try JSONDecoder().decode(HostLineage.self, from: ReplicaCanonicalJSON.encode(record)))
+                let store = try HostJournalStore.create(in: root, group: JournalFixture.group)
+                XCTAssertThrowsError(try store.enroll(incarnation: HostStoreIncarnationRecord(
+                    storeID: storeA, content: .nonempty, lineage: [record]
+                ))) { XCTAssertEqual($0 as? JournalStoreError, .invalidArgument("incarnation")) }
+                XCTAssertNil(store.view.incarnation)
+            }
+        }
+    }
+
+    func testRetentionWireRejectsMalformedReclamationAndAnchors() throws {
+        let anchor = HostSnapshotAnchor(origin: x, sequence: 3, digest: Data(repeating: 7, count: 32))
+        let entry = HostVectorEntry(origin: x, sequence: 3)
+        var valid = HostRetentionCorroboration(
+            member: provider, round: Data(repeating: 1, count: 16), proposal: Data(repeating: 2, count: 32),
+            anchors: [anchor], contentHash: Data(repeating: 3, count: 32)
+        )
+        XCTAssertEqual(try HostJournalMessage.decode(HostJournalMessage.retentionState(valid).encoded()).corroboration, valid)
+        valid.reclaimedThrough = [entry]
+        valid.stores = [storeA]
+        XCTAssertEqual(try HostJournalMessage.decode(HostJournalMessage.retentionState(valid).encoded()).corroboration, valid)
+        var invalid: [HostRetentionCorroboration] = []
+        for stores in [[], [Data([1])], [Data(repeating: 1, count: 32)], Array(repeating: storeA, count: 11)] {
+            var value = valid; value.stores = stores; invalid.append(value)
+        }
+        for vector in [
+            [], [HostVectorEntry(origin: Data([1]), sequence: 3)], [HostVectorEntry(origin: x, sequence: 0)],
+            [HostVectorEntry(origin: x, sequence: UInt64.max)], [entry, entry],
+            [HostVectorEntry(origin: x, sequence: 4)], [HostVectorEntry(origin: JournalFixture.origin(3), sequence: 1)],
+        ] {
+            var value = valid; value.reclaimedThrough = vector; invalid.append(value)
+        }
+        var missingStores = valid; missingStores.stores = nil; invalid.append(missingStores)
+        var missingFrontier = valid; missingFrontier.reclaimedThrough = nil; invalid.append(missingFrontier)
+        let duplicateAnchor = HostRetentionCorroboration(
+            member: valid.member, round: valid.round, proposal: valid.proposal, anchors: [anchor, anchor],
+            contentHash: valid.contentHash
+        )
+        invalid.append(duplicateAnchor)
+        for value in invalid {
+            XCTAssertThrowsError(try HostJournalMessage.decode(HostJournalMessage.retentionState(value).encoded()))
+        }
+        var vote = HostRetentionVote(round: valid.round, proposal: valid.proposal, accept: true)
+        vote.store = Data([1])
+        XCTAssertThrowsError(try HostJournalMessage.decode(HostJournalMessage.retentionVote(vote).encoded()))
+        vote.store = storeA; vote.applied = [anchor, anchor]
+        XCTAssertThrowsError(try HostJournalMessage.decode(HostJournalMessage.retentionVote(vote).encoded()))
+    }
+
+    func testReclamationRejectsInvalidScopeBeforeSavingAndOnReopen() throws {
+        let store = try joined(HostStoreIncarnationRecord(storeID: storeA, content: .empty, lineage: []))
+        try store.declareReady(capturedThrough: 0)
+        let chain = try JournalFixture.chain(x, count: 3)
+        let checkpoint = HostSnapshotOffer(
+            id: Data(repeating: 7, count: 16), schema: "test.state/1",
+            anchors: [HostSnapshotAnchor(origin: x, sequence: 3, digest: chain[2].digest)], length: 10,
+            contentHash: Data(repeating: 1, count: 32), chunks: [Data(repeating: 2, count: 152)]
+        )
+        let round = Data(repeating: 1, count: 16), proposal = Data(repeating: 9, count: 32)
+        XCTAssertThrowsError(try store.commitRetentionFloor(
+            round: round, proposal: proposal, checkpoint: checkpoint, reclaimStores: [Data([1])]
+        )) { XCTAssertEqual($0 as? JournalStoreError, .invalidArgument("reclamation")) }
+        XCTAssertNil(store.view.retention)
+        XCTAssertThrowsError(try store.adoptRetentionFloor(
+            round: round, proposal: proposal, checkpoint: checkpoint,
+            reclamation: HostJournalReclamationState(frontier: [x: 4], stores: [storeA], applied: false)
+        )) { XCTAssertEqual($0 as? JournalStoreError, .invalidArgument("reclamation")) }
+        XCTAssertTrue(try store.commitRetentionFloor(round: round, proposal: proposal, checkpoint: checkpoint, reclaimStores: [storeA]))
+        XCTAssertEqual(try HostJournalStore.open(store.url).view, store.view)
+
+        let badStores = try ReplicaCanonicalJSON.encode([Data([1])]).map { String(format: "%02x", $0) }.joined()
+        let badFrontier = try HostJournalStore.encodeVector([x: 4]).map { String(format: "%02x", $0) }.joined()
+        for (index, sql) in [
+            "UPDATE meta SET value = x'\(badStores)' WHERE key = 'reclamationStores'",
+            "UPDATE meta SET value = x'\(badFrontier)' WHERE key = 'reclamationFrontier'",
+            "DELETE FROM meta WHERE key = 'reclamationFrontier'",
+        ].enumerated() {
+            let copy = root.appendingPathComponent("bad-reclamation-\(index).sqlite3")
+            try FileManager.default.copyItem(at: store.url, to: copy)
+            try JournalFixture.tamper(copy, sql)
+            XCTAssertThrowsError(try HostJournalStore.open(copy)) {
+                XCTAssertEqual($0 as? JournalStoreError, .storeCorrupt("reclamation"))
+            }
+        }
+    }
 }

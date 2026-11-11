@@ -13,6 +13,12 @@ struct HostVectorEntry: Codable, Equatable, Hashable, Sendable {
     static func vector(_ entries: [HostVectorEntry]) -> [Data: UInt64] {
         Dictionary(entries.map { ($0.origin, $0.sequence) }, uniquingKeysWith: max)
     }
+
+    static func isCanonical(_ entries: [HostVectorEntry]) -> Bool {
+        entries.count <= 4_096
+            && entries.allSatisfy { $0.origin.count == JournalEnvelope.originLength && (1...JournalEnvelope.maxSequence).contains($0.sequence) }
+            && zip(entries, entries.dropFirst()).allSatisfy { $0.origin.lexicographicallyPrecedes($1.origin) }
+    }
 }
 
 /// A journal's account of what a store applied in one group, issued by the
@@ -26,7 +32,7 @@ struct HostLineageRecord: Codable, Equatable, Hashable, Sendable {
 
     var isWellFormed: Bool {
         group.count == 32 && journalID.count == 16 && (storeID.map { $0.count == 16 } ?? true)
-            && applied.count <= 4_096 && reclaimedThrough.count <= 4_096
+            && HostVectorEntry.isCanonical(applied) && HostVectorEntry.isCanonical(reclaimedThrough)
     }
 }
 
@@ -95,6 +101,19 @@ struct HostJournalReclamationState: Equatable, Sendable {
     /// The host reclaimed through the frontier, or installed a checkpoint
     /// that already reflects it.
     let applied: Bool
+
+    static func validStores(_ stores: [Data]) -> Bool {
+        (1...SyncGroupProfile.supportedMemberCeiling).contains(stores.count) && stores.allSatisfy { $0.count == 16 }
+    }
+
+    func isWellFormed(at anchors: [HostSnapshotAnchor]) -> Bool {
+        !frontier.isEmpty && HostVectorEntry.isCanonical(HostVectorEntry.entries(frontier))
+            && frontier.values.allSatisfy { $0 > 0 }
+            && Self.validStores(stores) && HostSnapshotAnchor.isCanonical(anchors)
+            && frontier.allSatisfy { origin, sequence in
+                anchors.contains { $0.origin == origin && $0.sequence >= sequence }
+            }
+    }
 }
 
 /// The host's finalization fence: no mutation captured at or before

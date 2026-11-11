@@ -1453,6 +1453,10 @@ final class HostJournalStore {
         guard round.count == 16, proposal.count == 32, checkpoint.isWellFormed, checkpoint.floor == nil else {
             throw JournalStoreError.invalidArgument("floor")
         }
+        if let reclaimStores, !HostJournalReclamationState(frontier: checkpoint.coverage, stores: reclaimStores, applied: false)
+            .isWellFormed(at: checkpoint.anchors) {
+            throw JournalStoreError.invalidArgument("reclamation")
+        }
         return try transaction("commitRetentionFloor") {
             let meta = try readMeta()
             guard meta.retirement == nil else { throw JournalStoreError.retired }
@@ -1516,6 +1520,9 @@ final class HostJournalStore {
     ) throws -> Bool {
         guard round.count == 16, proposal.count == 32, checkpoint.isWellFormed, checkpoint.floor == nil else {
             throw JournalStoreError.invalidArgument("floor")
+        }
+        if let reclamation, !reclamation.isWellFormed(at: checkpoint.anchors) {
+            throw JournalStoreError.invalidArgument("reclamation")
         }
         return try transaction("adoptRetentionFloor") {
             let meta = try readMeta()
@@ -2122,9 +2129,16 @@ final class HostJournalStore {
             guard let stores = blobs["reclamationStores"], let applied = integers["reclamationApplied"], applied <= 1 else {
                 throw JournalStoreError.storeCorrupt("reclamation")
             }
-            return HostJournalReclamationState(
+            let state = HostJournalReclamationState(
                 frontier: try decodeVector(bytes), stores: try ReplicaCanonicalJSON.decode([Data].self, from: stores), applied: applied == 1
             )
+            guard let retention, state.isWellFormed(at: retention.anchors) else {
+                throw JournalStoreError.storeCorrupt("reclamation")
+            }
+            return state
+        }
+        if reclamation == nil, blobs["reclamationStores"] != nil || integers["reclamationApplied"] != nil {
+            throw JournalStoreError.storeCorrupt("reclamation")
         }
         let finalization = integers["finalizedCapture"].map {
             HostJournalFinalizationState(capture: $0, own: integers["finalizedOwn"] ?? 0, released: integers["releasedMappings"] ?? 0)
