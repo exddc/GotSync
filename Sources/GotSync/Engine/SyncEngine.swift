@@ -436,6 +436,7 @@ public final class SyncEngine {
     private static let reservationRequestInterval = 5
     var reservationHookForTesting: (@MainActor () async -> Void)?
     var reservationSendHookForTesting: (@MainActor () async -> Void)?
+    var admissionWaitHookForTesting: (@MainActor () -> Void)?
     var afterAddHookForTesting: (@MainActor () throws -> Void)?
     /// Host only: awaited after the Add and before the joiner's decision is
     /// read, for tests that hold the inviter while the joiner declines.
@@ -820,6 +821,7 @@ public final class SyncEngine {
 
     private enum Admission {
         case fits
+        case intakePending
         case taskHistoryFull
         case groupFull
     }
@@ -835,6 +837,9 @@ public final class SyncEngine {
         before cursor: UInt64?
     ) async throws -> Admission {
         let hostLinked = linked && checkpoint != nil
+        if isHostMode, hostAdapter?.store?.isIntakeOutstanding == true {
+            return .intakePending
+        }
         guard checkpoint?.reservationsOverflowed != true, hostAdmissionAllowed(linked: hostLinked) else {
             return .taskHistoryFull
         }
@@ -846,6 +851,9 @@ public final class SyncEngine {
             view = try await admissionView(session: session)
             roster = Set(try await session.members().map(\.fingerprint))
             lastKnownEpoch = max(lastKnownEpoch, epoch)
+            if isHostMode, hostAdapter?.store?.isIntakeOutstanding == true {
+                return .intakePending
+            }
             guard !view.unknownOrigins, hostAdmissionAllowed(linked: hostLinked) else {
                 return .taskHistoryFull
             }
@@ -877,13 +885,21 @@ public final class SyncEngine {
         connection: any PairingConnection,
         invitation: Invitation
     ) async throws {
-        switch try await admission(of: joiner, origins: origins, session: session, linked: linked, before: cursor) {
-        case .fits:
-            return
-        case .taskHistoryFull:
-            try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
-        case .groupFull:
-            throw SyncError.groupAtCapacity
+        while true {
+            try Task.checkCancellation()
+            try requireCurrent(session)
+            switch try await admission(of: joiner, origins: origins, session: session, linked: linked, before: cursor) {
+            case .fits:
+                return
+            case .intakePending:
+                guard let store = hostAdapter?.store else { throw HostEngineError.journalUnbound }
+                admissionWaitHookForTesting?()
+                await store.drain(through: store.admitted)
+            case .taskHistoryFull:
+                try await refuseJoinerForTaskHistory(on: connection, invitation: invitation)
+            case .groupFull:
+                throw SyncError.groupAtCapacity
+            }
         }
     }
 

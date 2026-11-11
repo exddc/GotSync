@@ -654,7 +654,15 @@ final class SyncEngineMLSTests: XCTestCase {
         joiner.joinPrivateSync(url: try await invite(host))
         try await wait("safety code") { host.isHostApprovalPending && joiner.safetyCode != nil }
         let joinerFingerprint = try await fingerprint(joiner)
-        await relay.dropNextAppendResponse(thenUnavailable: thenUnavailable)
+        let authorization = try await XCTUnwrapAsync(host.mlsSessionForTesting).client.transportAuthorization()
+        let transport = try XCTUnwrap(relay)
+        var armed = true
+        host.reservationSendHookForTesting = {
+            guard armed else { return }
+            armed = false
+            await transport.dropAppendResponse(of: authorization, afterAccepting: 0, thenUnavailable: thenUnavailable)
+        }
+        defer { host.reservationSendHookForTesting = nil }
         host.approveSafetyCode()
         try await wait("pairing failed") { !host.canCancelPairing && joiner.phase == .failed }
         XCTAssertFalse(joiner.isPaired)
