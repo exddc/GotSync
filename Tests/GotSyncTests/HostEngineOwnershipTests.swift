@@ -548,6 +548,7 @@ extension HostEngineTests {
         await relay.setAppendsUnavailable(false)
 
         let inviter = await restart(b, "b")
+        try await wait("restarted member may invite") { inviter.canInviteToGroup }
         var gate: CheckedContinuation<Void, Never>?
         inviter.replyBatchHookForTesting = {
             if gate == nil, inviter.replyObligationForTesting?.bootstrap?.contains(where: { $0.cut != nil }) == true {
