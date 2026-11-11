@@ -1611,6 +1611,18 @@ public final class SyncEngine {
         beginInvitation(linked: false)
     }
 
+    /// Whether local membership, history and host prerequisites allow an invitation now.
+    public var canInviteToGroup: Bool {
+        guard hasDurableIdentity, hasDurableStorage, session != nil, isPaired,
+              pairingTask == nil, joinSettlementTask == nil, retentionParticipationReady,
+              !isHeldSyncStateUnreadable, hostWorkAllowed, linkedInviteRefusal == nil
+        else { return false }
+        if isHostMode {
+            guard let view = hostAdapter?.store?.view, view.isReady, !view.controlRepair else { return false }
+        }
+        return true
+    }
+
     /// Any linked member can issue a join invite into the existing group.
     public func inviteToGroup() {
         guard hasDurableIdentity, hasDurableStorage, isPaired, pairingTask == nil, joinSettlementTask == nil else {
