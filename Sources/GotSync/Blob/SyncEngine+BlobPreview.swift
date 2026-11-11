@@ -1,6 +1,6 @@
 import Foundation
 
-@_spi(BlobPreview) extension SyncEngine {
+extension SyncEngine {
     /// The blob transfer service of a host-journal engine, opened on first use;
     /// nil in other modes or without durable storage. It is bound to the active
     /// group by the engine's sync cycle and retired before leave, removal or

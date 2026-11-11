@@ -119,8 +119,12 @@ final class HostJournalAdapter {
         self.limits = limits
     }
 
+    /// Reclaiming groups record the host's declared store at enrollment.
+    var declaresAncestry = false
+
     func bind(_ store: HostJournal?) {
         self.store = store
+        store?.declaresAncestry = declaresAncestry
         proof = nil
     }
 

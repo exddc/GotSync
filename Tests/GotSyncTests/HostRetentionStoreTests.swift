@@ -161,6 +161,31 @@ final class HostRetentionStoreTests: XCTestCase {
         XCTAssertNil(store.view.retention)
     }
 
+    func testARefusedCheckpointCannotExposeOrAcknowledgeTheCompactedTail() throws {
+        let chain = try JournalFixture.chain(x, count: 5)
+        let committed = checkpoint(anchors([chain[2]]))
+        let proposal = Data(repeating: 9, count: 32)
+        var offer = committed
+        offer.floor = proposal
+        let joiner = try member()
+        XCTAssertTrue(try joiner.requestSnapshot(schema: "test.state/1"))
+        _ = try joiner.intakeAndPromote([JournalFixture.arrival(Array(chain[3...4]), cursor: 1)])
+        try joiner.recordCompletionTarget(provider: provider, through: [x: 5], offer: offer)
+        XCTAssertTrue(try joiner.adoptRetentionFloor(round: Data(repeating: 1, count: 16), proposal: proposal,
+                                                    checkpoint: committed))
+        while try joiner.promote() > 0 {}
+        XCTAssertTrue(try joiner.refuseSnapshot(.contentUnavailable, in: [.offered], id: offer.id))
+        XCTAssertTrue(joiner.view.isDeliveryHeld)
+        XCTAssertFalse(joiner.view.historyApplied)
+        XCTAssertEqual(try joiner.incoming(after: 0, limit: 64), [])
+        XCTAssertThrowsError(try joiner.coveredThrough(after: 0)) { XCTAssertEqual($0 as? JournalStoreError, .bootstrapPending) }
+        XCTAssertThrowsError(try joiner.markApplied(through: 2)) { XCTAssertEqual($0 as? JournalStoreError, .bootstrapPending) }
+        XCTAssertThrowsError(try joiner.declareReady(capturedThrough: 0)) { XCTAssertEqual($0 as? JournalStoreError, .bootstrapPending) }
+        XCTAssertEqual(joiner.view.appliedThrough, 0)
+        XCTAssertEqual(joiner.view.recordCount, 2)
+        XCTAssertEqual(try HostJournalStore.open(joiner.url).view, joiner.view)
+    }
+
     func testAJoinerAdoptsACorroboratedFloorAndReceivesOnlyTheTail() throws {
         let chain = try JournalFixture.chain(x, count: 5)
         let floorAnchors = anchors([chain[2]])

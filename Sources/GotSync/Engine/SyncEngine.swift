@@ -343,6 +343,8 @@ public final class SyncEngine {
     /// Joiners that asked for a snapshot and still wait for this member's floor.
     var retentionCorroborationRecipients: Set<Data> = []
     let checkpointFiles = HostCheckpointFiles()
+    /// A member lacked a reclamation host; later rounds propose the floor only.
+    var retentionReclaimDeclined = false
     var snapshotUnavailableLimitForTesting: Duration?
     private let hostJournalLimits: HostJournalLimits
     private(set) var hostLifecycle: HostLifecycle = .active { didSet { publishHostView() } }
@@ -573,7 +575,9 @@ public final class SyncEngine {
                 hasDurableStorage = false
             }
             Self.initScopeHookForTesting?("directories")
-            replication = HostJournalAdapter(directory: baseDirectory, limits: hostJournalLimits)
+            let adapter = HostJournalAdapter(directory: baseDirectory, limits: hostJournalLimits)
+            adapter.declaresAncestry = configuration.groupProfile.schema.allowsReclamation
+            replication = adapter
             if hasDurableStorage {
                 do {
                     if try LegacyLinkCredentials.exist(in: secretStore) {
@@ -4353,7 +4357,7 @@ extension SyncEngine {
     /// The handle of the current journal generation while host work may
     /// start; nil while opening, closing, failed, repaired or stopped. A
     /// handle is never re-bound: after a change, read this again.
-    @_spi(HostJournalPreview) public var hostJournal: HostJournal? {
+    public var hostJournal: HostJournal? {
         guard hostWorkAllowed, let store = hostAdapter?.store, store.fence == .open else { return nil }
         return store
     }
@@ -4429,7 +4433,7 @@ extension SyncEngine {
 
     /// An independent stream of composed-view revisions: the current one
     /// first, then the newest on every publication, until `stop`.
-    @_spi(HostJournalPreview) public func hostViewChanges() -> AsyncStream<UInt64> {
+    public func hostViewChanges() -> AsyncStream<UInt64> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<UInt64>.makeStream(bufferingPolicy: .bufferingNewest(1))
         hostViewSubscribers[id] = continuation

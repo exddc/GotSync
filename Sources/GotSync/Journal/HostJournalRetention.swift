@@ -47,6 +47,8 @@ enum HostRetentionDeclineReason: String, Codable, Sendable, CaseIterable {
     case hostNotAtCut
     case checkpointUnavailable
     case checkpointMismatch
+    /// The store's ancestry still needs the host's explicit resolution.
+    case ancestryUnresolved
 }
 
 /// One round's proposal, as broadcast by the coordinator.
@@ -56,6 +58,10 @@ struct HostRetentionProposal: Codable, Equatable, Sendable {
     let roster: [Data]
     let anchors: [HostSnapshotAnchor]
     let checkpoint: HostSnapshotOffer
+    /// Reclaiming groups: the anchors are also the reclamation frontier.
+    var reclaim: Bool? = nil
+    /// The coordinator's declared store, required for reclamation.
+    var store: Data? = nil
 
     var digest: Data { Data(SHA256.hash(data: (try? ReplicaCanonicalJSON.encode(self)) ?? Data())) }
 
@@ -63,6 +69,7 @@ struct HostRetentionProposal: Codable, Equatable, Sendable {
         round.count == 16 && !roster.isEmpty && roster.count <= SyncGroupProfile.supportedMemberCeiling
             && roster.allSatisfy { $0.count == 32 } && zip(roster, roster.dropFirst()).allSatisfy { $0.lexicographicallyPrecedes($1) }
             && !anchors.isEmpty && checkpoint.isWellFormed && checkpoint.anchors == anchors && checkpoint.floor == nil
+            && (reclaim != true || store?.count == 16)
     }
 }
 
@@ -73,6 +80,8 @@ struct HostRetentionVote: Codable, Equatable, Sendable {
     let accept: Bool
     var reason: HostRetentionDeclineReason?
     var applied: [HostSnapshotAnchor]?
+    /// The voter's declared store, for a reclamation round's scope.
+    var store: Data? = nil
 
     var isWellFormed: Bool {
         round.count == 16 && proposal.count == 32 && accept == (reason == nil)
@@ -87,6 +96,9 @@ struct HostRetentionCorroboration: Codable, Equatable, Sendable {
     let proposal: Data
     let anchors: [HostSnapshotAnchor]
     let contentHash: Data
+    /// The group's reclamation frontier and scope, when it reclaimed.
+    var reclaimedThrough: [HostVectorEntry]? = nil
+    var stores: [Data]? = nil
 
     var isWellFormed: Bool {
         member.count == 32 && round.count == 16 && proposal.count == 32 && contentHash.count == 32 && !anchors.isEmpty
