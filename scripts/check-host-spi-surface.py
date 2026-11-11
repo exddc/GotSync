@@ -118,6 +118,7 @@ REQUIRED_BLOB_CALLS = {
 SURFACE_MEMBERS = {
     "HostJournalReader": {"init(storageDirectory:)", "journals()", "export(_:after:limit:)"},
     "SyncEngine": {
+        "canInviteToGroup",
         "hostJournal",
         "hostJournalView",
         "hostViewChanges()",

@@ -221,14 +221,18 @@ final class HostEngineTests: XCTestCase {
     func testLaterInvitationsNeedReadiness() async throws {
         let a = engine("a")
         let b = engine("b")
+        XCTAssertFalse(a.canInviteToGroup)
         try await pair(a, b)
         try await enroll(a, "a")
+        XCTAssertFalse(a.canInviteToGroup)
         a.inviteToGroup()
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertNil(a.invitationURL)
         try await ready(a, "a")
+        try await wait("invitation admitted") { a.canInviteToGroup }
         a.inviteToGroup()
         try await wait("invitation") { a.invitationURL != nil }
+        XCTAssertFalse(a.canInviteToGroup)
     }
 
     func testProviderCompletesOnlyAfterItDeclaresReadiness() async throws {
