@@ -461,6 +461,7 @@ public final class SyncEngine {
     var chunkIntakeHookForTesting: (@MainActor () async -> Void)?
     var replyBatchHookForTesting: (@MainActor () async -> Void)?
     var snapshotSendHookForTesting: (@MainActor () throws -> Void)?
+    var retentionVoteSentHookForTesting: (@MainActor () async -> Void)?
     /// Runs before each closing step; throwing stops closing there, like a crash.
     var hostClosingHookForTesting: (@MainActor (String) async throws -> Void)?
     private var syncCycleRequested = false

@@ -443,7 +443,7 @@ extension SyncEngine {
             } catch {
                 return
             }
-            guard var current = self.retentionRound, current.digest == round.digest, !current.voted else { return }
+            guard let current = self.retentionRound, current.digest == round.digest, !current.voted else { return }
             var vote = HostRetentionVote(round: round.proposal.round, proposal: round.digest, accept: reason == nil)
             vote.reason = reason
             vote.store = self.hostAdapter?.store?.view.incarnation?.storeID
@@ -452,9 +452,11 @@ extension SyncEngine {
             } catch {
                 return
             }
-            current.voted = true
-            current.votes[me] = vote
-            self.retentionRound = current
+            await self.retentionVoteSentHookForTesting?()
+            guard var latest = self.retentionRound, latest.digest == round.digest, !latest.voted else { return }
+            latest.voted = true
+            latest.votes[me] = vote
+            self.retentionRound = latest
             self.requestSyncCycle(force: true)
         }
     }

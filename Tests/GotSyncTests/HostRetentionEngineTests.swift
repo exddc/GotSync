@@ -200,6 +200,42 @@ final class HostRetentionEngineTests: XCTestCase {
         XCTAssertEqual(tail, ["a4"])
     }
 
+    func testAVoteReceivedWhileTheLocalVoteIsSentIsKept() async throws {
+        let (a, b) = try await settledPair()
+        let c = engine("c")
+        try await pair(a, c)
+        try await enroll(c, "c")
+        try await wait("c history") { (try? self.journal(c).view.historyComplete) == true }
+        try await applyAll(c)
+        try await journal(c).declareReady(capturedThrough: 0)
+        try await wait("three settled") {
+            try [a, b, c].allSatisfy { engine in
+                let view = try self.journal(engine).view
+                return view.historyApplied && view.undelivered == 0 && view.pendingCount == 0
+            }
+        }
+        let lead = try await coordinator([a, b, c])
+        let voters: [SyncEngine] = [a, b, c].filter { $0 !== lead }
+        let (first, second) = (voters[0], voters[1])
+        let secondID = try await fingerprint(second)
+        let paused = OSAllocatedUnfairLock(initialState: false)
+        second.registerRetentionHost(HostRetentionHooks { request in
+            while !paused.withLock({ $0 }) { try await Task.sleep(for: .milliseconds(10)) }
+            return HostRetentionAttestation(appliedThrough: request.appliedThrough, capturedThrough: request.capturedThrough,
+                                            outboxEmpty: true, keepsDeletionMetadata: true)
+        })
+        first.retentionVoteSentHookForTesting = { [weak first] in
+            paused.withLock { $0 = true }
+            for _ in 0..<2_000 where first?.retentionRound?.votes[secondID] == nil {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        _ = try await lead.proposeRetentionFloor()
+        try await wait("every member committed") {
+            try [a, b, c].allSatisfy { (try self.journal($0).view.retention?.prunedRecords ?? 0) == 4 }
+        }
+    }
+
     func testACheckpointReuseRefusesChangedOrTruncatedBytes() async throws {
         let (a, b) = try await settledPair()
         let lead = try await coordinator([a, b])
