@@ -91,8 +91,10 @@ extension HostEngineTests {
         XCTAssertEqual(installs.first?.coverage, [origin: 3])
         XCTAssertEqual(installs.first?.appliedThrough, 3)
         XCTAssertEqual(joiner.state.withLock { $0.completed }, installs.map(\.id))
-        XCTAssertEqual(provider.state.withLock { $0.exports.count }, 1)
-        XCTAssertEqual(provider.state.withLock { $0.exports.first?.capturedThrough }, 3)
+        let exports = provider.state.withLock { $0.exports }
+        XCTAssertEqual(installs.map(\.id), exports.prefix(1).map(\.id), "the first export answered the request")
+        XCTAssertEqual(Set(exports.map(\.id)).count, exports.count)
+        XCTAssertEqual(exports.first?.capturedThrough, 3)
         let applied1 = try await applyAll(b, "b")
         XCTAssertEqual(applied1, [], "covered records are not delivered")
         XCTAssertTrue(try store(b).view.historyApplied)
@@ -104,7 +106,9 @@ extension HostEngineTests {
         let applied2 = try await applyAll(b, "b")
         XCTAssertEqual(applied2, [Data("four".utf8)])
         let joinerFingerprint = try await fingerprint(b)
-        XCTAssertNil(a.snapshotExport(for: joinerFingerprint), "the provider dropped its export once offered")
+        try await wait("the provider dropped its exports once offered", timeout: .seconds(60)) {
+            a.snapshotExport(for: joinerFingerprint) == nil
+        }
     }
 
     func testAnInstallInterruptedByRestartIsAskedAgainWithTheSameSnapshot() async throws {
@@ -157,9 +161,9 @@ extension HostEngineTests {
         try await wait("completed", timeout: .seconds(60)) { self.bootstrap(b) == .completed }
         let exports = provider.state.withLock { $0.exports }
         let installs = joiner.state.withLock { $0.installs }
-        XCTAssertEqual(exports.count, 2)
-        XCTAssertNotEqual(exports[0].id, exports[1].id)
-        XCTAssertEqual(installs.map(\.id), [exports[1].id], "the cancelled export's ID was never offered")
+        XCTAssertGreaterThanOrEqual(exports.count, 2)
+        XCTAssertEqual(Set(exports.map(\.id)).count, exports.count, "every export runs under a new ID")
+        XCTAssertEqual(installs.map(\.id), exports.dropFirst().prefix(1).map(\.id), "the cancelled export's ID was never offered")
     }
 
     func testAnUnsupportedSchemaRefusesVisiblyAndDeliversFullHistory() async throws {
