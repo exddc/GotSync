@@ -5,10 +5,21 @@ public struct SyncConfiguration: Sendable {
     public let endpointPolicy: EndpointSecurityPolicy
     public let storageDirectory: URL
     public let invitationURLScheme: String
+    /// The profile of groups this engine creates and joins. Groups with any
+    /// other profile are refused.
+    public let groupProfile: SyncGroupProfile
 
-    public init(relayURL: URL, mailboxURL: URL, storageDirectory: URL, invitationURLScheme: String, endpointPolicy: EndpointSecurityPolicy = .production) throws {
+    public init(
+        relayURL: URL,
+        mailboxURL: URL,
+        storageDirectory: URL,
+        invitationURLScheme: String,
+        endpointPolicy: EndpointSecurityPolicy = .production,
+        groupProfile: SyncGroupProfile = .legacyTaskDemo
+    ) throws {
         try Invitation.validateURLScheme(invitationURLScheme)
         self.invitationURLScheme = invitationURLScheme.lowercased()
+        self.groupProfile = groupProfile
         endpoints = try SyncEndpointConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, policy: endpointPolicy)
         self.endpointPolicy = endpointPolicy
         self.storageDirectory = storageDirectory

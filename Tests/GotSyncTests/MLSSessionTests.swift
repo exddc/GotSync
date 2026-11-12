@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import GotSyncMLS
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class MLSSessionTests: XCTestCase {
     private var root: URL!
@@ -33,7 +33,7 @@ final class MLSSessionTests: XCTestCase {
         let alice = try session("alice", transport: relay)
         let bob = try session("bob", transport: relay)
         let group = try Data.secureRandom(count: 32)
-        try await alice.createGroup(group)
+        try await alice.createGroup(group, profile: nil)
         try await admit(bob, by: alice, group: group)
         return (alice, bob, group)
     }
@@ -54,13 +54,13 @@ final class MLSSessionTests: XCTestCase {
 
     private func admit(_ joining: MLSSession, by inviter: MLSSession, group: Data) async throws {
         let token = try Data.secureRandom(count: 32)
-        let published = try await joining.publishKeyPackage(pairingToken: token)
+        let published = try await joining.publishKeyPackage(pairingToken: token, profile: nil)
         let keyPackage = try await XCTUnwrapAsync(await inviter.fetchKeyPackage(reference: published.reference, pairingToken: token))
         let added = try await inviter.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
         guard case .accepted = added else { return XCTFail("Add was not accepted: \(added)") }
         let joined = try await joining.join(
             group: group, keyPackageReference: published.reference,
-            verifiedInviterFingerprint: inviter.fingerprint()
+            verifiedInviterFingerprint: inviter.fingerprint(), profile: nil
         )
         XCTAssertTrue(joined)
     }
@@ -140,9 +140,9 @@ final class MLSSessionTests: XCTestCase {
         let alice = try session("alice", transport: relay)
         let bob = try session("bob", transport: relay)
         let group = try Data.secureRandom(count: 32)
-        try await alice.createGroup(group)
-        let published = try await bob.publishKeyPackage(pairingToken: Data(repeating: 3, count: 32))
-        let joined = try await bob.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint())
+        try await alice.createGroup(group, profile: nil)
+        let published = try await bob.publishKeyPackage(pairingToken: Data(repeating: 3, count: 32), profile: nil)
+        let joined = try await bob.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil)
         XCTAssertFalse(joined)
         let bobGroup = try await bob.group()
         XCTAssertNil(bobGroup)
@@ -152,10 +152,10 @@ final class MLSSessionTests: XCTestCase {
         let relay = FakeMLSRelay()
         let alice = try session("alice", transport: relay)
         let group = Data(repeating: 4, count: 32)
-        try await alice.createGroup(group)
-        try await alice.createGroup(group)
+        try await alice.createGroup(group, profile: nil)
+        try await alice.createGroup(group, profile: nil)
         do {
-            try await alice.createGroup(Data(repeating: 5, count: 32))
+            try await alice.createGroup(Data(repeating: 5, count: 32), profile: nil)
             XCTFail("Second group accepted")
         } catch { XCTAssertEqual(error as? MLSSessionError, .groupMismatch) }
     }
@@ -244,6 +244,486 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertEqual(afterDrain, [cursor])
     }
 
+    private func publishedPackage(
+        of joiner: MLSSession, for inviter: MLSSession
+    ) async throws -> (keyPackage: Data, published: MLSPublishedKeyPackage) {
+        let token = try Data.secureRandom(count: 32)
+        let published = try await joiner.publishKeyPackage(pairingToken: token, profile: nil)
+        let keyPackage = try await XCTUnwrapAsync(await inviter.fetchKeyPackage(reference: published.reference, pairingToken: token))
+        return (keyPackage, published)
+    }
+
+    private func assertConverged(
+        _ sessions: [MLSSession], relay: FakeMLSRelay, group: Data, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        for session in sessions { try await session.synchronize() }
+        var epochs: Set<UInt64> = []
+        var rosters: Set<[Data]> = []
+        for session in sessions {
+            epochs.insert(try await session.epoch())
+            let members = try await session.members()
+            XCTAssertEqual(Set(members.map(\.fingerprint)).count, members.count, "duplicate leaf", file: file, line: line)
+            rosters.insert(members.map(\.fingerprint).sorted { $0.lexicographicallyPrecedes($1) })
+        }
+        XCTAssertEqual(epochs.count, 1, "members are in different epochs", file: file, line: line)
+        XCTAssertEqual(rosters.count, 1, "members disagree on the roster", file: file, line: line)
+        XCTAssertEqual(rosters.first?.count, sessions.count, "ghost or missing leaf", file: file, line: line)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, sessions.count, "relay writers differ from the roster", file: file, line: line)
+        for (index, sender) in sessions.enumerated() {
+            let text = Data("after Add from \(index)".utf8)
+            guard case .accepted = try await sender.send(text) else { return XCTFail("send refused", file: file, line: line) }
+            for receiver in sessions where receiver !== sender {
+                try await receiver.synchronize()
+                let inbox = try await receiver.inbox()
+                XCTAssertEqual(inbox.last?.plaintext, text, file: file, line: line)
+            }
+        }
+    }
+
+    private func addEntries(of reference: Data, relay: FakeMLSRelay, group: Data) async -> Int {
+        await relay.log(group: group).filter { $0.delivery.keyPackageReference == reference }.count
+    }
+
+    func testLostAddResponseThenRateLimitedRetryRecoversTheAcceptedAddAcrossRestart() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The response should be lost")
+        } catch is URLError {}
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        await relay.rateLimitNext(adds: 1)
+        do {
+            _ = try await alice.flush()
+            XCTFail("The retry should be rate limited before deduplication")
+        } catch MLSRelayError.rateLimited {}
+        let retained = try await alice.pendingDelivery()
+        XCTAssertEqual(retained?.keyPackageReference, published.reference, "an Add with an unknown outcome was discarded")
+
+        let restarted = try session("alice", transport: relay)
+        guard case .accepted = try await restarted.flush() else { return XCTFail("The accepted Add was not applied") }
+        let cleared = try await restarted.pendingDelivery()
+        XCTAssertNil(cleared)
+        let copies = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(copies, 1)
+        try await assertConverged([restarted, bob, charlie], relay: relay, group: group)
+    }
+
+    /// The first request for an Add is held before the delivery store while
+    /// the inviter sees a lost connection. Reading an empty log must not end
+    /// it: the held request can still arrive, before or after the retry.
+    private func assertDelayedAddIsDelivered(originalFirst: Bool, restart: Bool) async throws {
+        let relay = FakeMLSRelay()
+        var (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.deferNextAddBeforeStore()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The ambiguous request should fail")
+        } catch is URLError {}
+        try await bob.synchronize()
+        let empty = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(empty, 0)
+        if restart {
+            alice = try session("alice", transport: relay)
+        }
+        if originalFirst {
+            try await relay.releaseDeferredAdd()
+        }
+        guard case .accepted = try await alice.flush() else { return XCTFail("The Add was not delivered") }
+        if !originalFirst {
+            try await relay.releaseDeferredAdd()
+        }
+        let copies = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(copies, 1, "the held request and the retry were both admitted")
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        try await assertConverged([alice, bob, charlie], relay: relay, group: group)
+    }
+
+    func testDelayedUnknownAddCannotBeAbandonedFromAnEmptyLog() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: false, restart: false)
+    }
+
+    func testDelayedUnknownAddArrivingBeforeTheRetryIsDeduplicated() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: true, restart: false)
+    }
+
+    func testDelayedUnknownAddSurvivesRestartBeforeTheRetry() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: false, restart: true)
+    }
+
+    func testDelayedUnknownAddArrivingDuringRestartIsDeduplicated() async throws {
+        try await assertDelayedAddIsDelivered(originalFirst: true, restart: true)
+    }
+
+    /// Reads the log to its head, acknowledging a full inbox on the way.
+    private func drain(_ session: MLSSession) async throws {
+        while true {
+            do {
+                try await session.synchronize()
+                return
+            } catch MLSClientError.capacityReached {
+                try await session.acknowledgeInbox(through: try await session.cursor())
+            }
+        }
+    }
+
+    /// Alice's Add of Charlie lands but its answer is lost, and Charlie joins
+    /// and sends. Alice leaving must remove only Alice. `prepare` runs on
+    /// Alice before she leaves.
+    private func assertLeavingKeepsAJoinerWhoSpoke(
+        floodAfterCharlieSpeaks: Bool = false,
+        prepare: (MLSSession, FakeMLSRelay) async throws -> MLSSession = { session, _ in session },
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.dropNextAddResponse()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The response should be lost", file: file, line: line)
+        } catch is URLError {}
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined, file: file, line: line)
+        guard case .accepted = try await charlie.send(Data("I joined and spoke".utf8)) else {
+            return XCTFail("Charlie could not speak", file: file, line: line)
+        }
+        if floodAfterCharlieSpeaks {
+            for index in 0...1_000 { _ = try await bob.send(Data("flood \(index)".utf8)) }
+        }
+        let leaving = try await prepare(alice, relay)
+        try await leaving.leave(withdrawing: [published.fingerprint])
+        let charlieFingerprint = try await charlie.fingerprint()
+        let evidence = try await leaving.spokenMembers()
+        XCTAssertTrue(evidence.contains(charlieFingerprint), file: file, line: line)
+        if floodAfterCharlieSpeaks {
+            let kept = try await leaving.inbox()
+            XCTAssertFalse(kept.contains { $0.sender == charlieFingerprint }, "the inbox still held the proof", file: file, line: line)
+        }
+        try await drain(bob)
+        guard case .accepted = try await bob.send(Data("remaining members".utf8)) else {
+            return XCTFail("Bob could not commit Alice's departure", file: file, line: line)
+        }
+        try await drain(charlie)
+        let removed = try await charlie.isRemoved()
+        XCTAssertFalse(removed, "leaving removed a joiner that already spoke", file: file, line: line)
+        for session in [bob, charlie] {
+            try await session.acknowledgeInbox(through: try await session.cursor())
+        }
+        try await assertConverged([bob, charlie], relay: relay, group: group, file: file, line: line)
+    }
+
+    func testLeavingAfterLostAddKeepsTheJoinerWhoAlreadySpoke() async throws {
+        try await assertLeavingKeepsAJoinerWhoSpoke()
+    }
+
+    func testLeavingKeepsAJoinerWhoseMessageWasAcknowledgedBeforeRestart() async throws {
+        try await assertLeavingKeepsAJoinerWhoSpoke { alice, relay in
+            guard case .accepted = try await alice.flush() else { throw SessionTestError.unexpected }
+            let inbox = try await alice.inbox()
+            try await alice.acknowledgeInbox(through: try XCTUnwrap(inbox.last).cursor)
+            let emptied = try await alice.inbox()
+            XCTAssertTrue(emptied.isEmpty)
+            return try self.session("alice", transport: relay)
+        }
+    }
+
+    func testLeavingKeepsAJoinerWhoseMessageAFullInboxDropped() async throws {
+        try await assertLeavingKeepsAJoinerWhoSpoke(floodAfterCharlieSpeaks: true)
+    }
+
+    /// The joiner's first message reaches the relay after the departing
+    /// inviter last read the log and before its cleanup Remove does.
+    func testDepartureKeepsAJoinerWhoseMessageLandsJustBeforeTheCleanup() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        guard case .accepted = try await alice.add(
+            keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference
+        ) else { return XCTFail("Add not accepted") }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        await relay.beforeNextRemoval {
+            _ = try await charlie.send(Data("I joined and spoke".utf8))
+        }
+        try await alice.leave(withdrawing: [published.fingerprint])
+        try await drain(bob)
+        guard case .accepted = try await bob.send(Data("remaining members".utf8)) else {
+            return XCTFail("Bob could not commit Alice's departure")
+        }
+        try await drain(charlie)
+        let removed = try await charlie.isRemoved()
+        XCTAssertFalse(removed, "cleanup removed a joiner whose message preceded it")
+        try await assertConverged([bob, charlie], relay: relay, group: group)
+    }
+
+    /// Alice, Bob, and a Charlie who joined but has not spoken.
+    private func groupWithSilentCharlie(
+        _ relay: FakeMLSRelay
+    ) async throws -> (alice: MLSSession, bob: MLSSession, charlie: MLSSession, group: Data, charlieFingerprint: Data) {
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        guard case .accepted = try await alice.add(
+            keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference
+        ) else { throw SessionTestError.unexpected }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        guard joined else { throw SessionTestError.unexpected }
+        try await bob.synchronize()
+        return (alice, bob, charlie, group, published.fingerprint)
+    }
+
+    /// Bob commits Alice's departure; Charlie stays and both converge.
+    private func assertCharlieStays(
+        bob: MLSSession, charlie: MLSSession, relay: FakeMLSRelay, group: Data, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        try await drain(bob)
+        guard case .accepted = try await bob.send(Data("remaining members".utf8)) else {
+            return XCTFail("Bob could not commit Alice's departure", file: file, line: line)
+        }
+        try await drain(charlie)
+        let removed = try await charlie.isRemoved()
+        XCTAssertFalse(removed, "cleanup removed a member whose message preceded it", file: file, line: line)
+        for session in [bob, charlie] {
+            try await session.acknowledgeInbox(through: try await session.cursor())
+        }
+        try await assertConverged([bob, charlie], relay: relay, group: group, file: file, line: line)
+    }
+
+    func testHeldConditionalRemoveIsRefusedForGoodOnceTheJoinerSpeaks() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, charlie, group, charlieFingerprint) = try await groupWithSilentCharlie(relay)
+        await relay.deferNextRemovalBeforeStore()
+        do {
+            try await alice.leave(withdrawing: [charlieFingerprint])
+            XCTFail("The held Remove should report a lost connection")
+        } catch is URLError {}
+        let held = try await XCTUnwrapAsync(await alice.pendingDelivery())
+        let expected = try XCTUnwrap(held.expectedHead)
+        _ = try await charlie.send(Data("I joined and spoke".utf8))
+        let late = try await relay.releaseDeferredRemoval()
+        XCTAssertEqual(late, .headAdvanced(head: expected + 1), "the held original landed after the joiner spoke")
+        let restarted = try session("alice", transport: relay)
+        let kept = try await restarted.pendingDelivery()
+        XCTAssertEqual(kept, held, "the guard changed across restart")
+        try await restarted.leave(withdrawing: [charlieFingerprint])
+        let removals = await relay.log(group: group).filter { $0.delivery.removeWriter != nil }
+        XCTAssertTrue(removals.isEmpty, "a copy of the refused Remove landed")
+        try await assertCharlieStays(bob: bob, charlie: charlie, relay: relay, group: group)
+    }
+
+    func testConditionalRemoveWhoseAnswerWasLostIsRecoveredAfterRestart() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, charlie, group, charlieFingerprint) = try await groupWithSilentCharlie(relay)
+        await relay.dropNextRemovalResponse()
+        do {
+            try await alice.leave(withdrawing: [charlieFingerprint])
+            XCTFail("The answer should be lost")
+        } catch is URLError {}
+        let held = try await XCTUnwrapAsync(await alice.pendingDelivery())
+        XCTAssertNotNil(held.expectedHead)
+        _ = try await bob.send(Data("unrelated traffic after the Remove".utf8))
+        let restarted = try session("alice", transport: relay)
+        try await restarted.leave(withdrawing: [charlieFingerprint])
+        let removals = await relay.log(group: group).filter { $0.delivery.removeWriter != nil }
+        XCTAssertEqual(removals.count, 1)
+        try await drain(bob)
+        guard case .accepted = try await bob.send(Data("after cleanup".utf8)) else { return XCTFail("Bob blocked") }
+        _ = try? await charlie.synchronize()
+        let charlieRemoved = try await charlie.isRemoved()
+        XCTAssertTrue(charlieRemoved, "the silent joiner was kept")
+        let members = try await bob.members()
+        XCTAssertEqual(members.count, 1)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 1)
+    }
+
+    func testUnrelatedActivityRefusesTheCleanupThenItRetriesWithTheNewHead() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, charlie, group, charlieFingerprint) = try await groupWithSilentCharlie(relay)
+        await relay.beforeNextRemoval {
+            _ = try await bob.send(Data("Bob, not Charlie".utf8))
+        }
+        try await alice.leave(withdrawing: [charlieFingerprint])
+        let requests = await relay.conditionalRequests
+        XCTAssertEqual(requests, 2, "the refused Remove was not reevaluated and sent again")
+        let removals = await relay.log(group: group).filter { $0.delivery.removeWriter != nil }
+        XCTAssertEqual(removals.count, 1)
+        try await drain(bob)
+        _ = try await bob.send(Data("after cleanup".utf8))
+        _ = try? await charlie.synchronize()
+        let removed = try await charlie.isRemoved()
+        XCTAssertTrue(removed)
+    }
+
+    func testFullInboxKeepsTheGuardAndTheActivityThatRefusesIt() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, charlie, group, charlieFingerprint) = try await groupWithSilentCharlie(relay)
+        await relay.deferNextRemovalBeforeStore()
+        do {
+            try await alice.leave(withdrawing: [charlieFingerprint])
+            XCTFail("The held Remove should report a lost connection")
+        } catch is URLError {}
+        let held = try await XCTUnwrapAsync(await alice.pendingDelivery())
+        _ = try await charlie.send(Data("I joined and spoke".utf8))
+        for index in 0...1_000 { _ = try await bob.send(Data("flood \(index)".utf8)) }
+        try await relay.releaseDeferredRemoval()
+        let restarted = try session("alice", transport: relay)
+        let kept = try await restarted.pendingDelivery()
+        XCTAssertEqual(kept?.expectedHead, held.expectedHead)
+        try await restarted.leave(withdrawing: [charlieFingerprint])
+        let evidence = try await restarted.spokenMembers()
+        XCTAssertTrue(evidence.contains(charlieFingerprint))
+        let removals = await relay.log(group: group).filter { $0.delivery.removeWriter != nil }
+        XCTAssertTrue(removals.isEmpty)
+        try await assertCharlieStays(bob: bob, charlie: charlie, relay: relay, group: group)
+    }
+
+    func testOlderRelayGetsNoCleanupAndNoUnconditionalFallback() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, charlie, group, charlieFingerprint) = try await groupWithSilentCharlie(relay)
+        await relay.setConditionalAppendSupported(false)
+        let refused = try await bob.remove(fingerprint: charlieFingerprint, onlyIfSilent: true)
+        XCTAssertEqual(refused, .superseded)
+        let bobPending = try await bob.pendingDelivery()
+        XCTAssertNil(bobPending)
+        try await alice.leave(withdrawing: [charlieFingerprint])
+        let requests = await relay.conditionalRequests
+        XCTAssertEqual(requests, 0)
+        let removals = await relay.log(group: group).filter { $0.delivery.removeWriter != nil }
+        XCTAssertTrue(removals.isEmpty, "cleanup fell back to an unconditional Remove")
+        try await assertCharlieStays(bob: bob, charlie: charlie, relay: relay, group: group)
+    }
+
+    func testExplicitRemovalOfAMemberThatSpokeStillWorks() async throws {
+        let relay = FakeMLSRelay()
+        let (_, bob, charlie, group, charlieFingerprint) = try await groupWithSilentCharlie(relay)
+        _ = try await charlie.send(Data("I spoke".utf8))
+        try await bob.synchronize()
+        let evidence = try await bob.spokenMembers()
+        XCTAssertTrue(evidence.contains(charlieFingerprint))
+        guard case .accepted = try await bob.remove(fingerprint: charlieFingerprint) else { return XCTFail("removal refused") }
+        _ = try? await charlie.synchronize()
+        let removed = try await charlie.isRemoved()
+        XCTAssertTrue(removed)
+        let requests = await relay.conditionalRequests
+        XCTAssertEqual(requests, 0)
+        let writers = await relay.activeWriterCount(group: group)
+        XCTAssertEqual(writers, 2)
+    }
+
+    func testRateLimitedAddIsKeptAndDeliveredOnRetry() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.rateLimitNext(adds: 1)
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The Add should be rate limited")
+        } catch MLSRelayError.rateLimited {}
+        let kept = try await alice.pendingDelivery()
+        XCTAssertEqual(kept?.keyPackageReference, published.reference)
+        guard case .accepted = try await alice.flush() else { return XCTFail("The retry was not accepted") }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        try await assertConverged([alice, bob, charlie], relay: relay, group: group)
+    }
+
+    /// Only the store's journaled refusal ends an Add whose first request is
+    /// still held: once the KeyPackage expires, the retry is refused, and so
+    /// is the held request when it finally arrives.
+    func testUnknownAddEndsOnlyWithTheStoresJournaledRefusal() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        let epoch = try await alice.epoch()
+        await relay.deferNextAddBeforeStore()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The ambiguous request should fail")
+        } catch is URLError {}
+        await relay.rateLimitNext(adds: 3)
+        for _ in 0..<3 {
+            do {
+                _ = try await alice.flush()
+                XCTFail("The retry should be rate limited")
+            } catch MLSRelayError.rateLimited {}
+        }
+        let kept = try await alice.pendingDelivery()
+        XCTAssertEqual(kept?.keyPackageReference, published.reference, "rate limits and timeouts are not terminal")
+        await relay.expireKeyPackages()
+        let flushed = try await alice.flush()
+        XCTAssertEqual(flushed, .superseded)
+        let discarded = try await alice.pendingDelivery()
+        XCTAssertNil(discarded)
+        try await relay.releaseDeferredAdd()
+        let copies = await addEntries(of: published.reference, relay: relay, group: group)
+        XCTAssertEqual(copies, 0, "a held copy landed after the refusal")
+        let after = try await alice.epoch()
+        XCTAssertEqual(after, epoch)
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertFalse(joined)
+        try await assertConverged([alice, bob], relay: relay, group: group)
+    }
+
+    func testLostAddBehindAFullInboxStaysPendingUntilTheInboxDrains() async throws {
+        let relay = FakeMLSRelay()
+        let (alice, bob, group) = try await pair(relay)
+        for index in 0...1_000 {
+            _ = try await bob.send(Data("edit \(index)".utf8))
+        }
+        let charlie = try session("charlie", transport: relay)
+        let (keyPackage, published) = try await publishedPackage(of: charlie, for: alice)
+        await relay.dropNextAppendResponse()
+        do {
+            _ = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
+            XCTFail("The response should be lost")
+        } catch is URLError {}
+        do {
+            _ = try await alice.flush()
+            XCTFail("A full inbox accepted more messages")
+        } catch MLSClientError.capacityReached {}
+        let kept = try await alice.pendingDelivery()
+        XCTAssertEqual(kept?.keyPackageReference, published.reference)
+        let held = try await alice.inbox()
+        try await alice.acknowledgeInbox(through: try XCTUnwrap(held.last).cursor)
+        guard case .accepted = try await alice.flush() else { return XCTFail("The accepted Add was not applied") }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        try await alice.acknowledgeInbox(through: try await alice.cursor())
+        try await bob.acknowledgeInbox(through: try await bob.cursor())
+        try await assertConverged([alice, bob, charlie], relay: relay, group: group)
+    }
+
     func testStaleSenderResolvesEpochConflicts() async throws {
         let relay = FakeMLSRelay()
         let (alice, bob, group) = try await pair(relay)
@@ -252,7 +732,7 @@ final class MLSSessionTests: XCTestCase {
 
         let dave = try session("dave", transport: relay)
         let token = Data(repeating: 6, count: 32)
-        let published = try await dave.publishKeyPackage(pairingToken: token)
+        let published = try await dave.publishKeyPackage(pairingToken: token, profile: nil)
         let keyPackage = try await XCTUnwrapAsync(await bob.fetchKeyPackage(reference: published.reference, pairingToken: token))
         let staleSend = try await bob.send(Data("after conflict".utf8))
         guard case .accepted = staleSend else { return XCTFail("Stale message not resealed") }
@@ -274,7 +754,7 @@ final class MLSSessionTests: XCTestCase {
     func testUnavailableKeyPackageUnblocksInviter() async throws {
         let relay = FakeMLSRelay()
         let alice = try session("alice", transport: relay)
-        try await alice.createGroup(Data(repeating: 8, count: 32))
+        try await alice.createGroup(Data(repeating: 8, count: 32), profile: nil)
         let bob = try session("bob", transport: relay)
         let identity = try await bob.joiningIdentityForTesting()
         let result = try await alice.add(
@@ -444,7 +924,7 @@ final class MLSSessionTests: XCTestCase {
         let bob = try session("bob", transport: relay)
         let bobAuthorization = try await bob.transportAuthorizationForTesting()
         let group = try Data.secureRandom(count: 32)
-        try await alice.createGroup(group)
+        try await alice.createGroup(group, profile: nil)
         await relay.failAcknowledgements(by: bobAuthorization, true)
         do {
             try await admit(bob, by: alice, group: group)
@@ -528,6 +1008,26 @@ final class MLSSessionTests: XCTestCase {
         } catch { XCTAssertEqual(error as? MLSRelayError, .insecureTransport) }
     }
 
+    func testHTTPTransportSeparatesGatewayRateLimitsFromStoreCapacity() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TooManyRequestsProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let cases: [(String, MLSRelayError)] = [
+            ("rate-limited.example", .rateLimited),
+            ("proxy.example", .rateLimited),
+            ("store-full.example", .capacityReached),
+        ]
+        for (host, expected) in cases {
+            let transport = HTTPMLSRelayTransport(baseURL: try XCTUnwrap(URL(string: "https://\(host)/v2/mls")), session: session)
+            do {
+                _ = try await transport.fetch(group: Data(repeating: 1, count: 32), after: 0, limit: 1, authorization: Data(repeating: 2, count: 32))
+                XCTFail("\(host) answered")
+            } catch {
+                XCTAssertEqual(error as? MLSRelayError, expected, host)
+            }
+        }
+    }
+
     func testRealRelayReportsMissingGroupAsExpiredHistory() async throws {
         guard let relay = try realRelay() else { return }
         let group = try Data.secureRandom(count: 32)
@@ -545,13 +1045,98 @@ final class MLSSessionTests: XCTestCase {
         } catch { XCTAssertEqual(error as? MLSRelayError, .historyExpired) }
     }
 
+    /// The real relay refuses a conditional Remove prepared before the
+    /// member spoke, and accepts one prepared after it caught up only while
+    /// nothing else lands.
+    func testConditionalRemoveThroughRealRelay() async throws {
+        guard let relay = try realRelay() else { return }
+        let (alice, bob, group) = try await pair(relay)
+        let charlie = try session("charlie", transport: relay)
+        let token = try Data.secureRandom(count: 32)
+        let published = try await charlie.publishKeyPackage(pairingToken: token, profile: nil)
+        let keyPackage = try await XCTUnwrapAsync(await alice.fetchKeyPackage(reference: published.reference, pairingToken: token))
+        guard case .accepted = try await alice.add(
+            keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference
+        ) else { return XCTFail("Add not accepted") }
+        let joined = try await charlie.join(
+            group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil
+        )
+        XCTAssertTrue(joined)
+        let supported = try await relay.supportsConditionalAppend(group: group, authorization: try await alice.client.transportAuthorization())
+        XCTAssertTrue(supported)
+        try await alice.synchronize()
+        let observed = try await alice.cursor()
+        let stale = try await alice.client.prepareRemove(fingerprint: published.fingerprint, expectedHead: observed)
+        _ = try await charlie.send(Data("I spoke".utf8))
+        let refused = try await alice.flush()
+        XCTAssertEqual(refused, .superseded)
+        let pending = try await alice.pendingDelivery()
+        XCTAssertNil(pending)
+        let again = try await relay.appendIfHead(stale, authorization: try await alice.client.transportAuthorization())
+        guard case .headAdvanced(let head) = again, head > observed else { return XCTFail("a copy was not refused: \(again)") }
+        let kept = try await alice.remove(fingerprint: published.fingerprint, onlyIfSilent: true)
+        XCTAssertEqual(kept, .superseded)
+        let members = try await alice.members()
+        XCTAssertEqual(members.count, 3)
+
+        try await bob.synchronize()
+        let dave = try session("dave", transport: relay)
+        let daveToken = try Data.secureRandom(count: 32)
+        let davePackage = try await dave.publishKeyPackage(pairingToken: daveToken, profile: nil)
+        let daveBytes = try await XCTUnwrapAsync(await bob.fetchKeyPackage(reference: davePackage.reference, pairingToken: daveToken))
+        guard case .accepted = try await bob.add(
+            keyPackage: daveBytes, verifiedFingerprint: davePackage.fingerprint, reference: davePackage.reference
+        ) else { return XCTFail("Add not accepted") }
+        guard case .accepted = try await bob.remove(fingerprint: davePackage.fingerprint, onlyIfSilent: true) else {
+            return XCTFail("a silent member was not removed")
+        }
+        let remaining = try await bob.members()
+        XCTAssertFalse(remaining.contains { $0.fingerprint == davePackage.fingerprint })
+    }
+
+    func testHTTPTransportMapsConditionalAppendAndCapabilities() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ConditionalRelayProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let group = Data(repeating: 1, count: 32)
+        let authorization = Data(repeating: 2, count: 32)
+        let removal = MLSDelivery(
+            group: group, epoch: 3, kind: .commit, payload: Data([1]), removeWriter: Data(repeating: 4, count: 32), expectedHead: 7
+        )
+        let current = HTTPMLSRelayTransport(baseURL: try XCTUnwrap(URL(string: "https://current.example/v2/mls")), session: session)
+        let supported = try await current.supportsConditionalAppend(group: group, authorization: authorization)
+        XCTAssertTrue(supported)
+        let refused = try await current.appendIfHead(removal, authorization: authorization)
+        XCTAssertEqual(refused, .headAdvanced(head: 9))
+        let behind = HTTPMLSRelayTransport(baseURL: try XCTUnwrap(URL(string: "https://behind.example/v2/mls")), session: session)
+        do {
+            _ = try await behind.appendIfHead(removal, authorization: authorization)
+            XCTFail("a refusal at or below the expected head was accepted")
+        } catch { XCTAssertEqual(error as? MLSRelayError, .invalidResponse) }
+        let older = HTTPMLSRelayTransport(baseURL: try XCTUnwrap(URL(string: "https://older.example/v2/mls")), session: session)
+        let unsupported = try await older.supportsConditionalAppend(group: group, authorization: authorization)
+        XCTAssertFalse(unsupported)
+        do {
+            _ = try await older.appendIfHead(removal, authorization: authorization)
+            XCTFail("an older relay accepted a conditional append")
+        } catch { XCTAssertEqual(error as? MLSRelayError, .rejected(status: 400, code: "invalidRequest")) }
+        do {
+            _ = try await current.append(removal, authorization: authorization)
+            XCTFail("a guarded Remove was sent unconditionally")
+        } catch { XCTAssertEqual(error as? MLSRelayError, .invalidRequest) }
+        do {
+            _ = try await current.appendIfHead(removal.withoutExpectedHead, authorization: authorization)
+            XCTFail("a Remove without a guard was sent conditionally")
+        } catch { XCTAssertEqual(error as? MLSRelayError, .invalidRequest) }
+    }
+
     func testThreeSessionsThroughRealRelay() async throws {
         guard let relay = try realRelay() else { return }
 
         let (alice, bob, group) = try await pair(relay)
         let token = try Data.secureRandom(count: 32)
         let charlie = try session("charlie", transport: relay)
-        let published = try await charlie.publishKeyPackage(pairingToken: token)
+        let published = try await charlie.publishKeyPackage(pairingToken: token, profile: nil)
         let wrongToken = try Data.secureRandom(count: 32)
         do {
             _ = try await alice.fetchKeyPackage(reference: published.reference, pairingToken: wrongToken)
@@ -562,7 +1147,7 @@ final class MLSSessionTests: XCTestCase {
         XCTAssertNil(consumed)
         let added = try await alice.add(keyPackage: keyPackage, verifiedFingerprint: published.fingerprint, reference: published.reference)
         guard case .accepted = added else { return XCTFail("Add not accepted") }
-        let joined = try await charlie.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint())
+        let joined = try await charlie.join(group: group, keyPackageReference: published.reference, verifiedInviterFingerprint: alice.fingerprint(), profile: nil)
         XCTAssertTrue(joined)
 
         _ = try await bob.send(Data("from Bob".utf8))
@@ -609,4 +1194,55 @@ extension MLSSession {
 
 private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
     try XCTUnwrap(value, file: file, line: line)
+}
+
+/// Answers every request with HTTP 429 and the body the host names: the
+/// relay's admission limiter, a proxy without a JSON body, or the delivery
+/// store.
+private final class TooManyRequestsProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        let body: Data = switch url.host {
+        case "rate-limited.example": Data(#"{"error":"rateLimited","version":2}"#.utf8)
+        case "store-full.example": Data(#"{"error":"deliveryCapacity","version":2}"#.utf8)
+        default: Data("Too Many Requests".utf8)
+        }
+        let response = HTTPURLResponse(url: url, statusCode: 429, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private enum SessionTestError: Error {
+    case unexpected
+}
+
+/// A relay that supports conditional appends (`current`), refuses with an
+/// inconsistent head (`behind`), or predates them (`older`).
+private final class ConditionalRelayProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        let operation = url.lastPathComponent
+        let (status, body): (Int, String) = switch (url.host, operation) {
+        case ("older.example", _): (400, #"{"error":"invalidRequest","version":2}"#)
+        case (_, "capabilities"): (200, #"{"conditionalAppend":true,"version":2}"#)
+        case ("behind.example", _): (409, #"{"error":"headAdvanced","head":7,"version":2}"#)
+        default: (409, #"{"error":"headAdvanced","head":9,"version":2}"#)
+        }
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

@@ -19,6 +19,11 @@ const MAX_STATE: usize = 16 * 1024 * 1024;
 const SNAPSHOT_VERSION: u8 = 4;
 const KEY_PACKAGE_LIFETIME: u64 = 7 * 24 * 60 * 60;
 const MAX_MESSAGE: usize = 384 * 1024;
+const LEGACY_MEMBER_LIMIT: usize = 8;
+const MEMBER_CEILING: u8 = 10;
+const PROFILE_EXTENSION: u16 = 0xF0D5;
+const PROFILE_FORMAT: u8 = 1;
+const MAX_PROFILE_LABEL: usize = 64;
 
 #[derive(Debug, thiserror::Error, uniffi::Error, PartialEq)]
 pub enum MlsError {
@@ -30,6 +35,8 @@ pub enum MlsError {
     InvalidState,
     #[error("MLS library rejected the operation: {code}")]
     LibraryRejected { code: String },
+    #[error("The group profile does not match")]
+    ProfileMismatch,
 }
 
 type Result<T> = std::result::Result<T, MlsError>;
@@ -108,7 +115,7 @@ fn roster(group: &MlsGroup) -> Result<Vec<MlsMember>> {
             writer_hash,
         });
     }
-    if members.is_empty() || members.len() > 8 {
+    if members.is_empty() || members.len() > member_limit(group)? {
         return Err(MlsError::InvalidInput);
     }
     Ok(members)
@@ -256,13 +263,31 @@ impl Client {
     }
 }
 
-fn config() -> MlsGroupCreateConfig {
+fn config_builder() -> MlsGroupCreateConfigBuilder {
     MlsGroupCreateConfig::builder()
         .ciphersuite(SUITE)
         .use_ratchet_tree_extension(true)
         .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(0)
-        .build()
+}
+
+fn config() -> MlsGroupCreateConfig {
+    config_builder().build()
+}
+
+fn create_config(profile: Option<Vec<u8>>) -> Result<MlsGroupCreateConfig> {
+    let Some(bytes) = profile else {
+        return Ok(config());
+    };
+    let extensions = Extensions::single(Extension::Unknown(
+        PROFILE_EXTENSION,
+        UnknownExtension(bytes),
+    ))
+    .map_err(|_| MlsError::InvalidInput)?;
+    Ok(config_builder()
+        .capabilities(profiled_capabilities())
+        .with_group_context_extensions(extensions)
+        .build())
 }
 
 fn encode(message: &MlsMessageOut) -> Result<Vec<u8>> {
@@ -282,6 +307,90 @@ fn verify_key(key: &[u8], expected: &[u8]) -> Result<()> {
         return Err(MlsError::FingerprintMismatch);
     }
     Ok(())
+}
+
+fn profile_label(bytes: &[u8], at: &mut usize) -> Result<()> {
+    let length = *bytes.get(*at).ok_or(MlsError::InvalidInput)? as usize;
+    let label = bytes
+        .get(*at + 1..*at + 1 + length)
+        .ok_or(MlsError::InvalidInput)?;
+    if label.is_empty()
+        || label.len() > MAX_PROFILE_LABEL
+        || !label[0].is_ascii_lowercase() && !label[0].is_ascii_digit()
+        || !label
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.' || *b == b'-')
+    {
+        return Err(MlsError::InvalidInput);
+    }
+    *at += 1 + length;
+    Ok(())
+}
+
+/// Validates a canonical profile descriptor and returns its member limit:
+/// format byte, length-prefixed application and schema labels, a nonzero
+/// big-endian schema version, and the member limit.
+fn profile_member_limit(bytes: &[u8]) -> Result<usize> {
+    if bytes.first() != Some(&PROFILE_FORMAT) {
+        return Err(MlsError::InvalidInput);
+    }
+    let mut at = 1;
+    profile_label(bytes, &mut at)?;
+    profile_label(bytes, &mut at)?;
+    let [major, minor, limit] = bytes.get(at..).ok_or(MlsError::InvalidInput)? else {
+        return Err(MlsError::InvalidInput);
+    };
+    if u16::from_be_bytes([*major, *minor]) == 0 || !(2..=MEMBER_CEILING).contains(limit) {
+        return Err(MlsError::InvalidInput);
+    }
+    Ok(*limit as usize)
+}
+
+/// The group's profile descriptor, or `None` for a legacy group. A group
+/// context may hold this extension and nothing else.
+fn group_profile_bytes(extensions: &Extensions<GroupContext>) -> Result<Option<Vec<u8>>> {
+    let mut profile = None;
+    for extension in extensions.iter() {
+        match extension {
+            Extension::Unknown(PROFILE_EXTENSION, UnknownExtension(bytes)) if profile.is_none() => {
+                profile_member_limit(bytes)?;
+                profile = Some(bytes.clone());
+            }
+            _ => return Err(MlsError::InvalidInput),
+        }
+    }
+    Ok(profile)
+}
+
+fn member_limit(group: &MlsGroup) -> Result<usize> {
+    group_profile_bytes(group.extensions())?.map_or(Ok(LEGACY_MEMBER_LIMIT), |bytes| {
+        profile_member_limit(&bytes)
+    })
+}
+
+fn validated_profile(profile: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    if let Some(bytes) = &profile {
+        profile_member_limit(bytes)?;
+    }
+    Ok(profile)
+}
+
+/// Leaf capabilities of a profiled member. Legacy members keep the defaults,
+/// so OpenMLS refuses to add them to a profiled group.
+fn profiled_capabilities() -> Capabilities {
+    Capabilities::builder()
+        .extensions(vec![ExtensionType::Unknown(PROFILE_EXTENSION)])
+        .build()
+}
+
+#[uniffi::export]
+pub fn supported_member_ceiling() -> u8 {
+    MEMBER_CEILING
+}
+
+#[uniffi::export]
+pub fn group_profile(state: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    group_profile_bytes(Client::load(state)?.group()?.extensions())
 }
 
 #[uniffi::export]
@@ -318,11 +427,16 @@ pub fn create_identity(device_id: Vec<u8>) -> Result<MlsIdentity> {
 }
 
 #[uniffi::export]
-pub fn publish_key_package(state: Vec<u8>) -> Result<MlsTransition> {
-    publish_with_lifetime(state, KEY_PACKAGE_LIFETIME)
+pub fn publish_key_package(state: Vec<u8>, profile: Option<Vec<u8>>) -> Result<MlsTransition> {
+    publish_with_lifetime(state, KEY_PACKAGE_LIFETIME, profile)
 }
 
-fn publish_with_lifetime(state: Vec<u8>, lifetime: u64) -> Result<MlsTransition> {
+fn publish_with_lifetime(
+    state: Vec<u8>,
+    lifetime: u64,
+    profile: Option<Vec<u8>>,
+) -> Result<MlsTransition> {
+    let profiled = validated_profile(profile)?.is_some();
     let mut client = Client::load(state)?;
     if client.snapshot.group_id.is_some() {
         return Err(MlsError::InvalidState);
@@ -342,18 +456,24 @@ fn publish_with_lifetime(state: Vec<u8>, lifetime: u64) -> Result<MlsTransition>
         let oldest = client.snapshot.key_package.remove(0);
         client.discard_key_package(&oldest)?;
     }
-    let bundle = protocol(
-        KeyPackage::builder()
-            .key_package_lifetime(Lifetime::new(lifetime))
-            .build(SUITE, &client.provider, &client.signer, client.credential()),
-    )?;
+    let mut builder = KeyPackage::builder().key_package_lifetime(Lifetime::new(lifetime));
+    if profiled {
+        builder = builder.leaf_node_capabilities(profiled_capabilities());
+    }
+    let bundle =
+        protocol(builder.build(SUITE, &client.provider, &client.signer, client.credential()))?;
     let bytes = protocol(bundle.key_package().tls_serialize_detached())?;
     client.snapshot.key_package.push(bytes.clone());
     client.save(bytes, None, None, None, false)
 }
 
 #[uniffi::export]
-pub fn create_group(state: Vec<u8>, group_id: Vec<u8>) -> Result<MlsTransition> {
+pub fn create_group(
+    state: Vec<u8>,
+    group_id: Vec<u8>,
+    profile: Option<Vec<u8>>,
+) -> Result<MlsTransition> {
+    let profile = validated_profile(profile)?;
     let mut client = Client::load(state)?;
     if client.snapshot.group_id.is_some() || group_id.len() != 32 {
         return Err(MlsError::InvalidState);
@@ -361,10 +481,13 @@ pub fn create_group(state: Vec<u8>, group_id: Vec<u8>) -> Result<MlsTransition> 
     let group = protocol(MlsGroup::new_with_group_id(
         &client.provider,
         &client.signer,
-        &config(),
+        &create_config(profile.clone())?,
         GroupId::from_slice(&group_id),
         client.credential(),
     ))?;
+    if group_profile_bytes(group.extensions())? != profile {
+        return Err(MlsError::ProfileMismatch);
+    }
     client.discard_key_packages()?;
     client.snapshot.group_id = Some(group_id);
     client.save(vec![], None, Some(&group), None, false)
@@ -395,7 +518,7 @@ pub fn prepare_add(
         .into_iter()
         .filter(|m| !departing.contains(&m.fingerprint))
         .collect();
-    if current.len() >= 8
+    if current.len() >= member_limit(&group)?
         || current.iter().any(|m| {
             m.fingerprint == verified_fingerprint
                 || m.device_id == device_id
@@ -475,7 +598,9 @@ pub fn join_group(
     welcome: Vec<u8>,
     expected_group_id: Vec<u8>,
     inviter_fingerprint: Vec<u8>,
+    expected_profile: Option<Vec<u8>>,
 ) -> Result<MlsTransition> {
+    let expected_profile = validated_profile(expected_profile)?;
     let mut client = Client::load(state)?;
     if client.snapshot.group_id.is_some() {
         return Err(MlsError::InvalidState);
@@ -495,6 +620,9 @@ pub fn join_group(
             .as_slice(),
         &inviter_fingerprint,
     )?;
+    if group_profile_bytes(staged.group_context().extensions())? != expected_profile {
+        return Err(MlsError::ProfileMismatch);
+    }
     let group = protocol(staged.into_group(&client.provider))?;
     roster(&group)?;
     if group.group_id().as_slice() != expected_group_id {
@@ -566,7 +694,11 @@ pub fn receive_message(state: Vec<u8>, message: Vec<u8>) -> Result<MlsTransition
                 .map(|member| (member.index, member.credential))
                 .collect();
             let removed = commit.self_removed();
+            let profile = group_profile_bytes(group.extensions())?;
             protocol(group.merge_staged_commit(&client.provider, *commit))?;
+            if group_profile_bytes(group.extensions())? != profile {
+                return Err(MlsError::InvalidInput);
+            }
             roster(&group)?;
             for member in group.members() {
                 if retained.iter().any(|(index, credential)| {
@@ -632,10 +764,10 @@ mod policy_tests {
                 .key_package
                 .is_empty()
         );
-        let short = publish_with_lifetime(identity.state, 2).unwrap();
-        let valid = publish_key_package(short.state).unwrap();
+        let short = publish_with_lifetime(identity.state, 2, None).unwrap();
+        let valid = publish_key_package(short.state, None).unwrap();
         let host = create_identity(vec![1; 16]).unwrap();
-        let group = create_group(host.state, vec![7; 32]).unwrap();
+        let group = create_group(host.state, vec![7; 32], None).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(2));
         let error = prepare_add(
             group.state.clone(),
@@ -645,7 +777,7 @@ mod policy_tests {
         .err()
         .unwrap();
         assert!(matches!(error, MlsError::LibraryRejected { ref code } if !code.is_empty()));
-        let fresh = publish_key_package(valid.state).unwrap();
+        let fresh = publish_key_package(valid.state, None).unwrap();
         let client = Client::load(fresh.state).unwrap();
         assert_eq!(
             client.snapshot.key_package,
@@ -659,17 +791,18 @@ mod policy_tests {
     #[test]
     fn create_and_join_discard_all_published_private_material() {
         let identity = create_identity(vec![2; 16]).unwrap();
-        let first = publish_key_package(identity.state).unwrap();
-        let second = publish_key_package(first.state).unwrap();
-        let created = create_group(second.state.clone(), vec![8; 32]).unwrap();
+        let first = publish_key_package(identity.state, None).unwrap();
+        let second = publish_key_package(first.state, None).unwrap();
+        let created = create_group(second.state.clone(), vec![8; 32], None).unwrap();
         let host = create_identity(vec![1; 16]).unwrap();
-        let group = create_group(host.state, vec![7; 32]).unwrap();
+        let group = create_group(host.state, vec![7; 32], None).unwrap();
         let pending = prepare_add(group.state, first.output.clone(), identity.fingerprint).unwrap();
         let joined = join_group(
             second.state,
             pending.welcome.unwrap(),
             vec![7; 32],
             host.fingerprint,
+            None,
         )
         .unwrap();
         for state in [created.state, joined.state] {
@@ -685,7 +818,7 @@ mod policy_tests {
         let mut state = create_identity(vec![2; 16]).unwrap().state;
         let mut packages = Vec::new();
         for _ in 0..9 {
-            let published = publish_key_package(state).unwrap();
+            let published = publish_key_package(state, None).unwrap();
             packages.push(published.output);
             state = published.state;
         }
@@ -727,19 +860,20 @@ mod policy_tests {
         let alice = create_identity(vec![1; 16]).unwrap();
         let bob = create_identity(vec![2; 16]).unwrap();
         let charlie = create_identity(vec![3; 16]).unwrap();
-        let group = create_group(alice.state, vec![7; 32]).unwrap();
-        let bob_package = publish_key_package(bob.state).unwrap();
+        let group = create_group(alice.state, vec![7; 32], None).unwrap();
+        let bob_package = publish_key_package(bob.state, None).unwrap();
         let pending = prepare_add(group.state, bob_package.output, bob.fingerprint).unwrap();
         let b = join_group(
             bob_package.state,
             pending.welcome.unwrap(),
             vec![7; 32],
             alice.fingerprint.clone(),
+            None,
         )
         .unwrap()
         .state;
         let a = accept_commit(pending.state, pending.output).unwrap().state;
-        let charlie_package = publish_key_package(charlie.state).unwrap();
+        let charlie_package = publish_key_package(charlie.state, None).unwrap();
         let pending = prepare_add(a, charlie_package.output, charlie.fingerprint).unwrap();
         let b = receive_message(b, pending.output.clone()).unwrap().state;
         let a = accept_commit(pending.state, pending.output).unwrap().state;
@@ -766,14 +900,15 @@ mod policy_tests {
     fn received_duplicate_identity_and_ninth_member_are_rejected() {
         let alice = create_identity(vec![1; 16]).unwrap();
         let bob = create_identity(vec![2; 16]).unwrap();
-        let group = create_group(alice.state, vec![7; 32]).unwrap();
-        let published = publish_key_package(bob.state).unwrap();
+        let group = create_group(alice.state, vec![7; 32], None).unwrap();
+        let published = publish_key_package(bob.state, None).unwrap();
         let pending = prepare_add(group.state, published.output, bob.fingerprint).unwrap();
         let mut receiver = join_group(
             published.state,
             pending.welcome.unwrap(),
             vec![7; 32],
             alice.fingerprint,
+            None,
         )
         .unwrap()
         .state;
@@ -797,7 +932,7 @@ mod policy_tests {
         let duplicate = create_identity(vec![2; 16]).unwrap();
         let (_, invalid) = unchecked_add(
             sender.clone(),
-            publish_key_package(duplicate.state).unwrap().output,
+            publish_key_package(duplicate.state, None).unwrap().output,
         );
         assert!(matches!(
             receive_message(receiver.clone(), invalid),
@@ -805,17 +940,105 @@ mod policy_tests {
         ));
         for id in 3..=8 {
             let joiner = create_identity(vec![id; 16]).unwrap();
-            let (next, commit) =
-                unchecked_add(sender, publish_key_package(joiner.state).unwrap().output);
+            let (next, commit) = unchecked_add(
+                sender,
+                publish_key_package(joiner.state, None).unwrap().output,
+            );
             receiver = receive_message(receiver, commit).unwrap().state;
             sender = next;
         }
         assert_eq!(members(receiver.clone()).unwrap().len(), 8);
         let ninth = create_identity(vec![9; 16]).unwrap();
-        let (_, invalid) = unchecked_add(sender, publish_key_package(ninth.state).unwrap().output);
+        let (_, invalid) = unchecked_add(
+            sender,
+            publish_key_package(ninth.state, None).unwrap().output,
+        );
         assert!(matches!(
             receive_message(receiver, invalid),
             Err(MlsError::InvalidInput)
         ));
+    }
+
+    fn profile(limit: u8) -> Vec<u8> {
+        let mut bytes = vec![1, 7];
+        bytes.extend_from_slice(b"example");
+        bytes.push(5);
+        bytes.extend_from_slice(b"tasks");
+        bytes.extend_from_slice(&[0, 2, limit]);
+        bytes
+    }
+
+    fn profiled_pair(limit: u8) -> (Vec<u8>, Vec<u8>) {
+        let alice = create_identity(vec![1; 16]).unwrap();
+        let bob = create_identity(vec![2; 16]).unwrap();
+        let group = create_group(alice.state, vec![7; 32], Some(profile(limit))).unwrap();
+        let published = publish_key_package(bob.state, Some(profile(limit))).unwrap();
+        let pending = prepare_add(group.state, published.output, bob.fingerprint).unwrap();
+        let receiver = join_group(
+            published.state,
+            pending.welcome.unwrap(),
+            vec![7; 32],
+            alice.fingerprint,
+            Some(profile(limit)),
+        )
+        .unwrap()
+        .state;
+        (
+            accept_commit(pending.state, pending.output).unwrap().state,
+            receiver,
+        )
+    }
+
+    #[test]
+    fn received_member_beyond_the_profiled_limit_is_rejected() {
+        let (mut sender, mut receiver) = profiled_pair(10);
+        for id in 3..=10 {
+            let joiner = create_identity(vec![id; 16]).unwrap();
+            let package = publish_key_package(joiner.state, Some(profile(10)))
+                .unwrap()
+                .output;
+            let (next, commit) = unchecked_add(sender, package);
+            receiver = receive_message(receiver, commit).unwrap().state;
+            sender = next;
+        }
+        assert_eq!(members(receiver.clone()).unwrap().len(), 10);
+        let eleventh = create_identity(vec![11; 16]).unwrap();
+        let package = publish_key_package(eleventh.state, Some(profile(10)))
+            .unwrap()
+            .output;
+        let (_, invalid) = unchecked_add(sender, package);
+        assert!(matches!(
+            receive_message(receiver, invalid),
+            Err(MlsError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn commit_changing_the_profile_is_rejected() {
+        for replacement in [Some(profile(9)), None] {
+            let (sender, receiver) = profiled_pair(10);
+            let client = Client::load(sender).unwrap();
+            let mut group = client.group().unwrap();
+            let extensions = match &replacement {
+                Some(bytes) => Extensions::from_vec(vec![
+                    Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                        &[ExtensionType::Unknown(PROFILE_EXTENSION)],
+                        &[],
+                        &[],
+                    )),
+                    Extension::Unknown(PROFILE_EXTENSION, UnknownExtension(bytes.clone())),
+                ])
+                .unwrap(),
+                None => Extensions::default(),
+            };
+            let (commit, _, _) = group
+                .update_group_context_extensions(&client.provider, extensions, &client.signer)
+                .unwrap();
+            assert!(matches!(
+                receive_message(receiver.clone(), encode(&commit).unwrap()),
+                Err(MlsError::InvalidInput)
+            ));
+            assert_eq!(group_profile(receiver).unwrap(), Some(profile(10)));
+        }
     }
 }

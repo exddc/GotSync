@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class ProtocolCompatibilityTests: XCTestCase {
     func testInvitationSecretsAreFreshAndRoundTripThroughPhrase() throws {

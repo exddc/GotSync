@@ -465,6 +465,22 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -779,6 +795,7 @@ enum MlsError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
     case InvalidState
     case LibraryRejected(code: String
     )
+    case ProfileMismatch
 
     
 
@@ -814,6 +831,7 @@ public struct FfiConverterTypeMlsError: FfiConverterRustBuffer {
         case 4: return .LibraryRejected(
             code: try FfiConverterString.read(from: &buf)
             )
+        case 5: return .ProfileMismatch
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -842,6 +860,10 @@ public struct FfiConverterTypeMlsError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
             FfiConverterString.write(code, into: &buf)
             
+        
+        case .ProfileMismatch:
+            writeInt(&buf, Int32(5))
+        
         }
     }
 }
@@ -918,12 +940,13 @@ public func acceptCommit(state: Data, acceptedCommit: Data)throws  -> MlsTransit
     )
 })
 }
-public func createGroup(state: Data, groupId: Data)throws  -> MlsTransition  {
+public func createGroup(state: Data, groupId: Data, profile: Data?)throws  -> MlsTransition  {
     return try  FfiConverterTypeMlsTransition_lift(try rustCallWithError(FfiConverterTypeMlsError_lift) {
         uniffiCallStatus in
     uniffi_gotsync_mls_fn_func_create_group(
         FfiConverterData.lower(state),
-        FfiConverterData.lower(groupId),uniffiCallStatus
+        FfiConverterData.lower(groupId),
+        FfiConverterOptionData.lower(profile),uniffiCallStatus
     )
 })
 }
@@ -943,14 +966,23 @@ public func discardCommit(state: Data)throws  -> MlsTransition  {
     )
 })
 }
-public func joinGroup(state: Data, welcome: Data, expectedGroupId: Data, inviterFingerprint: Data)throws  -> MlsTransition  {
+public func groupProfile(state: Data)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsError_lift) {
+        uniffiCallStatus in
+    uniffi_gotsync_mls_fn_func_group_profile(
+        FfiConverterData.lower(state),uniffiCallStatus
+    )
+})
+}
+public func joinGroup(state: Data, welcome: Data, expectedGroupId: Data, inviterFingerprint: Data, expectedProfile: Data?)throws  -> MlsTransition  {
     return try  FfiConverterTypeMlsTransition_lift(try rustCallWithError(FfiConverterTypeMlsError_lift) {
         uniffiCallStatus in
     uniffi_gotsync_mls_fn_func_join_group(
         FfiConverterData.lower(state),
         FfiConverterData.lower(welcome),
         FfiConverterData.lower(expectedGroupId),
-        FfiConverterData.lower(inviterFingerprint),uniffiCallStatus
+        FfiConverterData.lower(inviterFingerprint),
+        FfiConverterOptionData.lower(expectedProfile),uniffiCallStatus
     )
 })
 }
@@ -989,11 +1021,12 @@ public func prepareRemove(state: Data, memberFingerprint: Data)throws  -> MlsTra
     )
 })
 }
-public func publishKeyPackage(state: Data)throws  -> MlsTransition  {
+public func publishKeyPackage(state: Data, profile: Data?)throws  -> MlsTransition  {
     return try  FfiConverterTypeMlsTransition_lift(try rustCallWithError(FfiConverterTypeMlsError_lift) {
         uniffiCallStatus in
     uniffi_gotsync_mls_fn_func_publish_key_package(
-        FfiConverterData.lower(state),uniffiCallStatus
+        FfiConverterData.lower(state),
+        FfiConverterOptionData.lower(profile),uniffiCallStatus
     )
 })
 }
@@ -1012,6 +1045,13 @@ public func sealMessage(state: Data, plaintext: Data)throws  -> MlsTransition  {
     uniffi_gotsync_mls_fn_func_seal_message(
         FfiConverterData.lower(state),
         FfiConverterData.lower(plaintext),uniffiCallStatus
+    )
+})
+}
+public func supportedMemberCeiling() -> UInt8  {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_gotsync_mls_fn_func_supported_member_ceiling(uniffiCallStatus
     )
 })
 }
@@ -1034,7 +1074,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_gotsync_mls_checksum_func_accept_commit() != 49846) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_gotsync_mls_checksum_func_create_group() != 24189) {
+    if (uniffi_gotsync_mls_checksum_func_create_group() != 13179) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_gotsync_mls_checksum_func_create_identity() != 20019) {
@@ -1043,7 +1083,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_gotsync_mls_checksum_func_discard_commit() != 34729) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_gotsync_mls_checksum_func_join_group() != 19905) {
+    if (uniffi_gotsync_mls_checksum_func_group_profile() != 9147) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_gotsync_mls_checksum_func_join_group() != 58923) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_gotsync_mls_checksum_func_members() != 32944) {
@@ -1058,13 +1101,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_gotsync_mls_checksum_func_prepare_remove() != 36450) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_gotsync_mls_checksum_func_publish_key_package() != 5496) {
+    if (uniffi_gotsync_mls_checksum_func_publish_key_package() != 39200) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_gotsync_mls_checksum_func_receive_message() != 45398) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_gotsync_mls_checksum_func_seal_message() != 6494) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_gotsync_mls_checksum_func_supported_member_ceiling() != 60714) {
         return InitializationResult.apiChecksumMismatch
     }
 

@@ -32,7 +32,7 @@ final class SyncAppModel: ObservableObject {
         pairingRetryDelayNanoseconds: UInt64 = 1_000_000_000
     ) {
         let directory = baseDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("AccountlessSync", isDirectory: true)
-        let configuration = try! SyncConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, storageDirectory: directory, invitationURLScheme: DemoEndpoints.invitationURLScheme, endpointPolicy: DemoEndpoints.policy)
+        let configuration = try! SyncConfiguration(relayURL: relayURL, mailboxURL: mailboxURL, storageDirectory: directory, invitationURLScheme: DemoEndpoints.invitationURLScheme, endpointPolicy: DemoEndpoints.policy, groupProfile: ProductSyncPolicy.groupProfile)
         engine = SyncEngine(configuration: configuration, secretStore: keychain, backgroundMailboxScheduler: backgroundMailboxScheduler ?? SystemBackgroundMailboxScheduler.shared, pairingRetryDelayNanoseconds: pairingRetryDelayNanoseconds)
         snapshot = engine.state
         let states = engine.states()

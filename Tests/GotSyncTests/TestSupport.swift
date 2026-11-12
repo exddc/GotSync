@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import GotSyncMLS
-@testable import GotSync
+@_spi(HostJournalPreview) @testable import GotSync
 
 final class MemorySecretStore: SecretStore, @unchecked Sendable {
     private let lock = NSLock()
@@ -183,7 +183,7 @@ actor FakeMLSRelay: MLSRelayTransport {
     private var groups: [Data: Group] = [:]
     private var entries: [MLSRelayEntry] = []
     private var dropAppendResponse = false
-    private var droppedWriterAppend: (writer: Data, accepted: Int)?
+    private var droppedWriterAppend: (writer: Data, accepted: Int, unavailable: Bool)?
     private var appendsUnavailable = false
     private var unavailableAfterDrop = false
     private var holdsDroppedResponse = false
@@ -200,6 +200,21 @@ actor FakeMLSRelay: MLSRelayTransport {
     private(set) var acknowledgementCount = 0
 
     private var heldApplicationWriters: Set<Data>?
+    private var writerLimit: (count: Int, journaled: Bool)?
+    private var rejections: [Data: UInt64] = [:]
+    private var deferNextAdd = false
+    private var deferredAdd: (delivery: MLSDelivery, authorization: Data)?
+    private(set) var rateLimitedAdds = 0
+    private var rateLimitedFetches = 0
+    private var rateLimitedWriter: Data?
+    private var dropAddResponse = false
+    private var removalHook: (@Sendable () async throws -> Void)?
+    private var conditionalAppend = true
+    private var deferNextRemoval = false
+    private var deferredRemoval: (delivery: MLSDelivery, authorization: Data)?
+    private var dropRemovalResponse = false
+    private(set) var conditionalRequests = 0
+    private var fetchesLimitedAfterDrop: (count: Int, authorization: Data?) = (0, nil)
 
     /// Accepts the next append without answering. With `thenUnavailable`,
     /// every later append fails until `setAppendsUnavailable(false)`. With
@@ -222,14 +237,60 @@ actor FakeMLSRelay: MLSRelayTransport {
         heldApplicationWriters = authorizations.map { Set($0.map(Self.digest)) }
     }
 
+    /// Accepts the next Add without answering. From then on, the next
+    /// `fetches` fetches of `authorization` are rate limited, so that writer
+    /// cannot read the log to learn the Add landed.
+    func dropNextAddResponse(thenRateLimitFetches fetches: Int = 0, of authorization: Data? = nil) {
+        dropAddResponse = true
+        fetchesLimitedAfterDrop = (fetches, authorization)
+    }
+
+    /// Answers the next Adds and fetches, of `authorization` only if given,
+    /// with the relay gateway's HTTP 429 before the delivery store sees them,
+    /// so a retried entry is not deduplicated.
+    func rateLimitNext(adds: Int = 0, fetches: Int = 0, of authorization: Data? = nil) {
+        rateLimitedAdds = adds
+        rateLimitedFetches = fetches
+        rateLimitedWriter = authorization.map(Self.digest)
+    }
+
+    private func isRateLimited(_ authorization: Data) -> Bool {
+        rateLimitedWriter.map { $0 == Self.digest(authorization) } ?? true
+    }
+
+    /// Refuses an Add once the group has `count` active writers, as a relay
+    /// with a smaller writer directory does.
+    /// With `journaled`, as current relays do, an Add beyond `count` writers
+    /// is refused as `keyPackageUnavailable` and every later copy with it.
+    /// Without it, as earlier relays do, the Add receives HTTP 429.
+    func limitWriters(to count: Int?, journaled: Bool = true) {
+        writerLimit = count.map { ($0, journaled) }
+    }
+
+    /// Removes every published KeyPackage, as the relay does 15 minutes after
+    /// publication.
+    func expireKeyPackages() { packages = [:] }
+
+    /// Holds the next Add before the delivery store and reports a lost
+    /// connection; `releaseDeferredAdd()` delivers the held request later.
+    func deferNextAddBeforeStore() { deferNextAdd = true }
+
+    var holdsDeferredAdd: Bool { deferredAdd != nil }
+
+    func releaseDeferredAdd() throws {
+        guard let held = deferredAdd else { return }
+        deferredAdd = nil
+        _ = try appendNow(held.delivery, authorization: held.authorization)
+    }
+
     func activeWriterCount(group: Data) -> Int {
         groups[group]?.writers.values.filter { $0.removal == nil }.count ?? 0
     }
 
     /// Drops the response to `authorization`'s next new application entry
-    /// after `accepted` more, then makes appends unavailable.
-    func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int) {
-        droppedWriterAppend = (Self.digest(authorization), accepted)
+    /// after `accepted` more.
+    func dropAppendResponse(of authorization: Data, afterAccepting accepted: Int, thenUnavailable: Bool = true) {
+        droppedWriterAppend = (Self.digest(authorization), accepted, thenUnavailable)
     }
     var isWriterAppendDropPending: Bool { droppedWriterAppend != nil }
 
@@ -314,7 +375,87 @@ actor FakeMLSRelay: MLSRelayTransport {
         groups[group] = Group(writers: [writer: (0, nil)])
     }
 
+    /// Runs `action` when the next commit removing a writer reaches the
+    /// relay, before the relay looks at it, so other members can append
+    /// first.
+    func beforeNextRemoval(_ action: @escaping @Sendable () async throws -> Void) { removalHook = action }
+
+    /// Without it, the relay behaves like one that predates conditional
+    /// appends: it reports no support and answers them as invalid.
+    func setConditionalAppendSupported(_ supported: Bool) { conditionalAppend = supported }
+
+    /// Holds the next conditional Remove before the delivery store and
+    /// reports a lost connection; `releaseDeferredRemoval()` delivers it.
+    func deferNextRemovalBeforeStore() { deferNextRemoval = true }
+
+    @discardableResult
+    func releaseDeferredRemoval() throws -> MLSAppendResult? {
+        guard let held = deferredRemoval else { return nil }
+        deferredRemoval = nil
+        return try appendIfHeadNow(held.delivery, authorization: held.authorization)
+    }
+
+    /// Accepts the next conditional Remove without answering.
+    func dropNextRemovalResponse() { dropRemovalResponse = true }
+
+    func supportsConditionalAppend(group: Data, authorization: Data) throws -> Bool {
+        _ = try authorize(group: group, authorization: authorization)
+        return conditionalAppend
+    }
+
+    func appendIfHead(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        conditionalRequests += 1
+        if delivery.removeWriter != nil, let hook = removalHook {
+            removalHook = nil
+            try await hook()
+        }
+        if deferNextRemoval {
+            deferNextRemoval = false
+            deferredRemoval = (delivery, authorization)
+            throw URLError(.networkConnectionLost)
+        }
+        let result = try appendIfHeadNow(delivery, authorization: authorization)
+        if dropRemovalResponse, case .accepted = result {
+            dropRemovalResponse = false
+            throw URLError(.networkConnectionLost)
+        }
+        return result
+    }
+
+    /// The store's order: authorization, an accepted duplicate, the head
+    /// precondition, then the ordinary append checks.
+    private func appendIfHeadNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        guard conditionalAppend else { throw MLSRelayError.rejected(status: 400, code: "invalidRequest") }
+        guard let expected = delivery.expectedHead, delivery.kind == .commit, delivery.removeWriter != nil else {
+            throw MLSRelayError.rejected(status: 400, code: "invalidRequest")
+        }
+        if appendsUnavailable || offlineWriters.contains(Self.digest(authorization)) {
+            throw URLError(.notConnectedToInternet)
+        }
+        guard groups[delivery.group]?.writers[Self.digest(authorization)].map({ $0.removal == nil }) == true else {
+            throw MLSRelayError.unauthorized
+        }
+        let stored = delivery.withoutExpectedHead
+        if let duplicate = entries.first(where: { $0.delivery.group == delivery.group && $0.delivery.payload == delivery.payload }) {
+            guard duplicate.delivery == stored else { throw MLSRelayError.epochConflict }
+            return .accepted(cursor: duplicate.cursor)
+        }
+        let head = head(of: delivery.group)
+        guard expected <= head else { throw MLSRelayError.rejected(status: 400, code: "invalidRequest") }
+        guard expected == head else { return .headAdvanced(head: head) }
+        return try appendNow(stored, authorization: authorization)
+    }
+
+    func head(of group: Data) -> UInt64 {
+        entries.last { $0.delivery.group == group }?.cursor ?? 0
+    }
+
     func append(_ delivery: MLSDelivery, authorization: Data) async throws -> MLSAppendResult {
+        guard delivery.expectedHead == nil else { throw MLSRelayError.invalidRequest }
+        if delivery.removeWriter != nil, let hook = removalHook {
+            removalHook = nil
+            try await hook()
+        }
         let dropping = dropAppendResponse
         do {
             return try appendNow(delivery, authorization: authorization)
@@ -327,6 +468,15 @@ actor FakeMLSRelay: MLSRelayTransport {
     }
 
     private func appendNow(_ delivery: MLSDelivery, authorization: Data) throws -> MLSAppendResult {
+        if deferNextAdd, delivery.welcome != nil {
+            deferNextAdd = false
+            deferredAdd = (delivery, authorization)
+            throw URLError(.networkConnectionLost)
+        }
+        if rateLimitedAdds > 0, delivery.welcome != nil, isRateLimited(authorization) {
+            rateLimitedAdds -= 1
+            throw MLSRelayError.rateLimited
+        }
         if appendsUnavailable || offlineWriters.contains(Self.digest(authorization)) {
             rejectedAppends += 1
             throw URLError(.notConnectedToInternet)
@@ -341,6 +491,8 @@ actor FakeMLSRelay: MLSRelayTransport {
         if let duplicate = entries.first(where: { $0.delivery.group == delivery.group && $0.delivery.payload == delivery.payload }) {
             return try respond(.accepted(cursor: duplicate.cursor))
         }
+        let digest = Self.digest(delivery.group + delivery.payload)
+        if let epoch = rejections[digest] { return .keyPackageUnavailable(epoch: epoch) }
         guard delivery.epoch == groups[delivery.group]?.epoch else { throw MLSRelayError.epochConflict }
         if let unacknowledgedLimit, let group = groups[delivery.group] {
             let floor = group.writers.values.filter { $0.removal == nil }.map(\.ack).min() ?? 0
@@ -349,6 +501,12 @@ actor FakeMLSRelay: MLSRelayTransport {
         }
         if let reference = delivery.keyPackageReference {
             guard let package = packages[reference], package.writer == delivery.addWriter else {
+                rejections[digest] = delivery.epoch
+                return .keyPackageUnavailable(epoch: delivery.epoch)
+            }
+            if let writerLimit, activeWriterCount(group: delivery.group) >= writerLimit.count {
+                guard writerLimit.journaled else { throw MLSRelayError.capacityReached }
+                rejections[digest] = delivery.epoch
                 return .keyPackageUnavailable(epoch: delivery.epoch)
             }
             packages[reference] = nil
@@ -365,15 +523,26 @@ actor FakeMLSRelay: MLSRelayTransport {
         if let drop = droppedWriterAppend, drop.writer == sender, delivery.kind == .application {
             guard drop.accepted > 0 else {
                 droppedWriterAppend = nil
-                appendsUnavailable = true
+                appendsUnavailable = drop.unavailable
                 throw URLError(.networkConnectionLost)
             }
-            droppedWriterAppend = (drop.writer, drop.accepted - 1)
+            droppedWriterAppend = (drop.writer, drop.accepted - 1, drop.unavailable)
+        }
+        if dropAddResponse, delivery.welcome != nil {
+            dropAddResponse = false
+            if fetchesLimitedAfterDrop.count > 0 {
+                rateLimitNext(fetches: fetchesLimitedAfterDrop.count, of: fetchesLimitedAfterDrop.authorization)
+            }
+            throw URLError(.networkConnectionLost)
         }
         return try respond(.accepted(cursor: cursor))
     }
 
     func fetch(group: Data, after cursor: UInt64, limit: Int, authorization: Data) throws -> [MLSRelayEntry] {
+        if rateLimitedFetches > 0, isRateLimited(authorization) {
+            rateLimitedFetches -= 1
+            throw MLSRelayError.rateLimited
+        }
         if offlineWriters.contains(Self.digest(authorization)) { throw URLError(.notConnectedToInternet) }
         if let budget = fetchBudgets[Self.digest(authorization)] {
             guard budget > 0 else {

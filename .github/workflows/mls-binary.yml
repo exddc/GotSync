@@ -6,6 +6,10 @@ on:
         description: Release tag, for example mls-ffi-0.1.1
         required: true
         type: string
+      prerelease:
+        description: Mark this binary as a prerelease
+        default: false
+        type: boolean
 permissions:
   contents: write
 jobs:
@@ -15,6 +19,7 @@ jobs:
     env:
       GOTSYNC_CACHE_DIR: ${{ github.workspace }}/../gotsync-cache
       TAG: ${{ inputs.tag }}
+      PRERELEASE: ${{ inputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -36,7 +41,9 @@ jobs:
         run: |
           python3 scripts/package-mls.py "$RUNNER_TEMP/mls-package"
           checksum="$(cut -d ' ' -f 1 "$RUNNER_TEMP/mls-package/gotsync_mlsFFI.xcframework.zip.sha256")"
-          gh release create "$TAG" "$RUNNER_TEMP"/mls-package/* --target "$GITHUB_SHA" --latest=false \
+          release_flags=(--latest=false)
+          if [ "$PRERELEASE" = "true" ]; then release_flags+=(--prerelease); fi
+          gh release create "$TAG" "$RUNNER_TEMP"/mls-package/* --target "$GITHUB_SHA" "${release_flags[@]}" \
             --title "MLS binary $TAG" --notes "SwiftPM checksum: \`$checksum\`"
           {
             echo "Pin this binary on the same commit, then commit the result:"

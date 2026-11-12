@@ -11,6 +11,10 @@ public enum MnemonicError: Error, Equatable {
 }
 
 enum MnemonicCodec {
+    /// One word per secret byte plus one checksum word.
+    static let secretLength = 16
+    static let wordCount = secretLength + 1
+
     /// 256 single words (one per byte). No hyphens or compound tokens.
     static let words: [String] = [
         "able", "acid", "acre", "aged", "ahead", "aid", "aim", "air",
@@ -57,7 +61,7 @@ enum MnemonicCodec {
     }()
 
     static func encode(_ secret: Data) -> String {
-        precondition(secret.count == 16)
+        precondition(secret.count == secretLength)
         var bytes = Array(secret)
         bytes.append(secret.sha256[0])
         return bytes.map { words[Int($0)] }.joined(separator: " ")
@@ -68,7 +72,7 @@ enum MnemonicCodec {
             .lowercased()
             .split(whereSeparator: \.isWhitespace)
             .map(String.init)
-        guard tokens.count == 17 else {
+        guard tokens.count == wordCount else {
             throw MnemonicError.invalidWordCount
         }
 
@@ -78,8 +82,8 @@ enum MnemonicCodec {
             }
             return value
         }
-        let secret = Data(bytes.prefix(16))
-        guard bytes[16] == secret.sha256[0] else {
+        let secret = Data(bytes.prefix(secretLength))
+        guard bytes[secretLength] == secret.sha256[0] else {
             throw MnemonicError.invalidChecksum
         }
         return secret

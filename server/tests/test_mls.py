@@ -5,7 +5,7 @@ import hashlib
 
 import pytest
 
-from gotsync_server.mls import MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
+from gotsync_server.mls import MAX_WRITERS, MLSDeliveryServer, MLSDeliveryStore, DeliveryConflict, DeliveryCapacity, DeliveryUnauthorized, HistoryExpired
 from gotsync_server.server import _argument_parser
 from gotsync_server.http import RequestError, UnsupportedVersion, encode_base64url
 
@@ -146,17 +146,65 @@ def test_key_package_writer_mismatch_is_terminal(tmp_path):
     store.close()
 
 
-def test_writer_capacity_does_not_consume_package(tmp_path):
-    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
-    for index in range(7):
-        token = bytes([index + 2]) * 32
+def add_writers(store, count, first_epoch=0):
+    tokens = []
+    for index in range(count):
+        token = bytes([index + 2 + first_epoch]) * 32
         package = request(store, "key-package/publish", payload=encode_base64url(token), authorization=encode_base64url(token))["reference"]
-        append(store, payload=token, epoch=index, reference=package, welcome=encode_base64url(b"welcome"),
+        append(store, payload=token, epoch=first_epoch + index, reference=package, welcome=encode_base64url(b"welcome"),
                addWriter=encode_base64url(hashlib.sha256(token).digest()))
-    package = request(store, "key-package/publish", payload=encode_base64url(b"ninth package"))["reference"]
-    with pytest.raises(DeliveryCapacity):
-        append(store, payload=b"ninth", epoch=7, reference=package, welcome=encode_base64url(b"welcome"))
+        tokens.append(token)
+    return tokens
+
+
+def active_writers(store):
+    return store._db.execute("SELECT COUNT(*) FROM mls_writers WHERE removal IS NULL").fetchone()[0]
+
+
+def test_writer_ceiling_refusal_is_journaled_and_does_not_consume_package(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    tokens = add_writers(store, MAX_WRITERS - 1)
+    assert active_writers(store) == MAX_WRITERS == 10
+    package = request(store, "key-package/publish", payload=encode_base64url(b"eleventh package"))["reference"]
+    refused = append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome"))
+    assert refused == {"version": 2, "error": "keyPackageUnavailable", "epoch": MAX_WRITERS - 1}
+    assert append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome")) == refused
     assert request(store, "key-package/fetch", reference=package)["payload"] is not None
+    assert active_writers(store) == MAX_WRITERS
+    assert len(request(store, "fetch", group=encode_base64url(b"g" * 32), after=0, limit=32)["entries"]) == MAX_WRITERS - 1
+    leaving = encode_base64url(tokens[4])
+    request(store, "append", group=encode_base64url(b"g" * 32), epoch=MAX_WRITERS - 1, kind="proposal",
+            payload=encode_base64url(b"leave"), authorization=leaving)
+    assert active_writers(store) == MAX_WRITERS - 1
+    assert append(store, payload=b"eleventh", epoch=MAX_WRITERS - 1, reference=package, welcome=encode_base64url(b"welcome")) == refused
+    assert active_writers(store) == MAX_WRITERS - 1
+    store.close()
+
+
+def test_accepted_add_stays_a_duplicate_after_the_ceiling_is_reached(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    add_writers(store, MAX_WRITERS - 2)
+    token = b"z" * 32
+    package = request(store, "key-package/publish", payload=encode_base64url(token), authorization=encode_base64url(token))["reference"]
+    values = dict(payload=token, epoch=MAX_WRITERS - 2, reference=package, welcome=encode_base64url(b"welcome"),
+                  addWriter=encode_base64url(hashlib.sha256(token).digest()))
+    accepted = append(store, **values)
+    assert "entry" in accepted and active_writers(store) == MAX_WRITERS
+    assert append(store, **values) == accepted
+    store.close()
+
+
+def test_removed_writer_frees_a_slot_for_its_replacement(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    tokens = add_writers(store, MAX_WRITERS - 1)
+    removed = encode_base64url(hashlib.sha256(tokens[3]).digest())
+    append(store, payload=b"remove fifth", epoch=MAX_WRITERS - 1, removeWriter=removed)
+    assert active_writers(store) == MAX_WRITERS - 1
+    add_writers(store, 1, first_epoch=MAX_WRITERS)
+    assert active_writers(store) == MAX_WRITERS
+    with pytest.raises(DeliveryUnauthorized):
+        request(store, "append", group=encode_base64url(b"g" * 32), epoch=MAX_WRITERS + 1, kind="application",
+                payload=encode_base64url(b"from removed"), authorization=encode_base64url(tokens[3]))
     store.close()
 
 
@@ -796,3 +844,146 @@ def test_retention_configuration(tmp_path):
     for invalid in ("0.5", "inf", "nan", "soon"):
         with pytest.raises(SystemExit):
             _argument_parser().parse_args(["--retention-days", invalid])
+
+
+def conditional(store, payload, expected_head, epoch, removed=b"r" * 32, **values):
+    values.setdefault("authorization", encode_base64url(b"a" * 32))
+    values.setdefault("kind", "commit")
+    return request(store, "append-if-head", group=encode_base64url(b"g" * 32), epoch=epoch, payload=encode_base64url(payload),
+                   removeWriter=encode_base64url(removed), expectedHead=expected_head, **values)
+
+
+def group_head(store):
+    return store._db.execute("SELECT head FROM mls_groups").fetchone()[0]
+
+
+def two_writer_group(tmp_path):
+    store = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    add_writers(store, 1)
+    return store
+
+
+def test_conditional_remove_lands_only_at_the_expected_head(tmp_path):
+    store = two_writer_group(tmp_path)
+    head = group_head(store)
+    accepted = conditional(store, b"remove silent", head, epoch=1)
+    assert accepted["entry"]["cursor"] == head + 1
+    assert accepted["entry"]["removeWriter"] == encode_base64url(b"r" * 32)
+    assert group_head(store) == head + 1
+    store.close()
+
+
+def test_activity_after_the_observed_head_refuses_every_copy(tmp_path):
+    store = two_writer_group(tmp_path)
+    observed = group_head(store)
+    append(store, payload=b"joiner speaks", epoch=1, kind="application", authorization=encode_base64url(bytes([2]) * 32))
+    refused = conditional(store, b"remove silent", observed, epoch=1)
+    assert refused == {"version": 2, "error": "headAdvanced", "head": observed + 1}
+    assert conditional(store, b"remove silent", observed, epoch=1) == refused
+    append(store, payload=b"more traffic", epoch=1, kind="application")
+    assert conditional(store, b"remove silent", observed, epoch=1)["error"] == "headAdvanced"
+    entries = request(store, "fetch", group=encode_base64url(b"g" * 32), after=0, limit=32)["entries"]
+    assert not any(entry["removeWriter"] for entry in entries)
+    store.close()
+
+
+def test_accepted_conditional_remove_is_a_duplicate_before_its_precondition(tmp_path):
+    store = two_writer_group(tmp_path)
+    observed = group_head(store)
+    accepted = conditional(store, b"remove silent", observed, epoch=1)
+    append(store, payload=b"later traffic", epoch=2, kind="application")
+    assert conditional(store, b"remove silent", observed, epoch=1) == accepted
+    with pytest.raises(DeliveryConflict):
+        conditional(store, b"remove silent", observed, epoch=1, removed=b"x" * 32)
+    store.close()
+
+
+def test_head_survives_pruning_and_stays_monotonic(tmp_path):
+    store = two_writer_group(tmp_path)
+    append(store, payload=b"traffic", epoch=1, kind="application")
+    head = group_head(store)
+    for token in (b"a" * 32, bytes([2]) * 32):
+        request(store, "ack", route=encode_base64url(b"g" * 32), cursor=head, authorization=encode_base64url(token))
+    assert store._db.execute("SELECT COUNT(*) FROM mls_entries").fetchone()[0] == 0
+    assert group_head(store) == head
+    assert conditional(store, b"stale", head - 1, epoch=1)["error"] == "headAdvanced"
+    assert "entry" in conditional(store, b"current", head, epoch=1)
+    store.close()
+
+
+def test_conditional_append_rejects_invalid_requests(tmp_path):
+    store = two_writer_group(tmp_path)
+    head = group_head(store)
+    for expected in (head + 1, -1, "1", True, None, 2**53):
+        with pytest.raises(RequestError):
+            conditional(store, b"remove", expected, epoch=1)
+    with pytest.raises(RequestError):
+        request(store, "append-if-head", group=encode_base64url(b"g" * 32), epoch=1, kind="commit",
+                payload=encode_base64url(b"remove"), removeWriter=encode_base64url(b"r" * 32),
+                authorization=encode_base64url(b"a" * 32))
+    for kind in ("application", "proposal"):
+        with pytest.raises(RequestError):
+            conditional(store, b"not a removal", head, epoch=1, kind=kind)
+    with pytest.raises(RequestError):
+        request(store, "append-if-head", group=encode_base64url(b"g" * 32), epoch=1, kind="commit",
+                payload=encode_base64url(b"commit"), expectedHead=head, authorization=encode_base64url(b"a" * 32))
+    with pytest.raises(DeliveryUnauthorized):
+        conditional(store, b"remove", head, epoch=1, authorization=encode_base64url(b"z" * 32))
+    with pytest.raises(RequestError):
+        append(store, payload=b"ordinary", epoch=1, kind="application", expectedHead=head)
+    assert group_head(store) == head
+    store.close()
+
+
+def test_capabilities_require_a_writer(tmp_path):
+    store = two_writer_group(tmp_path)
+    assert request(store, "capabilities", group=encode_base64url(b"g" * 32),
+                   authorization=encode_base64url(b"a" * 32)) == {"version": 2, "conditionalAppend": True}
+    with pytest.raises(DeliveryUnauthorized):
+        request(store, "capabilities", group=encode_base64url(b"g" * 32), authorization=encode_base64url(b"z" * 32))
+    store.close()
+
+
+def test_conditional_append_holds_the_database_write_lock_across_connections(tmp_path, monkeypatch):
+    first = two_writer_group(tmp_path)
+    second = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    observed = group_head(first)
+    checked = __import__("threading").Event()
+    release = __import__("threading").Event()
+    original = MLSDeliveryStore._check_membership
+
+    def paused(self, route, entry):
+        if self is first:
+            checked.set()
+            assert release.wait(5)
+        return original(self, route, entry)
+
+    monkeypatch.setattr(MLSDeliveryStore, "_check_membership", paused)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        removal = pool.submit(conditional, first, b"remove silent", observed, 1)
+        assert checked.wait(5)
+        probe = sqlite3.connect(tmp_path / "mls.sqlite3", timeout=0)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            probe.execute("BEGIN IMMEDIATE")
+        probe.close()
+        speaking = pool.submit(append, second, b"joiner speaks", 1, "application",
+                               authorization=encode_base64url(bytes([2]) * 32))
+        __import__("time").sleep(0.3)
+        assert not speaking.done(), "another connection appended inside the conditional transaction"
+        release.set()
+        assert removal.result(5)["entry"]["cursor"] == observed + 1
+        with pytest.raises(DeliveryConflict):
+            speaking.result(10)
+    assert group_head(first) == observed + 1
+    second.close()
+    first.close()
+
+
+def test_activity_from_another_connection_first_refuses_the_conditional_remove(tmp_path):
+    first = two_writer_group(tmp_path)
+    second = MLSDeliveryStore(tmp_path / "mls.sqlite3")
+    observed = group_head(first)
+    append(second, payload=b"joiner speaks", epoch=1, kind="application", authorization=encode_base64url(bytes([2]) * 32))
+    assert conditional(first, b"remove silent", observed, epoch=1) == {"version": 2, "error": "headAdvanced", "head": observed + 1}
+    second.close()
+    first.close()

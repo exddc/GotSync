@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 import GotSyncMLS
 
 struct SecretStoreMLSStateKey: MLSStateKeyProvider {
@@ -34,6 +35,14 @@ enum MLSSessionError: Error, Equatable {
     case groupMismatch
     case removed
     case unresolvedConflict
+    case profileMismatch
+}
+
+struct MLSOperationCount: Equatable, Sendable {
+    var started: UInt64 = 0
+    var finished: UInt64 = 0
+
+    var isIdle: Bool { started == finished }
 }
 
 actor MLSSession {
@@ -45,7 +54,13 @@ actor MLSSession {
     private let fetchLimit: Int
     private var acknowledged: UInt64 = 0
     private var keepsInbox = true
+    /// The relay's answer to `supportsConditionalAppend`, asked once per
+    /// session.
+    private var conditionalAppendSupported: Bool?
     private var tail: Task<Void, Never>?
+    /// Set when closing begins; no exclusive operation is admitted after it.
+    private var isClosing = false
+    private let operations = OSAllocatedUnfairLock(initialState: MLSOperationCount())
 
     init(
         directory: URL,
@@ -80,11 +95,18 @@ actor MLSSession {
         try secretStore.delete(account: keyAccount)
     }
 
+    /// Operations that may fetch or process relay entries, counted when
+    /// they are queued and when they end. An owner that saw the inbox while
+    /// none ran knows it is unchanged for as long as this count is.
+    nonisolated var operationCount: MLSOperationCount { operations.withLock { $0 } }
+
     func fingerprint() async throws -> Data { try await client.fingerprint() }
     func group() async throws -> Data? { try await client.group() }
     func epoch() async throws -> UInt64 { try await client.epoch() }
     func cursor() async throws -> UInt64 { try await client.cursor() }
     func members() async throws -> [MLSMember] { try await client.members() }
+    func groupProfile() async throws -> Data? { try await client.groupProfile() }
+    func spokenMembers() async throws -> Set<Data> { try await client.spokenMembers() }
     func isRemoved() async throws -> Bool { try await client.isRemoved() }
     func pendingDelivery() async throws -> MLSDelivery? { try await client.pendingDelivery() }
     func rejectedCommit() async throws -> MLSDelivery? { try await client.rejectedCommit() }
@@ -103,10 +125,18 @@ actor MLSSession {
         try await client.acknowledgeInbox(through: cursor)
     }
 
-    func publishKeyPackage(pairingToken: Data) async throws -> MLSPublishedKeyPackage {
+    /// Stops keeping application plaintext for the rest of this session's
+    /// life, including a later departure from its slot.
+    func setControlOnly() async throws {
+        try await exclusive { session in try await session.client.setControlOnly() }
+    }
+
+    func isControlOnly() async throws -> Bool { try await client.isControlOnly() }
+
+    func publishKeyPackage(pairingToken: Data, profile: Data?) async throws -> MLSPublishedKeyPackage {
         guard pairingToken.count == 32 else { throw MLSRelayError.invalidRequest }
         return try await exclusive { session in
-            let identity = try await session.client.joiningIdentity()
+            let identity = try await session.client.joiningIdentity(profile: profile)
             let reference = try await session.transport.publishKeyPackage(
                 identity.keyPackage,
                 authorization: session.client.transportAuthorization(),
@@ -120,14 +150,17 @@ actor MLSSession {
         try await transport.fetchKeyPackage(reference: reference, pairingToken: pairingToken)
     }
 
-    func createGroup(_ id: Data) async throws {
+    /// Creates the group with `profile`, or registers it again with the
+    /// relay when this member already holds it with the same profile.
+    func createGroup(_ id: Data, profile: Data?) async throws {
         guard id.count == 32 else { throw MLSRelayError.invalidRequest }
         try await exclusive { session in
             switch try await session.client.group() {
-            case nil: try await session.client.createGroup(id: id)
+            case nil: try await session.client.createGroup(id: id, profile: profile)
             case id?: break
             default: throw MLSSessionError.groupMismatch
             }
+            guard try await session.client.groupProfile() == profile else { throw MLSSessionError.profileMismatch }
             try await session.transport.createGroup(id, authorization: session.client.transportAuthorization())
         }
     }
@@ -155,9 +188,17 @@ actor MLSSession {
         }
     }
 
-    func remove(fingerprint: Data) async throws -> MLSSubmission {
+    /// With `onlyIfSilent`, the member is removed only through
+    /// `removeSilent`, so a message it sent before the Remove keeps it.
+    func remove(fingerprint: Data, onlyIfSilent: Bool = false) async throws -> MLSSubmission {
         try await exclusive { session in
-            try await session.submit { client in
+            if onlyIfSilent {
+                return try await session.removeSilent { spoken, members, own in
+                    fingerprint != own && !spoken.contains(fingerprint) && members.contains { $0.fingerprint == fingerprint }
+                        ? fingerprint : nil
+                } ?? .superseded
+            }
+            return try await session.submit { client in
                 guard try await client.members().contains(where: { $0.fingerprint == fingerprint }) else {
                     return nil
                 }
@@ -179,7 +220,12 @@ actor MLSSession {
     /// drops unread plaintext when its inbox is full, and a full relay log
     /// makes it catch up and acknowledge first, so neither backlog can block
     /// the leave.
-    func leave() async throws {
+    ///
+    /// First, an Add still pending is delivered, because its outcome may be
+    /// unknown. After reading the log, the member it added and the members in
+    /// `withdrawing` are removed unless they sent an application message:
+    /// only this member knows they may never have joined.
+    func leave(withdrawing: [Data] = []) async throws {
         try await exclusive { session in
             session.keepsInbox = false
             guard let group = try await session.client.group() else { throw MLSSessionError.notInGroup }
@@ -188,6 +234,7 @@ actor MLSSession {
                 throw MLSSessionError.removed
             }
             let authorization = try await session.client.transportAuthorization()
+            try await session.client.withdrawPendingAdd()
             for _ in 0..<Self.maximumSubmitAttempts {
                 if try await session.client.isRemoved() { throw MLSSessionError.removed }
                 if let pending = try await session.client.pendingDelivery(), pending.kind != .proposal {
@@ -197,6 +244,19 @@ actor MLSSession {
                         _ = try await session.catchUp()
                     }
                     continue
+                }
+                let writer = try await session.client.withdrawnAddWriter()
+                if writer != nil || !withdrawing.isEmpty, try await session.client.pendingDelivery() == nil {
+                    let removal = try await session.removeSilent { spoken, members, own in
+                        members.first {
+                            $0.fingerprint != own && !spoken.contains($0.fingerprint)
+                                && (withdrawing.contains($0.fingerprint) || $0.writerHash == writer)
+                        }?.fingerprint
+                    }
+                    if removal != nil { continue }
+                    if writer != nil {
+                        try await session.client.clearWithdrawnAdd()
+                    }
                 }
                 let proposal: MLSDelivery
                 if let pending = try await session.client.pendingDelivery() {
@@ -231,7 +291,7 @@ actor MLSSession {
         try await exclusive { session in try await session.catchUp() }
     }
 
-    func join(group: Data, keyPackageReference: Data, verifiedInviterFingerprint: Data) async throws -> Bool {
+    func join(group: Data, keyPackageReference: Data, verifiedInviterFingerprint: Data, profile: Data?) async throws -> Bool {
         try await exclusive { session in
             guard try await session.client.group() == nil else { throw MLSSessionError.groupMismatch }
             let authorization = try await session.client.transportAuthorization()
@@ -254,7 +314,8 @@ actor MLSSession {
                         welcome: welcome,
                         group: group,
                         verifiedInviterFingerprint: verifiedInviterFingerprint,
-                        cursor: entry.cursor
+                        cursor: entry.cursor,
+                        expectedProfile: profile
                     )
                     _ = try await session.catchUp()
                     return true
@@ -283,13 +344,20 @@ actor MLSSession {
         return try await deliverPending()
     }
 
+    /// A pending entry leaves only on a terminal answer from the delivery
+    /// store: accepted, including as a duplicate of an earlier copy, refused
+    /// with a journaled `keyPackageUnavailable`, or overtaken by another
+    /// commit at its epoch. Any other failure keeps it, and a later call sends
+    /// the same bytes again, which the store deduplicates.
     private func deliverPending() async throws -> MLSSubmission {
         let authorization = try await client.transportAuthorization()
         for _ in 0..<Self.maximumSubmitAttempts {
             guard let pending = try await client.pendingDelivery() else { return .superseded }
             let result: MLSAppendResult
             do {
-                result = try await transport.append(pending, authorization: authorization)
+                result = pending.expectedHead == nil
+                    ? try await transport.append(pending, authorization: authorization)
+                    : try await transport.appendIfHead(pending, authorization: authorization)
             } catch MLSRelayError.epochConflict {
                 _ = try await catchUp()
                 if try await client.isRemoved() { throw MLSSessionError.removed }
@@ -306,9 +374,42 @@ actor MLSSession {
             case .keyPackageUnavailable(let epoch):
                 try await client.rejectAddForUnavailableKeyPackage(commit: pending.payload, rejectedEpoch: epoch)
                 return .superseded
+            case .headAdvanced:
+                try await client.discardRefusedRemove(pending)
+                return .superseded
             }
         }
         throw MLSSessionError.unresolvedConflict
+    }
+
+    /// Removes the member `choose` picks from the activity evidence, the
+    /// roster and this member's fingerprint, ordered against every other
+    /// writer: it reads the log to its head, chooses, and sends a Remove the
+    /// relay appends only while its head is still the position just read. A
+    /// message appended in between refuses the Remove for good, and the next
+    /// call reads it first. Returns `nil` when nobody is chosen or the relay
+    /// cannot append conditionally, in which case nothing is removed.
+    private func removeSilent(
+        _ choose: (_ spoken: Set<Data>, _ members: [MLSMember], _ own: Data) -> Data?
+    ) async throws -> MLSSubmission? {
+        guard let group = try await client.group() else { throw MLSSessionError.notInGroup }
+        _ = try await catchUp()
+        if try await client.isRemoved() { throw MLSSessionError.removed }
+        if conditionalAppendSupported == nil {
+            conditionalAppendSupported = try await transport.supportsConditionalAppend(
+                group: group, authorization: client.transportAuthorization()
+            )
+        }
+        guard conditionalAppendSupported == true else { return nil }
+        var prepared = false
+        let result = try await submit { client in
+            guard let target = choose(
+                try await client.spokenMembers(), try await client.members(), try await client.fingerprint()
+            ) else { return nil }
+            prepared = true
+            return try await client.prepareRemove(fingerprint: target, expectedHead: try await client.cursor())
+        }
+        return prepared ? result : nil
     }
 
     private func catchUp() async throws -> Int {
@@ -358,11 +459,31 @@ actor MLSSession {
         try await client.confirmRemovalAcknowledged()
     }
 
+    /// Waits for the queued operations, then closes the client's store, so
+    /// no write to the session's files can follow.
+    func close() async throws {
+        guard await close(after: { _ in () }).closed else { throw MLSClientError.storageUnavailable }
+    }
+
+    /// Refuses new exclusive operations, waits for the ones already
+    /// accepted, then reads the final state and closes the store in one
+    /// client turn.
+    func close<T: Sendable>(
+        after read: @Sendable (isolated MLSClient) throws -> T
+    ) async -> (result: Result<T, any Error>, closed: Bool) {
+        isClosing = true
+        await tail?.value
+        return await client.close(after: read)
+    }
+
     private func exclusive<T: Sendable>(
         _ operation: @escaping @Sendable (isolated MLSSession) async throws -> T
     ) async throws -> T {
+        guard !isClosing else { throw MLSClientError.storageUnavailable }
         let previous = tail
+        operations.withLock { $0.started &+= 1 }
         let task = Task {
+            defer { self.operations.withLock { $0.finished &+= 1 } }
             _ = await previous?.result
             return try await operation(self)
         }

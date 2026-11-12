@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 
+from gotsync_server.blob_format import PART_BYTES, TAG_BYTES, layout, object_id
 from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect
 
@@ -37,6 +39,7 @@ def send_request(
     *,
     tls: bool = True,
     content_length: int | None = None,
+    content_type: str | None = "application/json",
 ) -> tuple[int, http.client.HTTPMessage, bytes]:
     sock = tls_socket(via) if tls else socket.create_connection((via, 80), timeout=10)
     lines = [
@@ -44,8 +47,9 @@ def send_request(
         f"Host: {HOST}",
         "Connection: close",
         f"Content-Length: {len(body) if content_length is None else content_length}",
-        "Content-Type: application/json",
     ]
+    if content_type is not None:
+        lines.append(f"Content-Type: {content_type}")
     lines += [f"{name}: {value}" for name, value in (headers or {}).items()]
     sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
     response = http.client.HTTPResponse(sock)
@@ -194,5 +198,241 @@ def check_admission() -> None:
     expect(proxy_rejections > 0, "Traefik rate-limits rapid pairing handshakes from one source")
 
 
+BLOB_CAPABILITY = {
+    "version": 1, "partBytes": 524304, "maxObjectBytes": 10486080, "maxParts": 20,
+    "groupQuotaBytes": 201326592, "retentionSeconds": 2592000, "incompleteSeconds": 86400,
+}
+
+
+def b64(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def bearer(token: bytes) -> dict[str, str]:
+    return {"Authorization": f"Bearer {b64(token)}"}
+
+
+def is_json(data: bytes) -> bool:
+    try:
+        json.loads(data)
+    except ValueError:
+        return False
+    return True
+
+
+def mls_call(via: str, operation: str, token: bytes, **values) -> tuple[int, dict]:
+    body = json.dumps({"version": 2, **values}).encode()
+    status, _, data = send_request(via, "POST", f"/v2/mls/{operation}", body, bearer(token))
+    return status, json.loads(data)
+
+
+def blob_call(via: str, operation: str, token: bytes, headers: dict[str, str] | None = None,
+              **values) -> tuple[int, http.client.HTTPMessage, bytes]:
+    body = json.dumps({"version": 2, **values}).encode()
+    return send_request(via, "POST", f"/v2/mls/blob/{operation}", body, {**bearer(token), **(headers or {})})
+
+
+def blob_part(via: str, operation: str, group: bytes, object_: bytes, index: int, token: bytes, body: bytes = b"",
+              headers: dict[str, str] | None = None) -> tuple[int, http.client.HTTPMessage, bytes]:
+    return send_request(
+        via, "POST", f"/v2/mls/blob/{operation}/{b64(group)}/{b64(object_)}/{index}", body,
+        {**bearer(token), **(headers or {})},
+        content_type="application/octet-stream" if operation == "put" else None,
+    )
+
+
+def new_group(via: str = ALLOWED) -> tuple[bytes, bytes]:
+    group, token = os.urandom(32), os.urandom(32)
+    status, _ = mls_call(via, "create", token, group=b64(group))
+    expect(status == 200, "a test writer creates an MLS group through Traefik")
+    return group, token
+
+
+def synthetic_object(group: bytes, length: int) -> tuple[bytes, list[bytes], list[bytes]]:
+    parts_count, last = layout(length)
+    parts = [os.urandom(PART_BYTES) for _ in range(parts_count - 1)] + [os.urandom(last)]
+    hashes = [hashlib.sha256(part).digest() for part in parts]
+    return object_id(group, length, tuple(hashes)), hashes, parts
+
+
+def begin(via: str, group: bytes, token: bytes, length: int,
+          headers: dict[str, str] | None = None) -> tuple[int, bytes, bytes, list[bytes]]:
+    object_, hashes, parts = synthetic_object(group, length)
+    status, _, data = blob_call(via, "begin", token, headers, group=b64(group), object=b64(object_),
+                                length=length, parts=[b64(value) for value in hashes])
+    return status, data, object_, parts
+
+
+def expect_not_found(status: int, data: bytes, message: str) -> None:
+    expect(status == 404 and json.loads(data) == {"error": "notFound", "version": 2}, message)
+
+
+def check_blobs_off() -> None:
+    group, token = new_group()
+    status, document = mls_call(ALLOWED, "capabilities", token, group=b64(group))
+    expect(status == 200 and document == {"conditionalAppend": True, "version": 2},
+           "capabilities advertise no blobs without the opt-in override")
+    status, data, _, _ = begin(ALLOWED, group, token, TAG_BYTES + 1)
+    expect(status == 400 and json.loads(data) == {"error": "invalidRequest", "version": 2},
+           "a blob path answers 400 invalidRequest through the control router")
+
+
+def check_blobs_on() -> None:
+    group, token = new_group()
+    status, document = mls_call(ALLOWED, "capabilities", token, group=b64(group))
+    expect(status == 200 and document.get("blobs") == BLOB_CAPABILITY, "capabilities advertise the blobs object")
+
+    length = PART_BYTES + TAG_BYTES + 1
+    expect(layout(length).parts == 2, "the round-trip object has two GSB1 parts")
+    status, data, object_, parts = begin(ALLOWED, group, token, length)
+    expect(status == 200 and json.loads(data)["complete"] is False, "begin is routed to the blob lane")
+    for index, part in enumerate(parts):
+        status, _, data = blob_part(ALLOWED, "put", group, object_, index, token, part)
+        expect(status == 200 and json.loads(data) == {"version": 2, "stored": True, "complete": index == 1},
+               f"part {index} of {len(part)} bytes is stored through Traefik buffering")
+    status, headers, data = blob_part(ALLOWED, "get", group, object_, 1, token, headers={"X-GotSync-Route": "control"})
+    expect(status == 200 and data == parts[1] and headers.get("Cache-Control") == "no-store"
+           and headers.get("Content-Type") == "application/octet-stream",
+           "a client X-GotSync-Route: control on a blob path is overwritten and the exact part is served")
+    status, _, data = blob_call(ALLOWED, "manifest", token, group=b64(group), object=b64(object_))
+    expect(status == 200 and json.loads(data)["complete"] is True, "the manifest reports the object complete")
+    status, _, data = send_request(ALLOWED, "POST", "/v2/mls/fetch", b"{}", {"X-GotSync-Route": "blob"})
+    expect(status == 400 and json.loads(data).get("version") == 2, "a control request with a blob tag stays control")
+
+    try:
+        status, _, data = send_request(ALLOWED, "POST", f"/v2/mls/blob/put/{b64(group)}/{b64(object_)}/0",
+                                       headers=bearer(token), content_length=1_572_864,
+                                       content_type="application/octet-stream")
+    except OSError:
+        status, data = 0, b""
+    expect(status == 413 and not is_json(data), "Traefik refuses blob bodies over 1 MiB from the declared length")
+
+    check_blob_in_flight(group, token)
+    check_blob_rate(group, token)
+
+
+def wanted(via: str, group: bytes, token: bytes) -> tuple[int, http.client.HTTPMessage, bytes]:
+    return blob_call(via, "wanted", token, group=b64(group))
+
+
+def proxy_in_flight_refusal(response: tuple[int, http.client.HTTPMessage, bytes]) -> bool:
+    status, headers, data = response
+    return status == 429 and not is_json(data) and "X-Retry-In" not in headers and "Retry-After" not in headers
+
+
+def hold_blob_request(group: bytes, token: bytes) -> ssl.SSLSocket:
+    sock = tls_socket(ALLOWED)
+    sock.sendall(
+        (
+            f"POST /v2/mls/blob/put/{b64(group)}/{b64(os.urandom(32))}/0 HTTP/1.1\r\nHost: {HOST}\r\n"
+            f"Authorization: Bearer {b64(token)}\r\n"
+            "Content-Type: application/octet-stream\r\nContent-Length: 64\r\n\r\nx"
+        ).encode()
+    )
+    return sock
+
+
+def answered_early(held: list[ssl.SSLSocket]) -> list[bytes]:
+    answers = []
+    for sock in held:
+        sock.setblocking(False)
+        try:
+            answers.append(sock.recv(120) or b"closed")
+        except ssl.SSLWantReadError:
+            pass
+        except OSError as error:
+            answers.append(repr(error).encode())
+        finally:
+            sock.settimeout(10)
+    return answers
+
+
+def in_flight_attempt(group: bytes, token: bytes) -> tuple[bool, list[bytes]]:
+    """Holds four partial blob requests, then probes for Traefik's in-flight refusal; reports any held request
+    that was answered before the probes, which would leave fewer than four in flight."""
+    held = [hold_blob_request(group, token) for _ in range(4)]
+    try:
+        for _ in range(6):
+            early = answered_early(held)
+            if early:
+                return False, early
+            response = wanted(ALLOWED, group, token)
+            if proxy_in_flight_refusal(response):
+                status, _, data = send_request(ALLOWED, "POST", "/v2/mls/fetch", b"{}")
+                expect(status == 400 and is_json(data), "control requests from the same source are unaffected")
+                status, _, _ = wanted(DENIED, group, token)
+                expect(status == 200, "blob requests from another source are unaffected")
+                return True, []
+            expect(response[0] == 200, "a probe before the held requests count is served by the relay")
+            time.sleep(0.25)
+        return False, answered_early(held)
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def check_blob_in_flight(group: bytes, token: bytes) -> None:
+    outcomes = []
+    for _ in range(2):
+        refused, early = in_flight_attempt(group, token)
+        outcomes.append(early)
+        if refused:
+            break
+        wait_for_blob_recovery(group, token)
+    expect(refused, "Traefik's in-flight limiter (non-JSON 429 without rate headers) refuses a 5th concurrent "
+           f"blob request (held requests answered early per attempt: {outcomes})")
+    wait_for_blob_recovery(group, token)
+    expect(True, "the source recovers once its blob requests finish")
+
+
+def wait_for_blob_recovery(group: bytes, token: bytes) -> None:
+    for _ in range(20):
+        if wanted(ALLOWED, group, token)[0] == 200:
+            return
+        time.sleep(0.25)
+    expect(False, "the source recovers once its blob requests finish")
+
+
+def check_blob_rate(group: bytes, token: bytes) -> None:
+    statuses = []
+    for _ in range(80):
+        status, headers, data = wanted(ALLOWED, group, token)
+        statuses.append(status)
+        if status != 200:
+            break
+    expect(status == 429 and not is_json(data) and "X-Retry-In" in headers and set(statuses[:-1]) == {200},
+           f"Traefik's blob rate bucket refuses first, after {len(statuses) - 1} served requests")
+    status, _, data = send_request(ALLOWED, "POST", "/v2/mls/fetch", b"{}")
+    expect(status == 400 and is_json(data), "the control rate bucket is separate from the blob bucket")
+
+
+def check_blobs_misrouted() -> None:
+    group, token = new_group()
+    for headers, message in (
+        (None, "a blob request through the control router is refused as misrouted"),
+        ({"X-GotSync-Route": "blob"}, "a spoofed X-GotSync-Route: blob through the control router is overwritten and refused"),
+    ):
+        status, data, _, _ = begin(ALLOWED, group, token, TAG_BYTES + 1, headers)
+        expect_not_found(status, data, message)
+    status, _, data = send_request(ALLOWED, "POST", "/v2/mls/fetch", b"{}")
+    expect(status == 400 and is_json(data), "control requests are still served")
+
+
+def check_blobs_downgraded() -> None:
+    group, token = new_group()
+    status, document = mls_call(ALLOWED, "capabilities", token, group=b64(group))
+    expect(status == 200 and "blobs" not in document, "a relay with blobs disabled advertises no blobs capability")
+    status, data, _, _ = begin(ALLOWED, group, token, TAG_BYTES + 1)
+    expect(status == 400 and json.loads(data) == {"error": "invalidRequest", "version": 2},
+           "the kept blob router reaches a relay that answers 400 invalidRequest")
+
+
 if __name__ == "__main__":
-    {"open": check_open, "admission": check_admission}[sys.argv[1]]()
+    {
+        "open": check_open,
+        "admission": check_admission,
+        "blobs-off": check_blobs_off,
+        "blobs-on": check_blobs_on,
+        "blobs-misrouted": check_blobs_misrouted,
+        "blobs-downgraded": check_blobs_downgraded,
+    }[sys.argv[1]]()

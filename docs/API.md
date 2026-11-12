@@ -6,7 +6,8 @@ archives are implementation details rather than a supported consumer API.
 
 | Surface | Purpose |
 | --- | --- |
-| `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, and consumer invitation URL scheme. `relayURL` ends in `/v2/pairing` and `mailboxURL` in `/v2/mls` |
+| `SyncConfiguration` | Validated relay/mailbox URLs, endpoint policy, storage directory, consumer invitation URL scheme, and group profile. `relayURL` ends in `/v2/pairing` and `mailboxURL` in `/v2/mls` |
+| `SyncGroupProfile`, `SyncPayloadSchema`, `SyncGroupProfileError` | The application, payload schema, and member limit every group of an engine carries |
 | `SyncEngine` | MLS pairing, replication, local task mutations, and transport lifecycle |
 | `SyncState`, `SyncPhase`, `MailboxSyncState` | Immutable snapshots and connection state |
 | `LinkedDevice` | A group member as listed in `SyncState.linkedDevices` and passed to `removeDevice(_:)` |
@@ -161,11 +162,54 @@ Removing a device frees a group slot but not its slot in the task history.
 `isTaskHistoryAtCapacity` is `true` when linking one more device would leave
 no room for a new origin from that device or a current member. It is separate
 from `isGroupAtCapacity`, which counts current members only against
-`SyncEngine.maximumGroupSize` (8).
+`memberLimit`.
+
+### Group profiles and member limits
+
+`SyncConfiguration` takes a `groupProfile`, `SyncGroupProfile.legacyTaskDemo`
+by default. The legacy profile creates groups that earlier builds can pair
+with and admits eight devices. A profiled configuration names the application
+and member limit:
+
+```swift
+let profile = try SyncGroupProfile(
+    application: "com.example.tasks",
+    schema: .taskReplica,
+    memberLimit: SyncGroupProfile.supportedMemberCeiling
+)
+```
+
+The application is 1 to 64 bytes of lowercase ASCII letters, digits, `.` and
+`-`, starting with a letter or digit; otherwise the initializer throws
+`SyncGroupProfileError.invalidApplication`. `memberLimit` must be between 2 and
+`SyncGroupProfile.supportedMemberCeiling` (10), otherwise it throws
+`invalidMemberLimit`. `SyncPayloadSchema.taskReplica`, the task model this
+engine replicates, is the only schema consumers can select; it does not
+describe any other application data.
+
+`SyncEngine.groupProfile` returns the configured profile, and
+`SyncEngine.memberLimit` and `SyncState.memberLimit` its member limit. Read the
+limit from there instead of hardcoding a count. `isGroupAtCapacity` compares
+`linkedMemberCount` with it. `SyncGroupProfile.legacyMemberLimit` (8) is the
+limit of legacy groups. `SyncEngine.maximumGroupSize` is deprecated and still
+returns 8.
+
+`SyncError.incompatibleGroupProfile` reports that the other device or the
+stored group uses another application, schema, schema version, or member
+limit. Pairing fails with it on both devices before a KeyPackage is published
+or a safety code is shown. When the stored group's profile differs from the
+configuration, sync stops with it in `mailboxError`, `mailboxRequiresRepair`
+is `true`, and `inviteToGroup()` fails with it; the MLS state and tasks are
+kept. Configure the stored profile again, or unlink. Exhaustive switches over
+`SyncError` need a case for it. See [COMPATIBILITY.md](COMPATIBILITY.md#group-profiles-and-ten-members)
+for mixed builds, relays, and rollback.
 
 `unlinkAndKeepTasks()` and `eraseLocalData()` leave the group. The engine moves
 the MLS state into a departure journal and publishes a proposal removing this
-device in the background; another member commits it. The journal is erased
+device in the background; another member commits it. Before that, the journal
+removes devices this device added that have not sent a message yet, including
+one whose Add was still being delivered, because no other member knows they
+never joined. The journal is erased
 once the relay accepts the proposal. Both calls switch to a new MLS identity
 and fingerprint at once, so the same install can be invited again.
 `eraseLocalData()` also gives the new empty replica a new operation origin, so
@@ -212,6 +256,192 @@ The Keychain implementation requires a service name; use your own application
 namespace. Unit tests use an in-memory implementation. The example tests cover
 Keychain-backed identity and storage on the iOS Simulator.
 
+## Host journal and blob API
+
+The host journal and the encrypted blob transfer are ordinary `public` API.
+They were preview SPI before. `scripts/check-host-spi-surface.py` checks both
+surfaces against a reviewed list by name, and checks that no surface names an
+internal type.
+
+**Migrating from the preview imports:**
+- `@_spi(HostJournalPreview) import GotSync` and `@_spi(BlobPreview) import GotSync` keep compiling. No symbol is renamed.
+- Replace them with `import GotSync` at any time.
+- `HostMutation(id:payload:)` stays; reclaiming groups pass `capturedAt` through `HostMutation(id:payload:capturedAt:)`.
+- `enroll()` stays; reclaiming groups declare the store with `enroll(incarnation:)`.
+- Exhaustive switches over `HostJournalError` need:
+  - `bootstrapPending`;
+  - `ancestryUnresolved`;
+  - `mutationFinalized`;
+  - `captureRequired`.
+
+`SyncEngine.lastPairingFailure` retains the typed terminal failure of a pairing attempt until the next attempt starts. Use it to finish host pairing waits; `errorMessage` is presentation state that later sync activity can replace.
+
+For a linked member, `SyncEngine.canInviteToGroup` reports whether local membership, reservation history and host readiness allow an invitation now. A newly joined member can wait for it before calling `inviteToGroup()`; network errors can still occur after admission. `isGroupAtCapacity` identifies a full roster.
+
+When `resume` confirms a pending enrollment, it records the host's saved starting capture counter in the same transaction. A store that brings a nonzero counter from an earlier journal therefore has a matching initial export cut without inventing a submission. On an already confirmed enrollment, a host-ahead capture counter remains host rollback evidence; submission advances the journal's counter. Readiness still requires the host to finish its initial outbox.
+
+The host journal: size `submit` batches
+with `HostJournal.submissionLimits`, a `HostSubmissionLimits` value:
+
+| Field | Value |
+| --- | --- |
+| `maxPayloadBytes` | 65,536 |
+| `envelopeOverheadBytes` | 64 |
+| `maxRecordsPerSubmit` | 256 |
+| `maxEncodedBytesPerSubmit` | 262,144 |
+
+The values come from the journal itself, not from a copy of these numbers.
+`Invitation.phraseWordCount` is the number of words in an invitation phrase
+(17), read from the phrase codec.
+
+The blob API provides encrypted image transfer for host-journal
+engines. `await engine.blobTransfers()` returns the `BlobTransferService`
+actor, or nil in other modes. The engine binds the service to the active group
+during sync and retires the binding before leave, removal, reset or erase
+changes MLS state. A binding is kept across launches while the same member stays
+in the same group.
+
+| Call | Purpose |
+| --- | --- |
+| `seal(_:route:source:expectedContentHash:)` | Seal a private clone of a host file under a fresh key and upload it. The host file is never written or deleted |
+| `outgoing()` | Statuses. Only `readyForHandoff(descriptor, digest)` exposes a frozen descriptor |
+| `confirmHandoff(_:descriptorDigest:)` | Delete the row after the host stored the descriptor in its record; a different digest is `staleConfirmation` |
+| `cancelOutgoing(_:)` | Drop a transfer that was never offered |
+| `requestIncoming(_:route:descriptor:)` | Queue a descriptor from an accepted host record |
+| `incoming()` | Statuses. `awaitingPublish(file, contentHash, digest)` is verified content the host publishes |
+| `confirmPublished(_:descriptorDigest:)` | Delete the verified file after the host published it |
+| `cancelIncoming(_:)` | Drop an unverified variant, such as a rejected one |
+| `registerAvailable(route:descriptor:)`, `unregisterAvailable(route:objectID:)` | Objects whose content the host holds, re-uploaded when other members want them |
+| `release(route:objectIDs:)` | Availability hint to the relay |
+| `summary()`, `summary(for:)`, `updates()` | Aggregate or kind-filtered transfer/registry counts; byte totals, `relayUnsupported` and resource flags remain global. A signal follows each change |
+| `setHooks(_:)` | `verifiedContentURL(contentHash:)` for re-uploads, `acceptsImage(file:image:)` for the host's own image check, and `acceptsData(file:data:)`, which must admit each received data chunk and refuses by default |
+| `sealData(_:route:source:expectedContentHash:)` | Seal one application-data chunk of at most 10 MiB, with no image validation |
+| `requestIncomingData(_:route:descriptor:)` | Queue an application-data descriptor |
+| `registerAvailableData(route:descriptor:)` | Register a data chunk the host holds, for re-upload |
+
+`BlobTransferService.maximumObjectPlaintextLength` exposes the codec's per-object plaintext limit for both content kinds. Filtered counts describe transfers or registered variants, not distinct logical images.
+
+`BlobTransferID` (16 bytes) is chosen and persisted by the host; repeating a
+call with the same ID and parameters is safe, and different parameters are
+`transferMismatch`. `BlobDescriptorInfo(descriptor:)` reads an image
+descriptor's object ID, content hash, length and image fields for keying host
+variants by `(route, objectID)`.
+
+Images and application data are separate content kinds (`BlobContentKind`).
+Application data is one chunk of a host record too large for a journal
+payload. Its descriptor is version 2, with zero flags, zero dimensions and the
+media type `com.gotdone.sync.application-data`. Image descriptors stay version
+1 and their bytes are unchanged. The image calls refuse a data descriptor, and
+the data calls refuse an image descriptor, with `contentKindMismatch`; so does
+reusing a transfer ID for the other kind. `BlobDataDescriptorInfo(descriptor:)`
+reads a data descriptor's object ID, content hash, length and digest. Statuses
+carry `kind`. Other versions and nonzero flags are `unsupportedDescriptor`, and
+an earlier library reports a version 2 descriptor as unsupported. A received
+chunk is published only after its manifest, part hashes, authentication and
+content hash are verified and `acceptsData` admits it; otherwise the variant is
+`rejected(.dataRefused)`. The host splits a large record into ordered chunks,
+checks the whole record's length and hash after assembling them, and
+acknowledges only after applying it. Every chunk counts against the same
+ledger and limits as an image. Library caps are 64 MiB of bytes, 16 outgoing rows, 8
+incoming rows holding bytes, 1,024 queued descriptors, 4,000 registered
+objects and 512 MiB of free disk; a full cap is `capacity(_:)` and nothing is
+evicted. Images must pass the provisional validator: at most 10 MiB, JPEG, PNG,
+HEIC, HEIF, GIF, TIFF or WebP, at most 64 frames, 8,192 pixels per side and 40
+million pixels per frame. These limits are policy, not a measured memory
+ceiling. Files live under `blob-v1/` in the storage directory.
+
+### Snapshot bootstrap
+
+A joining host can install a peer's compact state instead of applying every
+record. Register `HostSnapshotHooks` with `engine.registerSnapshotHost(_:)`
+before pairing; without hooks, bootstrap keeps full history.
+
+**Joiner:**
+- A fresh journal asks its provider for a snapshot of the hooks' `HostSnapshotSchema`.
+- `HostJournalState.bootstrap` shows `requested` through `installing`. While it does, delivery is held: `incoming` returns nothing and `markApplied` throws `bootstrapPending`. Capture and `submit` continue.
+- The library checks the offer's per-origin anchors against records the joiner received and chain-checked itself, then fetches and verifies the content.
+- `install(HostSnapshotInstall)` receives a library-owned file, the provider, the covered `[origin: sequence]` and a recipient-local `appliedThrough`. Merge in one transaction that also saves that application mark and snapshot ID, never replacing local data, unsent outbox rows or drafts, then return `.installed`. A repeated ID must return `.installed` without changes.
+- After installation, `journal.coveredThrough(after:)` identifies a following contiguous run already represented by the snapshot. Save that mark in the host store before calling `markApplied`. `markApplied` records exactly the saved mark; it never silently advances past it.
+- After the install, `incoming` skips covered records and delivers the tail; `completed` reports that the library released its copy.
+
+**Provider:**
+- `export(HostSnapshotCut)` writes state that reflects exactly the remote records applied through `appliedThrough` and every submitted record, read in one transaction at the cut's capture counter.
+- Return the markers read, or `.notAtCut`, for example while outbox rows are unsent.
+
+**Refusals and fallback:**
+- A refusal (`HostSnapshotRefusal`) keeps the offer and delivers every record. It covers:
+  - a schema mismatch;
+  - an export over `HostSnapshotLimits.maxBytes` (32 MiB), refused after Add;
+  - a mismatched anchor;
+  - missing or rejected content;
+  - a host refusal;
+  - no remaining provider.
+- `declineSnapshotBootstrap()` ends a held bootstrap.
+
+**Retention:** every record stays retained and byte-checked. A snapshot changes only delivery, never retention.
+
+### Retention floors (compacting groups)
+
+A group created with `SyncPayloadSchema.compactingHostJournal(payload:version:)`
+may remove history, and only that profile allows it. Libraries without
+compaction, and clients configured with the `hostJournal` profile, refuse to
+pair into such a group, before Add.
+
+Every member must register two hosts before creating or joining; otherwise
+pairing fails with `incompatibleGroupProfile`:
+- a snapshot host whose schema is `HostSnapshotSchema(label: payload, version: version)`;
+- `registerRetentionHost(_:)`.
+
+**A round:**
+1. The current roster's lowest fingerprint coordinates. `proposeRetentionFloor()` starts a round on it and returns `notCoordinator` elsewhere. It also proposes on its own at 16 MiB of retained bytes.
+2. The coordinator exports a checkpoint at its cut through the snapshot `export` hook, stores it durably and uploads it.
+3. Every other member, by its own authenticated vote, accepts only after it has:
+   - fetched and stored the checkpoint, registered for re-upload;
+   - applied everything at or below the floor;
+   - no pending, quarantined or held content;
+   - its retention host's `attest` returning the journal's application marker and capture counter, an empty outbox and kept deletion metadata.
+4. When all have accepted, each member commits the floor. Records at or below it are then removed.
+
+A missing, offline, declining or changed roster commits nothing.
+
+**After compaction:**
+- An arriving record at or below the floor is a duplicate only within an exact run to the floor's anchor or to a retained record. Otherwise its message is quarantined (`belowFloor`).
+- Host mutation IDs keep their sequences.
+- Archive exports of a compacted journal start with `HostArchiveItem.checkpoint`.
+- A joiner installs the floor's checkpoint after every other current member reported the same floor, and then receives only records above it.
+
+`HostJournalState.retention` shows the floor and what was removed.
+
+### Provenance, ancestry and reclamation (reclaiming groups)
+
+`SyncPayloadSchema.reclaimingHostJournal(payload:version:)` adds three things
+to the compacting group:
+- store provenance;
+- ancestry gating;
+- tombstone and clear reclamation, plus host-mutation mapping release.
+
+Libraries without these semantics refuse to pair into it. `hostJournal` and
+`compactingHostJournal` groups are unchanged.
+
+**Enrolling:**
+- Mint a `storeID` once for the local store and keep it across restores and relinks.
+- Enroll with `enroll(incarnation: HostStoreIncarnation(storeID:content:lineage:))`, presenting every `HostLineage` saved earlier.
+- Save `HostJournal.lineage()` with the provenance.
+
+**Ancestry:**
+- `HostJournalState.ancestry` shows `fresh`, `founder`, `sameLineage`, `staleLineage`, `foreign` or `unknown`.
+- The last three need a preserving merge, then `resolveAncestry(.merged)`. Until then, `declareReady` throws `ancestryUnresolved` and this member declines every floor.
+
+**Reclamation:**
+- When every current member's retention host has a `reclaim` hook, a round also agrees on a reclamation frontier, with every current store in its scope.
+- `reclaim(HostReclamation)` deletes tombstones and clears whose deleting journal record is at or below the frontier, and saves the frontier in the same transaction. It is asked again until it returns.
+- A later joiner whose saved lineage is behind the frontier is `staleLineage`.
+
+**Mapping release:**
+- `finalizeSubmissions(capturedThrough:)` with an empty outbox fences every mutation captured through it. Mappings of own records removed under the floor are released afterwards.
+- After that, a mutation without `capturedAt` is refused `captureRequired`.
+- A finalized mutation whose mapping is gone is refused `mutationFinalized`. It never gets a new sequence.
+
 ## Deferred API refinements
 
 Main-actor isolation preserves the existing serial recovery behavior. MLS
@@ -233,3 +463,17 @@ full separation of localized copy and celebration timing is deferred.
 which does not invalidate credentials or require link repair, and for a
 blocked delivery log. A later API
 revision should expose typed codes consistently for all error surfaces.
+
+### Joining and checkpoint failure
+
+In reclaiming groups, submission remains fenced until the finite history cut has been applied, any checkpoint installed, and ancestry resolved. Keep capture local during that wait; do not publish ambiguous old incarnations before the preserving merge. A compacted checkpoint refusal keeps incoming delivery and acknowledgements held because full history is unavailable.
+
+Installing a checkpoint does not acknowledge application-side reclamation. The library calls the idempotent reclamation hook after installation and ancestry resolution, and records completion only after that hook returns. The host must commit its reclamation frontier with its barrier changes.
+
+A snapshot exporter may return `HostSnapshotExportResult.tooLarge` before writing an oversized file. The recipient then sees `HostSnapshotRefusal.tooLarge`; full-history fallback is available only when no adopted retention floor requires that checkpoint.
+
+### Offline journal inspection
+
+`HostJournalReader(storageDirectory:)` reads the same storage directory as `SyncConfiguration`, without creating an engine, identity, directory or connection to a relay. `journals()` returns active and retired `HostJournalInfo` values. A missing directory, an unreadable journal or an incomplete creation throws instead of looking empty. `export(_:after:limit:)` returns the existing revision-bound archive pages, including checkpoint files; checkpoint length and hash must be verified before decoding.
+
+For image cleanup, freeze the app's reference sources and compare the inventory with the journals the app expects. Every other owner must be inspected too. An active journal (`retirement == nil`) may have an associated MLS inbox the reader cannot inspect: stopping its writer is insufficient. After a completed Leave, a retired journal owns the handed-off inbox and can be inspected without restarting sync. Preserve content if any expected journal, checkpoint, pending record or quarantine cannot be understood. This reader has no write or discard method.

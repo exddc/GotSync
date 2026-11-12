@@ -10,6 +10,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from .http import (
@@ -27,6 +28,7 @@ from .protocol import PROTOCOL_VERSION as VERSION
 MAX_PAYLOAD = 448 * 1024
 MAX_ENTRIES = 10_000
 MAX_BYTES = 16 * 1024 * 1024
+MAX_WRITERS = 10
 DEFAULT_MAX_PACKAGES = 4096
 DEFAULT_MAX_GROUPS = 4096
 DEFAULT_RETENTION_SECONDS = 90 * 86400
@@ -175,6 +177,45 @@ class MLSDeliveryStore:
         with self._lock:
             self._expire_committed()
 
+    def authorize_active(self, route: bytes, token: object, *, timeout: float,
+                         admit: Callable[[bytes], None]) -> bytes:
+        """Read-only blob authorization: the writer must be active (no removal grace).
+
+        One `SELECT` pair under the delivery lock, acquired within `timeout` (else `TimeoutError`); no expiry, no
+        activity write and no commit. `admit(digest)` runs under the same lock, so a writer permit taken there is
+        ordered before any removal commit. Returns the writer digest.
+        """
+        try:
+            digest = hashlib.sha256(decode_canonical_base64url(token, field="authorization", exact_bytes=32)).digest()
+        except RequestError as error:
+            raise DeliveryUnauthorized("writer token required") from error
+        if not self._lock.acquire(timeout=timeout):
+            raise TimeoutError("delivery store busy")
+        try:
+            if self._db.execute("SELECT 1 FROM mls_groups WHERE route=?", (route,)).fetchone() is None:
+                raise HistoryExpired("group expired")
+            row = self._db.execute("SELECT removal FROM mls_writers WHERE route=? AND digest=?", (route, digest)).fetchone()
+            if row is None or row[0] is not None:
+                raise DeliveryUnauthorized("writer not authorized")
+            admit(digest)
+            return digest
+        finally:
+            self._lock.release()
+
+    def live_routes(self, routes: list[bytes], *, timeout: float) -> set[bytes]:
+        """Read-only: which of `routes` still have a delivery group."""
+        live: set[bytes] = set()
+        for start in range(0, len(routes), 512):
+            batch = routes[start:start + 512]
+            if not self._lock.acquire(timeout=timeout):
+                raise TimeoutError("delivery store busy")
+            try:
+                live.update(row[0] for row in self._db.execute(
+                    f"SELECT route FROM mls_groups WHERE route IN ({','.join('?' * len(batch))})", batch))
+            finally:
+                self._lock.release()
+        return live
+
     def _expire_committed(self) -> None:
         with self._db:
             self._expire(time.time())
@@ -183,6 +224,7 @@ class MLSDeliveryStore:
         operations = {
             "key-package/publish": self._publish, "key-package/fetch": self._package_fetch,
             "create": self._create, "fetch": self._fetch, "ack": self._ack, "append": self._append,
+            "append-if-head": self._append_if_head, "capabilities": self._capabilities,
         }
         handler = operations.get(operation)
         if handler is None:
@@ -295,10 +337,35 @@ class MLSDeliveryStore:
             (now - GRACE_SECONDS,),
         )
 
+    def _capabilities(self, doc: dict) -> dict:
+        route = blob(doc, "group", 32)
+        self._authorize(doc, route)
+        return {"conditionalAppend": True}
+
     def _append(self, doc: dict) -> dict:
+        if "expectedHead" in doc:
+            raise RequestError("expectedHead requires append-if-head")
+        route = blob(doc, "group", 32)
+        writer = self._authorize(doc, route, writing=True).digest
+        return self._append_entry(route, writer, self._parse_entry(doc, writer))
+
+    def _append_if_head(self, doc: dict) -> dict:
+        """Append a Remove commit only while the group's log head is `expectedHead`.
+
+        The head only grows, so a refusal is final for every copy of the request.
+        The write lock is taken first, so no other connection can append between
+        the head check and the insert.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
         route = blob(doc, "group", 32)
         writer = self._authorize(doc, route, writing=True).digest
         entry = self._parse_entry(doc, writer)
+        _, kind, _, welcome, _, removed_writer, _ = entry
+        if kind != "commit" or removed_writer is None or welcome is not None:
+            raise RequestError("conditional append requires a commit that removes a writer")
+        return self._append_entry(route, writer, entry, expected_head=number(doc, "expectedHead"))
+
+    def _append_entry(self, route: bytes, writer: bytes, entry: tuple, expected_head: int | None = None) -> dict:
         duplicate = self._db.execute(
             "SELECT cursor,epoch,kind,payload,welcome,package,removed_writer,added_writer FROM mls_entries WHERE route=? AND payload=?", (route, entry[2])
         ).fetchone()
@@ -306,6 +373,12 @@ class MLSDeliveryStore:
             if entry != duplicate[1:]:
                 raise DeliveryConflict("retry differs from accepted message")
             return {"entry": self._entry(duplicate)}
+        if expected_head is not None:
+            head = self._db.execute("SELECT head FROM mls_groups WHERE route=?", (route,)).fetchone()[0]
+            if expected_head > head:
+                raise RequestError("expectedHead is beyond the log")
+            if head > expected_head:
+                return {"error": "headAdvanced", "head": head}
         digest = hashlib.sha256(entry[2]).digest()
         rejected = self._db.execute("SELECT epoch FROM mls_rejections WHERE route=? AND digest=?", (route, digest)).fetchone()
         if rejected:
@@ -344,8 +417,10 @@ class MLSDeliveryStore:
         if package and (not joining or joining[0] != added_writer):
             return False
         if joining and not self._db.execute("SELECT 1 FROM mls_writers WHERE route=? AND digest=? AND removal IS NULL", (route, added_writer)).fetchone():
-            if self._db.execute("SELECT COUNT(*) FROM mls_writers WHERE route=? AND removal IS NULL", (route,)).fetchone()[0] >= 8:
-                raise DeliveryCapacity("writer directory full")
+            # Refused like an unavailable KeyPackage, so the journal fences
+            # every later copy of this Add and the client can discard it.
+            if self._db.execute("SELECT COUNT(*) FROM mls_writers WHERE route=? AND removal IS NULL", (route,)).fetchone()[0] >= MAX_WRITERS:
+                return False
         return True
 
     def _accept_entry(self, route: bytes, entry: tuple, writer: bytes) -> dict:
@@ -379,8 +454,9 @@ class MLSDeliveryStore:
 
 
 class MLSDeliveryServer:
-    def __init__(self, store: MLSDeliveryStore) -> None:
+    def __init__(self, store: MLSDeliveryStore, *, capability_extras: dict[str, Any] | None = None) -> None:
         self.store = store
+        self.capability_extras = capability_extras
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task] = set()
         self._expiry: asyncio.Task | None = None
@@ -459,7 +535,10 @@ class MLSDeliveryServer:
             scheme, _, token = authorization.partition(" ")
             if scheme.lower() == "bearer":
                 document["authorization"] = token
-            result = await asyncio.to_thread(self.store.request, target.removeprefix("/v2/mls/"), document)
+            operation = target.removeprefix("/v2/mls/")
+            result = await asyncio.to_thread(self.store.request, operation, document)
+            if operation == "capabilities" and self.capability_extras and "error" not in result:
+                result = {**result, **self.capability_extras}
             await write_http_response(writer, 409 if "error" in result else 200, result)
         except RequestError as error:
             await write_http_response(writer, error.status, error.body())

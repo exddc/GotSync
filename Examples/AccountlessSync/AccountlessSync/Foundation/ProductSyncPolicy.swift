@@ -33,7 +33,10 @@ enum ProductSyncPolicy {
         pairingWindowTimeToLive
     }
 
-    static let maxDevices = SyncEngine.maximumGroupSize
+    /// The demo keeps the task groups earlier builds create.
+    static let groupProfile = SyncGroupProfile.legacyTaskDemo
+
+    static let maxDevices = groupProfile.memberLimit
 
     /// BGTaskScheduler identifier for deferred mailbox upload.
     static let backgroundMailboxTaskIdentifier =
