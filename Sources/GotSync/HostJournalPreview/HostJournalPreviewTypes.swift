@@ -472,8 +472,9 @@ public struct HostJournalArchive: Hashable, Sendable {
     public let heldInbox: UInt64
 
     init?(_ listing: HostJournalListing) throws {
-        guard case .journal(_, let view) = listing, let retirement = view.retirement else { return nil }
-        guard view.recordCount >= view.ownHead else {
+        guard case .journal(let url, let view) = listing, let retirement = view.retirement else { return nil }
+        let ownRecords = try HostJournalFiles.recordCount(url, origin: view.origin)
+        guard ownRecords <= view.recordCount, ownRecords <= view.ownHead, view.retention != nil || ownRecords == view.ownHead else {
             throw HostJournalError.repairRequired(.journalCorrupt)
         }
         journalID = view.journalID
@@ -481,8 +482,8 @@ public struct HostJournalArchive: Hashable, Sendable {
         origin = view.origin
         reason = HostRetirementReason(retirement)
         retainedBytes = view.retainedBytes
-        own = view.ownHead
-        remote = view.recordCount - view.ownHead
+        own = ownRecords
+        remote = view.recordCount - ownRecords
         unapplied = view.undelivered
         pending = view.pendingCount
         quarantined = view.quarantineCount

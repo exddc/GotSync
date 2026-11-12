@@ -72,6 +72,12 @@ enum HostJournalFiles {
         return listings
     }
 
+    nonisolated static func recordCount(_ url: URL, origin: Data) throws -> UInt64 {
+        try read(url) { database in
+            try database.first("SELECT COUNT(*) FROM records WHERE origin = ?", [.blob(origin)]) { try $0.unsigned(0) } ?? 0
+        }
+    }
+
     static func admitsNewLink(_ listings: [HostJournalListing]) -> Bool {
         let held = listings.filter {
             switch $0 {

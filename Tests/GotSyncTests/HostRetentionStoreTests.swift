@@ -103,6 +103,25 @@ final class HostRetentionStoreTests: XCTestCase {
         XCTAssertEqual(next.first?.sequence, 3)
     }
 
+    func testACompactedArchiveCountsItsRetainedRecords() throws {
+        let (store, chain, _) = try caughtUpMember()
+        let floor = anchors([chain[3], try ownEnvelope(store, 2)])
+        try store.commitRetentionFloor(round: Data(repeating: 1, count: 16), proposal: Data(repeating: 9, count: 32), checkpoint: checkpoint(floor))
+        while try store.pruneBelowFloor() > 0 {}
+        XCTAssertEqual(store.view.recordCount, 1, "only x5 remains")
+        XCTAssertEqual(store.view.ownHead, 2)
+        try store.retire(.unlink, heldInbox: [])
+
+        let listing = try XCTUnwrap(HostJournalFiles.discover(in: root).first)
+        let archive = try XCTUnwrap(try HostJournalArchive(listing))
+        XCTAssertEqual(archive.own, 0)
+        XCTAssertEqual(archive.remote, 1)
+        let page = try HostJournalFiles.export(store.url, after: nil, limit: 10)
+        guard case .checkpoint(let exported)? = page.items.first else { return XCTFail("a compacted export starts with its checkpoint") }
+        XCTAssertEqual(exported.anchors, floor)
+        guard case .remote(_, _, 5, _, _)? = page.items.last, page.items.count == 2 else { return XCTFail("then only x5") }
+    }
+
     func testBelowFloorBytesAreDischargedOnlyByAnExactRunAndOtherwiseQuarantined() throws {
         let (store, chain, _) = try caughtUpMember()
         let floor = anchors([chain[2], try ownEnvelope(store, 1)])
