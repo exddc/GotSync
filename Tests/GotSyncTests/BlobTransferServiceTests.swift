@@ -295,6 +295,22 @@ final class BlobTransferServiceTests: XCTestCase {
         XCTAssertEqual(Invitation.phraseWordCount, 17)
     }
 
+    func testACancelledTimeoutDoesNotWakeTheNextWait() async throws {
+        let signal = BlobSignal()
+        signal.fire()
+        await signal.wait(seconds: 60)
+        let woke = OSAllocatedUnfairLock(initialState: false)
+        let waiter = Task {
+            await signal.wait(seconds: 60)
+            woke.withLock { $0 = true }
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(woke.withLock { $0 }, "the second wait stays suspended until its own signal")
+        signal.fire()
+        await waiter.value
+        XCTAssertTrue(woke.withLock { $0 })
+    }
+
     // MARK: - Helpers
 
     private func service(_ name: String) throws -> BlobTransferService {

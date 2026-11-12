@@ -1459,7 +1459,7 @@ final class BlobSignal: Sendable {
         guard waiting.withLock({ busy in defer { busy = true }; return !busy }) else { return }
         defer { waiting.withLock { $0 = false } }
         let timeout = Task { [continuation] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0.05, min(seconds, 86_400)) * 1_000_000_000))
+            guard (try? await Task.sleep(nanoseconds: UInt64(max(0.05, min(seconds, 86_400)) * 1_000_000_000))) != nil else { return }
             continuation.yield()
         }
         defer { timeout.cancel() }
